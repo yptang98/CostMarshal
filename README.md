@@ -4,6 +4,16 @@
 
 # CostMarshal
 
+<p align="center">
+  <img alt="Codex skill" src="https://img.shields.io/badge/Codex-Skill-111827">
+  <img alt="Multi-model orchestration" src="https://img.shields.io/badge/Multi--model-Orchestration-2563eb">
+  <img alt="Cost aware" src="https://img.shields.io/badge/Cost--aware-Routing-059669">
+  <img alt="Strong-demo replay" src="https://img.shields.io/badge/Strong--demo-Replay-f59e0b">
+  <img alt="Project evolution" src="https://img.shields.io/badge/Project-Self--evolution-7c3aed">
+  <img alt="WakeWait embedded" src="https://img.shields.io/badge/WakeWait-Embedded-0f766e">
+  <img alt="MIT License" src="https://img.shields.io/badge/License-MIT-green">
+</p>
+
 CostMarshal is a cost-aware multi-model control layer for Codex CLI.
 
 It lets the expensive leader model stay in charge of planning, routing, verification, and final integration, while cheaper worker models handle bounded tasks from structured briefs. The point is not just to call more models; it is to make long-running work cheaper without losing state, quality control, or the leader's clean context.
