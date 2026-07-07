@@ -419,6 +419,10 @@ python scripts/costmarshal.py --root <temp-root> check-agents --agents deepseek,
 - Token and cost estimates are recorded from caller-provided or provider-reported usage, not enforced by a central billing gateway.
 - Verification relaxation is conservative and based on accumulated scorecard evidence.
 
+## License
+
+MIT License. See [LICENSE](LICENSE).
+
 ## Acknowledgements
 
 CostMarshal is inspired in part by [Jinghao67/conductor](https://github.com/Jinghao67/conductor) and the model-hierarchy-skill approach to tiered model collaboration.
