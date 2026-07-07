@@ -27,6 +27,19 @@ CostMarshal is built around five advantages:
 
 This strong-demo replay loop is the main cost-saving pattern: spend expensive tokens once to discover and verify the path, then use cheaper agents to repeat the same class of task from a complete memory file instead of asking them to improvise.
 
+## Example Workflow
+
+```text
+1. Leader drafts a lightweight plan and asks the user to approve cost, time, risks, and acceptance checks.
+2. Senior agent solves the uncertain path once and returns a structured completion report.
+3. Leader verifies the result, records token/cost usage, and promotes the proven steps into replay memory.
+4. Cheaper agents receive only the bounded task brief plus that replay memory file.
+5. CostMarshal waits without polling, records each worker's model name, summary, tokens, cost, and wait time.
+6. At project finish, CostMarshal evolves global routing memory and writes compact knowledge lessons for future projects.
+```
+
+The result is a practical loop: strong model for discovery, cheaper models for repeatable execution, and project memory that gets sharper after every run.
+
 GitHub: https://github.com/yptang98/CostMarshal
 
 Version: `v0.0.2`
