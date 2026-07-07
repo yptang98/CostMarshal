@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+Thumbs.db
+
+# Never commit local secrets or generated run state.
+*.env
+.env
+costmarshal/
+multi-model-conductor/
+projects/
+memory/
+config/
