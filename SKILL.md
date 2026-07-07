@@ -45,6 +45,7 @@ python scripts/costmarshal.py new-review-task --project <project-dir> --source-t
 python scripts/costmarshal.py promote-memory --project <project-dir> --source-task CM-0001 --name reusable-flow --memory-task-type mechanical --summary "What the senior agent proved and exactly how to replay it" --working-dir "." --required-input "config.yaml exists" --allowed-param "top_k" --allowed-command "python run_eval.py --config config.yaml" --expected-output "results.json" --success-marker "command exits 0"
 python scripts/costmarshal.py new-task --project <project-dir> --title "replay reusable flow" --purpose "Run the proven flow with new parameters" --agent longcat --difficulty B --risk low --task-type mechanical --replay-memory reusable-flow --depends-on CM-0001
 python scripts/costmarshal.py record-memory-feedback --project <project-dir> --task CM-0003 --outcome partial --sufficient no --memory-quality 2 --attribution memory_issue --needs-senior-refresh --issue "Missing required input path"
+python scripts/costmarshal.py evolve-project --project <project-dir>
 python scripts/costmarshal.py status-project --project <project-dir>
 python scripts/costmarshal.py finish-project --project <project-dir>
 ```
@@ -96,7 +97,9 @@ Never hard-code API keys in prompts, reports, logs, or skill files. Refer to sec
 22. If feedback attribution is `memory_issue` or `--needs-senior-refresh`, mark the memory as needing revision and send it back to a senior agent. If attribution is `agent_capability`, adjust routing for that model instead of blaming the memory.
 23. Use `costmarshal.py record-handoff` for compressed task-to-task context and `new-review-task` for bounded cross-agent review.
 24. Use `costmarshal.py status-project` during long runs to inspect task states, locks, budget, replay memory health, agent cost, each task's concrete model name, short result summary, and accumulated WakeWait-style wait time.
-25. Use `costmarshal.py finish-project` at project completion so the global memory and project summary include per-agent input tokens, output tokens, total tokens, estimated CNY cost, task summaries, model names, and wait-time totals.
+25. Use `costmarshal.py finish-project` at project completion so the global memory and project summary include per-agent input tokens, output tokens, total tokens, estimated CNY cost, task summaries, model names, and wait-time totals. `finish-project` runs project evolution by default.
+26. Use `costmarshal.py evolve-project` after adding final leader notes or senior abstractions. The evolution phase writes `reports/evolution-report.md`, updates routing evidence, and promotes compact reusable lessons into `memory/knowledge-index.json` plus one small `memory/knowledge/<task-type>/<lesson>.md` file per lesson.
+27. For future projects, read the knowledge index first and attach at most one matching knowledge file unless the leader explicitly approves more context. Prefer replay memory for exact command reproduction; use knowledge lessons for common problem patterns, bug fixes, and reusable judgment.
 
 ## Senior Demo To Weak Replay Loop
 

@@ -429,6 +429,7 @@ Stop or escalate on:
 8. If evidence is weak, request rework or escalate.
 9. Merge only the suggested merge note or a leader-compressed summary.
 10. Update scorecard.
+11. At project completion, run `finish-project` or `evolve-project` so successful paths become routing evidence and compact knowledge lessons.
 
 ## Script Commands
 
@@ -453,6 +454,7 @@ python scripts/costmarshal.py status-project --project <project-dir>
 python scripts/costmarshal.py set-status --project <project-dir> --task CM-0001 --state running
 python scripts/costmarshal.py record-result --project <project-dir> --task CM-0001 --agent kimi --model kimi-k2.7-code --status done --quality-score 4 --accepted-by-leader
 python scripts/costmarshal.py finish-project --project <project-dir>
+python scripts/costmarshal.py evolve-project --project <project-dir>
 python scripts/costmarshal.py validate --project <project-dir>
 ```
 

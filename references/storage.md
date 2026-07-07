@@ -26,6 +26,8 @@ Use `python scripts/costmarshal.py init-root` to create it.
 
 `memory/agent-memory.json` is the global rolling model memory. It stores aggregate performance by agent and task type. `memory/events.jsonl` is append-only evidence.
 
+`memory/evolution-events.jsonl` records project-level evolution events. `memory/evolution-policy.json` stores the latest routing and retrieval policy generated from project evidence. `memory/knowledge-index.json` is the small hierarchical retrieval entrypoint for reusable lessons, grouped by task type. Full lesson files live under `memory/knowledge/<task-type>/<lesson>.md`; future tasks should attach at most one matching lesson unless the leader approves more context.
+
 ## Project Directory
 
 Every new project must be created with `costmarshal.py new-project`.
@@ -229,4 +231,4 @@ At the end of a project, run:
 python scripts/costmarshal.py finish-project --project <project>
 ```
 
-This creates `reports/project-summary.md` with per-agent performance, input/output token totals, estimated CNY cost, per-task model names, task summaries, and wait-time totals. The leader should then add final conclusions and promote reliable repeated procedures into replay memory.
+This creates `reports/project-summary.md` with per-agent performance, input/output token totals, estimated CNY cost, per-task model names, task summaries, and wait-time totals. It also runs project evolution by default, creating `reports/evolution-report.md`, appending evolution evidence, updating global routing policy, and promoting compact reusable lessons into the hierarchical knowledge index. The leader should then add final conclusions and promote exact repeated procedures into replay memory when command-level reproduction is required.

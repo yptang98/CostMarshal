@@ -252,10 +252,20 @@ def main() -> int:
 
         run_json(temp, "finish-project", "--project", str(project))
         summary = (project / "reports" / "project-summary.md").read_text(encoding="utf-8")
+        evolution = (project / "reports" / "evolution-report.md").read_text(encoding="utf-8")
+        knowledge_index = json.loads((temp / "memory" / "knowledge-index.json").read_text(encoding="utf-8"))
         assert_true("## Agent Performance" in summary, "project summary should include agent performance")
         assert_true("## Task Ledger" in summary, "project summary should include task ledger")
         assert_true("deepseek-smoke-model" in summary, "project summary should include recorded model names")
         assert_true("Wait Time" in summary, "project summary should include wait time")
+        assert_true("## Routing Evolution" in evolution, "evolution report should include routing evolution")
+        assert_true("## Knowledge Candidates" in evolution, "evolution report should include knowledge candidates")
+        assert_true("mechanical" in knowledge_index.get("categories", {}), "knowledge index should be grouped by task type")
+        mechanical_lessons = knowledge_index["categories"]["mechanical"]["lessons"]
+        assert_true(mechanical_lessons, "knowledge index should contain at least one lesson")
+        lesson_path = temp / mechanical_lessons[0]["path"]
+        assert_true(lesson_path.is_file(), "knowledge lesson file should exist")
+        assert_true("Retrieval Boundary" in lesson_path.read_text(encoding="utf-8"), "knowledge lesson should include retrieval boundary")
 
         print(json.dumps({"status": "ok", "temporary_state": "cleaned"}, indent=2))
         return 0

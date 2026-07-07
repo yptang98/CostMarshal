@@ -447,19 +447,38 @@ def empty_memory() -> dict[str, Any]:
     }
 
 
+def empty_knowledge_index() -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "updated_at": now_iso(),
+        "retrieval_policy": {
+            "default": "Read this small index first; attach at most one matching knowledge file unless the leader approves more.",
+            "match_order": ["task_type", "kind", "source quality", "recency"],
+        },
+        "categories": {},
+    }
+
+
 def ensure_root(root: Path) -> None:
     (root / "projects").mkdir(parents=True, exist_ok=True)
     (root / "memory").mkdir(parents=True, exist_ok=True)
+    (root / "memory" / "knowledge").mkdir(parents=True, exist_ok=True)
     (root / "config").mkdir(parents=True, exist_ok=True)
     config_path = root / "config" / "agents.json"
     memory_path = root / "memory" / "agent-memory.json"
     events_path = root / "memory" / "events.jsonl"
+    evolution_events_path = root / "memory" / "evolution-events.jsonl"
+    knowledge_index_path = root / "memory" / "knowledge-index.json"
     if not config_path.exists():
         atomic_write_json(config_path, default_agents_config())
     if not memory_path.exists():
         atomic_write_json(memory_path, empty_memory())
     if not events_path.exists():
         events_path.touch()
+    if not evolution_events_path.exists():
+        evolution_events_path.touch()
+    if not knowledge_index_path.exists():
+        atomic_write_json(knowledge_index_path, empty_knowledge_index())
 
 
 def project_path(root: Path, project_arg: str) -> Path:
@@ -2427,6 +2446,315 @@ def format_count(value: int) -> str:
     return f"{value:,}"
 
 
+def task_result_events(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [row for row in rows if row.get("event_type", "result") == "result"]
+
+
+def evolution_bucket_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    buckets: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in task_result_events(rows):
+        agent = row.get("agent", "unknown")
+        task_type = row.get("task_type", "unknown")
+        key = (agent, task_type)
+        bucket = buckets.setdefault(
+            key,
+            {
+                "agent": agent,
+                "task_type": task_type,
+                "tasks": 0,
+                "accepted": 0,
+                "escalated": 0,
+                "quality_total": 0.0,
+                "cost_total": 0.0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+            },
+        )
+        bucket["tasks"] += 1
+        if row.get("accepted_by_leader"):
+            bucket["accepted"] += 1
+        if row.get("needs_escalation"):
+            bucket["escalated"] += 1
+        bucket["quality_total"] += float(row.get("quality_score") or 0)
+        bucket["cost_total"] += float(row.get("estimated_cost_cny") or 0)
+        bucket["input_tokens"] += int(row.get("input_tokens") or 0)
+        bucket["output_tokens"] += int(row.get("output_tokens") or 0)
+    result = []
+    for bucket in buckets.values():
+        tasks = max(1, bucket["tasks"])
+        accept_rate = bucket["accepted"] / tasks
+        avg_quality = bucket["quality_total"] / tasks
+        if bucket["tasks"] < 2:
+            recommendation = "collect_more_evidence"
+            verification = "strict"
+        elif accept_rate >= 0.85 and avg_quality >= 4.2:
+            recommendation = "prefer_for_low_risk"
+            verification = "relaxed"
+        elif accept_rate >= 0.7 and avg_quality >= 3.5:
+            recommendation = "use_with_standard_review"
+            verification = "standard"
+        elif accept_rate < 0.5 or bucket["escalated"]:
+            recommendation = "avoid_or_escalate"
+            verification = "strict"
+        else:
+            recommendation = "use_cautiously"
+            verification = "strict"
+        bucket["accept_rate"] = round(accept_rate, 3)
+        bucket["avg_quality"] = round(avg_quality, 3)
+        bucket["avg_cost_cny"] = round(bucket["cost_total"] / tasks, 6)
+        bucket["recommendation"] = recommendation
+        bucket["verification_mode"] = verification
+        result.append(bucket)
+    return sorted(result, key=lambda item: (item["task_type"], item["agent"]))
+
+
+def result_by_task(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    latest: dict[str, dict[str, Any]] = {}
+    for row in task_result_events(rows):
+        task_id = row.get("task_id")
+        if task_id:
+            latest[task_id] = row
+    return latest
+
+
+def knowledge_kind(task_type: str, report: str) -> str:
+    bug_words = ["bug", "error", "failure", "failed", "fix", "regression", "exception", "traceback"]
+    lowered = report.lower()
+    if task_type in {"implementation", "verification"} or any(word in lowered for word in bug_words):
+        return "common_bug_or_fix"
+    if task_type in {"mechanical", "summarization"}:
+        return "repeatable_procedure"
+    return "general_solution"
+
+
+def build_knowledge_lesson(
+    project: dict[str, Any],
+    project_dir: Path,
+    task_dir: Path,
+    card: dict[str, Any],
+    row: dict[str, Any],
+    report: str,
+) -> dict[str, Any]:
+    task_id = task_dir.name
+    task_type = row.get("task_type") or card.get("task_type") or "unknown"
+    title = card.get("title") or task_id
+    lesson_id = slugify(f"{project['id']}-{task_id}-{title}", f"{project['id']}-{task_id}")
+    kind = knowledge_kind(task_type, report)
+    summary = completion_result_summary(report, card.get("purpose") or title)
+    return {
+        "id": lesson_id,
+        "title": title,
+        "kind": kind,
+        "task_type": task_type,
+        "source_project": project["id"],
+        "source_task": task_id,
+        "agent": row.get("agent"),
+        "model": row.get("model"),
+        "quality_score": row.get("quality_score"),
+        "accepted_by_leader": row.get("accepted_by_leader"),
+        "summary": summary,
+        "purpose": card.get("purpose", ""),
+        "replay_memory": card.get("replay_memory", []),
+        "created_at": now_iso(),
+        "path": f"memory/knowledge/{task_type}/{lesson_id}.md",
+    }
+
+
+def lesson_markdown(lesson: dict[str, Any]) -> str:
+    replay = lesson.get("replay_memory") or []
+    lines = [
+        f"# Knowledge: {lesson['title']}",
+        "",
+        f"Kind: `{lesson['kind']}`",
+        f"Task type: `{lesson['task_type']}`",
+        f"Source project: `{lesson['source_project']}`",
+        f"Source task: `{lesson['source_task']}`",
+        f"Agent: `{lesson.get('agent') or 'unknown'}`",
+        f"Model: `{lesson.get('model') or 'unknown'}`",
+        f"Quality score: `{lesson.get('quality_score')}`",
+        "",
+        "## When To Use",
+        lesson.get("purpose") or "Use when a future task matches this task type and problem pattern.",
+        "",
+        "## Problem Pattern",
+        lesson.get("purpose") or lesson.get("title", ""),
+        "",
+        "## Reusable Solution Summary",
+        lesson.get("summary") or "Leader should fill in a stronger reusable lesson after review.",
+        "",
+        "## Retrieval Boundary",
+        "- Find this file through `memory/knowledge-index.json` by task type first.",
+        "- Attach only this matching knowledge file to a future worker unless the leader approves broader context.",
+        "- Prefer replay memory over this lesson when exact commands or parameters must be reproduced.",
+        "",
+        "## Related Replay Memory",
+    ]
+    lines.extend(f"- `{item}`" for item in replay) if replay else lines.append("- none")
+    lines.extend(["", "## Leader Notes", "- Add a more general bug pattern or reusable fix here if the source task revealed one."])
+    return "\n".join(lines) + "\n"
+
+
+def upsert_knowledge_index(root: Path, lessons: list[dict[str, Any]]) -> dict[str, Any]:
+    index_path = root / "memory" / "knowledge-index.json"
+    index = read_json(index_path, empty_knowledge_index())
+    categories = index.setdefault("categories", {})
+    for lesson in lessons:
+        category = categories.setdefault(
+            lesson["task_type"],
+            {"updated_at": now_iso(), "lesson_count": 0, "lessons": []},
+        )
+        existing = [item for item in category.get("lessons", []) if item.get("id") != lesson["id"]]
+        entry = {
+            "id": lesson["id"],
+            "title": lesson["title"],
+            "kind": lesson["kind"],
+            "path": lesson["path"],
+            "source_project": lesson["source_project"],
+            "source_task": lesson["source_task"],
+            "agent": lesson.get("agent"),
+            "model": lesson.get("model"),
+            "quality_score": lesson.get("quality_score"),
+            "summary": lesson.get("summary"),
+            "updated_at": now_iso(),
+        }
+        existing.insert(0, entry)
+        category["lessons"] = existing[:50]
+        category["lesson_count"] = len(category["lessons"])
+        category["updated_at"] = now_iso()
+    index["updated_at"] = now_iso()
+    atomic_write_json(index_path, index)
+    return index
+
+
+def write_knowledge_lessons(root: Path, lessons: list[dict[str, Any]]) -> None:
+    for lesson in lessons:
+        path = root / lesson["path"]
+        atomic_write_text(path, lesson_markdown(lesson))
+
+
+def collect_knowledge_lessons(project: dict[str, Any], project_dir: Path, rows: list[dict[str, Any]], max_lessons: int, min_quality: int) -> list[dict[str, Any]]:
+    by_task = result_by_task(rows)
+    lessons = []
+    for task_dir in sorted((project_dir / "tasks").glob("CM-*")):
+        row = by_task.get(task_dir.name)
+        if not row:
+            continue
+        if not row.get("accepted_by_leader") or int(row.get("quality_score") or 0) < min_quality:
+            continue
+        card = read_json(task_dir / "branch-card.json", {})
+        report = read_text_if_exists(task_dir / "completion-report.md")
+        lessons.append(build_knowledge_lesson(project, project_dir, task_dir, card, row, report))
+    lessons.sort(key=lambda item: (int(item.get("quality_score") or 0), item.get("created_at", "")), reverse=True)
+    return lessons[:max_lessons]
+
+
+def render_evolution_report(project: dict[str, Any], buckets: list[dict[str, Any]], lessons: list[dict[str, Any]], replay_rows: list[dict[str, Any]]) -> str:
+    lines = [
+        f"# Evolution Report: {project['name']}",
+        "",
+        f"Project id: `{project['id']}`",
+        f"Generated: {now_iso()}",
+        "",
+        "## Purpose",
+        "Capture what this project taught CostMarshal about model routing, verification strictness, replay memory health, and reusable solution patterns.",
+        "",
+        "## Routing Evolution",
+        "",
+        "| Agent | Task Type | Tasks | Accept Rate | Avg Quality | Escalated | Avg Cost CNY | Recommendation | Verification |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+    ]
+    if buckets:
+        for item in buckets:
+            lines.append(
+                f"| {table_cell(item['agent'])} | {table_cell(item['task_type'])} | {item['tasks']} | {item['accept_rate']} | {item['avg_quality']} | {item['escalated']} | {item['avg_cost_cny']} | {item['recommendation']} | {item['verification_mode']} |"
+            )
+    else:
+        lines.append("| - | - | 0 | - | - | - | - | collect_more_evidence | strict |")
+    lines.extend(["", "## Replay Memory Health", "", "| Name | Type | Status | Feedback | Avg Quality | Path |", "| --- | --- | --- | ---: | ---: | --- |"])
+    if replay_rows:
+        for row in replay_rows:
+            lines.append(
+                f"| {table_cell(row.get('name'))} | {table_cell(row.get('task_type'))} | {table_cell(row.get('status'))} | {row.get('feedback_count', 0)} | {table_cell(row.get('avg_feedback_quality'))} | {table_cell(row.get('path'))} |"
+            )
+    else:
+        lines.append("| - | - | - | 0 | - | - |")
+    lines.extend(["", "## Knowledge Candidates", "", "| Task Type | Kind | Title | Source | Path |", "| --- | --- | --- | --- | --- |"])
+    if lessons:
+        for lesson in lessons:
+            lines.append(
+                f"| {table_cell(lesson['task_type'])} | {table_cell(lesson['kind'])} | {table_cell(lesson['title'])} | {table_cell(lesson['source_task'])} | {table_cell(lesson['path'])} |"
+            )
+    else:
+        lines.append("| - | - | - | - | - |")
+    lines.extend(
+        [
+            "",
+            "## Retrieval Cost Control",
+            "- Future projects should read `memory/knowledge-index.json` first.",
+            "- Select by task type and attach only the one most relevant knowledge file.",
+            "- Prefer replay memory for exact repeatable procedures; use knowledge files for common problems and bug patterns.",
+            "- Ask senior to refine a lesson before promoting it into broader reusable guidance.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def evolve_project(root: Path, project_dir: Path, max_lessons: int = 8, min_quality: int = 4, dry_run: bool = False) -> dict[str, Any]:
+    ensure_root(root)
+    project = load_project(project_dir)
+    rows = read_jsonl(project_dir / "memory" / "model-performance.jsonl")
+    buckets = evolution_bucket_rows(rows)
+    lessons = collect_knowledge_lessons(project, project_dir, rows, max_lessons, min_quality)
+    replay_rows = replay_memory_rows(project_dir)
+    report_text = render_evolution_report(project, buckets, lessons, replay_rows)
+    event = {
+        "event_type": "project_evolution",
+        "timestamp": now_iso(),
+        "project_id": project["id"],
+        "project": str(project_dir),
+        "routing_buckets": len(buckets),
+        "knowledge_lessons": len(lessons),
+        "replay_memory_count": len(replay_rows),
+        "report": "reports/evolution-report.md",
+    }
+    if not dry_run:
+        atomic_write_text(project_dir / "reports" / "evolution-report.md", report_text)
+        append_jsonl(project_dir / "memory" / "evolution-events.jsonl", event)
+        append_jsonl(root / "memory" / "evolution-events.jsonl", event)
+        write_knowledge_lessons(root, lessons)
+        upsert_knowledge_index(root, lessons)
+        policy = {
+            "schema_version": SCHEMA_VERSION,
+            "updated_at": now_iso(),
+            "source_project": project["id"],
+            "routing": buckets,
+            "retrieval_policy": {
+                "index": "memory/knowledge-index.json",
+                "max_knowledge_files_per_task": 1,
+                "attach_full_knowledge_only_after_task_type_match": True,
+            },
+        }
+        atomic_write_json(root / "memory" / "evolution-policy.json", policy)
+    return {"event": event, "routing": buckets, "lessons": lessons, "report_text": report_text}
+
+
+def command_evolve_project(args: argparse.Namespace) -> None:
+    root = args.root.resolve()
+    project_dir = project_path(root, args.project)
+    result = evolve_project(root, project_dir, args.max_lessons, args.min_quality, args.dry_run)
+    payload = {
+        "project": str(project_dir),
+        "report": str(project_dir / "reports" / "evolution-report.md"),
+        "routing_buckets": len(result["routing"]),
+        "knowledge_lessons": len(result["lessons"]),
+        "dry_run": args.dry_run,
+    }
+    if args.dry_run:
+        payload["report_preview"] = result["report_text"]
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
 def command_finish_project(args: argparse.Namespace) -> None:
     root = args.root.resolve()
     project_dir = project_path(root, args.project)
@@ -2492,9 +2820,21 @@ def command_finish_project(args: argparse.Namespace) -> None:
         ]
     )
     atomic_write_text(project_dir / "reports" / "project-summary.md", "\n".join(lines))
+    evolution_result = None
+    if not getattr(args, "no_evolve", False):
+        evolution_result = evolve_project(root, project_dir, getattr(args, "max_lessons", 8), getattr(args, "min_quality", 4))
     project["status"] = "completed"
     save_project(project_dir, project)
-    print(json.dumps({"project": str(project_dir), "summary": str(project_dir / "reports" / "project-summary.md")}, indent=2))
+    print(
+        json.dumps(
+            {
+                "project": str(project_dir),
+                "summary": str(project_dir / "reports" / "project-summary.md"),
+                "evolution": None if evolution_result is None else str(project_dir / "reports" / "evolution-report.md"),
+            },
+            indent=2,
+        )
+    )
 
 
 def command_recommend(args: argparse.Namespace) -> None:
@@ -3038,7 +3378,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     finish = sub.add_parser("finish-project", help="Create project summary")
     finish.add_argument("--project", required=True)
+    finish.add_argument("--no-evolve", action="store_true", help="Skip project evolution report and global knowledge update")
+    finish.add_argument("--max-lessons", type=int, default=8, help="Maximum accepted task lessons to promote into the knowledge index")
+    finish.add_argument("--min-quality", type=int, choices=[1, 2, 3, 4, 5], default=4)
     finish.set_defaults(func=command_finish_project)
+
+    evolve = sub.add_parser("evolve-project", help="Update routing evolution, knowledge index, and project evolution report")
+    evolve.add_argument("--project", required=True)
+    evolve.add_argument("--max-lessons", type=int, default=8)
+    evolve.add_argument("--min-quality", type=int, choices=[1, 2, 3, 4, 5], default=4)
+    evolve.add_argument("--dry-run", action="store_true")
+    evolve.set_defaults(func=command_evolve_project)
 
     recommend = sub.add_parser("recommend", help="Recommend an agent from global memory")
     recommend.add_argument("--task-type", choices=sorted(TASK_TYPES), required=True)

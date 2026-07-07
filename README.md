@@ -19,7 +19,7 @@ This strong-demo replay loop is the main cost-saving pattern: spend expensive to
 
 GitHub: https://github.com/yptang98/CostMarshal
 
-Version: `v0.0.1`
+Version: `v0.0.2`
 
 ## Install By Codex Prompt
 
@@ -76,6 +76,7 @@ python scripts/costmarshal.py new-review-task --project <project-dir> --source-t
 python scripts/costmarshal.py promote-memory --project <project-dir> --source-task CM-0001 --name reusable-flow --memory-task-type mechanical --summary "Exact replayable procedure" --working-dir "." --required-input "config.yaml exists" --allowed-param "top_k" --allowed-command "python run_eval.py --config config.yaml" --expected-output "results.json" --success-marker "command exits 0"
 python scripts/costmarshal.py new-task --project <project-dir> --title "Replay reusable flow" --purpose "Run the proven flow with new parameters" --agent longcat --difficulty B --risk low --task-type mechanical --replay-memory reusable-flow --depends-on CM-0001
 python scripts/costmarshal.py record-memory-feedback --project <project-dir> --task CM-0003 --outcome succeeded --sufficient yes --memory-quality 5 --attribution unknown
+python scripts/costmarshal.py evolve-project --project <project-dir>
 python scripts/costmarshal.py status-project --project <project-dir>
 python scripts/costmarshal.py finish-project --project <project-dir>
 ```
@@ -106,11 +107,11 @@ That separation is what makes cheap models useful without letting them quietly t
 3. **Run cheap workers safely:** use the read-only OpenAI-compatible runner for DeepSeek, Kimi, LongCat, or other configured providers.
 4. **Review before trusting:** the leader reads `completion-report.md`, verifies evidence, and records final quality with `record-result`.
 5. **Turn hard paths into cheap repeats:** if the task pattern will recur, let a strong agent prove it once, promote the result into replay memory, and dispatch cheaper agents against that memory for repeated or same-type tasks.
-6. **Learn over time:** CostMarshal updates global agent memory so future routing is based on evidence, not only model priors.
+6. **Evolve after projects:** `finish-project` updates routing evidence, writes an evolution report, and promotes compact reusable lessons into a hierarchical knowledge index.
 
 ## Environment Requirements
 
-CostMarshal v0.0.1 depends on Python for its deterministic CLI:
+CostMarshal v0.0.2 depends on Python for its deterministic CLI:
 
 | Dependency | Required | Notes |
 | --- | --- | --- |
@@ -130,7 +131,7 @@ python scripts/install_smoke_test.py
 python -m py_compile scripts/costmarshal.py scripts/mc.py scripts/smoke_test.py scripts/install_smoke_test.py
 ```
 
-`smoke_test.py` creates a temporary project and verifies the core workflow: default CNY 20 budget, user plan gate, task creation, result recording, wait telemetry, replay memory promotion, weak-agent replay attachment, draft-memory blocking, status output, and final project summary.
+`smoke_test.py` creates a temporary project and verifies the core workflow: default CNY 20 budget, user plan gate, task creation, result recording, wait telemetry, replay memory promotion, weak-agent replay attachment, draft-memory blocking, status output, final project summary, project evolution, and hierarchical knowledge indexing.
 
 `install_smoke_test.py` simulates installing into a temporary `CODEX_HOME`, runs the installed CLI, verifies default runtime storage, then uninstalls the skill directory while preserving runtime state.
 
@@ -158,7 +159,7 @@ py -3 scripts/costmarshal.py --help
 | Quality gates | completion reports, review tasks, leader `record-result`, strict early verification | model output is evidence to verify, not truth to merge blindly |
 | Strong-demo replay | senior pathfinding, replay memory promotion, reproducibility contract, weak-agent replay feedback | expensive discovery becomes a reusable low-cost procedure |
 | Live task ledger | `status-project` task table with agent, model, summary, replay memory, and wait time | users can see who did what and how long orchestration waited |
-| Learning memory | project and global agent scorecards by task type | routing improves as real evidence accumulates |
+| Self-evolution | project evolution report, routing policy update, hierarchical knowledge index | every completed project can make future routing and reuse sharper |
 | Waiting | embedded WakeWait-style sleep/file/text/command/task waits | long runs do not waste leader tokens polling |
 | Research loops | Arbor/Feynman/autoresearch project kinds and task types | research workflows can be decomposed into measurable phases |
 
@@ -220,6 +221,10 @@ Runtime state is stored outside the skill:
   config/agents.json
   memory/agent-memory.json
   memory/events.jsonl
+  memory/evolution-events.jsonl
+  memory/evolution-policy.json
+  memory/knowledge-index.json
+  memory/knowledge/<task-type>/<lesson>.md
   projects/<timestamp>-<slug>/
 ```
 
@@ -236,6 +241,24 @@ Project-local replay memory files live inside each project:
           memory.md
           metadata.json
 ```
+
+## Project Evolution
+
+At project completion, CostMarshal should evolve from the evidence it just collected:
+
+```bash
+python scripts/costmarshal.py finish-project --project <project-dir>
+```
+
+`finish-project` writes `reports/project-summary.md`, then runs project evolution by default. The evolution phase writes `reports/evolution-report.md`, appends evidence to `memory/evolution-events.jsonl`, updates `memory/evolution-policy.json`, and promotes compact reusable lessons into the global hierarchical knowledge index.
+
+You can rerun evolution after adding leader notes:
+
+```bash
+python scripts/costmarshal.py evolve-project --project <project-dir> --max-lessons 8 --min-quality 4
+```
+
+The knowledge system is deliberately hierarchical to control retrieval cost. Future projects should read the small `memory/knowledge-index.json` first, match by task type and lesson kind, and attach at most one relevant `memory/knowledge/<task-type>/<lesson>.md` file unless the leader approves more context. Use replay memory for exact command-level reproduction; use knowledge lessons for common problem patterns, bug fixes, and reusable judgment.
 
 ## Embedded Waits
 
@@ -389,9 +412,13 @@ For live provider checks, keep local keys in one of the CostMarshal secret files
 python scripts/costmarshal.py --root <temp-root> check-agents --agents deepseek,kimi,longcat --live
 ```
 
-## v0.0.1 Limitations
+## v0.0.2 Limitations
 
 - CostMarshal can launch read-only OpenAI-compatible workers with `run-task`, but it does not yet run a full parallel wave scheduler.
 - Senior Codex subagents are still invoked through Codex/subagent tooling.
 - Token and cost estimates are recorded from caller-provided or provider-reported usage, not enforced by a central billing gateway.
 - Verification relaxation is conservative and based on accumulated scorecard evidence.
+
+## Acknowledgements
+
+CostMarshal is inspired in part by [Jinghao67/conductor](https://github.com/Jinghao67/conductor) and the model-hierarchy-skill approach to tiered model collaboration.
