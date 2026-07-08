@@ -42,7 +42,7 @@ The result is a practical loop: strong model for discovery, cheaper models for r
 
 GitHub: https://github.com/yptang98/CostMarshal
 
-Version: `v0.0.3`
+Version: `v0.0.4`
 
 ## Install By Codex Prompt
 
@@ -142,10 +142,11 @@ That separation is what makes cheap models useful without letting them quietly t
 5. **Turn hard paths into cheap repeats:** if the task pattern will recur, let a strong agent prove it once, promote the result into replay memory, and dispatch cheaper agents against that memory for repeated or same-type tasks.
 6. **Evolve after projects:** `finish-project` updates routing evidence, writes an evolution report, and promotes compact reusable lessons into a hierarchical knowledge index.
 7. **Adopt existing work:** `adopt-project` summarizes an already-running project into CostMarshal state while preserving the same plan gate, branch tree, and task protocol.
+8. **Fall back to context control:** default `auto` mode tries cost-saving first, then uses same-agent orchestration when no cheap worker keys are configured.
 
 ## Environment Requirements
 
-CostMarshal v0.0.3 depends on Python for its deterministic CLI:
+CostMarshal v0.0.4 depends on Python for its deterministic CLI:
 
 | Dependency | Required | Notes |
 | --- | --- | --- |
@@ -206,6 +207,26 @@ CostMarshal treats model tiers as priors, then updates them from evidence:
 | High | Senior Codex agent | Architecture, complex implementation, rescue, final review |
 | Medium | DeepSeek / Kimi | Bounded analysis, local implementation, review, verification |
 | Low | LongCat | Mechanical execution of proven scripts/runbooks, extraction, compression |
+
+## Orchestration Modes
+
+CostMarshal defaults to `--mode auto`. Auto mode has a cost-saving intent: if at least one enabled medium/low agent has its required API key configured, the effective mode becomes `cost-saving`. If no cheap worker is configured, CostMarshal automatically falls back to `same-agent`, using the same strong Codex agent form as a context-control layer.
+
+| Mode | When To Use | Routing Bias |
+| --- | --- | --- |
+| `auto` | Default | Cost-saving when cheap workers exist; same-agent when they do not |
+| `cost-saving` | You want strong discovery plus cheaper bounded work | Prefer configured medium/low agents when verification is clear |
+| `same-agent` | You want conductor-style context management with strong agents | Prefer `senior`, while still using branch trees, briefs, reports, waits, and memory |
+| `balanced` | You want quality and cost both considered | Bias toward senior for uncertain work and cheaper agents for bounded work |
+
+Examples:
+
+```bash
+python scripts/costmarshal.py new-project --name run --objective "..." --mode auto
+python scripts/costmarshal.py adopt-project --path <existing-project> --name adopted --mode same-agent
+```
+
+`same-agent` is not a failure mode. It is useful when the goal is to keep long projects clean: isolate subtask context, preserve structured handoffs, avoid leader context pollution, and keep final integration under the leader.
 
 ## Budget Defaults
 
@@ -404,6 +425,8 @@ $CODEX_HOME/.sandbox-secrets/costmarshal.env
 <CostMarshal root>/secrets.env
 ```
 
+Set `COSTMARSHAL_NO_AUTO_SECRETS=1` in tests or isolated runs to disable automatic secret discovery and use only an explicit `COSTMARSHAL_SECRETS_FILE` or `--secrets-file`.
+
 You can also pass an explicit file:
 
 ```bash
@@ -469,7 +492,7 @@ For live provider checks, keep local keys in one of the CostMarshal secret files
 python scripts/costmarshal.py --root <temp-root> check-agents --agents deepseek,kimi,longcat --live
 ```
 
-## v0.0.3 Limitations
+## v0.0.4 Limitations
 
 - CostMarshal can launch read-only OpenAI-compatible workers with `run-task`, but it does not yet run a full parallel wave scheduler.
 - Senior Codex subagents are still invoked through Codex/subagent tooling.

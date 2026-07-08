@@ -30,8 +30,8 @@ Common commands:
 
 ```bash
 python scripts/costmarshal.py init-root
-python scripts/costmarshal.py new-project --name my-run --kind arbor --objective "Improve benchmark score with Arbor-style experiments"
-python scripts/costmarshal.py adopt-project --path <existing-project-dir> --name adopted-run --kind arbor --objective "Continue this existing run under CostMarshal rules"
+python scripts/costmarshal.py new-project --name my-run --kind arbor --objective "Improve benchmark score with Arbor-style experiments" --mode auto
+python scripts/costmarshal.py adopt-project --path <existing-project-dir> --name adopted-run --kind arbor --objective "Continue this existing run under CostMarshal rules" --mode auto
 python scripts/costmarshal.py check-agents --project <project-dir>
 python scripts/costmarshal.py draft-plan --project <project-dir> --summary "Lightweight direction check; adapt later tasks after first evidence." --predicted-cost-cny 3 --predicted-wall-time "30m"
 python scripts/costmarshal.py approve-plan --project <project-dir> --approved-by user --note "User confirmed the plan"
@@ -53,7 +53,7 @@ python scripts/costmarshal.py finish-project --project <project-dir>
 
 Use `--root <dir>` or `COSTMARSHAL_HOME` to choose the global storage location. Default storage is `$CODEX_HOME/costmarshal` when `CODEX_HOME` is set, otherwise `~/.codex/costmarshal`. Legacy `MMC_HOME` and `MULTI_MODEL_CONDUCTOR_HOME` are still accepted.
 
-Always start a new long-running project with `new-project`, or use `adopt-project` when an existing project is already in progress and should be summarized into CostMarshal state. Adoption imports existing progress into `imported-progress.md` and `reusable-candidates.md`, but it does not bypass the plan gate or convert old artifacts into trusted replay memory. After the leader drafts a lightweight direction check with coarse cost/time/token predictions, write it with `draft-plan`, show `plan-approval.md` to the user, and continue only after the user confirms and `approve-plan` is recorded. Do not over-plan the whole project up front; later task planning should adapt to worker evidence, replay memory feedback, failed checks, imported evidence, and budget state. New projects default to a CNY 20 project budget; override with `--max-project-cost-cny <amount>` only when the run intentionally needs more. Use live checks only when provider base URL env vars are configured.
+Always start a new long-running project with `new-project`, or use `adopt-project` when an existing project is already in progress and should be summarized into CostMarshal state. Adoption imports existing progress into `imported-progress.md` and `reusable-candidates.md`, but it does not bypass the plan gate or convert old artifacts into trusted replay memory. Projects default to `--mode auto`: CostMarshal tries cost-saving orchestration when cheap medium/low agents are configured, and automatically falls back to `same-agent` context-control mode when they are not. After the leader drafts a lightweight direction check with coarse cost/time/token predictions, write it with `draft-plan`, show `plan-approval.md` to the user, and continue only after the user confirms and `approve-plan` is recorded. Do not over-plan the whole project up front; later task planning should adapt to worker evidence, replay memory feedback, failed checks, imported evidence, and budget state. New projects default to a CNY 20 project budget; override with `--max-project-cost-cny <amount>` only when the run intentionally needs more. Use live checks only when provider base URL env vars are configured.
 
 ## Agent Tiers
 
@@ -66,6 +66,19 @@ Use these as priors, then update routing from scorecard evidence.
 | Low | LongCat | Mechanical reuse of a proven script/runbook, parameter changes, extraction, compression, simple formatting |
 
 Never hard-code API keys in prompts, reports, logs, or skill files. Refer to secrets only by environment variable names such as `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`, and `LONGCAT_API_KEY`.
+
+## Orchestration Modes
+
+Use `--mode auto` by default. Auto means the default intent is cost-saving, but if no enabled medium/low agent has its required API key configured, CostMarshal records `effective_mode = same-agent` and uses the strong Codex agent form for context management.
+
+| Mode | Use | Routing behavior |
+| --- | --- | --- |
+| `auto` | Default | Cost-saving if cheap agents are configured; same-agent fallback otherwise |
+| `cost-saving` | Save money | Prefer configured cheaper agents for bounded low-risk work |
+| `same-agent` | Manage context with strong agents | Prefer `senior` while still splitting tasks, reports, waits, and memory |
+| `balanced` | Mixed quality/cost | Prefer senior for uncertain work, cheap agents for bounded work |
+
+`same-agent` is a first-class mode, not a failure. It is useful when the user has no cheap worker keys configured or wants conductor-style context isolation with strong models only.
 
 ## Dispatch Loop
 

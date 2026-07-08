@@ -7,6 +7,7 @@ The test uses only temporary state and no provider network calls.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -19,12 +20,22 @@ CLI = ROOT / "scripts" / "costmarshal.py"
 
 
 def run(root: Path, *args: str, expect_ok: bool = True) -> subprocess.CompletedProcess[str]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"DEEPSEEK_API_KEY", "MOONSHOT_API_KEY", "KIMI_API_KEY", "LONGCAT_API_KEY"}
+    }
+    env["COSTMARSHAL_NO_AUTO_SECRETS"] = "1"
+    explicit_secrets = root / "config" / "secrets.env"
+    if explicit_secrets.is_file():
+        env["COSTMARSHAL_SECRETS_FILE"] = str(explicit_secrets)
     result = subprocess.run(
         [sys.executable, str(CLI), "--root", str(root), *args],
         cwd=str(ROOT),
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=env,
         check=False,
     )
     if expect_ok and result.returncode != 0:
@@ -74,6 +85,9 @@ def main() -> int:
         adopted = Path(adopted_info["project"])
         adopted_project_json = json.loads((adopted / "project.json").read_text(encoding="utf-8"))
         assert_true(adopted_project_json["plan_approval"]["status"] == "not_drafted", "adopted projects should still require plan drafting")
+        assert_true(adopted_project_json["orchestration"]["requested_mode"] == "auto", "adopted project should default to auto mode")
+        assert_true(adopted_project_json["orchestration"]["effective_mode"] == "same-agent", "auto mode should fall back to same-agent without cheap agent keys")
+        assert_true(adopted_project_json["orchestration"]["fallback_used"], "same-agent fallback should be explicit")
         assert_true((adopted / "adopted-project.json").is_file(), "adopted-project.json should record source metadata")
         imported_progress = (adopted / "imported-progress.md").read_text(encoding="utf-8")
         reusable_candidates = (adopted / "reusable-candidates.md").read_text(encoding="utf-8")
@@ -112,6 +126,20 @@ def main() -> int:
             "5m",
         )
         run_json(temp, "approve-plan", "--project", str(adopted), "--approved-by", "smoke-test")
+        adopted_recommendation = run_json(
+            temp,
+            "recommend",
+            "--project",
+            str(adopted),
+            "--task-type",
+            "analysis",
+            "--difficulty",
+            "A",
+            "--risk",
+            "medium",
+        )
+        assert_true(adopted_recommendation["recommended"] == "senior", "same-agent mode should recommend senior first")
+        assert_true(adopted_recommendation["orchestration"]["effective_mode"] == "same-agent", "recommend should expose project mode")
         adopted_task = run_json(
             temp,
             "new-task",
@@ -130,6 +158,7 @@ def main() -> int:
         adopted_validation = run_json(temp, "validate", "--project", str(adopted))
         assert_true(adopted_validation["status"] == "ok", "validate should pass for adopted project")
 
+        (temp / "config" / "secrets.env").write_text("DEEPSEEK_API_KEY=dummy-key\n", encoding="utf-8")
         project_info = run_json(
             temp,
             "new-project",
@@ -141,6 +170,8 @@ def main() -> int:
         project = Path(project_info["project"])
         project_json = json.loads((project / "project.json").read_text(encoding="utf-8"))
         assert_true(project_json["budget"]["max_project_cost_cny"] == 20.0, "default project budget should be CNY 20")
+        assert_true(project_json["orchestration"]["effective_mode"] == "cost-saving", "auto mode should use cost-saving when a cheap agent key is configured")
+        assert_true(project_json["orchestration"]["configured_cheap_agents"] == ["deepseek"], "configured cheap agents should be recorded")
         assert_true((project / "memory" / "wait-events.jsonl").exists(), "wait-events.jsonl should be initialized")
 
         blocked = run(
@@ -173,6 +204,20 @@ def main() -> int:
             "5m",
         )
         run_json(temp, "approve-plan", "--project", str(project), "--approved-by", "smoke-test")
+        cost_recommendation = run_json(
+            temp,
+            "recommend",
+            "--project",
+            str(project),
+            "--task-type",
+            "mechanical",
+            "--difficulty",
+            "B",
+            "--risk",
+            "low",
+        )
+        assert_true(cost_recommendation["orchestration"]["effective_mode"] == "cost-saving", "recommend should expose cost-saving mode")
+        assert_true(cost_recommendation["recommended"] == "deepseek", "recommend should prefer configured cheap agents over unavailable cheap agents")
 
         task_info = run_json(
             temp,

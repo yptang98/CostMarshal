@@ -70,6 +70,7 @@ MEMORY_FEEDBACK_ATTRIBUTIONS = {
 }
 TERMINAL_TASK_STATES = {"done", "failed", "escalate", "cancelled"}
 ACTIVE_CLAIM_STATES = {"planned", "running"}
+ORCHESTRATION_MODES = {"auto", "cost-saving", "same-agent", "balanced"}
 
 
 def now_iso() -> str:
@@ -130,6 +131,8 @@ def candidate_secret_files(root: Path, explicit: Path | None = None) -> list[Pat
     env_secret = os.environ.get("COSTMARSHAL_SECRETS_FILE")
     if env_secret:
         candidates.append(Path(env_secret).expanduser())
+    if os.environ.get("COSTMARSHAL_NO_AUTO_SECRETS") == "1":
+        return candidates
 
     codex_home = Path(os.environ["CODEX_HOME"]).expanduser() if os.environ.get("CODEX_HOME") else None
     home = Path.home()
@@ -481,6 +484,54 @@ def ensure_root(root: Path) -> None:
         atomic_write_json(knowledge_index_path, empty_knowledge_index())
 
 
+def configured_cheap_agents(config: dict[str, Any]) -> list[str]:
+    agents = []
+    for name, agent in (config.get("agents") or {}).items():
+        if not agent.get("enabled", True):
+            continue
+        if agent.get("tier") not in {"medium", "low"}:
+            continue
+        required = agent.get("required_env") or []
+        if all(os.environ.get(env) for env in required):
+            agents.append(name)
+    return sorted(agents)
+
+
+def agent_available_for_routing(config: dict[str, Any], agent_name: str) -> bool:
+    agent = (config.get("agents") or {}).get(agent_name, {})
+    if not agent:
+        return False
+    if not agent.get("enabled", True):
+        return False
+    required = agent.get("required_env") or []
+    return all(os.environ.get(env) for env in required)
+
+
+def resolve_orchestration_mode(root: Path, requested_mode: str) -> dict[str, Any]:
+    ensure_root(root)
+    load_local_secrets(root)
+    config = read_json(root / "config" / "agents.json", default_agents_config())
+    cheap_agents = configured_cheap_agents(config)
+    if requested_mode == "auto":
+        effective = "cost-saving" if cheap_agents else "same-agent"
+        reason = (
+            "enabled medium/low agents have required API key environment variables"
+            if cheap_agents
+            else "no enabled medium/low agent API keys were found; using the same strong agent for context control"
+        )
+    else:
+        effective = requested_mode
+        reason = f"explicit --mode {requested_mode}"
+    return {
+        "requested_mode": requested_mode,
+        "effective_mode": effective,
+        "default_intent": "cost-saving",
+        "fallback_used": requested_mode == "auto" and effective == "same-agent",
+        "fallback_reason": reason,
+        "configured_cheap_agents": cheap_agents,
+    }
+
+
 def project_path(root: Path, project_arg: str) -> Path:
     path = Path(project_arg).expanduser()
     if path.exists():
@@ -775,6 +826,7 @@ def create_project_scaffold(
     kind: str,
     max_project_cost_cny: float,
     max_agent_cost_cny: float | None,
+    mode: str,
 ) -> tuple[Path, dict[str, Any]]:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     slug = slugify(name or objective[:48])
@@ -783,11 +835,13 @@ def create_project_scaffold(
     if project_dir.exists():
         raise SystemExit(f"Project already exists: {project_dir}")
     project_structure(project_dir, kind)
+    orchestration = resolve_orchestration_mode(root, mode)
     project = {
         "schema_version": SCHEMA_VERSION,
         "id": project_id,
         "name": name or slug,
         "kind": kind,
+        "orchestration": orchestration,
         "objective": objective,
         "status": "active",
         "created_at": now_iso(),
@@ -823,6 +877,13 @@ def create_project_scaffold(
                 "## Objective",
                 objective,
                 "",
+                "## Orchestration Mode",
+                f"- Requested: `{orchestration['requested_mode']}`",
+                f"- Effective: `{orchestration['effective_mode']}`",
+                f"- Default intent: `{orchestration['default_intent']}`",
+                f"- Fallback used: `{orchestration['fallback_used']}`",
+                f"- Reason: {orchestration['fallback_reason']}",
+                "",
                 "## Leader Plan",
                 "- Draft a lightweight direction check with `costmarshal.py draft-plan` before creating worker tasks.",
                 "",
@@ -850,6 +911,12 @@ def create_project_scaffold(
                 "",
                 "## Objective",
                 objective,
+                "",
+                "## Orchestration Mode",
+                f"- Requested: `{orchestration['requested_mode']}`",
+                f"- Effective: `{orchestration['effective_mode']}`",
+                f"- Default intent: `{orchestration['default_intent']}`",
+                f"- Fallback reason: {orchestration['fallback_reason']}",
                 "",
                 "## Acceptance Criteria",
                 "- Define concrete acceptance criteria before dispatching worker tasks.",
@@ -894,6 +961,7 @@ def command_new_project(args: argparse.Namespace) -> None:
         kind=args.kind,
         max_project_cost_cny=args.max_project_cost_cny,
         max_agent_cost_cny=args.max_agent_cost_cny,
+        mode=args.mode,
     )
     print(
         json.dumps(
@@ -1259,6 +1327,7 @@ def command_adopt_project(args: argparse.Namespace) -> None:
         kind=args.kind,
         max_project_cost_cny=args.max_project_cost_cny,
         max_agent_cost_cny=args.max_agent_cost_cny,
+        mode=args.mode,
     )
     scan = scan_existing_project(source, args.max_files, args.max_sample_chars)
     adoption = {
@@ -3261,6 +3330,7 @@ def command_finish_project(args: argparse.Namespace) -> None:
 def command_recommend(args: argparse.Namespace) -> None:
     root = args.root.resolve()
     ensure_root(root)
+    load_local_secrets(root)
     config = read_json(root / "config" / "agents.json")
     memory = read_json(root / "memory" / "agent-memory.json", empty_memory())
     difficulty = args.difficulty
@@ -3269,6 +3339,13 @@ def command_recommend(args: argparse.Namespace) -> None:
     replay_feedback_by_agent: dict[str, int] = {}
     replay_memory_status = None
     replay_memory_path = None
+    project_dir = None
+    project = None
+    orchestration = None
+    if args.project:
+        project_dir = project_path(root, args.project)
+        project = load_project(project_dir)
+        orchestration = project.get("orchestration") or {}
     if difficulty == "S" or risk == "high":
         preferred = ["senior"]
     elif task_type == "mechanical" and difficulty in {"B", "C"} and risk == "low":
@@ -3279,8 +3356,15 @@ def command_recommend(args: argparse.Namespace) -> None:
         preferred = ["deepseek", "kimi", "senior"]
     else:
         preferred = ["deepseek", "kimi", "longcat", "senior"]
+    if (orchestration or {}).get("effective_mode") == "same-agent":
+        preferred = ["senior"] + [agent for agent in preferred if agent != "senior"]
+    elif (orchestration or {}).get("effective_mode") == "balanced" and "senior" in preferred:
+        preferred = ["senior"] + [agent for agent in preferred if agent != "senior"]
+    available_preferred = [agent for agent in preferred if agent_available_for_routing(config, agent)]
+    unavailable_preferred = [agent for agent in preferred if agent not in available_preferred]
+    preferred = available_preferred + unavailable_preferred
     if args.project and args.replay_memory:
-        project_dir = project_path(root, args.project)
+        assert project_dir is not None
         replay_memory_file = find_replay_memory(project_dir, args.replay_memory)
         replay_memory_path = replay_memory_file.relative_to(project_dir).as_posix()
         replay_metadata = read_json(replay_memory_file.parent / "metadata.json", {})
@@ -3304,6 +3388,7 @@ def command_recommend(args: argparse.Namespace) -> None:
                 "success_rate": agent_mem.get("success_rate"),
                 "total_tasks": agent_mem.get("total_tasks", 0),
                 "replay_agent_capability_failures": replay_feedback_by_agent.get(name, 0),
+                "available": agent_available_for_routing(config, name),
             }
         )
     if replay_feedback_by_agent and replay_memory_status != "needs_revision":
@@ -3311,6 +3396,8 @@ def command_recommend(args: argparse.Namespace) -> None:
     verification_mode = "strict"
     if candidates and candidates[0].get("verification_mode") in {"standard", "relaxed"} and risk == "low":
         verification_mode = candidates[0]["verification_mode"]
+    if (orchestration or {}).get("effective_mode") == "same-agent":
+        verification_mode = "strict"
     print(
         json.dumps(
             {
@@ -3318,6 +3405,7 @@ def command_recommend(args: argparse.Namespace) -> None:
                 "difficulty": difficulty,
                 "risk": risk,
                 "project": args.project,
+                "orchestration": orchestration,
                 "replay_memory": replay_memory_path,
                 "replay_memory_status": replay_memory_status,
                 "recommended": candidates[0]["agent"],
@@ -3455,6 +3543,7 @@ def project_status_payload(root: Path, project_dir: Path) -> dict[str, Any]:
         "name": project.get("name"),
         "status": project.get("status"),
         "objective": project.get("objective"),
+        "orchestration": project.get("orchestration") or {},
         "plan_approval": project.get("plan_approval") or {},
         "budget": {
             **budget,
@@ -3483,6 +3572,7 @@ def command_status_project(args: argparse.Namespace) -> None:
         "",
         f"Project id: `{payload['project_id']}`",
         f"Status: {payload['status']}",
+        f"Mode: {(payload.get('orchestration') or {}).get('effective_mode', 'unknown')}",
         f"Plan approval: {(payload.get('plan_approval') or {}).get('status', 'unknown')}",
         f"Spent CNY: {payload['budget']['spent_cny']}",
         "",
@@ -3551,6 +3641,12 @@ def build_parser() -> argparse.ArgumentParser:
     new_project.add_argument("--name", default="")
     new_project.add_argument("--objective", required=True)
     new_project.add_argument("--kind", choices=["general", "arbor", "feynman", "autoresearch", "research"], default="general")
+    new_project.add_argument(
+        "--mode",
+        choices=sorted(ORCHESTRATION_MODES),
+        default="auto",
+        help="Orchestration mode: auto defaults to cost-saving but falls back to same-agent when no cheap agents are configured",
+    )
     new_project.add_argument("--max-project-cost-cny", type=float, default=20.0)
     new_project.add_argument("--max-agent-cost-cny", type=float)
     new_project.set_defaults(func=command_new_project)
@@ -3560,6 +3656,12 @@ def build_parser() -> argparse.ArgumentParser:
     adopt_project.add_argument("--name", default="")
     adopt_project.add_argument("--objective", help="Adopted project objective; defaults to continuing the source project")
     adopt_project.add_argument("--kind", choices=["general", "arbor", "feynman", "autoresearch", "research"], default="general")
+    adopt_project.add_argument(
+        "--mode",
+        choices=sorted(ORCHESTRATION_MODES),
+        default="auto",
+        help="Orchestration mode: auto defaults to cost-saving but falls back to same-agent when no cheap agents are configured",
+    )
     adopt_project.add_argument("--max-project-cost-cny", type=float, default=20.0)
     adopt_project.add_argument("--max-agent-cost-cny", type=float)
     adopt_project.add_argument("--max-files", type=int, default=120, help="Maximum relevant source files to capture in the import summary")

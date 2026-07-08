@@ -109,6 +109,22 @@ Every new project starts with `project.json.plan_approval.status = not_drafted` 
 
 Adopted projects follow the same rule. `adopt-project` imports existing progress into the project directory, but `new-task` remains blocked until the leader writes a plan with `draft-plan`, shows it to the user, and records approval with `approve-plan`.
 
+## Orchestration Mode
+
+Every project records an `orchestration` object in `project.json`:
+
+```json
+{
+  "requested_mode": "auto",
+  "effective_mode": "cost-saving",
+  "default_intent": "cost-saving",
+  "fallback_used": false,
+  "configured_cheap_agents": ["deepseek"]
+}
+```
+
+`auto` is the default. It resolves to `cost-saving` when at least one enabled medium/low agent has its required API key configured. It resolves to `same-agent` when no cheap worker is configured, so CostMarshal can still manage context, branch trees, structured reports, handoffs, waits, and project memory with the strong agent form.
+
 Before creating worker tasks, the leader must draft the initial plan and predictions:
 
 ```bash
@@ -212,6 +228,8 @@ Run `costmarshal.py check-agents --project <project> --live` only after provider
 - `<CostMarshal root>/secrets.env`
 
 Use `--secrets-file <path>` when a project should use a specific key file.
+
+Set `COSTMARSHAL_NO_AUTO_SECRETS=1` for tests or isolated runs that should not search ambient secret locations. Explicit `COSTMARSHAL_SECRETS_FILE` or `--secrets-file` paths still work.
 
 Do not store API keys in project files, reports, branch cards, or raw logs.
 

@@ -64,6 +64,23 @@ python scripts/costmarshal.py adopt-project --path <existing-project> --name ado
 
 The imported files are facts and candidates only. The leader must still draft a user-visible plan from the imported evidence and obtain approval before dispatching new worker tasks.
 
+## Orchestration Modes
+
+Project creation supports:
+
+```bash
+python scripts/costmarshal.py new-project --name run --objective "..." --mode auto
+python scripts/costmarshal.py adopt-project --path <existing-project> --name adopted --mode same-agent
+```
+
+Modes:
+- `auto`: default; cost-saving intent, with same-agent fallback when no cheap worker API keys are configured
+- `cost-saving`: prefer configured medium/low agents for bounded work
+- `same-agent`: prefer `senior` for context-control workflows while preserving branch trees, briefs, completion reports, and memory
+- `balanced`: consider quality and cost together
+
+`recommend --project <project>` must respect the project's effective mode. In `same-agent` mode, the recommended agent should be `senior` unless the leader explicitly chooses otherwise.
+
 ## Task Classification
 
 Classify every task before dispatch.
@@ -445,8 +462,8 @@ Use these commands as the stable interface:
 
 ```bash
 python scripts/costmarshal.py init-root
-python scripts/costmarshal.py new-project --kind arbor --name run-name --objective "..." --max-project-cost-cny 20
-python scripts/costmarshal.py adopt-project --path <existing-project> --kind arbor --name adopted-run --objective "..."
+python scripts/costmarshal.py new-project --kind arbor --name run-name --objective "..." --mode auto --max-project-cost-cny 20
+python scripts/costmarshal.py adopt-project --path <existing-project> --kind arbor --name adopted-run --objective "..." --mode auto
 python scripts/costmarshal.py check-agents --project <project-dir>
 python scripts/costmarshal.py draft-plan --project <project-dir> --summary "..." --step "..." --task "..." --agent-plan "..." --predicted-cost-cny 3 --predicted-wall-time "30m" --acceptance "..." --verification "..." --risk "..."
 python scripts/costmarshal.py approve-plan --project <project-dir> --approved-by user
