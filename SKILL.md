@@ -31,6 +31,7 @@ Common commands:
 ```bash
 python scripts/costmarshal.py init-root
 python scripts/costmarshal.py new-project --name my-run --kind arbor --objective "Improve benchmark score with Arbor-style experiments"
+python scripts/costmarshal.py adopt-project --path <existing-project-dir> --name adopted-run --kind arbor --objective "Continue this existing run under CostMarshal rules"
 python scripts/costmarshal.py check-agents --project <project-dir>
 python scripts/costmarshal.py draft-plan --project <project-dir> --summary "Lightweight direction check; adapt later tasks after first evidence." --predicted-cost-cny 3 --predicted-wall-time "30m"
 python scripts/costmarshal.py approve-plan --project <project-dir> --approved-by user --note "User confirmed the plan"
@@ -52,7 +53,7 @@ python scripts/costmarshal.py finish-project --project <project-dir>
 
 Use `--root <dir>` or `COSTMARSHAL_HOME` to choose the global storage location. Default storage is `$CODEX_HOME/costmarshal` when `CODEX_HOME` is set, otherwise `~/.codex/costmarshal`. Legacy `MMC_HOME` and `MULTI_MODEL_CONDUCTOR_HOME` are still accepted.
 
-Always start a new long-running project with `new-project`, then run `check-agents`. After the leader drafts a lightweight direction check with coarse cost/time/token predictions, write it with `draft-plan`, show `plan-approval.md` to the user, and continue only after the user confirms and `approve-plan` is recorded. Do not over-plan the whole project up front; later task planning should adapt to worker evidence, replay memory feedback, failed checks, and budget state. New projects default to a CNY 20 project budget; override with `--max-project-cost-cny <amount>` only when the run intentionally needs more. Use live checks only when provider base URL env vars are configured.
+Always start a new long-running project with `new-project`, or use `adopt-project` when an existing project is already in progress and should be summarized into CostMarshal state. Adoption imports existing progress into `imported-progress.md` and `reusable-candidates.md`, but it does not bypass the plan gate or convert old artifacts into trusted replay memory. After the leader drafts a lightweight direction check with coarse cost/time/token predictions, write it with `draft-plan`, show `plan-approval.md` to the user, and continue only after the user confirms and `approve-plan` is recorded. Do not over-plan the whole project up front; later task planning should adapt to worker evidence, replay memory feedback, failed checks, imported evidence, and budget state. New projects default to a CNY 20 project budget; override with `--max-project-cost-cny <amount>` only when the run intentionally needs more. Use live checks only when provider base URL env vars are configured.
 
 ## Agent Tiers
 
@@ -68,10 +69,10 @@ Never hard-code API keys in prompts, reports, logs, or skill files. Refer to sec
 
 ## Dispatch Loop
 
-1. Run `costmarshal.py new-project` for every new project or long-running research run.
+1. Run `costmarshal.py new-project` for every new project or long-running research run. If the work already exists, run `costmarshal.py adopt-project --path <existing-project>` instead; this creates a normal CostMarshal project plus imported progress summaries.
 2. Run `costmarshal.py check-agents --project <project>` before dispatching workers.
 3. Refresh `master-snapshot.md`: goal, non-goals, constraints, acceptance criteria, current risks.
-4. Draft only a lightweight high-level approach, coarse predicted cost/time/token range, initial agent allocation, acceptance criteria, verification direction, and known risks with `costmarshal.py draft-plan`.
+4. Draft only a lightweight high-level approach, coarse predicted cost/time/token range, initial agent allocation, acceptance criteria, verification direction, known risks, and any imported reuse evidence with `costmarshal.py draft-plan`.
 5. Present `plan-approval.md` to the user. Do not create worker tasks until the user confirms the plan.
 6. After confirmation, run `costmarshal.py approve-plan --project <project>`. `new-task` is blocked until this approval exists unless the leader uses an explicit manual override.
 7. Plan incrementally after approval: classify each next task by difficulty, risk, expected context size, write scope, and verification method based on the latest evidence.
@@ -100,6 +101,19 @@ Never hard-code API keys in prompts, reports, logs, or skill files. Refer to sec
 25. Use `costmarshal.py finish-project` at project completion so the global memory and project summary include per-agent input tokens, output tokens, total tokens, estimated CNY cost, task summaries, model names, and wait-time totals. `finish-project` runs project evolution by default.
 26. Use `costmarshal.py evolve-project` after adding final leader notes or senior abstractions. The evolution phase writes `reports/evolution-report.md`, updates routing evidence, and promotes compact reusable lessons into `memory/knowledge-index.json` plus one small `memory/knowledge/<task-type>/<lesson>.md` file per lesson.
 27. For future projects, read the knowledge index first and attach at most one matching knowledge file unless the leader explicitly approves more context. Prefer replay memory for exact command reproduction; use knowledge lessons for common problem patterns, bug fixes, and reusable judgment.
+
+## Existing Project Adoption
+
+Use `adopt-project` when a project is already running outside CostMarshal. Adoption must follow normal design rules:
+- create a new CostMarshal project directory
+- record the original path in `adopted-project.json`
+- write factual progress into `imported-progress.md`
+- classify possible reuse into `reusable-candidates.md`
+- add imported nodes to the branch tree
+- keep `project.json.plan_approval.status = not_drafted`
+- require `draft-plan` and user `approve-plan` before new worker tasks
+
+Imported progress is evidence, not acceptance. Imported scripts, logs, reports, checkpoints, and result files are only candidates. Promote them to replay memory only after the normal reproducibility rule is satisfied or a senior agent refreshes the path.
 
 ## Senior Demo To Weak Replay Loop
 

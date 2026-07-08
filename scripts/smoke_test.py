@@ -50,6 +50,86 @@ def main() -> int:
     temp = Path(tempfile.mkdtemp(prefix="costmarshal-smoke-"))
     try:
         run_json(temp, "init-root")
+        existing = temp / "external-existing"
+        (existing / "reports").mkdir(parents=True)
+        (existing / "scripts").mkdir(parents=True)
+        (existing / "logs").mkdir(parents=True)
+        (existing / "README.md").write_text("# Existing Project\n\nCurrent goal and notes.\n", encoding="utf-8")
+        (existing / "reports" / "result-summary.md").write_text("Accuracy improved after baseline run.\n", encoding="utf-8")
+        (existing / "scripts" / "run_eval.py").write_text("print('eval')\n", encoding="utf-8")
+        (existing / "logs" / "failed-run.log").write_text("Traceback: example failure to avoid.\n", encoding="utf-8")
+
+        adopted_info = run_json(
+            temp,
+            "adopt-project",
+            "--path",
+            str(existing),
+            "--name",
+            "adopted-smoke",
+            "--objective",
+            "Continue the existing smoke project under CostMarshal rules",
+            "--kind",
+            "research",
+        )
+        adopted = Path(adopted_info["project"])
+        adopted_project_json = json.loads((adopted / "project.json").read_text(encoding="utf-8"))
+        assert_true(adopted_project_json["plan_approval"]["status"] == "not_drafted", "adopted projects should still require plan drafting")
+        assert_true((adopted / "adopted-project.json").is_file(), "adopted-project.json should record source metadata")
+        imported_progress = (adopted / "imported-progress.md").read_text(encoding="utf-8")
+        reusable_candidates = (adopted / "reusable-candidates.md").read_text(encoding="utf-8")
+        branch_tree = json.loads((adopted / "branch-tree.json").read_text(encoding="utf-8"))
+        assert_true("Existing Project" in imported_progress, "imported progress should include observed project notes")
+        assert_true("observed_reuse_candidate" in reusable_candidates, "reusable candidates should classify observed reuse")
+        assert_true("failed_attempt" in reusable_candidates, "reusable candidates should classify failures")
+        assert_true("imported-progress" in [node["id"] for node in branch_tree["nodes"]], "branch tree should include imported progress node")
+
+        adopted_blocked = run(
+            temp,
+            "new-task",
+            "--project",
+            str(adopted),
+            "--title",
+            "blocked adopted task",
+            "--purpose",
+            "should fail before adopted plan approval",
+            "--agent",
+            "deepseek",
+            "--task-type",
+            "analysis",
+            expect_ok=False,
+        )
+        assert_true("not approved" in (adopted_blocked.stderr + adopted_blocked.stdout), "adopted project should enforce plan approval")
+        run_json(
+            temp,
+            "draft-plan",
+            "--project",
+            str(adopted),
+            "--summary",
+            "Use the imported progress only as evidence, then plan the next bounded step.",
+            "--predicted-cost-cny",
+            "1",
+            "--predicted-wall-time",
+            "5m",
+        )
+        run_json(temp, "approve-plan", "--project", str(adopted), "--approved-by", "smoke-test")
+        adopted_task = run_json(
+            temp,
+            "new-task",
+            "--project",
+            str(adopted),
+            "--title",
+            "Review imported progress",
+            "--purpose",
+            "Create a bounded review after adoption approval",
+            "--agent",
+            "deepseek",
+            "--task-type",
+            "analysis",
+        )
+        assert_true(adopted_task["task_id"] == "CM-0001", "adopted project should create normal tasks after approval")
+        adopted_validation = run_json(temp, "validate", "--project", str(adopted))
+        assert_true(adopted_validation["status"] == "ok", "validate should pass for adopted project")
+
         project_info = run_json(
             temp,
             "new-project",

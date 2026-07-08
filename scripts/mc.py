@@ -767,22 +767,28 @@ def command_init_root(args: argparse.Namespace) -> None:
     print(json.dumps({"root": str(root), "status": "ok"}, ensure_ascii=False, indent=2))
 
 
-def command_new_project(args: argparse.Namespace) -> None:
-    root = args.root.resolve()
-    ensure_root(root)
+def create_project_scaffold(
+    root: Path,
+    *,
+    name: str,
+    objective: str,
+    kind: str,
+    max_project_cost_cny: float,
+    max_agent_cost_cny: float | None,
+) -> tuple[Path, dict[str, Any]]:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    slug = slugify(args.name or args.objective[:48])
+    slug = slugify(name or objective[:48])
     project_id = f"{stamp}-{slug}"
     project_dir = root / "projects" / project_id
     if project_dir.exists():
         raise SystemExit(f"Project already exists: {project_dir}")
-    project_structure(project_dir, args.kind)
+    project_structure(project_dir, kind)
     project = {
         "schema_version": SCHEMA_VERSION,
         "id": project_id,
-        "name": args.name or slug,
-        "kind": args.kind,
-        "objective": args.objective,
+        "name": name or slug,
+        "kind": kind,
+        "objective": objective,
         "status": "active",
         "created_at": now_iso(),
         "updated_at": now_iso(),
@@ -794,8 +800,8 @@ def command_new_project(args: argparse.Namespace) -> None:
             "relax_after_min_avg_quality": 4.2,
         },
         "budget": {
-            "max_project_cost_cny": args.max_project_cost_cny,
-            "max_agent_cost_cny": args.max_agent_cost_cny,
+            "max_project_cost_cny": max_project_cost_cny,
+            "max_agent_cost_cny": max_agent_cost_cny,
         },
         "plan_approval": {
             "required": True,
@@ -815,7 +821,7 @@ def command_new_project(args: argparse.Namespace) -> None:
                 "Status: not_drafted",
                 "",
                 "## Objective",
-                args.objective,
+                objective,
                 "",
                 "## Leader Plan",
                 "- Draft a lightweight direction check with `costmarshal.py draft-plan` before creating worker tasks.",
@@ -840,10 +846,10 @@ def command_new_project(args: argparse.Namespace) -> None:
                 f"# Master Snapshot: {project['name']}",
                 "",
                 f"Created: {project['created_at']}",
-                f"Kind: {args.kind}",
+                f"Kind: {kind}",
                 "",
                 "## Objective",
-                args.objective,
+                objective,
                 "",
                 "## Acceptance Criteria",
                 "- Define concrete acceptance criteria before dispatching worker tasks.",
@@ -875,9 +881,424 @@ def command_new_project(args: argparse.Namespace) -> None:
     (project_dir / "memory" / "model-performance.jsonl").touch()
     (project_dir / "memory" / "wait-events.jsonl").touch()
     atomic_write_json(project_dir / "checks" / "connectivity.json", {"checked_at": None, "agents": {}})
+    return project_dir, project
+
+
+def command_new_project(args: argparse.Namespace) -> None:
+    root = args.root.resolve()
+    ensure_root(root)
+    project_dir, project = create_project_scaffold(
+        root,
+        name=args.name,
+        objective=args.objective,
+        kind=args.kind,
+        max_project_cost_cny=args.max_project_cost_cny,
+        max_agent_cost_cny=args.max_agent_cost_cny,
+    )
     print(
         json.dumps(
-            {"project": str(project_dir), "project_id": project_id, "plan": str(project_dir / "plan-approval.md")},
+            {"project": str(project_dir), "project_id": project["id"], "plan": str(project_dir / "plan-approval.md")},
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+ADOPTION_SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "env",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "node_modules",
+    "dist",
+    "build",
+}
+ADOPTION_SENSITIVE_NAMES = {
+    ".env",
+    "secrets.env",
+    "credentials.json",
+    "credential.json",
+    "id_rsa",
+    "id_ed25519",
+}
+ADOPTION_SECRET_PATTERNS = ("secret", "credential", "token", "apikey", "api_key", "private-key", "private_key")
+ADOPTION_DOC_SUFFIXES = {".md", ".txt", ".rst"}
+ADOPTION_SCRIPT_SUFFIXES = {".py", ".sh", ".ps1", ".bat", ".cmd", ".ipynb"}
+ADOPTION_DATA_SUFFIXES = {".json", ".jsonl", ".csv", ".tsv", ".yaml", ".yml", ".toml"}
+ADOPTION_LOG_SUFFIXES = {".log", ".out", ".err"}
+ADOPTION_CHECKPOINT_SUFFIXES = {".pt", ".pth", ".ckpt", ".safetensors", ".pkl"}
+
+
+def is_sensitive_adoption_path(path: Path) -> bool:
+    lowered_parts = [part.lower() for part in path.parts]
+    name = path.name.lower()
+    if name in ADOPTION_SENSITIVE_NAMES:
+        return True
+    return any(pattern in part for pattern in ADOPTION_SECRET_PATTERNS for part in lowered_parts)
+
+
+def classify_adoption_file(path: Path) -> str | None:
+    name = path.name.lower()
+    suffix = path.suffix.lower()
+    stem = path.stem.lower()
+    if suffix in ADOPTION_LOG_SUFFIXES or "log" in stem:
+        return "log"
+    if suffix in ADOPTION_SCRIPT_SUFFIXES:
+        return "script"
+    if suffix in ADOPTION_CHECKPOINT_SUFFIXES or "checkpoint" in stem or "ckpt" in stem:
+        return "checkpoint"
+    if suffix in ADOPTION_DOC_SUFFIXES and any(
+        key in name for key in ["readme", "report", "summary", "note", "progress", "plan", "benchmark", "result"]
+    ):
+        return "document"
+    if suffix in ADOPTION_DATA_SUFFIXES and any(
+        key in name for key in ["result", "metric", "score", "eval", "benchmark", "config", "state", "tree"]
+    ):
+        return "artifact"
+    return None
+
+
+def read_sample(path: Path, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    try:
+        return redact(path.read_text(encoding="utf-8", errors="ignore")[:max_chars])
+    except OSError:
+        return ""
+
+
+def summarize_sample(text: str) -> str:
+    cleaned = " ".join(line.strip() for line in text.splitlines() if line.strip())
+    return cleaned[:240] if cleaned else ""
+
+
+def run_git_capture(source: Path, args: list[str]) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(source), *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return redact(result.stdout.strip())
+
+
+def scan_existing_project(source: Path, max_files: int, max_sample_chars: int) -> dict[str, Any]:
+    discovered: list[dict[str, Any]] = []
+    skipped_sensitive = 0
+    visited_files = 0
+    for current, dirs, files in os.walk(source):
+        current_path = Path(current)
+        dirs[:] = [
+            item
+            for item in sorted(dirs)
+            if item.lower() not in ADOPTION_SKIP_DIRS and not is_sensitive_adoption_path(current_path / item)
+        ]
+        for name in sorted(files):
+            path = current_path / name
+            rel = path.relative_to(source).as_posix()
+            if path.is_symlink():
+                continue
+            if is_sensitive_adoption_path(path):
+                skipped_sensitive += 1
+                continue
+            visited_files += 1
+            kind = classify_adoption_file(path)
+            if not kind:
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            sample = ""
+            if kind in {"document", "artifact", "log", "script"} and stat.st_size <= 2_000_000:
+                sample = read_sample(path, max_sample_chars)
+            discovered.append(
+                {
+                    "path": rel,
+                    "kind": kind,
+                    "size_bytes": stat.st_size,
+                    "modified_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).astimezone().isoformat(timespec="seconds"),
+                    "sample_summary": summarize_sample(sample),
+                }
+            )
+            if len(discovered) >= max_files:
+                break
+        if len(discovered) >= max_files:
+            break
+
+    git_root = run_git_capture(source, ["rev-parse", "--show-toplevel"])
+    git = {
+        "inside_work_tree": bool(git_root),
+        "root": git_root,
+        "branch": run_git_capture(source, ["branch", "--show-current"]),
+        "head": run_git_capture(source, ["rev-parse", "--short", "HEAD"]),
+        "status_short": run_git_capture(source, ["status", "--short"]),
+        "recent_commits": run_git_capture(source, ["log", "--oneline", "-5"]),
+    }
+    return {
+        "source_path": str(source),
+        "scanned_at": now_iso(),
+        "visited_files": visited_files,
+        "captured_files": len(discovered),
+        "skipped_sensitive_files": skipped_sensitive,
+        "max_files": max_files,
+        "max_sample_chars": max_sample_chars,
+        "git": git,
+        "files": discovered,
+    }
+
+
+def adoption_reuse_bucket(row: dict[str, Any]) -> str:
+    text = f"{row.get('path', '')} {row.get('sample_summary', '')}".lower()
+    if any(marker in text for marker in ["traceback", "exception", " error ", " failed", "failure"]):
+        return "failed_attempt"
+    if row.get("kind") in {"script", "artifact", "checkpoint"}:
+        return "observed_reuse_candidate"
+    if row.get("kind") in {"document", "log"}:
+        return "unverified_note"
+    return "unverified_note"
+
+
+def markdown_rows(rows: list[list[Any]]) -> list[str]:
+    if not rows:
+        return ["- none"]
+    lines = ["| " + " | ".join(str(item) for item in rows[0]) + " |"]
+    lines.append("| " + " | ".join("---" for _ in rows[0]) + " |")
+    for row in rows[1:]:
+        lines.append("| " + " | ".join(table_cell(str(item)) for item in row) + " |")
+    return lines
+
+
+def render_imported_progress(project: dict[str, Any], source: Path, scan: dict[str, Any]) -> str:
+    git = scan.get("git") or {}
+    files = scan.get("files") or []
+    rows = [["Path", "Kind", "Size", "Modified", "Observed summary"]]
+    for item in files[:80]:
+        rows.append(
+            [
+                item.get("path", ""),
+                item.get("kind", ""),
+                item.get("size_bytes", 0),
+                item.get("modified_at", ""),
+                item.get("sample_summary", "") or "-",
+            ]
+        )
+    lines = [
+        f"# Imported Progress: {project['name']}",
+        "",
+        "This file is a factual import of an existing project. It is not a new plan and does not bypass the CostMarshal approval gate.",
+        "",
+        "## Source",
+        f"- Path: `{source}`",
+        f"- Imported at: {scan.get('scanned_at')}",
+        f"- Files visited: {scan.get('visited_files')}",
+        f"- Relevant files captured: {scan.get('captured_files')}",
+        f"- Sensitive-looking files skipped: {scan.get('skipped_sensitive_files')}",
+        "",
+        "## Git State",
+        f"- Inside work tree: {git.get('inside_work_tree')}",
+        f"- Git root: `{git.get('root') or '-'}`",
+        f"- Branch: `{git.get('branch') or '-'}`",
+        f"- Head: `{git.get('head') or '-'}`",
+        "",
+        "### Git Status",
+        "```text",
+        git.get("status_short") or "clean or unavailable",
+        "```",
+        "",
+        "### Recent Commits",
+        "```text",
+        git.get("recent_commits") or "unavailable",
+        "```",
+        "",
+        "## Observed Artifacts",
+    ]
+    lines.extend(markdown_rows(rows))
+    lines.extend(
+        [
+            "",
+            "## Leader Import Rules",
+            "- Treat these observations as evidence to verify, not as accepted CostMarshal results.",
+            "- Imported work has unknown token/cost unless separately recorded after adoption.",
+            "- Draft the next lightweight plan with `draft-plan` and get user approval before dispatching new worker tasks.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def render_reusable_candidates(project: dict[str, Any], scan: dict[str, Any]) -> str:
+    buckets: dict[str, list[dict[str, Any]]] = {
+        "verified_replay_candidate": [],
+        "observed_reuse_candidate": [],
+        "unverified_note": [],
+        "failed_attempt": [],
+    }
+    for row in scan.get("files") or []:
+        buckets[adoption_reuse_bucket(row)].append(row)
+    lines = [
+        f"# Reusable Candidates: {project['name']}",
+        "",
+        "Imported project artifacts are candidates only. Do not attach them as replay memory until the leader or a senior agent verifies the full reproducibility contract.",
+        "",
+        "## Candidate Classes",
+        "- `verified_replay_candidate`: reserved for future imports with explicit verification metadata.",
+        "- `observed_reuse_candidate`: scripts, configs, results, or checkpoints that may be reusable after review.",
+        "- `unverified_note`: reports, notes, logs, or summaries that can inform planning but are not instructions.",
+        "- `failed_attempt`: evidence of errors or dead ends worth avoiding or routing to a stronger agent.",
+        "",
+    ]
+    for bucket, rows in buckets.items():
+        lines.extend([f"## {bucket}", ""])
+        if not rows:
+            lines.append("- none")
+        else:
+            table = [["Path", "Kind", "Reason"]]
+            for row in rows[:60]:
+                reason = row.get("sample_summary") or f"Imported {row.get('kind')} from existing project."
+                table.append([row.get("path", ""), row.get("kind", ""), reason])
+            lines.extend(markdown_rows(table))
+        lines.append("")
+    lines.extend(
+        [
+            "## Promotion Rule",
+            "- Use `promote-memory` only after a source task or senior refresh supplies exact working directory, inputs, allowed parameters, commands, outputs, success markers, and failure protocol.",
+            "- Until then, reference this file from the leader plan as reuse evidence, not as worker replay context.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def append_adoption_to_project_files(project_dir: Path, project: dict[str, Any], source: Path) -> None:
+    snapshot_path = project_dir / "master-snapshot.md"
+    snapshot = snapshot_path.read_text(encoding="utf-8")
+    snapshot += "\n".join(
+        [
+            "",
+            "## Imported Existing Progress",
+            f"- Source path: `{source}`",
+            "- Factual import: `imported-progress.md`",
+            "- Reuse candidates: `reusable-candidates.md`",
+            "- Existing progress is summarized into CostMarshal state but does not bypass plan approval.",
+            "- Before dispatching new workers, draft a lightweight plan based on the import and get user confirmation.",
+            "",
+        ]
+    )
+    atomic_write_text(snapshot_path, snapshot)
+
+    plan_path = project_dir / "plan-approval.md"
+    plan = plan_path.read_text(encoding="utf-8")
+    plan += "\n".join(
+        [
+            "",
+            "## Adoption Import",
+            f"- Source path: `{source}`",
+            "- Review `imported-progress.md` and `reusable-candidates.md` before drafting the next plan.",
+            "- Imported progress is evidence, not approval.",
+            "",
+        ]
+    )
+    atomic_write_text(plan_path, plan)
+
+    tree = load_tree(project_dir)
+    root = next((node for node in tree.get("nodes", []) if node.get("id") == tree.get("root_id", "root")), None)
+    imported_nodes = [
+        {
+            "id": "imported-progress",
+            "parent": "root",
+            "kind": "imported",
+            "title": "Imported progress summary",
+            "status": "observed",
+            "path": "imported-progress.md",
+            "children": [],
+        },
+        {
+            "id": "reusable-candidates",
+            "parent": "root",
+            "kind": "imported",
+            "title": "Reusable candidates from existing project",
+            "status": "candidate",
+            "path": "reusable-candidates.md",
+            "children": [],
+        },
+    ]
+    existing_ids = {node.get("id") for node in tree.get("nodes", [])}
+    for node in imported_nodes:
+        if node["id"] not in existing_ids:
+            tree.setdefault("nodes", []).append(node)
+            if root is not None:
+                root.setdefault("children", []).append(node["id"])
+    save_tree(project_dir, tree)
+
+
+def command_adopt_project(args: argparse.Namespace) -> None:
+    root = args.root.resolve()
+    ensure_root(root)
+    source = args.path.expanduser().resolve()
+    if not source.exists() or not source.is_dir():
+        raise SystemExit(f"Existing project path is not a directory: {source}")
+    objective = args.objective or f"Continue existing project from {source}"
+    project_dir, project = create_project_scaffold(
+        root,
+        name=args.name or source.name,
+        objective=objective,
+        kind=args.kind,
+        max_project_cost_cny=args.max_project_cost_cny,
+        max_agent_cost_cny=args.max_agent_cost_cny,
+    )
+    scan = scan_existing_project(source, args.max_files, args.max_sample_chars)
+    adoption = {
+        "source_path": str(source),
+        "adopted_at": now_iso(),
+        "mode": "shadow_control_layer",
+        "rules": {
+            "existing_progress_imported_only": True,
+            "plan_approval_still_required": True,
+            "replay_memory_requires_promotion": True,
+            "external_costs_unknown_by_default": True,
+        },
+        "scan": {
+            "visited_files": scan["visited_files"],
+            "captured_files": scan["captured_files"],
+            "skipped_sensitive_files": scan["skipped_sensitive_files"],
+            "max_files": scan["max_files"],
+            "max_sample_chars": scan["max_sample_chars"],
+        },
+    }
+    project["adoption"] = adoption
+    project["updated_at"] = now_iso()
+    atomic_write_json(project_dir / "project.json", project)
+    atomic_write_json(project_dir / "adopted-project.json", {"adoption": adoption, "git": scan.get("git", {})})
+    atomic_write_json(project_dir / "raw" / "adoption-scan.json", scan)
+    atomic_write_text(project_dir / "imported-progress.md", render_imported_progress(project, source, scan))
+    atomic_write_text(project_dir / "reusable-candidates.md", render_reusable_candidates(project, scan))
+    append_adoption_to_project_files(project_dir, project, source)
+    print(
+        json.dumps(
+            {
+                "project": str(project_dir),
+                "project_id": project["id"],
+                "source": str(source),
+                "imported_progress": str(project_dir / "imported-progress.md"),
+                "reusable_candidates": str(project_dir / "reusable-candidates.md"),
+                "plan": str(project_dir / "plan-approval.md"),
+                "plan_status": "not_drafted",
+                "status": "adopted_pending_plan",
+            },
             ensure_ascii=False,
             indent=2,
         )
@@ -3133,6 +3554,17 @@ def build_parser() -> argparse.ArgumentParser:
     new_project.add_argument("--max-project-cost-cny", type=float, default=20.0)
     new_project.add_argument("--max-agent-cost-cny", type=float)
     new_project.set_defaults(func=command_new_project)
+
+    adopt_project = sub.add_parser("adopt-project", help="Create a CostMarshal project from an existing project without bypassing plan approval")
+    adopt_project.add_argument("--path", type=Path, required=True, help="Existing project directory to summarize into CostMarshal state")
+    adopt_project.add_argument("--name", default="")
+    adopt_project.add_argument("--objective", help="Adopted project objective; defaults to continuing the source project")
+    adopt_project.add_argument("--kind", choices=["general", "arbor", "feynman", "autoresearch", "research"], default="general")
+    adopt_project.add_argument("--max-project-cost-cny", type=float, default=20.0)
+    adopt_project.add_argument("--max-agent-cost-cny", type=float)
+    adopt_project.add_argument("--max-files", type=int, default=120, help="Maximum relevant source files to capture in the import summary")
+    adopt_project.add_argument("--max-sample-chars", type=int, default=2000, help="Maximum text sample characters per captured file")
+    adopt_project.set_defaults(func=command_adopt_project)
 
     draft_plan = sub.add_parser("draft-plan", help="Write a lightweight leader direction check and predictions for user confirmation")
     draft_plan.add_argument("--project", required=True)

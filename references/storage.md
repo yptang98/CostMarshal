@@ -30,11 +30,14 @@ Use `python scripts/costmarshal.py init-root` to create it.
 
 ## Project Directory
 
-Every new project must be created with `costmarshal.py new-project`.
+Every new project must be created with `costmarshal.py new-project`. If a project already exists outside CostMarshal, create a normal CostMarshal control layer with `costmarshal.py adopt-project --path <existing-project>` instead of bypassing the project protocol.
 
 ```text
 <project>/
   project.json
+  adopted-project.json
+  imported-progress.md
+  reusable-candidates.md
   master-snapshot.md
   plan-approval.md
   branch-tree.json
@@ -73,7 +76,10 @@ Every new project must be created with `costmarshal.py new-project`.
   runbooks/
   artifacts/
   raw/
+    adoption-scan.json
 ```
+
+`adopted-project.json`, `imported-progress.md`, `reusable-candidates.md`, and `raw/adoption-scan.json` exist only for adopted projects. They summarize the source project read-only and do not approve the plan or create trusted replay memory.
 
 Research projects also get:
 
@@ -100,6 +106,8 @@ Tree rules:
 ## Plan Approval
 
 Every new project starts with `project.json.plan_approval.status = not_drafted` and a `plan-approval.md` placeholder.
+
+Adopted projects follow the same rule. `adopt-project` imports existing progress into the project directory, but `new-task` remains blocked until the leader writes a plan with `draft-plan`, shows it to the user, and records approval with `approve-plan`.
 
 Before creating worker tasks, the leader must draft the initial plan and predictions:
 

@@ -56,6 +56,14 @@ python scripts/costmarshal.py approve-plan --project <project-dir> --approved-by
 
 `new-task` rejects worker task creation until approval is recorded. Use `--allow-unapproved-plan` only when explicit user confirmation happened outside CostMarshal state and the leader is intentionally recording that exception.
 
+For an existing project, first import progress without changing the source project:
+
+```bash
+python scripts/costmarshal.py adopt-project --path <existing-project> --name adopted-run --objective "Continue this run under CostMarshal rules"
+```
+
+The imported files are facts and candidates only. The leader must still draft a user-visible plan from the imported evidence and obtain approval before dispatching new worker tasks.
+
 ## Task Classification
 
 Classify every task before dispatch.
@@ -438,6 +446,7 @@ Use these commands as the stable interface:
 ```bash
 python scripts/costmarshal.py init-root
 python scripts/costmarshal.py new-project --kind arbor --name run-name --objective "..." --max-project-cost-cny 20
+python scripts/costmarshal.py adopt-project --path <existing-project> --kind arbor --name adopted-run --objective "..."
 python scripts/costmarshal.py check-agents --project <project-dir>
 python scripts/costmarshal.py draft-plan --project <project-dir> --summary "..." --step "..." --task "..." --agent-plan "..." --predicted-cost-cny 3 --predicted-wall-time "30m" --acceptance "..." --verification "..." --risk "..."
 python scripts/costmarshal.py approve-plan --project <project-dir> --approved-by user

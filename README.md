@@ -42,7 +42,7 @@ The result is a practical loop: strong model for discovery, cheaper models for r
 
 GitHub: https://github.com/yptang98/CostMarshal
 
-Version: `v0.0.2`
+Version: `v0.0.3`
 
 ## Install By Codex Prompt
 
@@ -104,6 +104,16 @@ python scripts/costmarshal.py status-project --project <project-dir>
 python scripts/costmarshal.py finish-project --project <project-dir>
 ```
 
+To bring an already-running project under CostMarshal, create a normal CostMarshal control layer from the existing progress:
+
+```bash
+python scripts/costmarshal.py adopt-project --path <existing-project> --kind arbor --name adopted-run --objective "Continue this run under CostMarshal rules"
+python scripts/costmarshal.py draft-plan --project <project-dir> --summary "Use imported progress as evidence, then plan the next bounded step." --predicted-cost-cny 3 --predicted-wall-time "30m"
+python scripts/costmarshal.py approve-plan --project <project-dir> --approved-by user
+```
+
+`adopt-project` imports facts into `imported-progress.md` and `reusable-candidates.md`, but it does not approve the plan, trust old work as replay memory, or bypass branch/task rules.
+
 ## Why CostMarshal
 
 Running multiple models directly is easy to make messy: keys leak into prompts, weak models improvise beyond their ability, expensive models get dragged into routine work, and long projects lose track of which agent did what. CostMarshal turns that into a software-engineered workflow.
@@ -131,10 +141,11 @@ That separation is what makes cheap models useful without letting them quietly t
 4. **Review before trusting:** the leader reads `completion-report.md`, verifies evidence, and records final quality with `record-result`.
 5. **Turn hard paths into cheap repeats:** if the task pattern will recur, let a strong agent prove it once, promote the result into replay memory, and dispatch cheaper agents against that memory for repeated or same-type tasks.
 6. **Evolve after projects:** `finish-project` updates routing evidence, writes an evolution report, and promotes compact reusable lessons into a hierarchical knowledge index.
+7. **Adopt existing work:** `adopt-project` summarizes an already-running project into CostMarshal state while preserving the same plan gate, branch tree, and task protocol.
 
 ## Environment Requirements
 
-CostMarshal v0.0.2 depends on Python for its deterministic CLI:
+CostMarshal v0.0.3 depends on Python for its deterministic CLI:
 
 | Dependency | Required | Notes |
 | --- | --- | --- |
@@ -154,7 +165,7 @@ python scripts/install_smoke_test.py
 python -m py_compile scripts/costmarshal.py scripts/mc.py scripts/smoke_test.py scripts/install_smoke_test.py
 ```
 
-`smoke_test.py` creates a temporary project and verifies the core workflow: default CNY 20 budget, user plan gate, task creation, result recording, wait telemetry, replay memory promotion, weak-agent replay attachment, draft-memory blocking, status output, final project summary, project evolution, and hierarchical knowledge indexing.
+`smoke_test.py` creates temporary projects and verifies the core workflow: adopting existing progress without bypassing the approval gate, default CNY 20 budget, user plan gate, task creation, result recording, wait telemetry, replay memory promotion, weak-agent replay attachment, draft-memory blocking, status output, final project summary, project evolution, and hierarchical knowledge indexing.
 
 `install_smoke_test.py` simulates installing into a temporary `CODEX_HOME`, runs the installed CLI, verifies default runtime storage, then uninstalls the skill directory while preserving runtime state.
 
@@ -257,12 +268,35 @@ Project-local replay memory files live inside each project:
 
 ```text
 <project>/
+  adopted-project.json
+  imported-progress.md
+  reusable-candidates.md
+  raw/adoption-scan.json
   memory/
     replay/
       <task-type>/
         <memory-name>/
           memory.md
           metadata.json
+```
+
+The adoption files exist only for projects created with `adopt-project`.
+
+## Adopt Existing Projects
+
+CostMarshal can attach to an already-running project without rewriting that project or bypassing its own control rules:
+
+```bash
+python scripts/costmarshal.py adopt-project --path <existing-project> --kind feynman --name adopted-study --objective "Continue the existing study with cost-aware routing"
+```
+
+This creates a new CostMarshal project directory and scans the source project read-only. Sensitive-looking files such as `.env`, credentials, tokens, private keys, and common dependency/cache directories are skipped. Imported progress is evidence for the leader, not proof of correctness. Existing scripts, reports, logs, and outputs are classified as reuse candidates, failed attempts, or unverified notes; they become replay memory only after the normal `promote-memory` reproducibility contract is satisfied.
+
+After adoption, the next step is still the normal plan gate:
+
+```bash
+python scripts/costmarshal.py draft-plan --project <project-dir> --summary "Use imported progress as evidence, then plan the next bounded step."
+python scripts/costmarshal.py approve-plan --project <project-dir> --approved-by user
 ```
 
 ## Project Evolution
@@ -435,7 +469,7 @@ For live provider checks, keep local keys in one of the CostMarshal secret files
 python scripts/costmarshal.py --root <temp-root> check-agents --agents deepseek,kimi,longcat --live
 ```
 
-## v0.0.2 Limitations
+## v0.0.3 Limitations
 
 - CostMarshal can launch read-only OpenAI-compatible workers with `run-task`, but it does not yet run a full parallel wave scheduler.
 - Senior Codex subagents are still invoked through Codex/subagent tooling.
