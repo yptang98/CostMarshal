@@ -7,14 +7,23 @@ Install CostMarshal from https://github.com/yptang98/CostMarshal into my Codex s
 
 Requirements:
 - Clone or download https://github.com/yptang98/CostMarshal.
-- Copy the skill folder to $CODEX_HOME/skills/costmarshal, or to ~/.codex/skills/costmarshal if CODEX_HOME is unset.
+- Resolve the Codex skills directory: $CODEX_HOME/skills if CODEX_HOME is set, otherwise ~/.codex/skills.
+- If costmarshal is not installed, copy the skill folder to <skills-dir>/costmarshal.
+- If <skills-dir>/costmarshal already exists, treat this as an update:
+  - Read <skills-dir>/costmarshal/VERSION if it exists and report the old version.
+  - Move the old installed skill folder to <skills-dir>/costmarshal.backup-<timestamp>.
+  - Copy the new CostMarshal skill folder to <skills-dir>/costmarshal.
+  - Do not copy .git, __pycache__, .env files, local runtime folders, or secret files.
+  - Preserve $CODEX_HOME/costmarshal or ~/.codex/costmarshal runtime state exactly as-is.
+  - Preserve local secret files exactly as-is; do not print secret values.
 - Do not copy any local .env files or secrets.
 - Verify Python 3.10+ is available with: python --version
 - If python is unavailable on Windows, try: py -3 --version
 - Do not install WakeWait separately; CostMarshal bundles embedded WakeWait-style wait commands.
 - Run: python <installed-skill>/scripts/costmarshal.py init-root
 - Run: python <installed-skill>/scripts/costmarshal.py --help
+- Run: python <installed-skill>/scripts/costmarshal.py validate
 - Tell me I can invoke it with `$costmarshal`, for example: `$costmarshal start a new Arbor project for ...`
 - Run skill validation if quick_validate.py is available.
-- Report the installed path and validation result.
+- Report the installed path, old version if updated, new version, backup path if created, and validation result.
 ```

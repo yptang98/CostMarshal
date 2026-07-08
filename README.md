@@ -42,7 +42,7 @@ The result is a practical loop: strong model for discovery, cheaper models for r
 
 GitHub: https://github.com/yptang98/CostMarshal
 
-Version: `v0.0.4`
+Version: `v0.0.5`
 
 ## Install By Codex Prompt
 
@@ -55,13 +55,22 @@ Install CostMarshal from https://github.com/yptang98/CostMarshal into my Codex s
 
 Requirements:
 - Clone or download https://github.com/yptang98/CostMarshal.
-- Copy the skill folder to $CODEX_HOME/skills/costmarshal, or to ~/.codex/skills/costmarshal if CODEX_HOME is unset.
+- Resolve the Codex skills directory: $CODEX_HOME/skills if CODEX_HOME is set, otherwise ~/.codex/skills.
+- If costmarshal is not installed, copy the skill folder to <skills-dir>/costmarshal.
+- If <skills-dir>/costmarshal already exists, treat this as an update:
+  - Read <skills-dir>/costmarshal/VERSION if it exists and report the old version.
+  - Move the old installed skill folder to <skills-dir>/costmarshal.backup-<timestamp>.
+  - Copy the new CostMarshal skill folder to <skills-dir>/costmarshal.
+  - Do not copy .git, __pycache__, .env files, local runtime folders, or secret files.
+  - Preserve $CODEX_HOME/costmarshal or ~/.codex/costmarshal runtime state exactly as-is.
+  - Preserve local secret files exactly as-is; do not print secret values.
 - Do not copy any local .env files or secrets.
 - Verify Python 3.10+ is available with: python --version
 - Do not install WakeWait separately; CostMarshal bundles embedded WakeWait-style wait commands.
 - Run: python <installed-skill>/scripts/costmarshal.py init-root
 - Run: python <installed-skill>/scripts/costmarshal.py --help
-- Report the installed path and validation result.
+- Run: python <installed-skill>/scripts/costmarshal.py validate
+- Report the installed path, old version if updated, new version, backup path if created, and validation result.
 ```
 
 After install, restart Codex if the skill list is cached.
@@ -146,7 +155,7 @@ That separation is what makes cheap models useful without letting them quietly t
 
 ## Environment Requirements
 
-CostMarshal v0.0.4 depends on Python for its deterministic CLI:
+CostMarshal v0.0.5 depends on Python for its deterministic CLI:
 
 | Dependency | Required | Notes |
 | --- | --- | --- |
@@ -492,7 +501,7 @@ For live provider checks, keep local keys in one of the CostMarshal secret files
 python scripts/costmarshal.py --root <temp-root> check-agents --agents deepseek,kimi,longcat --live
 ```
 
-## v0.0.4 Limitations
+## v0.0.5 Limitations
 
 - CostMarshal can launch read-only OpenAI-compatible workers with `run-task`, but it does not yet run a full parallel wave scheduler.
 - Senior Codex subagents are still invoked through Codex/subagent tooling.

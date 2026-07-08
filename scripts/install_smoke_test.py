@@ -64,10 +64,26 @@ def main() -> int:
         codex_home = temp / "codex-home"
         skills_dir = codex_home / "skills"
         install_dir = skills_dir / "costmarshal"
+        runtime_root = codex_home / "costmarshal"
+        skills_dir.mkdir(parents=True)
+        runtime_root.mkdir(parents=True)
+        (runtime_root / "runtime-marker.txt").write_text("preserve me\n", encoding="utf-8")
+        install_dir.mkdir(parents=True)
+        (install_dir / "VERSION").write_text("v0.0.1\n", encoding="utf-8")
+        (install_dir / "SKILL.md").write_text("---\nname: costmarshal\n---\n# Old\n", encoding="utf-8")
+        (install_dir / ".env").write_text("DO_NOT_COPY_OR_PRINT=secret\n", encoding="utf-8")
+
+        old_version = (install_dir / "VERSION").read_text(encoding="utf-8").strip()
+        backup_dir = skills_dir / "costmarshal.backup-smoke"
+        shutil.move(str(install_dir), str(backup_dir))
         shutil.copytree(SOURCE, install_dir, ignore=ignore_install_artifacts)
 
+        assert_true(old_version == "v0.0.1", "update flow should detect old installed version")
+        assert_true(backup_dir.exists(), "update flow should back up an existing install")
+        assert_true((backup_dir / ".env").is_file(), "backup should preserve old local files")
         assert_true((install_dir / "SKILL.md").is_file(), "installed skill should include SKILL.md")
         assert_true((install_dir / "scripts" / "costmarshal.py").is_file(), "installed skill should include CLI")
+        assert_true((install_dir / "VERSION").read_text(encoding="utf-8").strip() != old_version, "update should install the new version")
         assert_true(not (install_dir / ".git").exists(), "install copy should not include .git")
         assert_true(not any(install_dir.rglob("*.env")), "install copy should not include .env files")
 
@@ -76,14 +92,17 @@ def main() -> int:
         cli = install_dir / "scripts" / "costmarshal.py"
         run([sys.executable, str(cli), "--help"], env)
         run([sys.executable, str(cli), "init-root"], env)
+        run([sys.executable, str(cli), "validate"], env)
 
-        runtime_root = codex_home / "costmarshal"
         assert_true((runtime_root / "config" / "agents.json").is_file(), "init-root should create default runtime config")
         assert_true((runtime_root / "memory" / "agent-memory.json").is_file(), "init-root should create runtime memory")
+        assert_true((runtime_root / "runtime-marker.txt").read_text(encoding="utf-8") == "preserve me\n", "update should preserve runtime state")
 
         install_prompt = (install_dir / "INSTALL_PROMPT.md").read_text(encoding="utf-8")
         uninstall_prompt = (install_dir / "UNINSTALL_PROMPT.md").read_text(encoding="utf-8")
         assert_true("https://github.com/yptang98/CostMarshal" in install_prompt, "install prompt should include GitHub URL")
+        assert_true("already exists, treat this as an update" in install_prompt, "install prompt should describe update behavior")
+        assert_true("Preserve $CODEX_HOME/costmarshal" in install_prompt, "install prompt should preserve runtime state during updates")
         assert_true("Do not delete CostMarshal runtime state unless I explicitly confirm." in uninstall_prompt, "uninstall prompt should preserve runtime state by default")
 
         shutil.rmtree(install_dir)
