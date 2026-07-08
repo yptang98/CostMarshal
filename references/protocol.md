@@ -4,6 +4,7 @@
 
 - Principles
 - Leader self-work gate
+- Adaptive verification shards
 - User plan approval gate
 - Task classification
 - Routing matrix
@@ -49,6 +50,30 @@ python scripts/costmarshal.py record-leader-work --project <project-dir> --task 
 ```
 
 The record must include the reason and bounded scope. Add files, minutes, input/output tokens, and estimated cost when known. `status-project` and `finish-project` surface these exceptions so the user can see whether the workflow is actually delegating or drifting back to leader-only execution.
+
+## Adaptive Verification Shards
+
+Use medium-tier agents for simple, enumerable checks so the leader does not spend expensive context reading every detail. The leader still owns final acceptance.
+
+Set the project default:
+
+```bash
+python scripts/costmarshal.py set-leader-review --project <project-dir> --level auto --reason "Adapt verification depth to risk and evidence"
+```
+
+Create a check shard:
+
+```bash
+python scripts/costmarshal.py new-check-task --project <project-dir> --source-task CM-0001 --check "Evidence supports the main claim" --check "No unapproved writes are proposed" --reviewer deepseek
+```
+
+Levels:
+- `high`: leader reads full check report and key evidence
+- `medium`: leader reads structured report and samples evidence
+- `low`: leader reads failures, unclear items, and compact pass summary
+- `auto`: high for high risk or S difficulty, low for low-risk B/C checks, medium otherwise
+
+Check shards must be read-only, bounded to explicit context, and return PASS/FAIL/UNCLEAR for each check with evidence paths. They should escalate instead of judging architecture, security, broad debugging, missing context, or anything outside the listed checks.
 
 ## User Plan Approval Gate
 
@@ -302,6 +327,7 @@ python scripts/costmarshal.py status-project --project <project-dir>
 ```
 
 The status view should show task agent, concrete model, result summary, replay memory, wait time, active locks, budget, and leader self-work exceptions.
+It should also show the current leader review policy so the user can see whether verification is high, medium, low, or adaptive.
 
 ## Read-Only Worker Runner
 
@@ -489,8 +515,10 @@ python scripts/costmarshal.py adopt-project --path <existing-project> --kind arb
 python scripts/costmarshal.py check-agents --project <project-dir>
 python scripts/costmarshal.py draft-plan --project <project-dir> --summary "..." --step "..." --task "..." --agent-plan "..." --predicted-cost-cny 3 --predicted-wall-time "30m" --acceptance "..." --verification "..." --risk "..."
 python scripts/costmarshal.py approve-plan --project <project-dir> --approved-by user
+python scripts/costmarshal.py set-leader-review --project <project-dir> --level auto --reason "Adapt verification depth to risk and evidence"
 python scripts/costmarshal.py recommend --task-type implementation --difficulty A --risk medium
 python scripts/costmarshal.py new-task --project <project-dir> --title "..." --purpose "..." --agent kimi --difficulty A --risk medium --task-type implementation --claim-path src/module.py
+python scripts/costmarshal.py new-check-task --project <project-dir> --source-task CM-0001 --check "Evidence supports the claim" --reviewer deepseek
 python scripts/costmarshal.py run-task --project <project-dir> --task CM-0001 --dry-run
 python scripts/costmarshal.py run-task --project <project-dir> --task CM-0001
 python scripts/costmarshal.py record-handoff --project <project-dir> --source-task CM-0001 --summary "Compressed handoff"

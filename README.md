@@ -9,6 +9,7 @@
   <img alt="Multi-model orchestration" src="https://img.shields.io/badge/Multi--model-Orchestration-2563eb">
   <img alt="Cost aware" src="https://img.shields.io/badge/Cost--aware-Routing-059669">
   <img alt="Leader gate" src="https://img.shields.io/badge/Leader-Self--work--Gate-b91c1c">
+  <img alt="Adaptive verification" src="https://img.shields.io/badge/Adaptive-Verification--Shards-0891b2">
   <img alt="Strong-demo replay" src="https://img.shields.io/badge/Strong--demo-Replay-f59e0b">
   <img alt="Project evolution" src="https://img.shields.io/badge/Project-Self--evolution-7c3aed">
   <img alt="WakeWait embedded" src="https://img.shields.io/badge/WakeWait-Embedded-0f766e">
@@ -19,10 +20,11 @@ CostMarshal is a cost-aware multi-model control layer for Codex CLI.
 
 It lets the expensive leader model stay in charge of planning, routing, verification, and final integration, while cheaper worker models handle bounded tasks from structured briefs. The point is not just to call more models; it is to make long-running work cheaper without losing state, quality control, or the leader's clean context.
 
-CostMarshal is built around six advantages:
+CostMarshal is built around seven advantages:
 - **Cost control:** project budgets, per-task caps, provider token usage, and per-agent CNY cost summaries.
 - **Quality control:** user-approved plans, branch-tree tasks, dependencies, write locks, completion reports, review tasks, and escalation gates.
 - **Leader self-work gate:** the leader may plan, verify, integrate, and rescue, but direct implementation-like work is recorded as an exception with reason, scope, tokens, and cost.
+- **Adaptive verification:** simple checks can be split into medium-model verification shards with high/medium/low/auto leader participation.
 - **Strong-demo replay:** a strong agent can solve an uncertain path once, the leader promotes it into replay memory, and cheaper agents reuse that exact procedure for repeated or similar work.
 - **Visible orchestration:** project status shows each task's agent, concrete model name, short result summary, replay memory, and accumulated WakeWait-style wait time.
 - **Learning over time:** global agent memory records which model performs well for each task type, so routing improves across projects.
@@ -44,7 +46,7 @@ The result is a practical loop: strong model for discovery, cheaper models for r
 
 GitHub: https://github.com/yptang98/CostMarshal
 
-Version: `v0.0.6`
+Version: `v0.0.7`
 
 ## Install By Codex Prompt
 
@@ -99,8 +101,10 @@ python scripts/costmarshal.py new-project --kind arbor --name demo --objective "
 python scripts/costmarshal.py check-agents --project <project-dir>
 python scripts/costmarshal.py draft-plan --project <project-dir> --summary "Start with a lightweight baseline inspection, then adapt task routing from the first evidence." --predicted-cost-cny 3 --predicted-wall-time "30m"
 python scripts/costmarshal.py approve-plan --project <project-dir> --approved-by user --note "User confirmed initial plan"
+python scripts/costmarshal.py set-leader-review --project <project-dir> --level auto --reason "Adapt leader verification effort to risk and evidence"
 python scripts/costmarshal.py recommend --task-type research-ideate --difficulty A --risk medium
 python scripts/costmarshal.py new-task --project <project-dir> --title "First hypothesis" --purpose "Create a bounded hypothesis" --agent deepseek --difficulty A --risk medium --task-type research-ideate --claim-path reports/idea.md
+python scripts/costmarshal.py new-check-task --project <project-dir> --source-task CM-0001 --check "Evidence supports the claimed result" --check "No unapproved writes are proposed" --reviewer deepseek
 python scripts/costmarshal.py run-task --project <project-dir> --task CM-0001 --dry-run
 python scripts/costmarshal.py run-task --project <project-dir> --task CM-0001
 python scripts/costmarshal.py wait-task --project <project-dir> --task CM-0001 --every 30s --timeout 1h
@@ -151,15 +155,16 @@ That separation is what makes cheap models useful without letting them quietly t
 2. **Dispatch bounded tasks incrementally:** create branch-card tasks with dependencies, write claims, context limits, and budgets as evidence arrives.
 3. **Run cheap workers safely:** use the read-only OpenAI-compatible runner for DeepSeek, Kimi, LongCat, or other configured providers.
 4. **Review before trusting:** the leader reads `completion-report.md`, verifies evidence, and records final quality with `record-result`.
-5. **Record leader exceptions:** if the leader directly handles implementation-like work, record the reason, scope, time, token estimate, and cost with `record-leader-work`.
-6. **Turn hard paths into cheap repeats:** if the task pattern will recur, let a strong agent prove it once, promote the result into replay memory, and dispatch cheaper agents against that memory for repeated or same-type tasks.
-7. **Evolve after projects:** `finish-project` updates routing evidence, writes an evolution report, and promotes compact reusable lessons into a hierarchical knowledge index.
-8. **Adopt existing work:** `adopt-project` summarizes an already-running project into CostMarshal state while preserving the same plan gate, branch tree, and task protocol.
-9. **Fall back to context control:** default `auto` mode tries cost-saving first, then uses same-agent orchestration when no cheap worker keys are configured.
+5. **Shard simple verification:** split enumerable checks into `new-check-task` verification shards for medium models, with adaptive leader participation.
+6. **Record leader exceptions:** if the leader directly handles implementation-like work, record the reason, scope, time, token estimate, and cost with `record-leader-work`.
+7. **Turn hard paths into cheap repeats:** if the task pattern will recur, let a strong agent prove it once, promote the result into replay memory, and dispatch cheaper agents against that memory for repeated or same-type tasks.
+8. **Evolve after projects:** `finish-project` updates routing evidence, writes an evolution report, and promotes compact reusable lessons into a hierarchical knowledge index.
+9. **Adopt existing work:** `adopt-project` summarizes an already-running project into CostMarshal state while preserving the same plan gate, branch tree, and task protocol.
+10. **Fall back to context control:** default `auto` mode tries cost-saving first, then uses same-agent orchestration when no cheap worker keys are configured.
 
 ## Environment Requirements
 
-CostMarshal v0.0.6 depends on Python for its deterministic CLI:
+CostMarshal v0.0.7 depends on Python for its deterministic CLI:
 
 | Dependency | Required | Notes |
 | --- | --- | --- |
@@ -205,6 +210,7 @@ py -3 scripts/costmarshal.py --help
 | Cost accounting | default CNY 20 project budget, task caps, provider usage events, per-agent summaries | cheap work stays cheap, expensive work is visible |
 | Worker execution | read-only OpenAI-compatible `run-task` for configured providers | DeepSeek/Kimi/LongCat can produce reports without polluting leader context |
 | Quality gates | completion reports, review tasks, leader `record-result`, strict early verification | model output is evidence to verify, not truth to merge blindly |
+| Adaptive verification | `new-check-task`, high/medium/low/auto leader participation | cheap models handle simple evidence checks while leader reviews only as much as risk requires |
 | Strong-demo replay | senior pathfinding, replay memory promotion, reproducibility contract, weak-agent replay feedback | expensive discovery becomes a reusable low-cost procedure |
 | Live task ledger | `status-project` task table with agent, model, summary, replay memory, leader self-work, and wait time | users can see who did what, what the leader handled directly, and how long orchestration waited |
 | Self-evolution | project evolution report, routing policy update, hierarchical knowledge index | every completed project can make future routing and reuse sharper |
@@ -274,6 +280,26 @@ python scripts/costmarshal.py record-leader-work --project <project-dir> --task 
 ```
 
 `status-project` and `finish-project` show the exception count, reason, scope, minutes, token estimate, and estimated CNY cost. This makes it obvious whether CostMarshal is actually delegating work or drifting back to leader-only execution.
+
+## Adaptive Verification Shards
+
+Leader verification can be expensive when every claim, file, log, or artifact is read by the strongest model. CostMarshal supports splitting simple checks into small medium-model tasks:
+
+```bash
+python scripts/costmarshal.py set-leader-review --project <project-dir> --level auto --reason "Adapt verification depth to risk and evidence"
+python scripts/costmarshal.py new-check-task --project <project-dir> --source-task CM-0001 --check "The report cites the expected artifact" --check "No unapproved writes are proposed" --reviewer deepseek
+```
+
+Leader participation levels:
+
+| Level | Use | Leader Reads |
+| --- | --- | --- |
+| `high` | high risk, S difficulty, unfamiliar agent, security/data-loss concerns | full check report plus key evidence |
+| `medium` | normal verification while capability is still being learned | structured report plus sampled evidence |
+| `low` | low-risk B/C checks with clear evidence and proven agents | failures, unclear items, and compact pass summary |
+| `auto` | default | high for high/S, low for low-risk B/C, medium otherwise |
+
+Check shards are read-only, default to `deepseek`, use `task_type=verification`, and require PASS/FAIL/UNCLEAR per check with evidence paths. They are for enumerable evidence checks, not architecture judgment or broad debugging.
 
 ## Layout
 
@@ -518,12 +544,13 @@ For live provider checks, keep local keys in one of the CostMarshal secret files
 python scripts/costmarshal.py --root <temp-root> check-agents --agents deepseek,kimi,longcat --live
 ```
 
-## v0.0.6 Limitations
+## v0.0.7 Limitations
 
 - CostMarshal can launch read-only OpenAI-compatible workers with `run-task`, but it does not yet run a full parallel wave scheduler.
 - Senior Codex subagents are still invoked through Codex/subagent tooling.
 - Token and cost estimates are recorded from caller-provided or provider-reported usage, not enforced by a central billing gateway.
 - Leader self-work is audited and budget-visible, but CostMarshal cannot technically prevent a human or leader model from editing files outside the CLI.
+- Adaptive leader review currently uses conservative risk/difficulty heuristics; scorecard-aware fine-tuning is still evolving.
 - Verification relaxation is conservative and based on accumulated scorecard evidence.
 
 ## License

@@ -64,6 +64,7 @@ Every new project must be created with `costmarshal.py new-project`. If a projec
   memory/
     handoffs.jsonl
     leader-self-work.jsonl
+    leader-review-policy.jsonl
     model-performance.jsonl
     replay-feedback.jsonl
     replay/
@@ -168,6 +169,34 @@ python scripts/costmarshal.py record-leader-work --project <project> --task CM-0
 ```
 
 Each row records `event_type=leader_self_work`, project id, optional task id, work type, risk, bounded scope, reason, touched files, minutes, token estimates, and estimated CNY cost. These rows are appended to global `memory/events.jsonl` for audit, but they are not fed into worker scorecards. They do count toward project spend when an estimated cost is provided, and they appear in `status-project` and `finish-project`.
+
+## Leader Review Policy
+
+Every project has a leader review policy in `project.json`:
+
+```json
+{
+  "leader_review": {
+    "level": "auto",
+    "updated_at": "2026-07-08T00:00:00+08:00",
+    "reason": "Adapt leader participation from task risk, difficulty, and evidence."
+  }
+}
+```
+
+Changes are appended to:
+
+```text
+memory/leader-review-policy.jsonl
+```
+
+Use:
+
+```bash
+python scripts/costmarshal.py set-leader-review --project <project> --level auto --reason "Adapt verification depth to risk and evidence"
+```
+
+`new-check-task` uses this policy unless `--leader-review-level high|medium|low|auto` is provided. `auto` resolves to high for high-risk or S-difficulty checks, low for low-risk B/C checks, and medium otherwise.
 
 ## Budget, Dependencies, Locks, And Handoffs
 

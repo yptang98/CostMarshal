@@ -71,6 +71,7 @@ MEMORY_FEEDBACK_ATTRIBUTIONS = {
 TERMINAL_TASK_STATES = {"done", "failed", "escalate", "cancelled"}
 ACTIVE_CLAIM_STATES = {"planned", "running"}
 ORCHESTRATION_MODES = {"auto", "cost-saving", "same-agent", "balanced"}
+LEADER_REVIEW_LEVELS = {"auto", "high", "medium", "low"}
 LEADER_WORK_TYPES = {
     "planning",
     "integration",
@@ -871,6 +872,11 @@ def create_project_scaffold(
             "max_project_cost_cny": max_project_cost_cny,
             "max_agent_cost_cny": max_agent_cost_cny,
         },
+        "leader_review": {
+            "level": "auto",
+            "updated_at": now_iso(),
+            "reason": "Default: adapt leader participation from task risk, difficulty, and evidence.",
+        },
         "plan_approval": {
             "required": True,
             "status": "not_drafted",
@@ -962,6 +968,7 @@ def create_project_scaffold(
     (project_dir / "memory" / "model-performance.jsonl").touch()
     (project_dir / "memory" / "wait-events.jsonl").touch()
     (project_dir / "memory" / "leader-self-work.jsonl").touch()
+    (project_dir / "memory" / "leader-review-policy.jsonl").touch()
     atomic_write_json(project_dir / "checks" / "connectivity.json", {"checked_at": None, "agents": {}})
     return project_dir, project
 
@@ -1518,6 +1525,55 @@ def require_plan_approved(project_dir: Path, project: dict[str, Any], allow_unap
         )
 
 
+def effective_leader_review_level(project: dict[str, Any], requested_level: str | None, risk: str, difficulty: str) -> str:
+    level = requested_level or (project.get("leader_review") or {}).get("level") or "auto"
+    if level != "auto":
+        return level
+    if risk == "high" or difficulty == "S":
+        return "high"
+    if risk == "low" and difficulty in {"B", "C"}:
+        return "low"
+    return "medium"
+
+
+def leader_review_instruction(level: str) -> str:
+    instructions = {
+        "high": (
+            "Leader participation: high. Provide complete evidence and all uncertainties; the leader is expected to inspect the full check report and key evidence before acceptance."
+        ),
+        "medium": (
+            "Leader participation: medium. Provide a structured pass/fail/unclear table with key evidence; the leader is expected to read the full report and sample evidence."
+        ),
+        "low": (
+            "Leader participation: low. Keep the pass summary compact, highlight only failures/unclear items, and escalate aggressively instead of relying on hidden judgment."
+        ),
+    }
+    return instructions.get(level, instructions["medium"])
+
+
+def command_set_leader_review(args: argparse.Namespace) -> None:
+    root = args.root.resolve()
+    ensure_root(root)
+    project_dir = project_path(root, args.project)
+    project = load_project(project_dir)
+    project["leader_review"] = {
+        "level": args.level,
+        "updated_at": now_iso(),
+        "reason": redact(args.reason or ""),
+    }
+    save_project(project_dir, project)
+    row = {
+        "event_type": "leader_review_policy",
+        "timestamp": now_iso(),
+        "project_id": project["id"],
+        "level": args.level,
+        "reason": redact(args.reason or ""),
+    }
+    append_jsonl(project_dir / "memory" / "leader-review-policy.jsonl", row)
+    append_jsonl(root / "memory" / "events.jsonl", row)
+    print(json.dumps({"project": str(project_dir), "leader_review": project["leader_review"]}, ensure_ascii=False, indent=2))
+
+
 def branch_card_markdown(card: dict[str, Any]) -> str:
     lines = [
         f"# Branch Card: {card['id']}",
@@ -1667,11 +1723,11 @@ def command_new_task(args: argparse.Namespace) -> None:
             + "\n".join(f"- {claim.get('path')} claimed by {claim.get('task_id')} ({claim.get('agent')})" for claim in conflicts)
         )
     enforce_budget(project_dir, project, args.agent, float(args.max_cost_cny or 0.0))
+    memory_names = (args.replay_memory or []) + (args.project_skill or [])
+    replay_memory = replay_memory_context(project_dir, memory_names)
     task_dir.mkdir(parents=True)
     (task_dir / "raw").mkdir()
     (task_dir / "artifacts").mkdir()
-    memory_names = (args.replay_memory or []) + (args.project_skill or [])
-    replay_memory = replay_memory_context(project_dir, memory_names)
     allowed_context = args.allowed_context or ["master-snapshot.md"]
     allowed_context = allowed_context + replay_memory
     card = {
@@ -2157,6 +2213,86 @@ def command_new_review_task(args: argparse.Namespace) -> None:
         max_cost_cny=args.max_cost_cny,
     )
     command_new_task(review_args)
+
+
+def command_new_check_task(args: argparse.Namespace) -> None:
+    root = args.root.resolve()
+    project_dir = project_path(root, args.project)
+    project = load_project(project_dir)
+    source_rel = None
+    depends_on = args.depends_on or []
+    parent = args.parent or "root"
+    if args.source_task:
+        source_task_dir = project_dir / "tasks" / args.source_task
+        if not source_task_dir.exists():
+            raise SystemExit(f"Source task not found: {args.source_task}")
+        source_rel = f"tasks/{args.source_task}"
+        parent = args.parent or args.source_task
+        if args.source_task not in depends_on:
+            depends_on.append(args.source_task)
+    checks = args.check or []
+    if not checks:
+        raise SystemExit("new-check-task requires at least one --check item.")
+    default_context = []
+    if source_rel:
+        default_context = [
+            f"{source_rel}/branch-card.md",
+            f"{source_rel}/status.json",
+            f"{source_rel}/completion-report.md",
+        ]
+    allowed_context = (args.allowed_context or default_context) + (args.extra_context or [])
+    if not allowed_context:
+        raise SystemExit("new-check-task requires --allowed-context when --source-task is omitted.")
+    title = args.title or (f"Check {args.source_task}" if args.source_task else "Verification shard")
+    leader_review_level = effective_leader_review_level(project, args.leader_review_level, args.risk, args.difficulty)
+    check_lines = "\n".join(f"- {item}" for item in checks)
+    purpose = args.purpose or (
+        "Run a bounded verification shard for the leader. Check only the listed points and return concise evidence.\n\n"
+        f"Checks:\n{check_lines}\n\n{leader_review_instruction(leader_review_level)}"
+    )
+    check_args = argparse.Namespace(
+        root=args.root,
+        project=args.project,
+        id=args.id,
+        title=title,
+        parent=parent,
+        agent=args.reviewer,
+        agent_tier=args.agent_tier,
+        difficulty=args.difficulty,
+        risk=args.risk,
+        task_type="verification",
+        purpose=purpose,
+        acceptance=args.acceptance
+        or [
+            "For each check, report PASS, FAIL, or UNCLEAR.",
+            "Cite the exact evidence path and a short excerpt or line reference when available.",
+            "Do not implement fixes or broaden the review beyond the listed checks.",
+            "Escalate if the check requires architecture, security, broad context, or judgment outside the evidence.",
+            leader_review_instruction(leader_review_level),
+        ],
+        allowed_context=allowed_context,
+        replay_memory=None,
+        project_skill=None,
+        depends_on=depends_on,
+        allowed_path=[],
+        claim_path=[],
+        allow_lock_conflict=False,
+        allow_unapproved_plan=getattr(args, "allow_unapproved_plan", False),
+        write_scope="none",
+        command=args.command or [],
+        escalate_if=args.escalate_if
+        or [
+            "evidence is insufficient",
+            "check requires raw transcript or unapproved context",
+            "architecture, security, or data-loss concern appears",
+            "the answer is uncertain after the allowed context is reviewed",
+        ],
+        max_wall_minutes=args.max_wall_minutes,
+        max_input_tokens=args.max_input_tokens,
+        max_output_tokens=args.max_output_tokens,
+        max_cost_cny=args.max_cost_cny,
+    )
+    command_new_task(check_args)
 
 
 def command_set_status(args: argparse.Namespace) -> None:
@@ -3335,6 +3471,7 @@ def command_finish_project(args: argparse.Namespace) -> None:
         "",
         f"Project id: `{project['id']}`",
         f"Finished: {now_iso()}",
+        f"Leader review: `{(project.get('leader_review') or {}).get('level', 'auto')}`",
         "",
         "## Objective",
         project.get("objective", ""),
@@ -3645,6 +3782,7 @@ def project_status_payload(root: Path, project_dir: Path) -> dict[str, Any]:
         "status": project.get("status"),
         "objective": project.get("objective"),
         "orchestration": project.get("orchestration") or {},
+        "leader_review": project.get("leader_review") or {"level": "auto"},
         "plan_approval": project.get("plan_approval") or {},
         "budget": {
             **budget,
@@ -3675,6 +3813,7 @@ def command_status_project(args: argparse.Namespace) -> None:
         f"Project id: `{payload['project_id']}`",
         f"Status: {payload['status']}",
         f"Mode: {(payload.get('orchestration') or {}).get('effective_mode', 'unknown')}",
+        f"Leader review: {(payload.get('leader_review') or {}).get('level', 'auto')}",
         f"Plan approval: {(payload.get('plan_approval') or {}).get('status', 'unknown')}",
         f"Spent CNY: {payload['budget']['spent_cny']}",
         "",
@@ -3820,6 +3959,12 @@ def build_parser() -> argparse.ArgumentParser:
     approve_plan.add_argument("--approved-by", default="user")
     approve_plan.add_argument("--note")
     approve_plan.set_defaults(func=command_approve_plan)
+
+    leader_review_policy = sub.add_parser("set-leader-review", help="Set project default leader participation for verification")
+    leader_review_policy.add_argument("--project", required=True)
+    leader_review_policy.add_argument("--level", choices=sorted(LEADER_REVIEW_LEVELS), required=True)
+    leader_review_policy.add_argument("--reason")
+    leader_review_policy.set_defaults(func=command_set_leader_review)
 
     check_agents = sub.add_parser("check-agents", help="Check configured agents")
     check_agents.add_argument("--project", help="Project path or id to store connectivity results")
@@ -4006,6 +4151,32 @@ def build_parser() -> argparse.ArgumentParser:
     review_task.add_argument("--max-cost-cny", type=float, default=0.3)
     review_task.add_argument("--allow-unapproved-plan", action="store_true")
     review_task.set_defaults(func=command_new_review_task)
+
+    check_task = sub.add_parser("new-check-task", help="Create a bounded verification shard for a medium-tier reviewer")
+    check_task.add_argument("--project", required=True)
+    check_task.add_argument("--source-task", help="Task whose output should be checked")
+    check_task.add_argument("--check", action="append", help="One concrete check item; repeat for multiple points")
+    check_task.add_argument("--reviewer", default="deepseek")
+    check_task.add_argument("--id")
+    check_task.add_argument("--title")
+    check_task.add_argument("--purpose")
+    check_task.add_argument("--parent")
+    check_task.add_argument("--agent-tier", choices=["high", "medium", "low", "auto"], default="medium")
+    check_task.add_argument("--difficulty", choices=sorted(DIFFICULTIES), default="B")
+    check_task.add_argument("--risk", choices=sorted(RISKS), default="low")
+    check_task.add_argument("--leader-review-level", choices=sorted(LEADER_REVIEW_LEVELS), help="Override the project leader-review policy for this check")
+    check_task.add_argument("--acceptance", action="append")
+    check_task.add_argument("--allowed-context", action="append")
+    check_task.add_argument("--extra-context", action="append")
+    check_task.add_argument("--depends-on", action="append")
+    check_task.add_argument("--command", action="append")
+    check_task.add_argument("--escalate-if", action="append")
+    check_task.add_argument("--max-wall-minutes", type=int, default=10)
+    check_task.add_argument("--max-input-tokens", type=int, default=16000)
+    check_task.add_argument("--max-output-tokens", type=int, default=1500)
+    check_task.add_argument("--max-cost-cny", type=float, default=0.15)
+    check_task.add_argument("--allow-unapproved-plan", action="store_true")
+    check_task.set_defaults(func=command_new_check_task)
 
     set_status = sub.add_parser("set-status", help="Set task status and signal files")
     set_status.add_argument("--project", required=True)

@@ -171,9 +171,11 @@ def main() -> int:
         project_json = json.loads((project / "project.json").read_text(encoding="utf-8"))
         assert_true(project_json["budget"]["max_project_cost_cny"] == 20.0, "default project budget should be CNY 20")
         assert_true(project_json["orchestration"]["effective_mode"] == "cost-saving", "auto mode should use cost-saving when a cheap agent key is configured")
+        assert_true(project_json["leader_review"]["level"] == "auto", "leader review should default to adaptive auto")
         assert_true(project_json["orchestration"]["configured_cheap_agents"] == ["deepseek"], "configured cheap agents should be recorded")
         assert_true((project / "memory" / "wait-events.jsonl").exists(), "wait-events.jsonl should be initialized")
         assert_true((project / "memory" / "leader-self-work.jsonl").exists(), "leader-self-work.jsonl should be initialized")
+        assert_true((project / "memory" / "leader-review-policy.jsonl").exists(), "leader-review-policy.jsonl should be initialized")
 
         blocked = run(
             temp,
@@ -205,6 +207,16 @@ def main() -> int:
             "5m",
         )
         run_json(temp, "approve-plan", "--project", str(project), "--approved-by", "smoke-test")
+        run_json(
+            temp,
+            "set-leader-review",
+            "--project",
+            str(project),
+            "--level",
+            "auto",
+            "--reason",
+            "Smoke test adaptive leader participation",
+        )
         cost_recommendation = run_json(
             temp,
             "recommend",
@@ -392,8 +404,27 @@ def main() -> int:
         )
         assert_true("not complete" in (draft_blocked.stderr + draft_blocked.stdout), "draft replay memory should be blocked")
 
+        check_info = run_json(
+            temp,
+            "new-check-task",
+            "--project",
+            str(project),
+            "--source-task",
+            "CM-0001",
+            "--check",
+            "Completion report contains concrete evidence",
+            "--check",
+            "Replay memory source task is marked done",
+            "--reviewer",
+            "deepseek",
+        )
+        assert_true(check_info["task_id"] == "CM-0003", "check task should be the third task")
+        check_brief = (project / "tasks" / "CM-0003" / "brief.md").read_text(encoding="utf-8")
+        assert_true("Leader participation: low" in check_brief, "auto leader review should be low for low-risk B checks")
+
         status = run_json(temp, "status-project", "--project", str(project), "--format", "json")
         first_task = status["tasks"][0]
+        assert_true(status["leader_review"]["level"] == "auto", "status should include leader review policy")
         assert_true(first_task["model"] == "deepseek-smoke-model", "status should preserve recorded model name")
         assert_true(first_task["summary"], "status should include a task summary")
         assert_true(first_task["wait_count"] == 1, "status should include wait count")
