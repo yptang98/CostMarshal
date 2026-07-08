@@ -71,6 +71,14 @@ MEMORY_FEEDBACK_ATTRIBUTIONS = {
 TERMINAL_TASK_STATES = {"done", "failed", "escalate", "cancelled"}
 ACTIVE_CLAIM_STATES = {"planned", "running"}
 ORCHESTRATION_MODES = {"auto", "cost-saving", "same-agent", "balanced"}
+LEADER_WORK_TYPES = {
+    "planning",
+    "integration",
+    "verification",
+    "emergency-fix",
+    "trivial-glue",
+    "other",
+}
 
 
 def now_iso() -> str:
@@ -786,8 +794,14 @@ def project_cost_rows(project_dir: Path) -> list[dict[str, Any]]:
     return read_jsonl(project_dir / "memory" / "model-performance.jsonl")
 
 
+def leader_self_work_rows(project_dir: Path) -> list[dict[str, Any]]:
+    return read_jsonl(project_dir / "memory" / "leader-self-work.jsonl")
+
+
 def project_spend(project_dir: Path, agent: str | None = None) -> float:
     rows = project_cost_rows(project_dir)
+    if agent in {None, "leader"}:
+        rows += leader_self_work_rows(project_dir)
     total = 0.0
     for row in rows:
         if agent and row.get("agent") != agent:
@@ -947,6 +961,7 @@ def create_project_scaffold(
     save_tree(project_dir, tree)
     (project_dir / "memory" / "model-performance.jsonl").touch()
     (project_dir / "memory" / "wait-events.jsonl").touch()
+    (project_dir / "memory" / "leader-self-work.jsonl").touch()
     atomic_write_json(project_dir / "checks" / "connectivity.json", {"checked_at": None, "agents": {}})
     return project_dir, project
 
@@ -2421,6 +2436,44 @@ def command_record_result(args: argparse.Namespace) -> None:
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
+def command_record_leader_work(args: argparse.Namespace) -> None:
+    root = args.root.resolve()
+    ensure_root(root)
+    project_dir = project_path(root, args.project)
+    project = load_project(project_dir)
+    task_id = args.task
+    if task_id and not (project_dir / "tasks" / task_id).exists():
+        raise SystemExit(f"Task not found for leader self-work record: {task_id}")
+    input_tokens = int(args.input_tokens or 0)
+    output_tokens = int(args.output_tokens or 0)
+    estimated_cost_cny = float(args.estimated_cost_cny or 0.0)
+    minutes = int(args.minutes or 0)
+    row = {
+        "event_type": "leader_self_work",
+        "timestamp": now_iso(),
+        "project_id": project["id"],
+        "task_id": task_id,
+        "agent": "leader",
+        "model": args.model,
+        "work_type": args.work_type,
+        "risk": args.risk,
+        "scope": redact(args.scope),
+        "reason": redact(args.reason),
+        "files": redact(args.file or []),
+        "minutes": minutes,
+        "wall_seconds": minutes * 60,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "estimated_cost_cny": estimated_cost_cny,
+        "cost_source": "caller" if args.estimated_cost_cny is not None else "not_provided",
+        "note": redact(args.note or ""),
+    }
+    append_jsonl(project_dir / "memory" / "leader-self-work.jsonl", row)
+    append_jsonl(root / "memory" / "events.jsonl", row)
+    print(json.dumps({"recorded": True, "event": row}, ensure_ascii=False, indent=2))
+
+
 def agent_base_url(agent_name: str, agent: dict[str, Any]) -> str | None:
     base_url_env = agent.get("base_url_env")
     return os.environ.get(base_url_env or "") or agent.get("base_url") or DEFAULT_BASE_URLS.get(agent_name)
@@ -2932,6 +2985,29 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return summary
 
 
+def summarize_leader_self_work(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    total_minutes = sum(int(row.get("minutes") or 0) for row in rows)
+    input_tokens = sum(int(row.get("input_tokens") or 0) for row in rows)
+    output_tokens = sum(int(row.get("output_tokens") or 0) for row in rows)
+    total_tokens = sum(int(row.get("total_tokens") or 0) for row in rows)
+    estimated_cost_cny = round(sum(float(row.get("estimated_cost_cny") or 0.0) for row in rows), 4)
+    by_type: dict[str, int] = {}
+    for row in rows:
+        work_type = row.get("work_type") or "unknown"
+        by_type[work_type] = by_type.get(work_type, 0) + 1
+    return {
+        "count": len(rows),
+        "total_minutes": total_minutes,
+        "total_wall_seconds": total_minutes * 60,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "estimated_cost_cny": estimated_cost_cny,
+        "by_type": by_type,
+        "latest_events": rows[-10:],
+    }
+
+
 def format_count(value: int) -> str:
     return f"{value:,}"
 
@@ -3252,6 +3328,7 @@ def command_finish_project(args: argparse.Namespace) -> None:
     config = read_json(root / "config" / "agents.json", {})
     rows = read_jsonl(project_dir / "memory" / "model-performance.jsonl")
     summary = summarize_rows(rows)
+    leader_work = summarize_leader_self_work(leader_self_work_rows(project_dir))
     tasks = task_rows(project_dir, config)
     lines = [
         f"# Project Summary: {project['name']}",
@@ -3283,6 +3360,29 @@ def command_finish_project(args: argparse.Namespace) -> None:
         lines.append(
             f"| **Total** | {totals['runs']} | {totals['tasks']} |  |  |  | {format_count(totals['input_tokens'])} | {format_count(totals['output_tokens'])} | {format_count(totals['total_tokens'])} | {totals['estimated_cost_cny']} |"
         )
+    lines.extend(
+        [
+            "",
+            "## Leader Self-Work Exceptions",
+            "",
+            f"- Count: {leader_work['count']}",
+            f"- Total minutes: {leader_work['total_minutes']}",
+            f"- Input tokens: {format_count(leader_work['input_tokens'])}",
+            f"- Output tokens: {format_count(leader_work['output_tokens'])}",
+            f"- Total tokens: {format_count(leader_work['total_tokens'])}",
+            f"- Est. cost CNY: {leader_work['estimated_cost_cny']}",
+            "",
+        ]
+    )
+    if leader_work["latest_events"]:
+        lines.append("| Time | Task | Type | Risk | Scope | Reason | Files |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+        for row in leader_work["latest_events"]:
+            lines.append(
+                f"| {table_cell(row.get('timestamp'))} | {table_cell(row.get('task_id'))} | {table_cell(row.get('work_type'))} | {table_cell(row.get('risk'))} | {table_cell(row.get('scope'))} | {table_cell(row.get('reason'))} | {table_cell(', '.join(row.get('files') or []) or '-')} |"
+            )
+    else:
+        lines.append("- none")
     lines.extend(
         [
             "",
@@ -3530,6 +3630,7 @@ def project_status_payload(root: Path, project_dir: Path) -> dict[str, Any]:
     config = read_json(root / "config" / "agents.json", {})
     rows = project_cost_rows(project_dir)
     summary = summarize_rows(rows)
+    leader_work = summarize_leader_self_work(leader_self_work_rows(project_dir))
     claims = load_claims(project_dir)
     tasks = task_rows(project_dir, config)
     state_counts: dict[str, int] = {}
@@ -3556,6 +3657,7 @@ def project_status_payload(root: Path, project_dir: Path) -> dict[str, Any]:
         "tasks": tasks,
         "active_claims": [claim for claim in claims.get("claims", []) if claim.get("state") in ACTIVE_CLAIM_STATES],
         "agent_cost_summary": summary,
+        "leader_self_work": leader_work,
         "replay_memory": replay_memory_rows(project_dir),
     }
 
@@ -3595,6 +3697,26 @@ def command_status_project(args: argparse.Namespace) -> None:
             )
     else:
         lines.append("- none")
+    lines.extend(["", "## Leader Self-Work Exceptions"])
+    leader_work = payload["leader_self_work"]
+    if leader_work["count"]:
+        lines.extend(
+            [
+                f"- Count: {leader_work['count']}",
+                f"- Total minutes: {leader_work['total_minutes']}",
+                f"- Total tokens: {format_count(leader_work['total_tokens'])}",
+                f"- Est. cost CNY: {leader_work['estimated_cost_cny']}",
+                "",
+                "| Time | Task | Type | Risk | Scope | Reason |",
+                "| --- | --- | --- | --- | --- | --- |",
+            ]
+        )
+        for row in leader_work["latest_events"]:
+            lines.append(
+                f"| {table_cell(row.get('timestamp'))} | {table_cell(row.get('task_id'))} | {table_cell(row.get('work_type'))} | {table_cell(row.get('risk'))} | {table_cell(row.get('scope'))} | {table_cell(row.get('reason'))} |"
+            )
+    else:
+        lines.append("- none")
     lines.extend(["", "## Tasks"])
     lines.append("| Task | State | Agent | Model | Summary | Wait | Depends On | Claims | Replay Memory |")
     lines.append("| --- | --- | --- | --- | --- | ---: | --- | --- | --- |")
@@ -3613,7 +3735,15 @@ def command_validate(args: argparse.Namespace) -> None:
             issues.append(f"missing {rel}")
     if args.project:
         project_dir = project_path(root, args.project)
-        for rel in ["project.json", "master-snapshot.md", "plan-approval.md", "branch-tree.json", "branch-tree.md", "tasks", "memory/model-performance.jsonl"]:
+        for rel in [
+            "project.json",
+            "master-snapshot.md",
+            "plan-approval.md",
+            "branch-tree.json",
+            "branch-tree.md",
+            "tasks",
+            "memory/model-performance.jsonl",
+        ]:
             if not (project_dir / rel).exists():
                 issues.append(f"project missing {rel}")
         tree = read_json(project_dir / "branch-tree.json", {"nodes": []})
@@ -3909,6 +4039,22 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--quality-score", type=int, choices=[1, 2, 3, 4, 5], required=True)
     record.add_argument("--note")
     record.set_defaults(func=command_record_result)
+
+    leader_work = sub.add_parser("record-leader-work", help="Record an exception when the leader performs direct implementation-like work")
+    leader_work.add_argument("--project", required=True)
+    leader_work.add_argument("--task", help="Related task id, if this self-work belongs to a task")
+    leader_work.add_argument("--work-type", choices=sorted(LEADER_WORK_TYPES), default="other")
+    leader_work.add_argument("--risk", choices=sorted(RISKS), default="medium")
+    leader_work.add_argument("--scope", required=True, help="Small scope the leader handled directly")
+    leader_work.add_argument("--reason", required=True, help="Why delegation was unsuitable or too risky")
+    leader_work.add_argument("--file", action="append", help="Touched or inspected file path")
+    leader_work.add_argument("--minutes", type=int, default=0)
+    leader_work.add_argument("--model", default="codex-leader")
+    leader_work.add_argument("--input-tokens", type=int, default=0)
+    leader_work.add_argument("--output-tokens", type=int, default=0)
+    leader_work.add_argument("--estimated-cost-cny", type=float)
+    leader_work.add_argument("--note")
+    leader_work.set_defaults(func=command_record_leader_work)
 
     finish = sub.add_parser("finish-project", help="Create project summary")
     finish.add_argument("--project", required=True)

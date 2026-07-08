@@ -20,6 +20,8 @@ The leader must:
 
 The leader should not write large implementations unless no worker is suitable, the task is on the critical path, or quality/safety requires direct intervention.
 
+If the leader performs direct implementation-like work, record it as an auditable exception with `record-leader-work`. This keeps the leader from quietly becoming the default worker while still allowing small integration, verification, or emergency fixes when delegation would reduce quality.
+
 The senior-demo replay loop exists to expand weaker agents' safe usable range and stability. The leader should classify the proven path as a task type, then save the fully reproducible details in a single replay memory file. Cheaper agents receive that one memory file as task context instead of reading a growing set of reusable documents.
 
 ## Script-First Rule
@@ -41,6 +43,7 @@ python scripts/costmarshal.py run-task --project <project-dir> --task CM-0001 --
 python scripts/costmarshal.py run-task --project <project-dir> --task CM-0001
 python scripts/costmarshal.py wait-task --project <project-dir> --task CM-0001 --every 30s --timeout 1h
 python scripts/costmarshal.py record-result --project <project-dir> --task CM-0001 --status done --agent deepseek --model deepseek-v4-flash --quality-score 4 --accepted-by-leader
+python scripts/costmarshal.py record-leader-work --project <project-dir> --task CM-0001 --work-type verification --risk low --scope "Sampled evidence and integrated final decision" --reason "Final acceptance requires leader review"
 python scripts/costmarshal.py record-handoff --project <project-dir> --source-task CM-0001 --summary "Compressed handoff for reviewer" --next-step "Review evidence"
 python scripts/costmarshal.py new-review-task --project <project-dir> --source-task CM-0001 --reviewer kimi
 python scripts/costmarshal.py promote-memory --project <project-dir> --source-task CM-0001 --name reusable-flow --memory-task-type mechanical --summary "What the senior agent proved and exactly how to replay it" --working-dir "." --required-input "config.yaml exists" --allowed-param "top_k" --allowed-command "python run_eval.py --config config.yaml" --expected-output "results.json" --success-marker "command exits 0"
@@ -93,27 +96,29 @@ Use `--mode auto` by default. Auto means the default intent is cost-saving, but 
 9. Use `costmarshal.py new-task` to create the branch card, task brief, status file, completion report template, and branch-tree node. Use `--depends-on` for prerequisites and `--claim-path` for write locks.
 10. Keep each round to at most three active workers: one high-tier senior worker, one medium-tier worker, and one low-tier LongCat worker.
 11. For OpenAI-compatible medium/low agents, use `costmarshal.py run-task --dry-run` before the first call, then `run-task` to execute the read-only worker runner. Senior Codex subagents still require direct Codex/subagent dispatch.
-12. Give each worker only its `brief.md`, explicit file paths, approved summaries, and task-local messages.
-13. Use status files (`status.json`, `DONE`, `FAILED`, or `ESCALATE`) as the normal return channel.
-14. Use CostMarshal's embedded WakeWait-style commands when waiting on worker status, long commands, training, evaluations, or file readiness. Do not require a separate WakeWait skill install and do not spend leader turns polling.
+12. In `same-agent` mode, still create a `senior` task/subagent for nontrivial work; do not let the leader absorb the task just because the same strong model family is being used.
+13. Give each worker only its `brief.md`, explicit file paths, approved summaries, and task-local messages.
+14. Use status files (`status.json`, `DONE`, `FAILED`, or `ESCALATE`) as the normal return channel.
+15. Use CostMarshal's embedded WakeWait-style commands when waiting on worker status, long commands, training, evaluations, or file readiness. Do not require a separate WakeWait skill install and do not spend leader turns polling.
     - `costmarshal.py sleep --duration 10m`
     - `costmarshal.py wait-task --project <project> --task CM-0001 --every 30s --timeout 1h`
     - `costmarshal.py wait-file --path <path> --every 30s --timeout 1h`
     - `costmarshal.py wait-contains --path <log> --text DONE --every 30s --timeout 1h`
     - `costmarshal.py wait-command --command "<check command>" --every 30s --timeout 1h`
-15. Read `completion-report.md` first. Read raw worker transcript only for audit, incident review, unclear reports, or explicit user request.
-16. Accept, request rework, or escalate based on verification evidence, not worker confidence alone.
-17. Use `costmarshal.py record-result` after every worker attempt to record the leader's final evaluation. `run-task` records a separate usage event automatically from provider token data, but it does not count as leader acceptance.
-18. Record `--input-tokens` and `--output-tokens` whenever provider usage is available. If `--estimated-cost-cny` is omitted, CostMarshal estimates cost from known per-agent CNY-per-1M-token prices.
-19. After a high-tier senior worker proves a repeatable workflow, classify it by task type and run `costmarshal.py promote-memory --project <project> --source-task <task> --name <memory-name> --memory-task-type <type> ...` to create one replay memory file under `memory/replay/<task-type>/<memory-name>/memory.md`.
-20. Assign weak or cheaper agents to replay only after the replay memory exists. Create those tasks with `--replay-memory <memory-name>`, low risk, bounded allowed writes, explicit parameters, and clear success markers.
-21. After every replay attempt, run `costmarshal.py record-memory-feedback` so the memory file accumulates quality evidence.
-22. If feedback attribution is `memory_issue` or `--needs-senior-refresh`, mark the memory as needing revision and send it back to a senior agent. If attribution is `agent_capability`, adjust routing for that model instead of blaming the memory.
-23. Use `costmarshal.py record-handoff` for compressed task-to-task context and `new-review-task` for bounded cross-agent review.
-24. Use `costmarshal.py status-project` during long runs to inspect task states, locks, budget, replay memory health, agent cost, each task's concrete model name, short result summary, and accumulated WakeWait-style wait time.
-25. Use `costmarshal.py finish-project` at project completion so the global memory and project summary include per-agent input tokens, output tokens, total tokens, estimated CNY cost, task summaries, model names, and wait-time totals. `finish-project` runs project evolution by default.
-26. Use `costmarshal.py evolve-project` after adding final leader notes or senior abstractions. The evolution phase writes `reports/evolution-report.md`, updates routing evidence, and promotes compact reusable lessons into `memory/knowledge-index.json` plus one small `memory/knowledge/<task-type>/<lesson>.md` file per lesson.
-27. For future projects, read the knowledge index first and attach at most one matching knowledge file unless the leader explicitly approves more context. Prefer replay memory for exact command reproduction; use knowledge lessons for common problem patterns, bug fixes, and reusable judgment.
+16. Read `completion-report.md` first. Read raw worker transcript only for audit, incident review, unclear reports, or explicit user request.
+17. Accept, request rework, or escalate based on verification evidence, not worker confidence alone.
+18. Use `costmarshal.py record-result` after every worker attempt to record the leader's final evaluation. `run-task` records a separate usage event automatically from provider token data, but it does not count as leader acceptance.
+19. Record `--input-tokens` and `--output-tokens` whenever provider usage is available. If `--estimated-cost-cny` is omitted, CostMarshal estimates cost from known per-agent CNY-per-1M-token prices.
+20. If the leader directly writes or fixes implementation-like work instead of dispatching it, immediately run `costmarshal.py record-leader-work --project <project> --scope <small-scope> --reason <why-delegation-was-unsuitable>`. Use it for integration, verification, emergency fixes, and trivial glue; avoid using it as a substitute for worker tasks.
+21. After a high-tier senior worker proves a repeatable workflow, classify it by task type and run `costmarshal.py promote-memory --project <project> --source-task <task> --name <memory-name> --memory-task-type <type> ...` to create one replay memory file under `memory/replay/<task-type>/<memory-name>/memory.md`.
+22. Assign weak or cheaper agents to replay only after the replay memory exists. Create those tasks with `--replay-memory <memory-name>`, low risk, bounded allowed writes, explicit parameters, and clear success markers.
+23. After every replay attempt, run `costmarshal.py record-memory-feedback` so the memory file accumulates quality evidence.
+24. If feedback attribution is `memory_issue` or `--needs-senior-refresh`, mark the memory as needing revision and send it back to a senior agent. If attribution is `agent_capability`, adjust routing for that model instead of blaming the memory.
+25. Use `costmarshal.py record-handoff` for compressed task-to-task context and `new-review-task` for bounded cross-agent review.
+26. Use `costmarshal.py status-project` during long runs to inspect task states, locks, budget, replay memory health, agent cost, each task's concrete model name, short result summary, leader self-work exceptions, and accumulated WakeWait-style wait time.
+27. Use `costmarshal.py finish-project` at project completion so the global memory and project summary include per-agent input tokens, output tokens, total tokens, estimated CNY cost, task summaries, model names, leader self-work exceptions, and wait-time totals. `finish-project` runs project evolution by default.
+28. Use `costmarshal.py evolve-project` after adding final leader notes or senior abstractions. The evolution phase writes `reports/evolution-report.md`, updates routing evidence, and promotes compact reusable lessons into `memory/knowledge-index.json` plus one small `memory/knowledge/<task-type>/<lesson>.md` file per lesson.
+29. For future projects, read the knowledge index first and attach at most one matching knowledge file unless the leader explicitly approves more context. Prefer replay memory for exact command reproduction; use knowledge lessons for common problem patterns, bug fixes, and reusable judgment.
 
 ## Existing Project Adoption
 

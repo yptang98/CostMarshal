@@ -3,6 +3,7 @@
 ## Table Of Contents
 
 - Principles
+- Leader self-work gate
 - User plan approval gate
 - Task classification
 - Routing matrix
@@ -29,6 +30,25 @@ Separate context from control:
 Use prior tier labels only as initial guesses. Prefer scorecard evidence after enough tasks.
 
 Use `scripts/costmarshal.py` for persistent state. The markdown schemas below define the contract; the script creates and updates the canonical files. `scripts/mc.py` is a compatibility entrypoint.
+
+## Leader Self-Work Gate
+
+The leader owns planning, routing, verification, final integration, and acceptance. The leader should not become the default bulk implementer. Nontrivial work should be dispatched as a worker task, including `senior` tasks in `same-agent` mode.
+
+Allowed leader direct work:
+- lightweight planning and task decomposition
+- reading structured reports and deciding accept/retry/escalate
+- final integration decisions and small glue edits
+- emergency fixes when delegation would increase quality, security, or latency risk
+- evidence sampling required for final acceptance
+
+When the leader directly performs implementation-like work, record the exception:
+
+```bash
+python scripts/costmarshal.py record-leader-work --project <project-dir> --task CM-0001 --work-type integration --risk low --scope "Small final glue edit" --reason "Delegating this would create more coordination cost than risk reduction"
+```
+
+The record must include the reason and bounded scope. Add files, minutes, input/output tokens, and estimated cost when known. `status-project` and `finish-project` surface these exceptions so the user can see whether the workflow is actually delegating or drifting back to leader-only execution.
 
 ## User Plan Approval Gate
 
@@ -281,6 +301,8 @@ Use `status-project` during long runs:
 python scripts/costmarshal.py status-project --project <project-dir>
 ```
 
+The status view should show task agent, concrete model, result summary, replay memory, wait time, active locks, budget, and leader self-work exceptions.
+
 ## Read-Only Worker Runner
 
 Use `run-task` for OpenAI-compatible medium and low-tier workers when the task can be handled from `brief.md` and approved context:
@@ -476,6 +498,7 @@ python scripts/costmarshal.py new-review-task --project <project-dir> --source-t
 python scripts/costmarshal.py promote-memory --project <project-dir> --source-task CM-0001 --name reusable-flow --memory-task-type mechanical --summary "Exact replayable procedure" --working-dir "." --required-input "config.yaml exists" --allowed-param "top_k" --allowed-command "python run_eval.py --config config.yaml" --expected-output "results.json" --success-marker "command exits 0"
 python scripts/costmarshal.py new-task --project <project-dir> --title "..." --purpose "Replay proven flow" --agent longcat --difficulty B --risk low --task-type mechanical --replay-memory reusable-flow --depends-on CM-0001
 python scripts/costmarshal.py record-memory-feedback --project <project-dir> --task CM-0003 --outcome succeeded --sufficient yes --memory-quality 5 --attribution unknown
+python scripts/costmarshal.py record-leader-work --project <project-dir> --task CM-0001 --work-type verification --risk low --scope "Sampled evidence before acceptance" --reason "Leader final acceptance requires direct review"
 python scripts/costmarshal.py status-project --project <project-dir>
 python scripts/costmarshal.py set-status --project <project-dir> --task CM-0001 --state running
 python scripts/costmarshal.py record-result --project <project-dir> --task CM-0001 --agent kimi --model kimi-k2.7-code --status done --quality-score 4 --accepted-by-leader

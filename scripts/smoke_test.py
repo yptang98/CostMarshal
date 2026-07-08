@@ -173,6 +173,7 @@ def main() -> int:
         assert_true(project_json["orchestration"]["effective_mode"] == "cost-saving", "auto mode should use cost-saving when a cheap agent key is configured")
         assert_true(project_json["orchestration"]["configured_cheap_agents"] == ["deepseek"], "configured cheap agents should be recorded")
         assert_true((project / "memory" / "wait-events.jsonl").exists(), "wait-events.jsonl should be initialized")
+        assert_true((project / "memory" / "leader-self-work.jsonl").exists(), "leader-self-work.jsonl should be initialized")
 
         blocked = run(
             temp,
@@ -263,6 +264,33 @@ def main() -> int:
             "500",
         )
         run(temp, "wait-task", "--project", str(project), "--task", "CM-0001", "--every", "1s", "--timeout", "2s")
+
+        run_json(
+            temp,
+            "record-leader-work",
+            "--project",
+            str(project),
+            "--task",
+            "CM-0001",
+            "--work-type",
+            "verification",
+            "--risk",
+            "low",
+            "--scope",
+            "Smoke-test verification note only",
+            "--reason",
+            "Leader acceptance requires direct evidence sampling",
+            "--file",
+            "reports/smoke.md",
+            "--minutes",
+            "2",
+            "--input-tokens",
+            "120",
+            "--output-tokens",
+            "30",
+            "--estimated-cost-cny",
+            "0.01",
+        )
 
         run_json(
             temp,
@@ -371,6 +399,9 @@ def main() -> int:
         assert_true(first_task["wait_count"] == 1, "status should include wait count")
         assert_true(first_task["wait_elapsed_seconds"] >= 0, "status should include wait elapsed seconds")
         assert_true(status["replay_memory"][0]["status"] in {"complete", "draft"}, "status should include replay memory")
+        assert_true(status["leader_self_work"]["count"] == 1, "status should include leader self-work exceptions")
+        assert_true(status["leader_self_work"]["total_minutes"] == 2, "status should aggregate leader self-work minutes")
+        assert_true(status["budget"]["spent_cny"] >= 0.012, "budget spend should include worker and leader self-work costs")
 
         validation = run_json(temp, "validate", "--project", str(project))
         assert_true(validation["status"] == "ok", "validate should pass for the smoke project")
@@ -383,6 +414,8 @@ def main() -> int:
         assert_true("## Task Ledger" in summary, "project summary should include task ledger")
         assert_true("deepseek-smoke-model" in summary, "project summary should include recorded model names")
         assert_true("Wait Time" in summary, "project summary should include wait time")
+        assert_true("## Leader Self-Work Exceptions" in summary, "project summary should include leader self-work exceptions")
+        assert_true("Smoke-test verification note only" in summary, "leader self-work scope should be visible")
         assert_true("## Routing Evolution" in evolution, "evolution report should include routing evolution")
         assert_true("## Knowledge Candidates" in evolution, "evolution report should include knowledge candidates")
         assert_true("mechanical" in knowledge_index.get("categories", {}), "knowledge index should be grouped by task type")
