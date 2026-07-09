@@ -1,4 +1,4 @@
-﻿---
+---
 name: costmarshal
 description: "CostMarshal v2: scheduler-first, cost-aware multi-agent orchestration for Codex CLI with durable actor mailboxes, pluggable runtime backends, leader acceptance records, write locks, recovery, and audit trails."
 ---
