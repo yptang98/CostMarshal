@@ -15,7 +15,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / "run.py"
+CLI = ROOT / "scripts" / "costmarshal.py"
 
 
 def run(temp: Path, *args: str, expect_ok: bool = True) -> subprocess.CompletedProcess[str]:

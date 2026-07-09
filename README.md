@@ -1,4 +1,4 @@
-<p align="center">
+﻿<p align="center">
   <img src="assets/cover.png" alt="CostMarshal cover" width="100%">
 </p>
 
@@ -22,7 +22,7 @@ entrypoint. The official CLI is now:
 python scripts/costmarshal.py ...
 ```
 
-That script loads the v2 package under `v2/costmarshal_v2`. The old v1 engine
+That script loads the v2 package under `costmarshal_v2`. The old v1 engine
 is left in `scripts/mc.py` only as legacy reference material for existing users
 who intentionally run it directly.
 
@@ -139,17 +139,17 @@ python scripts/costmarshal.py record-result --project <project-id> --task V2-000
 ## Validation
 
 ```bash
-python v2/tests/unit_test.py
-python v2/tests/smoke_test.py
-python v2/tests/local_backend_contract_test.py
-python v2/tests/tmux_contract_test.py
+python tests/unit_test.py
+python tests/smoke_test.py
+python tests/local_backend_contract_test.py
+python tests/tmux_contract_test.py
 python scripts/install_smoke_test.py
 ```
 
 PowerShell compile check:
 
 ```powershell
-$files = @('scripts/costmarshal.py','v2/run.py') + (Get-ChildItem -Path 'v2/costmarshal_v2','v2/tests','scripts' -Filter '*.py' | ForEach-Object { $_.FullName })
+$files = @('scripts/costmarshal.py') + (Get-ChildItem -Path 'costmarshal_v2','tests','scripts' -Filter '*.py' | ForEach-Object { $_.FullName })
 python -m py_compile @files
 ```
 
@@ -159,3 +159,4 @@ CostMarshal v2 is deliberately scheduler-first. The scheduler is not another
 thinking agent; it is a small durable control plane. The leader remains
 responsible for decisions, while agent actors remain responsible for bounded
 task work and structured reports.
+

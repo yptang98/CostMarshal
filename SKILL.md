@@ -1,4 +1,4 @@
----
+﻿---
 name: costmarshal
 description: "CostMarshal v2: scheduler-first, cost-aware multi-agent orchestration for Codex CLI with durable actor mailboxes, pluggable runtime backends, leader acceptance records, write locks, recovery, and audit trails."
 ---
@@ -91,16 +91,17 @@ storage is `$CODEX_HOME/costmarshal-v2` when `CODEX_HOME` is set, otherwise
 For changes to CostMarshal itself, run:
 
 ```bash
-python v2/tests/unit_test.py
-python v2/tests/smoke_test.py
-python v2/tests/local_backend_contract_test.py
-python v2/tests/tmux_contract_test.py
+python tests/unit_test.py
+python tests/smoke_test.py
+python tests/local_backend_contract_test.py
+python tests/tmux_contract_test.py
 python scripts/install_smoke_test.py
 ```
 
 Compile check:
 
 ```powershell
-$files = @('scripts/costmarshal.py','v2/run.py') + (Get-ChildItem -Path 'v2/costmarshal_v2','v2/tests','scripts' -Filter '*.py' | ForEach-Object { $_.FullName })
+$files = @('scripts/costmarshal.py') + (Get-ChildItem -Path 'costmarshal_v2','tests','scripts' -Filter '*.py' | ForEach-Object { $_.FullName })
 python -m py_compile @files
 ```
+

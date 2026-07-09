@@ -17,7 +17,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / "run.py"
+CLI = ROOT / "scripts" / "costmarshal.py"
 
 
 FAKE_TMUX = r'''
@@ -113,7 +113,7 @@ def run(root: Path, *args: str, expect_ok: bool = True) -> subprocess.CompletedP
     env["COSTMARSHAL_V2_HOME"] = str(root)
     result = subprocess.run(
         [sys.executable, str(CLI), "--root", str(root), *args],
-        cwd=str(ROOT.parent),
+        cwd=str(ROOT),
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
