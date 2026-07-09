@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Deterministic state manager for the CostMarshal skill.
+"""Legacy v1 deterministic state manager for the CostMarshal skill.
+
+The official CostMarshal entrypoint is now ``scripts/costmarshal.py``, which
+loads the v2 scheduler-first runtime. This module remains only for users who
+intentionally need old v1 behavior.
 
 This script keeps the fragile parts out of model prose:
 - global agent memory

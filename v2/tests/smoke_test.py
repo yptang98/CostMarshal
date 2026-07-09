@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke test for the independent CostMarshal v2 beta runtime."""
+"""Smoke test for the CostMarshal v2 runtime package."""
 
 from __future__ import annotations
 
@@ -49,9 +49,9 @@ def assert_true(condition: bool, message: str) -> None:
 def main() -> int:
     temp = Path(tempfile.mkdtemp(prefix="costmarshal-v2-smoke-"))
     try:
-        source = temp / "v1-source"
+        source = temp / "legacy-source"
         source.mkdir()
-        (source / "project.json").write_text('{"schema_version": 1, "id": "v1-source"}\n', encoding="utf-8")
+        (source / "project.json").write_text('{"schema_version": 1, "id": "legacy-source"}\n', encoding="utf-8")
         (source / "marker.txt").write_text("do not mutate\n", encoding="utf-8")
         missing_source = run(
             temp,
@@ -85,7 +85,7 @@ def main() -> int:
         project = Path(init["project"])
         assert_true(init["backend"] == "local", "smoke project should force the portable local backend")
         assert_true(project.is_dir(), "v2 project should be created")
-        assert_true(not (source / "v2").exists(), "v2 init should not write inside the referenced v1 project")
+        assert_true(not (source / "v2").exists(), "v2 init should not write inside the referenced legacy project")
         assert_true((source / "marker.txt").read_text(encoding="utf-8") == "do not mutate\n", "source project should remain untouched")
 
         start_plan = run_json(temp, "start-leader", "--project", str(project), "--command", "codex --prompt {prompt_file}", "--dry-run")

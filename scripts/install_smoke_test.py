@@ -25,6 +25,7 @@ IGNORED_DIRS = {
     ".mypy_cache",
     ".ruff_cache",
     "costmarshal",
+    "costmarshal-v2",
     "projects",
     "memory",
     "config",
@@ -64,10 +65,13 @@ def main() -> int:
         codex_home = temp / "codex-home"
         skills_dir = codex_home / "skills"
         install_dir = skills_dir / "costmarshal"
-        runtime_root = codex_home / "costmarshal"
+        runtime_root = codex_home / "costmarshal-v2"
+        legacy_runtime_root = codex_home / "costmarshal"
         skills_dir.mkdir(parents=True)
         runtime_root.mkdir(parents=True)
+        legacy_runtime_root.mkdir(parents=True)
         (runtime_root / "runtime-marker.txt").write_text("preserve me\n", encoding="utf-8")
+        (legacy_runtime_root / "legacy-marker.txt").write_text("preserve legacy\n", encoding="utf-8")
         install_dir.mkdir(parents=True)
         (install_dir / "VERSION").write_text("v0.0.1\n", encoding="utf-8")
         (install_dir / "SKILL.md").write_text("---\nname: costmarshal\n---\n# Old\n", encoding="utf-8")
@@ -91,23 +95,42 @@ def main() -> int:
         env["CODEX_HOME"] = str(codex_home)
         cli = install_dir / "scripts" / "costmarshal.py"
         run([sys.executable, str(cli), "--help"], env)
-        run([sys.executable, str(cli), "init-root"], env)
-        run([sys.executable, str(cli), "validate"], env)
+        init = run(
+            [
+                sys.executable,
+                str(cli),
+                "init",
+                "--name",
+                "install-smoke",
+                "--objective",
+                "Validate CostMarshal v2 install",
+                "--backend",
+                "local",
+            ],
+            env,
+        )
+        import json
 
-        assert_true((runtime_root / "config" / "agents.json").is_file(), "init-root should create default runtime config")
-        assert_true((runtime_root / "memory" / "agent-memory.json").is_file(), "init-root should create runtime memory")
+        project = Path(json.loads(init.stdout)["project"])
+        run([sys.executable, str(cli), "validate", "--project", str(project)], env)
+
+        assert_true((project / "project.json").is_file(), "v2 init should create project state")
+        assert_true((project / "scheduler" / "session.json").is_file(), "v2 init should create scheduler session state")
         assert_true((runtime_root / "runtime-marker.txt").read_text(encoding="utf-8") == "preserve me\n", "update should preserve runtime state")
+        assert_true((legacy_runtime_root / "legacy-marker.txt").read_text(encoding="utf-8") == "preserve legacy\n", "update should preserve legacy runtime state")
 
         install_prompt = (install_dir / "INSTALL_PROMPT.md").read_text(encoding="utf-8")
         uninstall_prompt = (install_dir / "UNINSTALL_PROMPT.md").read_text(encoding="utf-8")
         assert_true("https://github.com/yptang98/CostMarshal" in install_prompt, "install prompt should include GitHub URL")
         assert_true("already exists, treat this as an update" in install_prompt, "install prompt should describe update behavior")
-        assert_true("Preserve $CODEX_HOME/costmarshal" in install_prompt, "install prompt should preserve runtime state during updates")
+        assert_true("Preserve $CODEX_HOME/costmarshal-v2" in install_prompt, "install prompt should preserve v2 runtime state during updates")
+        assert_true("legacy $CODEX_HOME/costmarshal" in install_prompt, "install prompt should preserve legacy runtime state during updates")
         assert_true("Do not delete CostMarshal runtime state unless I explicitly confirm." in uninstall_prompt, "uninstall prompt should preserve runtime state by default")
 
         shutil.rmtree(install_dir)
         assert_true(not install_dir.exists(), "uninstall should remove installed skill directory")
         assert_true(runtime_root.exists(), "uninstall should preserve runtime state by default")
+        assert_true(legacy_runtime_root.exists(), "uninstall should preserve legacy runtime state by default")
 
         print("install smoke ok: temporary state cleaned")
         return 0

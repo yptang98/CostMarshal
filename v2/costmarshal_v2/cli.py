@@ -26,12 +26,12 @@ from .scheduler import (
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="CostMarshal v2 beta scheduler")
+    parser = argparse.ArgumentParser(description="CostMarshal v2 scheduler")
     parser.add_argument("--root", type=Path, default=default_root(), help="CostMarshal v2 runtime root")
     parser.add_argument("--version", action="version", version=f"CostMarshal v2 {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    init = sub.add_parser("init", help="Create a v2 project without touching v1 state")
+    init = sub.add_parser("init", help="Create a v2 project without touching legacy state")
     init.add_argument("--name", default="")
     init.add_argument("--objective", required=True)
     init.add_argument("--source-project", help="Optional existing project to reference read-only")

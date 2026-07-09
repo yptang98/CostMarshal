@@ -14,15 +14,16 @@ Requirements:
   - Move the old installed skill folder to <skills-dir>/costmarshal.backup-<timestamp>.
   - Copy the new CostMarshal skill folder to <skills-dir>/costmarshal.
   - Do not copy .git, __pycache__, .env files, local runtime folders, or secret files.
-  - Preserve $CODEX_HOME/costmarshal or ~/.codex/costmarshal runtime state exactly as-is.
+  - Preserve $CODEX_HOME/costmarshal-v2 or ~/.codex/costmarshal-v2 runtime state exactly as-is.
+  - Preserve legacy $CODEX_HOME/costmarshal or ~/.codex/costmarshal runtime state exactly as-is.
   - Preserve local secret files exactly as-is; do not print secret values.
 - Do not copy any local .env files or secrets.
 - Verify Python 3.10+ is available with: python --version
 - If python is unavailable on Windows, try: py -3 --version
-- Do not install WakeWait separately; CostMarshal bundles embedded WakeWait-style wait commands.
-- Run: python <installed-skill>/scripts/costmarshal.py init-root
+- CostMarshal v2 uses scheduler actors and pluggable runtime backends; do not run legacy v1 initialization unless I explicitly ask for it.
 - Run: python <installed-skill>/scripts/costmarshal.py --help
-- Run: python <installed-skill>/scripts/costmarshal.py validate
+- Run: python <installed-skill>/scripts/costmarshal.py init --name install-smoke --objective "Validate CostMarshal v2 install" --backend local
+- Run: python <installed-skill>/scripts/costmarshal.py validate --project <created-project-dir>
 - Tell me I can invoke it with `$costmarshal`, for example: `$costmarshal start a new Arbor project for ...`
 - Run skill validation if quick_validate.py is available.
 - Report the installed path, old version if updated, new version, backup path if created, and validation result.

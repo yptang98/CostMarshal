@@ -1,8 +1,8 @@
-# CostMarshal v2 Beta
+# CostMarshal v2
 
-CostMarshal v2 is a separate scheduler-first implementation. It does not
-replace v1 and does not mutate v1 project directories. You can reference an
-existing v1 project as read-only input with `--source-project`.
+CostMarshal v2 is the official scheduler-first implementation. It does not use
+the old v1 runtime as its control plane. You can reference an existing legacy
+project as read-only input with `--source-project`.
 
 The v2 runtime models the system as actors:
 
@@ -37,19 +37,19 @@ The scheduler writes durable state under its own runtime root:
 ## Quick Start
 
 ```bash
-python v2/run.py init --name demo --objective "Try scheduler-first orchestration" --backend auto
-python v2/run.py start-leader --project <project-id> --command "codex --prompt {prompt_file}" --dry-run
-python v2/run.py new-task --project <project-id> --title "Inspect baseline" --purpose "Return a bounded report" --claim-path reports/baseline.md
-python v2/run.py dispatch --project <project-id> --task V2-0001 --model gpt-5 --command "codex --model {model} --prompt {prompt_file}"
-python v2/run.py send --project <project-id> --to leader --message "Task V2-0001 is dispatched."
-python v2/run.py relay --project <project-id> --actor leader
-python v2/run.py collect --project <project-id> --task V2-0001 --state waiting_leader
-python v2/run.py record-result --project <project-id> --task V2-0001 --status done --quality-score 4 --accepted-by-leader
-python v2/run.py record-leader-work --project <project-id> --task V2-0001 --work-type verification --risk low --scope "Sampled evidence" --reason "Leader acceptance requires review"
-python v2/run.py stop-actor --project <project-id> --actor agent-v2-0001 --reason "task complete"
-python v2/run.py status --project <project-id>
-python v2/run.py recover --project <project-id> --plan-restarts
-python v2/run.py validate --project <project-id>
+python scripts/costmarshal.py init --name demo --objective "Try scheduler-first orchestration" --backend auto
+python scripts/costmarshal.py start-leader --project <project-id> --command "codex --prompt {prompt_file}" --dry-run
+python scripts/costmarshal.py new-task --project <project-id> --title "Inspect baseline" --purpose "Return a bounded report" --claim-path reports/baseline.md
+python scripts/costmarshal.py dispatch --project <project-id> --task V2-0001 --model gpt-5 --command "codex --model {model} --prompt {prompt_file}"
+python scripts/costmarshal.py send --project <project-id> --to leader --message "Task V2-0001 is dispatched."
+python scripts/costmarshal.py relay --project <project-id> --actor leader
+python scripts/costmarshal.py collect --project <project-id> --task V2-0001 --state waiting_leader
+python scripts/costmarshal.py record-result --project <project-id> --task V2-0001 --status done --quality-score 4 --accepted-by-leader
+python scripts/costmarshal.py record-leader-work --project <project-id> --task V2-0001 --work-type verification --risk low --scope "Sampled evidence" --reason "Leader acceptance requires review"
+python scripts/costmarshal.py stop-actor --project <project-id> --actor agent-v2-0001 --reason "task complete"
+python scripts/costmarshal.py status --project <project-id>
+python scripts/costmarshal.py recover --project <project-id> --plan-restarts
+python scripts/costmarshal.py validate --project <project-id>
 ```
 
 Use `--start` on `dispatch` or `start-leader` without `--dry-run` to launch
@@ -109,14 +109,14 @@ project state stays portable.
 The scheduler can send a message directly:
 
 ```bash
-python v2/run.py send --project <project-id> --to leader --message "Status changed"
+python scripts/costmarshal.py send --project <project-id> --to leader --message "Status changed"
 ```
 
 Actors can also append JSON messages to their own `outbox.jsonl`. The scheduler
 then relays those messages with a durable cursor:
 
 ```bash
-python v2/run.py relay --project <project-id> --actor leader
+python scripts/costmarshal.py relay --project <project-id> --actor leader
 ```
 
 Relay messages must include:
@@ -141,7 +141,7 @@ rather than a reader of actor context.
 After a worker report is collected, the leader records the final evaluation:
 
 ```bash
-python v2/run.py record-result --project <project-id> --task V2-0001 --status done --quality-score 4 --accepted-by-leader --input-tokens 1000 --output-tokens 400 --estimated-cost-cny 0.02 --summary "Accepted after evidence check"
+python scripts/costmarshal.py record-result --project <project-id> --task V2-0001 --status done --quality-score 4 --accepted-by-leader --input-tokens 1000 --output-tokens 400 --estimated-cost-cny 0.02 --summary "Accepted after evidence check"
 ```
 
 The row is appended to `reports/results.jsonl`, copied into the task's latest
@@ -153,7 +153,7 @@ If the leader performs direct implementation-like work instead of delegating it,
 record a small audit exception:
 
 ```bash
-python v2/run.py record-leader-work --project <project-id> --task V2-0001 --work-type verification --risk low --scope "Sampled evidence and final integration check" --reason "Final acceptance cannot be delegated"
+python scripts/costmarshal.py record-leader-work --project <project-id> --task V2-0001 --work-type verification --risk low --scope "Sampled evidence and final integration check" --reason "Final acceptance cannot be delegated"
 ```
 
 These rows are stored in `reports/leader-work.jsonl` and summarized by `status`.
@@ -165,14 +165,14 @@ quality, risk, token, and cost fields.
 Tasks can claim file or directory paths before they are dispatched:
 
 ```bash
-python v2/run.py new-task --project <project-id> --title "Write report" --purpose "Produce one report" --claim-path reports/result.md
+python scripts/costmarshal.py new-task --project <project-id> --title "Write report" --purpose "Produce one report" --claim-path reports/result.md
 ```
 
 Active claims are stored in `locks/claims.json`. The scheduler rejects a new
 task if its `--claim-path` overlaps an active task's claim:
 
 ```bash
-python v2/run.py new-task --project <project-id> --title "Conflicting report" --purpose "Should wait" --claim-path reports/result.md
+python scripts/costmarshal.py new-task --project <project-id> --title "Conflicting report" --purpose "Should wait" --claim-path reports/result.md
 ```
 
 Claims are released when the owning task reaches a terminal state such as

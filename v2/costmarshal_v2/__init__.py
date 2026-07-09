@@ -1,8 +1,7 @@
-"""CostMarshal v2 beta.
+"""CostMarshal v2.
 
-The v2 package is intentionally separate from the v1 skill CLI. It implements
-a scheduler-first runtime with durable mailboxes and pluggable actor backends
-while leaving v1 project state and commands untouched.
+The v2 package implements the official scheduler-first runtime with durable
+mailboxes and pluggable actor backends.
 """
 
-__version__ = "v0.1.0-beta.3"
+__version__ = "v2.0.0"

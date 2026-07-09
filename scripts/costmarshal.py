@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""CostMarshal CLI entrypoint.
+"""CostMarshal official v2 CLI entrypoint."""
 
-Keeps the old implementation in mc.py for compatibility while exposing the
-new product name in docs and commands.
-"""
+from __future__ import annotations
 
-from mc import main
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "v2"))
+
+from costmarshal_v2.cli import main  # noqa: E402
 
 
 if __name__ == "__main__":
