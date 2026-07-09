@@ -23,6 +23,8 @@ Requirements:
 - CostMarshal v2 uses scheduler actors and pluggable runtime backends; do not run legacy v1 initialization unless I explicitly ask for it.
 - Run: python <installed-skill>/scripts/costmarshal.py --help
 - Run: python <installed-skill>/scripts/costmarshal.py init --name install-smoke --objective "Validate CostMarshal v2 install" --backend local
+- Run: python <installed-skill>/scripts/costmarshal.py run-scheduler --project <created-project-dir> --once
+- Run: python <installed-skill>/scripts/costmarshal.py dashboard --project <created-project-dir> --format json
 - Run: python <installed-skill>/scripts/costmarshal.py validate --project <created-project-dir>
 - Tell me I can invoke it with `$costmarshal`, for example: `$costmarshal start a new Arbor project for ...`
 - Run skill validation if quick_validate.py is available.

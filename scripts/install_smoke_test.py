@@ -112,6 +112,9 @@ def main() -> int:
         import json
 
         project = Path(json.loads(init.stdout)["project"])
+        run([sys.executable, str(cli), "run-scheduler", "--project", str(project), "--once"], env)
+        dashboard = run([sys.executable, str(cli), "dashboard", "--project", str(project), "--format", "json"], env)
+        assert_true(any(row["id"] == "scheduler" for row in json.loads(dashboard.stdout)["processes"]), "dashboard should show scheduler process state")
         run([sys.executable, str(cli), "validate", "--project", str(project)], env)
 
         assert_true((project / "project.json").is_file(), "v2 init should create project state")

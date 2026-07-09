@@ -104,10 +104,28 @@ def ensure_runtime_dirs(layout: ProjectLayout) -> None:
         layout.results_jsonl.touch()
     if not layout.leader_work_jsonl.exists():
         layout.leader_work_jsonl.touch()
+    if not layout.usage_jsonl.exists():
+        layout.usage_jsonl.touch()
     if not layout.relay_cursors_json.exists():
         atomic_write_json(
             layout.relay_cursors_json,
             {"schema_version": SCHEMA_VERSION, "updated_at": now_iso(), "actors": {}},
+        )
+    if not layout.scheduler_state_json.exists():
+        atomic_write_json(
+            layout.scheduler_state_json,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "id": "scheduler",
+                "role": "scheduler",
+                "status": "idle",
+                "pid": None,
+                "started_at": None,
+                "heartbeat_at": None,
+                "last_cycle_at": None,
+                "cycle_count": 0,
+                "processed_commands": 0,
+            },
         )
     if not layout.locks_json.exists():
         atomic_write_json(

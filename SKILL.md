@@ -23,8 +23,9 @@ The leader must:
 - record direct implementation-like leader work with `record-leader-work`
 
 The scheduler must stay small. It relays messages, launches/stops actors through
-a runtime backend, writes durable state, checks recovery, enforces write claims,
-and reports status. It must not plan, implement, review, or summarize raw actor
+a runtime backend, executes validated actor-authored scheduler commands, writes
+durable state, checks recovery, enforces write claims, records usage, and
+reports status. It must not plan, implement, review, or summarize raw actor
 context.
 
 ## Runtime Model
@@ -48,10 +49,13 @@ Actor execution is provided by a pluggable backend:
 ```bash
 python scripts/costmarshal.py init --name demo --objective "Try scheduler-first orchestration" --backend auto
 python scripts/costmarshal.py start-leader --project <project-id> --command "codex --prompt {prompt_file}" --dry-run
+python scripts/costmarshal.py run-scheduler --project <project-id> --interval 2
+python scripts/costmarshal.py dashboard --project <project-id> --watch
 python scripts/costmarshal.py new-task --project <project-id> --title "Inspect baseline" --purpose "Return a bounded report" --claim-path reports/baseline.md
 python scripts/costmarshal.py dispatch --project <project-id> --task V2-0001 --model gpt-5 --command "codex --model {model} --prompt {prompt_file}"
 python scripts/costmarshal.py send --project <project-id> --to leader --message "Task V2-0001 is dispatched."
 python scripts/costmarshal.py relay --project <project-id> --actor leader
+python scripts/costmarshal.py record-usage --project <project-id> --actor agent-v2-0001 --input-tokens 100 --output-tokens 40
 python scripts/costmarshal.py collect --project <project-id> --task V2-0001 --state waiting_leader
 python scripts/costmarshal.py record-result --project <project-id> --task V2-0001 --status done --quality-score 4 --accepted-by-leader
 python scripts/costmarshal.py record-leader-work --project <project-id> --task V2-0001 --work-type verification --risk low --scope "Sampled evidence" --reason "Leader acceptance requires review"
@@ -72,11 +76,13 @@ storage is `$CODEX_HOME/costmarshal-v2` when `CODEX_HOME` is set, otherwise
 3. Create bounded tasks with `new-task`; include `--claim-path` for write scopes.
 4. Dispatch at most a small number of active agents at once.
 5. Give agents only the durable prompt file, task brief, allowed context, and mailbox messages.
-6. Use `collect` to move task reports into leader review.
-7. Use `record-result` after every worker attempt; worker usage is not leader acceptance.
-8. Use `record-leader-work` whenever the leader directly writes or fixes implementation-like work.
-9. Use `status` and `validate` as the normal audit surface.
-10. Use `recover --plan-restarts` or `recover --restart-missing` after disconnects.
+6. Prefer `run-scheduler` and actor-authored outbox commands for routine dispatch, usage, collection, and acceptance; use direct CLI commands for recovery or manual override.
+7. Use `dashboard --watch` to monitor scheduler, leader, agents, process liveness, mailbox counts, logs, and agent token totals.
+8. Use `collect` to move task reports into leader review when manually operating without the scheduler loop.
+9. Use `record-result` after every worker attempt; worker usage is not leader acceptance.
+10. Use `record-leader-work` whenever the leader directly writes or fixes implementation-like work.
+11. Use `status`, `dashboard`, and `validate` as the normal audit surface.
+12. Use `recover --plan-restarts` or `recover --restart-missing` after disconnects.
 
 ## Isolation Rules
 
@@ -84,6 +90,9 @@ storage is `$CODEX_HOME/costmarshal-v2` when `CODEX_HOME` is set, otherwise
 - Keep worker write scopes disjoint with `--claim-path`; validate active lock conflicts.
 - Never put API keys or secrets in prompts, reports, logs, or skill files.
 - Use mailbox relay rather than having the scheduler inspect actor reasoning.
+- Actors may append scheduler commands to outbox messages addressed to `scheduler`.
+  Supported commands are `create_task`, `dispatch_task`, `collect_task`,
+  `record_result`, `record_usage`, `heartbeat`, and `stop_actor`.
 - If a worker needs broader context, new write scope, secrets, or architectural judgment, escalate.
 
 ## Required Verification

@@ -22,7 +22,7 @@ integration, and final acceptance. Task-scoped agent actors work from bounded
 briefs, communicate through durable mailboxes, and leave structured reports,
 token/cost records, write locks, and recovery state behind.
 
-Version: `v2.0.0`
+Version: `v2.1.0-beta`
 
 GitHub: https://github.com/yptang98/CostMarshal
 
@@ -61,9 +61,12 @@ CostMarshal v2 turns this into a software-engineered workflow:
   allowed write paths.
 - **Write-lock safety:** active `--claim-path` overlaps are rejected unless the
   leader explicitly overrides them.
-- **Cost visibility:** `record-result` and `record-leader-work` preserve input
-  tokens, output tokens, total tokens, estimated CNY cost, quality, and
-  acceptance.
+- **Cost visibility:** `record-usage`, `record-result`, and
+  `record-leader-work` preserve input tokens, output tokens, total tokens,
+  estimated CNY cost, quality, and acceptance.
+- **Live dashboard:** `dashboard --watch` shows the scheduler, leader, agent
+  processes, mailbox counts, runtime pid/target, log paths, and per-agent
+  cumulative token totals.
 - **Recovery by files, not memory:** prompts, mailboxes, status files, and
   backend runtime metadata are enough to resume after interruption.
 
@@ -94,6 +97,8 @@ Requirements:
 - CostMarshal v2 uses scheduler actors and pluggable runtime backends; do not run legacy v1 initialization unless I explicitly ask for it.
 - Run: python <installed-skill>/scripts/costmarshal.py --help
 - Run: python <installed-skill>/scripts/costmarshal.py init --name install-smoke --objective "Validate CostMarshal v2 install" --backend local
+- Run: python <installed-skill>/scripts/costmarshal.py run-scheduler --project <created-project-dir> --once
+- Run: python <installed-skill>/scripts/costmarshal.py dashboard --project <created-project-dir> --format json
 - Run: python <installed-skill>/scripts/costmarshal.py validate --project <created-project-dir>
 - Tell me I can invoke it with `$costmarshal`, for example: `$costmarshal start a new Arbor project for ...`
 - Run skill validation if quick_validate.py is available.
@@ -121,11 +126,20 @@ Use CostMarshal v2 for this long task. Keep the leader as planner/reviewer, disp
 ```bash
 python scripts/costmarshal.py init --name demo --objective "Try scheduler-first orchestration" --backend auto
 python scripts/costmarshal.py start-leader --project <project-id> --command "codex --prompt {prompt_file}" --dry-run
+
+# Keep this running in a scheduler terminal.
+python scripts/costmarshal.py run-scheduler --project <project-id> --interval 2
+
+# Keep this running in a dashboard terminal.
+python scripts/costmarshal.py dashboard --project <project-id> --watch
+
+# Manual commands remain available for setup, recovery, and overrides.
 python scripts/costmarshal.py new-task --project <project-id> --title "Inspect baseline" --purpose "Return a bounded report" --claim-path reports/baseline.md
 python scripts/costmarshal.py dispatch --project <project-id> --task V2-0001 --model gpt-5 --command "codex --model {model} --prompt {prompt_file}" --dry-run
 python scripts/costmarshal.py dispatch --project <project-id> --task V2-0001 --model gpt-5 --command "codex --model {model} --prompt {prompt_file}" --start
 python scripts/costmarshal.py send --project <project-id> --to leader --message "Task V2-0001 is dispatched."
 python scripts/costmarshal.py relay --project <project-id> --actor leader
+python scripts/costmarshal.py record-usage --project <project-id> --actor agent-v2-0001 --input-tokens 100 --output-tokens 40
 python scripts/costmarshal.py collect --project <project-id> --task V2-0001 --state waiting_leader --summary "Worker report is ready for leader review"
 python scripts/costmarshal.py record-result --project <project-id> --task V2-0001 --status done --quality-score 4 --accepted-by-leader --summary "Accepted after evidence check"
 python scripts/costmarshal.py record-leader-work --project <project-id> --task V2-0001 --work-type verification --risk low --scope "Sampled evidence" --reason "Leader acceptance requires review"
@@ -145,7 +159,7 @@ v2 models each project as durable actors:
 
 | Actor | Responsibility | Must Not Do |
 | --- | --- | --- |
-| `scheduler` | Relay mailboxes, start/stop runtimes, write state, enforce locks, audit recovery | Plan, implement, review, summarize raw reasoning |
+| `scheduler` | Relay mailboxes, execute structured actor commands, start/stop runtimes, write state, enforce locks, audit recovery | Plan, implement, review, summarize raw reasoning |
 | `leader` | Define goals, split tasks, route agents, verify reports, accept/retry/escalate | Become the hidden default worker |
 | `agent-*` | Execute one bounded task from its brief and explicit context | Broaden context, change write scope, expose secrets, make architecture decisions |
 
@@ -165,6 +179,7 @@ Actor execution is backend-driven:
     project.json
     PROTOCOL.md
     scheduler/
+      state.json
       session.json
       events.jsonl
       relay-cursors.json
@@ -189,6 +204,7 @@ Actor execution is backend-driven:
     reports/
       results.jsonl
       leader-work.jsonl
+      usage.jsonl
     transcripts/
     locks/
       claims.json
@@ -207,13 +223,16 @@ from chat memory.
 | `dispatch` | Bind a task to an agent actor and optionally start that actor |
 | `send` | Write a durable mailbox message, optionally injecting it into the runtime |
 | `relay` | Relay actor-authored outbox messages using durable cursors |
+| `run-scheduler` | Run the waiting loop that relays actor outboxes and executes structured scheduler commands |
 | `heartbeat` | Record actor liveness and advance running task state |
 | `collect` | Mark a worker report ready for leader review |
+| `record-usage` | Record actor-reported input/output token usage while work is in progress |
 | `record-result` | Record leader acceptance/rejection, quality, token usage, and cost |
 | `record-leader-work` | Audit direct leader implementation-like work |
 | `stop-actor` | Mark an actor stopped and optionally stop its runtime process |
 | `recover` | Audit missing prompts, mailboxes, runtimes, and restart plans |
 | `status` | Show actors, mailboxes, relay cursors, results, leader work, locks, and tasks |
+| `dashboard` | Show a process board for scheduler, leader, agents, liveness, mailboxes, logs, and token totals |
 | `validate` | Validate v2 project structure and ledger consistency |
 
 ## Leader Discipline
@@ -248,6 +267,28 @@ python scripts/costmarshal.py init --name adopted-run --objective "Continue this
 
 The source project is treated as read-only reference material. v2 writes its
 own project state under the CostMarshal v2 runtime root.
+
+## Scheduler Loop And Dashboard
+
+`run-scheduler` is the small waiting loop. It repeatedly relays actor outboxes,
+processes messages addressed to `scheduler`, executes only validated structured
+commands, writes scheduler heartbeat state, then waits for the next cycle.
+
+Actors ask for scheduler actions by appending JSONL messages to their outbox:
+
+```json
+{"from":"leader","to":"scheduler","subject":"scheduler.command","metadata":{"command":"dispatch_task","args":{"task":"V2-0001","model":"gpt-5","start":true}}}
+```
+
+Supported scheduler commands are `create_task`, `dispatch_task`,
+`collect_task`, `record_result`, `record_usage`, `heartbeat`, and
+`stop_actor`. Leader-only commands stay leader-only; agents may report their
+own usage, heartbeat, collection, and stop requests.
+
+`dashboard --watch` is the visual process board. It shows the scheduler row,
+leader row, every agent row, backend pid/target, alive status, log path,
+mailbox counts, task bindings, recent events, and per-agent cumulative token
+totals.
 
 ## Design Boundary
 

@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import os
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from .mailbox import deliver_outbox_message, inbox_message_ids, send_message
@@ -11,6 +16,7 @@ from .session_backend import (
     backend_from_session,
     command_to_string,
     format_actor_command,
+    pid_is_alive,
     platform_summary,
     select_backend_kind,
     session_backend_config,
@@ -55,10 +61,53 @@ LEADER_ID = "leader"
 RESULT_TASK_STATES = {"done", "failed", "escalate"}
 RISKS = {"high", "medium", "low"}
 LEADER_WORK_TYPES = {"planning", "integration", "verification", "emergency-fix", "trivial-glue", "other"}
+SCHEDULER_COMMANDS = {
+    "create_task",
+    "dispatch_task",
+    "collect_task",
+    "record_result",
+    "record_usage",
+    "heartbeat",
+    "stop_actor",
+}
 
 
 def print_json(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def default_scheduler_state() -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "id": SCHEDULER_ID,
+        "role": "scheduler",
+        "status": "idle",
+        "pid": None,
+        "started_at": None,
+        "heartbeat_at": None,
+        "last_cycle_at": None,
+        "cycle_count": 0,
+        "processed_commands": 0,
+    }
+
+
+def load_scheduler_state(layout: ProjectLayout) -> dict[str, Any]:
+    state = read_json(layout.scheduler_state_json, default_scheduler_state())
+    if not isinstance(state, dict):
+        return default_scheduler_state()
+    return {**default_scheduler_state(), **state}
+
+
+def save_scheduler_state(layout: ProjectLayout, state: dict[str, Any]) -> None:
+    state["schema_version"] = SCHEMA_VERSION
+    atomic_write_json(layout.scheduler_state_json, state)
+
+
+def update_scheduler_state(layout: ProjectLayout, **fields: Any) -> dict[str, Any]:
+    state = load_scheduler_state(layout)
+    state.update(fields)
+    save_scheduler_state(layout, state)
+    return state
 
 
 def default_actor_command(model: str | None) -> str:
@@ -304,6 +353,12 @@ def render_actor_prompt(layout: ProjectLayout, actor: dict[str, Any]) -> str:
             f"- Actor state: `{relpath(layout.actors_dir / (slugify(actor['id'], 'actor') + '.json'), layout.project_dir)}`",
             f"- Inbox: `{mailbox.get('inbox')}`",
             f"- Outbox: `{mailbox.get('outbox')}`",
+            "",
+            "## Scheduler Command Protocol",
+            "- To ask the scheduler to act, append one JSONL message to your outbox with `to: \"scheduler\"`.",
+            "- Put the action in `metadata.command` and parameters in `metadata.args`.",
+            "- Supported commands: `create_task`, `dispatch_task`, `collect_task`, `record_result`, `record_usage`, `heartbeat`, `stop_actor`.",
+            "- The scheduler validates authority and executes commands; it does not infer project plans from prose.",
         ]
         )
     if task:
@@ -422,7 +477,16 @@ def protocol_text() -> str:
             "## Return Protocol",
             "- Update the task status file.",
             "- Write `completion-report.md` with result, evidence, blockers, and leader decisions needed.",
+            "- Report usage with a `record_usage` scheduler command when token counts are known.",
+            "- Ask collection with a `collect_task` scheduler command instead of relying on the user to run `collect`.",
             "- Escalate instead of expanding context or changing write scope on your own.",
+            "",
+            "## Actor-Authored Scheduler Commands",
+            "Append JSONL to your outbox. Example:",
+            "```json",
+            "{\"from\":\"leader\",\"to\":\"scheduler\",\"subject\":\"scheduler.command\",\"metadata\":{\"command\":\"dispatch_task\",\"args\":{\"task\":\"V2-0001\",\"model\":\"gpt-5\",\"start\":true}}}",
+            "```",
+            "The scheduler loop relays this through `run-scheduler`; the scheduler is still only a command executor, not a planner.",
             "",
         ]
     )
@@ -595,6 +659,8 @@ def render_task_brief(task: dict[str, Any]) -> str:
             "## Return Protocol",
             "- Update `status.json`.",
             "- Write `completion-report.md`.",
+            "- Append `record_usage` to your outbox when token counts are known.",
+            "- Append `collect_task` to your outbox when the report is ready for leader review.",
             "- Stop and escalate if the task requires broader context, new write scope, secrets, or architectural judgment.",
             "",
         ]
@@ -603,6 +669,10 @@ def render_task_brief(task: dict[str, Any]) -> str:
 
 def command_new_task(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
+    if not str(args.title or "").strip():
+        raise SystemExit("title is required")
+    if not str(args.purpose or "").strip():
+        raise SystemExit("purpose is required")
     task_id = args.id or next_task_id(layout)
     directory = task_dir(layout, task_id)
     if directory.exists():
@@ -758,26 +828,31 @@ def save_relay_cursors(layout: ProjectLayout, cursors: dict[str, Any]) -> None:
     atomic_write_json(layout.relay_cursors_json, cursors)
 
 
-def command_relay(args: Any) -> None:
-    layout = resolve_project(args.root, args.project)
-    require_actor(layout, args.actor)
-    outbox_path = layout.mailboxes_dir / slugify(args.actor, "actor") / "outbox.jsonl"
+def relay_actor_outbox(
+    layout: ProjectLayout,
+    *,
+    actor_id: str,
+    limit: int | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    require_actor(layout, actor_id)
+    outbox_path = layout.mailboxes_dir / slugify(actor_id, "actor") / "outbox.jsonl"
     rows = read_jsonl(outbox_path)
     cursors = load_relay_cursors(layout)
-    actor_cursor = cursors.setdefault("actors", {}).setdefault(args.actor, {})
+    actor_cursor = cursors.setdefault("actors", {}).setdefault(actor_id, {})
     start_line = int(actor_cursor.get("outbox_lines") or 0)
     if start_line > len(rows):
         start_line = 0
     pending = rows[start_line:]
-    if args.limit is not None:
-        pending = pending[: args.limit]
+    if limit is not None:
+        pending = pending[:limit]
     deliveries: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     for offset, row in enumerate(pending, start=start_line + 1):
         recipient = row.get("to")
-        sender = row.get("from") or args.actor
-        if sender != args.actor:
-            raise SystemExit(f"Outbox line {offset} has from={sender}, expected {args.actor}")
+        sender = row.get("from") or actor_id
+        if sender != actor_id:
+            raise SystemExit(f"Outbox line {offset} has from={sender}, expected {actor_id}")
         if not recipient:
             raise SystemExit(f"Outbox line {offset} is missing 'to'")
         if recipient != SCHEDULER_ID:
@@ -787,29 +862,379 @@ def command_relay(args: Any) -> None:
         if already_delivered:
             skipped.append({"line": offset, "id": message_id, "to": recipient, "reason": "already_delivered"})
             continue
-        if args.dry_run:
+        if dry_run:
             deliveries.append({"line": offset, "id": message_id, "from": sender, "to": recipient, "dry_run": True})
             continue
         message = dict(row)
         message["from"] = sender
         delivered = deliver_outbox_message(layout, message=message)
         deliveries.append({"line": offset, "id": delivered.get("id"), "from": sender, "to": recipient})
-    if not args.dry_run:
+    if not dry_run:
         actor_cursor["outbox_lines"] = start_line + len(pending)
         actor_cursor["last_relayed_at"] = now_iso()
         actor_cursor["last_delivery_count"] = len(deliveries)
         actor_cursor["last_skipped_count"] = len(skipped)
         save_relay_cursors(layout, cursors)
+    return {
+        "status": "ok",
+        "actor": actor_id,
+        "outbox_lines": len(rows),
+        "start_line": start_line,
+        "processed": len(pending),
+        "delivered": deliveries,
+        "skipped": skipped,
+        "dry_run": bool(dry_run),
+    }
+
+
+def command_relay(args: Any) -> None:
+    layout = resolve_project(args.root, args.project)
+    print_json(relay_actor_outbox(layout, actor_id=args.actor, limit=args.limit, dry_run=bool(args.dry_run)))
+
+
+def as_list(value: Any) -> list[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    return [str(value)]
+
+
+def as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def run_cli_helper(layout: ProjectLayout, func: Any, **fields: Any) -> dict[str, Any]:
+    args = SimpleNamespace(root=layout.root, project=str(layout.project_dir), **fields)
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        func(args)
+    text = output.getvalue().strip()
+    if not text:
+        return {}
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {"stdout": text}
+
+
+def parse_scheduler_command(message: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+    nested = metadata.get("scheduler") if isinstance(metadata.get("scheduler"), dict) else {}
+    command = (
+        nested.get("command")
+        or metadata.get("scheduler_command")
+        or metadata.get("command")
+        or message.get("scheduler_command")
+        or message.get("command")
+    )
+    args = nested.get("args") or metadata.get("args") or metadata.get("command_args") or message.get("args") or {}
+    subject = str(message.get("subject") or "").strip().lower()
+    body = str(message.get("body") or "").strip()
+    if not command and subject.startswith("scheduler.command") and body.startswith("{"):
+        try:
+            body_payload = json.loads(body)
+        except json.JSONDecodeError:
+            body_payload = {}
+        if isinstance(body_payload, dict):
+            command = body_payload.get("command")
+            args = body_payload.get("args") or {}
+    if not command:
+        return None
+    if not isinstance(args, dict):
+        raise ValueError("scheduler command args must be an object")
+    normalized = str(command).strip().replace("-", "_")
+    return normalized, args
+
+
+def require_scheduler_command_authority(layout: ProjectLayout, *, sender: str, command: str, command_args: dict[str, Any], message: dict[str, Any]) -> None:
+    if sender not in {LEADER_ID, SCHEDULER_ID}:
+        require_actor(layout, sender)
+    leader_only = {"create_task", "dispatch_task", "record_result"}
+    if command in leader_only and sender != LEADER_ID:
+        raise SystemExit(f"{command} may only be issued by the leader")
+    if command in {"collect_task", "record_usage", "heartbeat", "stop_actor"} and sender != LEADER_ID:
+        actor = load_actor(layout, sender)
+        target_actor = str(command_args.get("actor") or sender)
+        if command in {"record_usage", "heartbeat", "stop_actor"} and target_actor != sender:
+            raise SystemExit(f"{command} may only target the sender unless issued by the leader")
+        if command == "collect_task":
+            task_id = str(command_args.get("task") or message.get("task_id") or actor.get("task_id") or "")
+            if actor.get("role") == "agent" and task_id and actor.get("task_id") != task_id:
+                raise SystemExit(f"agent {sender} cannot collect task {task_id}")
+
+
+def execute_scheduler_command(
+    layout: ProjectLayout,
+    *,
+    sender: str,
+    command: str,
+    command_args: dict[str, Any],
+    message: dict[str, Any],
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    if command not in SCHEDULER_COMMANDS:
+        raise SystemExit(f"Unsupported scheduler command: {command}")
+    require_scheduler_command_authority(layout, sender=sender, command=command, command_args=command_args, message=message)
+    if dry_run:
+        return {"dry_run": True, "command": command, "args": command_args}
+    if command == "create_task":
+        return run_cli_helper(
+            layout,
+            command_new_task,
+            id=command_args.get("id"),
+            title=str(command_args.get("title") or ""),
+            purpose=str(command_args.get("purpose") or ""),
+            task_type=str(command_args.get("task_type") or "analysis"),
+            agent=str(command_args.get("agent") or "auto"),
+            model=str(command_args.get("model") or "inherit"),
+            acceptance=as_list(command_args.get("acceptance")),
+            allowed_context=as_list(command_args.get("allowed_context")),
+            allowed_path=as_list(command_args.get("allowed_path")),
+            claim_path=as_list(command_args.get("claim_path")),
+            allow_lock_conflict=as_bool(command_args.get("allow_lock_conflict")),
+        )
+    if command == "dispatch_task":
+        task_id = str(command_args.get("task") or message.get("task_id") or "")
+        return run_cli_helper(
+            layout,
+            command_dispatch,
+            task=task_id,
+            actor_id=command_args.get("actor_id"),
+            agent=command_args.get("agent"),
+            model=command_args.get("model"),
+            command=command_args.get("actor_command") or command_args.get("command_template"),
+            start=as_bool(command_args.get("start")),
+            dry_run=False,
+            force=as_bool(command_args.get("force")),
+        )
+    if command == "collect_task":
+        actor = command_args.get("actor") or (sender if sender != LEADER_ID else None)
+        task_id = str(command_args.get("task") or message.get("task_id") or "")
+        return run_cli_helper(
+            layout,
+            command_collect,
+            task=task_id,
+            actor=actor,
+            state=str(command_args.get("state") or "waiting_leader"),
+            report=command_args.get("report"),
+            summary=command_args.get("summary"),
+        )
+    if command == "record_result":
+        task_id = str(command_args.get("task") or message.get("task_id") or "")
+        return run_cli_helper(
+            layout,
+            command_record_result,
+            task=task_id,
+            status=str(command_args.get("status") or ""),
+            quality_score=int(command_args.get("quality_score") or 0),
+            accepted_by_leader=as_bool(command_args.get("accepted_by_leader") or command_args.get("accepted")),
+            agent=command_args.get("agent"),
+            actor=command_args.get("actor"),
+            model=command_args.get("model"),
+            input_tokens=int(command_args.get("input_tokens") or 0),
+            output_tokens=int(command_args.get("output_tokens") or 0),
+            estimated_cost_cny=command_args.get("estimated_cost_cny"),
+            summary=command_args.get("summary"),
+            note=command_args.get("note"),
+        )
+    if command == "record_usage":
+        return run_cli_helper(
+            layout,
+            command_record_usage,
+            actor=str(command_args.get("actor") or sender),
+            task=command_args.get("task") or message.get("task_id"),
+            model=command_args.get("model"),
+            input_tokens=int(command_args.get("input_tokens") or 0),
+            output_tokens=int(command_args.get("output_tokens") or 0),
+            estimated_cost_cny=command_args.get("estimated_cost_cny"),
+            note=command_args.get("note"),
+        )
+    if command == "heartbeat":
+        return run_cli_helper(
+            layout,
+            command_heartbeat,
+            actor=str(command_args.get("actor") or sender),
+            status=str(command_args.get("status") or "running"),
+            note=command_args.get("note"),
+        )
+    if command == "stop_actor":
+        return run_cli_helper(
+            layout,
+            command_stop_actor,
+            actor=str(command_args.get("actor") or sender),
+            reason=command_args.get("reason"),
+            stop_runtime=as_bool(command_args.get("stop_runtime")),
+            kill_window=as_bool(command_args.get("stop_runtime")),
+            dry_run=False,
+        )
+    raise SystemExit(f"Unsupported scheduler command: {command}")
+
+
+def acknowledge_scheduler_command(layout: ProjectLayout, *, message: dict[str, Any], status: str, body: str, metadata: dict[str, Any] | None = None) -> None:
+    sender = message.get("from")
+    if not sender or sender == SCHEDULER_ID or not actor_exists(layout, str(sender)):
+        return
+    send_message(
+        layout,
+        sender=SCHEDULER_ID,
+        recipient=str(sender),
+        subject=f"Scheduler command {status}: {message.get('id') or '(no id)'}",
+        body=body,
+        task_id=message.get("task_id"),
+        metadata=metadata,
+    )
+
+
+def process_scheduler_inbox(layout: ProjectLayout, *, limit: int | None = None, dry_run: bool = False) -> dict[str, Any]:
+    ensure_mailbox(layout, SCHEDULER_ID)
+    inbox_path = layout.mailboxes_dir / slugify(SCHEDULER_ID, "actor") / "inbox.jsonl"
+    rows = read_jsonl(inbox_path)
+    cursors = load_relay_cursors(layout)
+    command_cursor = cursors.setdefault("scheduler_commands", {})
+    start_line = int(command_cursor.get("inbox_lines") or 0)
+    if start_line > len(rows):
+        start_line = 0
+    pending = rows[start_line:]
+    if limit is not None:
+        pending = pending[:limit]
+    processed: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    for offset, message in enumerate(pending, start=start_line + 1):
+        try:
+            parsed = parse_scheduler_command(message)
+            if not parsed:
+                skipped.append({"line": offset, "id": message.get("id"), "reason": "not_a_scheduler_command"})
+                continue
+            command, command_args = parsed
+            sender = str(message.get("from") or "")
+            result = execute_scheduler_command(layout, sender=sender, command=command, command_args=command_args, message=message, dry_run=dry_run)
+            processed.append({"line": offset, "id": message.get("id"), "from": sender, "command": command, "result": result})
+            if not dry_run:
+                acknowledge_scheduler_command(
+                    layout,
+                    message=message,
+                    status="ok",
+                    body=f"Executed `{command}` from {sender}.",
+                    metadata={"command": command, "result": result},
+                )
+                append_event(layout, "scheduler_command_executed", message_id=message.get("id"), sender=sender, command=command)
+        except SystemExit as exc:
+            error = str(exc)
+            failed.append({"line": offset, "id": message.get("id"), "error": error})
+            if not dry_run:
+                acknowledge_scheduler_command(layout, message=message, status="failed", body=error, metadata={"error": error})
+                append_event(layout, "scheduler_command_failed", message_id=message.get("id"), sender=message.get("from"), error=error)
+        except Exception as exc:  # noqa: BLE001 - command failures are returned as durable scheduler errors
+            error = f"{type(exc).__name__}: {exc}"
+            failed.append({"line": offset, "id": message.get("id"), "error": error})
+            if not dry_run:
+                acknowledge_scheduler_command(layout, message=message, status="failed", body=error, metadata={"error": error})
+                append_event(layout, "scheduler_command_failed", message_id=message.get("id"), sender=message.get("from"), error=error)
+    if not dry_run:
+        command_cursor["inbox_lines"] = start_line + len(pending)
+        command_cursor["last_processed_at"] = now_iso()
+        command_cursor["last_processed_count"] = len(processed)
+        command_cursor["last_failed_count"] = len(failed)
+        save_relay_cursors(layout, cursors)
+    return {
+        "status": "ok" if not failed else "degraded",
+        "inbox_lines": len(rows),
+        "start_line": start_line,
+        "processed": processed,
+        "skipped": skipped,
+        "failed": failed,
+        "dry_run": bool(dry_run),
+    }
+
+
+def scheduler_cycle(layout: ProjectLayout, *, relay_limit: int | None = None, command_limit: int | None = None, dry_run: bool = False) -> dict[str, Any]:
+    relays: list[dict[str, Any]] = []
+    for actor in actor_rows(layout):
+        payload = relay_actor_outbox(layout, actor_id=actor["id"], limit=relay_limit, dry_run=dry_run)
+        if payload["processed"] or payload["delivered"] or payload["skipped"]:
+            relays.append(payload)
+    commands = process_scheduler_inbox(layout, limit=command_limit, dry_run=dry_run)
+    changed = bool(relays or commands["processed"] or commands["failed"])
+    if not dry_run:
+        state = load_scheduler_state(layout)
+        state["status"] = "running"
+        state["pid"] = os.getpid()
+        state["heartbeat_at"] = now_iso()
+        state["last_cycle_at"] = now_iso()
+        state["cycle_count"] = int(state.get("cycle_count") or 0) + 1
+        state["processed_commands"] = int(state.get("processed_commands") or 0) + len(commands["processed"])
+        save_scheduler_state(layout, state)
+        append_event(
+            layout,
+            "scheduler_cycle",
+            relayed_actor_count=len(relays),
+            processed_command_count=len(commands["processed"]),
+            failed_command_count=len(commands["failed"]),
+            changed=changed,
+        )
+    return {
+        "status": "ok" if commands["status"] == "ok" else "degraded",
+        "changed": changed,
+        "relays": relays,
+        "commands": commands,
+    }
+
+
+def command_run_scheduler(args: Any) -> None:
+    layout = resolve_project(args.root, args.project)
+    ensure_runtime_dirs(layout)
+    ensure_mailbox(layout, SCHEDULER_ID)
+    started_at = now_iso()
+    if not args.dry_run:
+        update_scheduler_state(
+            layout,
+            status="running",
+            pid=os.getpid(),
+            started_at=started_at,
+            heartbeat_at=started_at,
+            last_cycle_at=None,
+        )
+    interval = max(float(args.interval), 0.05)
+    max_cycles = 1 if args.once else int(args.max_cycles or 0)
+    cycles: list[dict[str, Any]] = []
+    completed_status = "idle" if args.once or max_cycles else "stopped"
+    try:
+        while True:
+            cycle = scheduler_cycle(layout, relay_limit=args.relay_limit, command_limit=args.command_limit, dry_run=bool(args.dry_run))
+            cycles.append(cycle)
+            if args.once:
+                break
+            if max_cycles and len(cycles) >= max_cycles:
+                break
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        completed_status = "stopped"
+    finally:
+        if not args.dry_run:
+            update_scheduler_state(
+                layout,
+                status=completed_status,
+                pid=os.getpid(),
+                heartbeat_at=now_iso(),
+                stopped_at=now_iso() if completed_status == "stopped" else None,
+            )
     print_json(
         {
-            "status": "ok",
-            "actor": args.actor,
-            "outbox_lines": len(rows),
-            "start_line": start_line,
-            "processed": len(pending),
-            "delivered": deliveries,
-            "skipped": skipped,
-            "dry_run": bool(args.dry_run),
+            "status": "ok" if all(cycle["status"] == "ok" for cycle in cycles) else "degraded",
+            "project": str(layout.project_dir),
+            "cycles": len(cycles),
+            "changed_cycles": sum(1 for cycle in cycles if cycle["changed"]),
+            "processed_commands": sum(len(cycle["commands"]["processed"]) for cycle in cycles),
+            "failed_commands": sum(len(cycle["commands"]["failed"]) for cycle in cycles),
+            "scheduler_state": load_scheduler_state(layout),
         }
     )
 
@@ -920,6 +1345,8 @@ def command_record_result(args: Any) -> None:
         raise SystemExit(f"record-result status must be one of: {', '.join(sorted(RESULT_TASK_STATES))}")
     if args.accepted_by_leader and args.status != "done":
         raise SystemExit("--accepted-by-leader requires --status done")
+    if int(args.quality_score) not in {1, 2, 3, 4, 5}:
+        raise SystemExit("quality-score must be 1-5")
     input_tokens = require_non_negative_int(args.input_tokens, "input-tokens")
     output_tokens = require_non_negative_int(args.output_tokens, "output-tokens")
     estimated_cost_cny = require_non_negative_float(args.estimated_cost_cny, "estimated-cost-cny")
@@ -1018,6 +1445,50 @@ def command_record_leader_work(args: Any) -> None:
     print_json({"status": "ok", "recorded": True, "event": row})
 
 
+def command_record_usage(args: Any) -> None:
+    layout = resolve_project(args.root, args.project)
+    require_actor(layout, args.actor)
+    actor = load_actor(layout, args.actor)
+    task_id = args.task or actor.get("task_id")
+    if task_id:
+        require_task(layout, task_id)
+    input_tokens = require_non_negative_int(args.input_tokens, "input-tokens")
+    output_tokens = require_non_negative_int(args.output_tokens, "output-tokens")
+    estimated_cost_cny = require_non_negative_float(args.estimated_cost_cny, "estimated-cost-cny")
+    project = load_project(layout)
+    row = {
+        "id": new_id("USG"),
+        "event_type": "usage",
+        "timestamp": now_iso(),
+        "project_id": project.get("project_id"),
+        "actor_id": args.actor,
+        "role": actor.get("role"),
+        "agent": actor.get("agent_name") or ("leader" if actor.get("role") == "leader" else args.actor),
+        "task_id": task_id,
+        "model": args.model or actor.get("model") or "inherit",
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens(input_tokens, output_tokens),
+        "estimated_cost_cny": estimated_cost_cny,
+        "cost_source": cost_source(estimated_cost_cny),
+        "note": args.note or "",
+    }
+    append_jsonl(layout.usage_jsonl, row)
+    actor_usage = actor.setdefault("usage", {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "estimated_cost_cny": 0.0, "unknown_cost_count": 0})
+    actor_usage["input_tokens"] = int(actor_usage.get("input_tokens") or 0) + input_tokens
+    actor_usage["output_tokens"] = int(actor_usage.get("output_tokens") or 0) + output_tokens
+    actor_usage["total_tokens"] = int(actor_usage.get("total_tokens") or 0) + row["total_tokens"]
+    if estimated_cost_cny is None:
+        actor_usage["unknown_cost_count"] = int(actor_usage.get("unknown_cost_count") or 0) + 1
+    else:
+        actor_usage["estimated_cost_cny"] = round(float(actor_usage.get("estimated_cost_cny") or 0.0) + estimated_cost_cny, 6)
+    actor["heartbeat_at"] = now_iso()
+    save_actor(layout, actor)
+    sync_actor_summary(layout, actor)
+    append_event(layout, "usage_recorded", actor_id=args.actor, task_id=task_id, usage_id=row["id"], total_tokens=row["total_tokens"])
+    print_json({"status": "ok", "recorded": True, "event": row})
+
+
 def actor_rows(layout: ProjectLayout) -> list[dict[str, Any]]:
     rows = []
     for path in sorted(layout.actors_dir.glob("*.json")):
@@ -1045,6 +1516,89 @@ def result_rows(layout: ProjectLayout) -> list[dict[str, Any]]:
 
 def leader_work_rows(layout: ProjectLayout) -> list[dict[str, Any]]:
     return read_jsonl(layout.leader_work_jsonl)
+
+
+def usage_rows(layout: ProjectLayout) -> list[dict[str, Any]]:
+    return read_jsonl(layout.usage_jsonl)
+
+
+def empty_token_bucket() -> dict[str, Any]:
+    return {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "estimated_cost_cny": 0.0,
+        "unknown_cost_count": 0,
+        "usage_rows": 0,
+        "result_rows": 0,
+        "leader_work_rows": 0,
+        "source": "none",
+    }
+
+
+def add_token_values(bucket: dict[str, Any], row: dict[str, Any], *, source: str) -> None:
+    bucket["input_tokens"] = int(bucket.get("input_tokens") or 0) + int(row.get("input_tokens") or 0)
+    bucket["output_tokens"] = int(bucket.get("output_tokens") or 0) + int(row.get("output_tokens") or 0)
+    bucket["total_tokens"] = int(bucket.get("total_tokens") or 0) + int(row.get("total_tokens") or 0)
+    if row.get("estimated_cost_cny") is None:
+        bucket["unknown_cost_count"] = int(bucket.get("unknown_cost_count") or 0) + 1
+    else:
+        bucket["estimated_cost_cny"] = round(float(bucket.get("estimated_cost_cny") or 0.0) + float(row.get("estimated_cost_cny") or 0.0), 6)
+    key = f"{source}_rows"
+    bucket[key] = int(bucket.get(key) or 0) + 1
+    if bucket.get("source") in {None, "none"}:
+        bucket["source"] = source
+    elif source not in str(bucket.get("source", "")).split("+"):
+        bucket["source"] = f"{bucket['source']}+{source}"
+
+
+def add_token_bucket(bucket: dict[str, Any], source_bucket: dict[str, Any]) -> None:
+    bucket["input_tokens"] = int(bucket.get("input_tokens") or 0) + int(source_bucket.get("input_tokens") or 0)
+    bucket["output_tokens"] = int(bucket.get("output_tokens") or 0) + int(source_bucket.get("output_tokens") or 0)
+    bucket["total_tokens"] = int(bucket.get("total_tokens") or 0) + int(source_bucket.get("total_tokens") or 0)
+    bucket["estimated_cost_cny"] = round(float(bucket.get("estimated_cost_cny") or 0.0) + float(source_bucket.get("estimated_cost_cny") or 0.0), 6)
+    bucket["unknown_cost_count"] = int(bucket.get("unknown_cost_count") or 0) + int(source_bucket.get("unknown_cost_count") or 0)
+    for key in ["usage_rows", "result_rows", "leader_work_rows"]:
+        bucket[key] = int(bucket.get(key) or 0) + int(source_bucket.get(key) or 0)
+    source = source_bucket.get("source")
+    if source and source != "none":
+        if bucket.get("source") in {None, "none"}:
+            bucket["source"] = source
+        elif source not in str(bucket.get("source", "")).split("+"):
+            bucket["source"] = f"{bucket['source']}+{source}"
+
+
+def actor_token_summary(
+    results: list[dict[str, Any]],
+    leader_work: list[dict[str, Any]],
+    usage: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    buckets: dict[str, dict[str, Any]] = {}
+    usage_by_task: dict[tuple[str, str], dict[str, Any]] = {}
+    result_by_task: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in usage:
+        actor_id = row.get("actor_id")
+        if not actor_id:
+            continue
+        task_key = str(row.get("task_id") or row.get("id") or "")
+        add_token_values(usage_by_task.setdefault((actor_id, task_key), empty_token_bucket()), row, source="usage")
+    for row in results:
+        actor_id = row.get("actor_id") or row.get("agent")
+        if not actor_id:
+            continue
+        task_key = str(row.get("task_id") or row.get("id") or "")
+        add_token_values(result_by_task.setdefault((actor_id, task_key), empty_token_bucket()), row, source="result")
+    for key in sorted(set(usage_by_task) | set(result_by_task)):
+        usage_bucket = usage_by_task.get(key)
+        result_bucket = result_by_task.get(key)
+        if usage_bucket and result_bucket:
+            chosen = usage_bucket if int(usage_bucket.get("total_tokens") or 0) >= int(result_bucket.get("total_tokens") or 0) else result_bucket
+        else:
+            chosen = usage_bucket or result_bucket or empty_token_bucket()
+        add_token_bucket(buckets.setdefault(key[0], empty_token_bucket()), chosen)
+    for row in leader_work:
+        add_token_values(buckets.setdefault(LEADER_ID, empty_token_bucket()), row, source="leader_work")
+    return buckets
 
 
 def summarize_results(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1140,6 +1694,44 @@ def summarize_leader_self_work(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def summarize_usage(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    input_tokens = 0
+    output_tokens = 0
+    total_token_count = 0
+    estimated_cost_cny = 0.0
+    unknown_cost_count = 0
+    by_actor: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        input_value = int(row.get("input_tokens") or 0)
+        output_value = int(row.get("output_tokens") or 0)
+        total_value = int(row.get("total_tokens") or 0)
+        input_tokens += input_value
+        output_tokens += output_value
+        total_token_count += total_value
+        actor_id = row.get("actor_id") or "unknown"
+        bucket = by_actor.setdefault(actor_id, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "estimated_cost_cny": 0.0, "unknown_cost_count": 0})
+        bucket["input_tokens"] += input_value
+        bucket["output_tokens"] += output_value
+        bucket["total_tokens"] += total_value
+        if row.get("estimated_cost_cny") is None:
+            unknown_cost_count += 1
+            bucket["unknown_cost_count"] += 1
+        else:
+            cost = float(row.get("estimated_cost_cny") or 0.0)
+            estimated_cost_cny += cost
+            bucket["estimated_cost_cny"] = round(float(bucket.get("estimated_cost_cny") or 0.0) + cost, 6)
+    return {
+        "count": len(rows),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_token_count,
+        "estimated_cost_cny": round(estimated_cost_cny, 6),
+        "unknown_cost_count": unknown_cost_count,
+        "by_actor": by_actor,
+        "latest_events": rows[-5:],
+    }
+
+
 def task_rows(layout: ProjectLayout) -> list[dict[str, Any]]:
     rows = []
     for path in sorted(layout.tasks_dir.glob("*/task.json")):
@@ -1166,6 +1758,10 @@ def status_payload(layout: ProjectLayout) -> dict[str, Any]:
     tasks = task_rows(layout)
     results = result_rows(layout)
     leader_work = leader_work_rows(layout)
+    usage = usage_rows(layout)
+    token_by_actor = actor_token_summary(results, leader_work, usage)
+    for actor in actors:
+        actor["token_usage"] = token_by_actor.get(actor["id"], empty_token_bucket())
     task_counts: dict[str, int] = {}
     for task in tasks:
         state = task.get("status") or "unknown"
@@ -1173,6 +1769,7 @@ def status_payload(layout: ProjectLayout) -> dict[str, Any]:
     return {
         "project": project,
         "session": session,
+        "scheduler": load_scheduler_state(layout),
         "backend": session_backend_config(session),
         "actor_count": len(actors),
         "actors": actors,
@@ -1181,9 +1778,167 @@ def status_payload(layout: ProjectLayout) -> dict[str, Any]:
         "tasks": tasks,
         "result_summary": summarize_results(results),
         "leader_self_work": summarize_leader_self_work(leader_work),
+        "usage_summary": summarize_usage(usage),
         "relay_cursors": load_relay_cursors(layout),
         "active_locks": active_lock_rows(layout),
     }
+
+
+def process_liveness(layout: ProjectLayout, actor: dict[str, Any]) -> dict[str, Any]:
+    session = load_session(layout)
+    backend = backend_from_session(session)
+    runtime = actor.get("runtime") or actor_runtime(actor)
+    runtime_name = runtime.get("actor_name") or actor_runtime_name(actor["id"])
+    backend_available = backend.available()
+    alive = False
+    reason = "backend_unavailable"
+    if backend_available:
+        alive = backend.actor_alive(
+            session_name=backend_session_name(session),
+            actor_name=runtime_name,
+            target=runtime.get("target"),
+            pid=runtime.get("pid"),
+        )
+        reason = "alive" if alive else "not_found"
+    return {"alive": alive, "reason": reason, "backend_available": backend_available}
+
+
+def scheduler_process_row(layout: ProjectLayout) -> dict[str, Any]:
+    ensure_mailbox(layout, SCHEDULER_ID)
+    state = load_scheduler_state(layout)
+    pid = state.get("pid")
+    try:
+        pid_value = int(pid) if pid else None
+    except (TypeError, ValueError):
+        pid_value = None
+    alive = pid_is_alive(pid_value) if pid_value else False
+    return {
+        "id": SCHEDULER_ID,
+        "role": "scheduler",
+        "status": state.get("status") or "idle",
+        "alive": alive,
+        "liveness_reason": "alive" if alive else "not_running",
+        "runtime_backend": "process",
+        "runtime_target": f"pid:{pid_value}" if pid_value else None,
+        "runtime_pid": pid_value,
+        "runtime_log_path": None,
+        "model": "-",
+        "task_id": None,
+        "heartbeat_at": state.get("heartbeat_at"),
+        "mailbox_counts": mailbox_counts(layout, SCHEDULER_ID),
+        "token_usage": empty_token_bucket(),
+        "cycle_count": state.get("cycle_count", 0),
+        "processed_commands": state.get("processed_commands", 0),
+    }
+
+
+def dashboard_payload(layout: ProjectLayout) -> dict[str, Any]:
+    payload = status_payload(layout)
+    process_rows = [scheduler_process_row(layout)]
+    for actor in payload["actors"]:
+        liveness = process_liveness(layout, actor)
+        row = {
+            **actor,
+            "alive": liveness["alive"],
+            "liveness_reason": liveness["reason"],
+            "runtime_backend_available": liveness["backend_available"],
+        }
+        process_rows.append(row)
+    events = read_jsonl(layout.events_jsonl)
+    payload["processes"] = process_rows
+    payload["recent_events"] = events[-8:]
+    payload["scheduler_commands"] = (payload.get("relay_cursors") or {}).get("scheduler_commands") or {}
+    return payload
+
+
+def render_dashboard(payload: dict[str, Any]) -> str:
+    project = payload["project"]
+    backend = payload.get("backend") or {}
+    scheduler = payload.get("scheduler") or {}
+    lines = [
+        f"# CostMarshal v2 Dashboard: {project.get('name')}",
+        "",
+        f"Project id: `{project.get('project_id')}`",
+        f"Objective: {compact_text(project.get('objective') or '', 120)}",
+        f"Backend: `{backend.get('kind')}` session `{backend.get('session_name')}`",
+        f"Scheduler: `{scheduler.get('status')}` pid `{scheduler.get('pid') or '-'}` cycles `{scheduler.get('cycle_count') or 0}` commands `{scheduler.get('processed_commands') or 0}`",
+        "",
+        "## Process Board",
+        "| Process | Role | State | Alive | PID/Target | Model | Task | Mailbox | Tokens | Cost CNY | Log |",
+        "| --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | --- |",
+    ]
+    for row in payload["processes"]:
+        counts = row.get("mailbox_counts") or {"inbox": 0, "outbox": 0}
+        tokens = row.get("token_usage") or empty_token_bucket()
+        target = row.get("runtime_target") or (f"pid:{row.get('runtime_pid')}" if row.get("runtime_pid") else "-")
+        log_path = row.get("runtime_log_path") or "-"
+        alive = "yes" if row.get("alive") else "no"
+        lines.append(
+            f"| {row.get('id')} | {row.get('role')} | {row.get('status')} | {alive} | {target} | {row.get('model') or '-'} | {row.get('task_id') or '-'} | in {counts.get('inbox', 0)} / out {counts.get('outbox', 0)} | {tokens.get('total_tokens', 0)} | {tokens.get('estimated_cost_cny', 0.0)} | {log_path} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Agent Token Totals",
+            "| Agent Actor | Agent | Input | Output | Total | Cost CNY | Source |",
+            "| --- | --- | ---: | ---: | ---: | ---: | --- |",
+        ]
+    )
+    agent_rows = [row for row in payload["processes"] if row.get("role") == "agent"]
+    if agent_rows:
+        for row in agent_rows:
+            tokens = row.get("token_usage") or empty_token_bucket()
+            lines.append(
+                f"| {row.get('id')} | {row.get('agent_name') or row.get('id')} | {tokens.get('input_tokens', 0)} | {tokens.get('output_tokens', 0)} | {tokens.get('total_tokens', 0)} | {tokens.get('estimated_cost_cny', 0.0)} | {tokens.get('source') or 'none'} |"
+            )
+    else:
+        lines.append("| - | - | 0 | 0 | 0 | 0.0 | none |")
+    results = payload["result_summary"]
+    usage = payload["usage_summary"]
+    lines.extend(
+        [
+            "",
+            "## Ledgers",
+            f"- Usage rows: {usage['count']} tokens total {usage['total_tokens']} cost {usage['estimated_cost_cny']} unknown {usage['unknown_cost_count']}",
+            f"- Result rows: {results['count']} accepted {results['accepted']} tokens total {results['total_tokens']} cost {results['estimated_cost_cny']} unknown {results['unknown_cost_count']}",
+            "",
+            "## Scheduler Commands",
+            f"- Inbox cursor: {payload.get('scheduler_commands', {}).get('inbox_lines', 0)}",
+            f"- Last processed: {payload.get('scheduler_commands', {}).get('last_processed_at') or '-'}",
+            f"- Last counts: ok {payload.get('scheduler_commands', {}).get('last_processed_count', 0)} / failed {payload.get('scheduler_commands', {}).get('last_failed_count', 0)}",
+            "",
+            "## Tasks",
+            "| Task | State | Actor | Model | Report |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+    )
+    for task in payload["tasks"]:
+        lines.append(f"| {task.get('id')} | {task.get('status')} | {task.get('agent_id') or '-'} | {task.get('model') or '-'} | {task.get('report_path') or '-'} |")
+    lines.extend(["", "## Recent Events"])
+    if payload["recent_events"]:
+        lines.append("| Event | Actor | Task | Time |")
+        lines.append("| --- | --- | --- | --- |")
+        for event in payload["recent_events"]:
+            lines.append(f"| {event.get('event_type')} | {event.get('actor_id') or event.get('sender') or '-'} | {event.get('task_id') or '-'} | {event.get('timestamp') or '-'} |")
+    else:
+        lines.append("- none")
+    return "\n".join(lines)
+
+
+def command_dashboard(args: Any) -> None:
+    layout = resolve_project(args.root, args.project)
+    interval = max(float(args.interval), 0.1)
+    while True:
+        payload = dashboard_payload(layout)
+        if args.format == "json":
+            print_json(payload)
+        else:
+            if args.watch:
+                os.system("cls" if os.name == "nt" else "clear")
+            print(render_dashboard(payload))
+        if not args.watch:
+            break
+        time.sleep(interval)
 
 
 def command_status(args: Any) -> None:
@@ -1199,15 +1954,17 @@ def command_status(args: Any) -> None:
         f"Backend: `{(payload.get('backend') or {}).get('kind')}`",
         f"Session: `{(payload.get('backend') or {}).get('session_name')}`",
         f"Scheduler: `{payload['project'].get('scheduler_contract', {}).get('role')}`",
+        f"Scheduler state: `{payload.get('scheduler', {}).get('status')}` pid `{payload.get('scheduler', {}).get('pid') or '-'}` cycles `{payload.get('scheduler', {}).get('cycle_count') or 0}`",
         "",
         "## Actors",
-        "| Actor | Role | Status | Backend | Model | Task | Mailbox |",
-        "| --- | --- | --- | --- | --- | --- | ---: |",
+        "| Actor | Role | Status | Backend | Model | Task | Mailbox | Tokens |",
+        "| --- | --- | --- | --- | --- | --- | ---: | ---: |",
     ]
     for actor in payload["actors"]:
         counts = actor["mailbox_counts"]
+        tokens = actor.get("token_usage") or empty_token_bucket()
         lines.append(
-            f"| {actor['id']} | {actor['role']} | {actor.get('status')} | {actor.get('runtime_backend') or '-'} | {actor.get('model')} | {actor.get('task_id') or '-'} | in {counts['inbox']} / out {counts['outbox']} |"
+            f"| {actor['id']} | {actor['role']} | {actor.get('status')} | {actor.get('runtime_backend') or '-'} | {actor.get('model')} | {actor.get('task_id') or '-'} | in {counts['inbox']} / out {counts['outbox']} | {tokens.get('total_tokens', 0)} |"
         )
     lines.extend(["", "## Relay Cursors"])
     relay_actors = (payload.get("relay_cursors") or {}).get("actors") or {}
@@ -1236,6 +1993,16 @@ def command_status(args: Any) -> None:
             lines.append(
                 f"| {event.get('task_id')} | {event.get('status')} | {event.get('agent') or '-'} | {event.get('model') or '-'} | {event.get('quality_score') or '-'} | {event.get('accepted_by_leader')} |"
             )
+    usage = payload["usage_summary"]
+    lines.extend(
+        [
+            "",
+            "## Actor Usage Ledger",
+            f"- Records: {usage['count']}",
+            f"- Tokens: in {usage['input_tokens']} / out {usage['output_tokens']} / total {usage['total_tokens']}",
+            f"- Est. cost CNY: {usage['estimated_cost_cny']} (unknown {usage['unknown_cost_count']})",
+        ]
+    )
     leader_work = payload["leader_self_work"]
     lines.extend(
         [
@@ -1348,6 +2115,7 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
     required = [
         layout.project_json,
         layout.session_json,
+        layout.scheduler_state_json,
         layout.events_jsonl,
         layout.relay_cursors_json,
         layout.locks_json,
@@ -1355,6 +2123,7 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
         layout.reports_dir,
         layout.results_jsonl,
         layout.leader_work_jsonl,
+        layout.usage_jsonl,
         layout.actors_dir,
         layout.mailboxes_dir,
         layout.tasks_dir,
@@ -1371,6 +2140,9 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
     if source_project and not Path(source_project).exists():
         issues.append(f"source project no longer exists: {source_project}")
     session = load_session(layout)
+    scheduler_state = load_scheduler_state(layout)
+    if scheduler_state.get("id") != SCHEDULER_ID:
+        issues.append("scheduler state id must be scheduler")
     backend_config = session_backend_config(session)
     backend_kind = backend_config.get("kind")
     if backend_kind not in {"local", "tmux"}:
@@ -1465,6 +2237,21 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
         if not row.get("reason"):
             issues.append(f"{label} reason is required")
         validate_non_negative_number(row.get("minutes"), f"{label} minutes", issues)
+        validate_non_negative_number(row.get("input_tokens"), f"{label} input_tokens", issues)
+        validate_non_negative_number(row.get("output_tokens"), f"{label} output_tokens", issues)
+        validate_non_negative_number(row.get("total_tokens"), f"{label} total_tokens", issues)
+        validate_non_negative_number(row.get("estimated_cost_cny"), f"{label} estimated_cost_cny", issues, allow_none=True)
+    usage_rows_to_validate = read_rows_for_validation(layout.usage_jsonl, "usage.jsonl", issues)
+    for index, row in enumerate(usage_rows_to_validate, start=1):
+        label = f"usage.jsonl line {index}"
+        if row.get("event_type") != "usage":
+            issues.append(f"{label} event_type must be usage")
+        actor_id = row.get("actor_id")
+        if actor_id not in actor_ids:
+            issues.append(f"{label} references missing actor {actor_id}")
+        task_id = row.get("task_id")
+        if task_id and task_id not in task_ids:
+            issues.append(f"{label} references missing task {task_id}")
         validate_non_negative_number(row.get("input_tokens"), f"{label} input_tokens", issues)
         validate_non_negative_number(row.get("output_tokens"), f"{label} output_tokens", issues)
         validate_non_negative_number(row.get("total_tokens"), f"{label} total_tokens", issues)

@@ -203,6 +203,34 @@ def main() -> int:
         running_status = run_json(temp, "status", "--project", str(project), "--format", "json")
         running_task = next(item for item in running_status["tasks"] if item["id"] == "V2-0001")
         assert_true(running_task["status"] == "running", "agent running heartbeat should advance the task to running")
+        agent_outbox = project / "scheduler" / "mailboxes" / "agent-v2-0001" / "outbox.jsonl"
+        usage_command = {
+            "id": "MSG-agent-usage-command",
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "from": "agent-v2-0001",
+            "to": "scheduler",
+            "subject": "scheduler.command",
+            "body": "record agent token usage",
+            "task_id": "V2-0001",
+            "metadata": {
+                "command": "record_usage",
+                "args": {
+                    "input_tokens": 12,
+                    "output_tokens": 3,
+                    "estimated_cost_cny": 0.002,
+                    "note": "scheduler loop smoke",
+                },
+            },
+        }
+        with agent_outbox.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(usage_command, sort_keys=True) + "\n")
+        scheduler_once = run_json(temp, "run-scheduler", "--project", str(project), "--once", "--interval", "0.1")
+        assert_true(scheduler_once["processed_commands"] == 1, "run-scheduler --once should execute agent-authored scheduler commands")
+        dashboard = run_json(temp, "dashboard", "--project", str(project), "--format", "json")
+        agent_process = next(item for item in dashboard["processes"] if item["id"] == "agent-v2-0001")
+        assert_true(agent_process["token_usage"]["total_tokens"] == 15, "dashboard should expose cumulative agent token usage")
+        scheduler_process = next(item for item in dashboard["processes"] if item["id"] == "scheduler")
+        assert_true(scheduler_process["role"] == "scheduler", "dashboard should expose the scheduler process row")
         run_json(temp, "send", "--project", str(project), "--to", "leader", "--subject", "Manual relay", "--message", "Scheduler relay smoke message")
         missing_report = run(
             temp,
@@ -322,11 +350,35 @@ def main() -> int:
         assert_true(status["leader_self_work"]["count"] == 1, "status should summarize leader self-work audit rows")
         assert_true(status["leader_self_work"]["total_minutes"] == 2, "status should summarize leader self-work minutes")
         assert_true(status["leader_self_work"]["estimated_cost_cny"] == 0.01, "status should summarize leader self-work cost")
+        assert_true(status["usage_summary"]["count"] == 1, "status should summarize actor usage rows")
         agent = next(actor for actor in status["actors"] if actor["id"] == "agent-v2-0001")
         assert_true(agent["status"] == "stopped", "stopped agent should appear in status")
+        assert_true(agent["token_usage"]["total_tokens"] == 150, "status should use the final result token count when it exceeds partial usage")
         leader = next(actor for actor in status["actors"] if actor["id"] == "leader")
         assert_true(leader["mailbox_counts"]["inbox"] >= 2, "leader should receive dispatch and collect messages")
         assert_true(status["relay_cursors"]["actors"]["leader"]["outbox_lines"] == 2, "status should expose the leader relay cursor")
+        leader_create_task = {
+            "id": "MSG-leader-create-task-command",
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "from": "leader",
+            "to": "scheduler",
+            "subject": "scheduler.command",
+            "body": "create a follow-up task",
+            "metadata": {
+                "command": "create_task",
+                "args": {
+                    "title": "Leader commanded task",
+                    "purpose": "Verify leader-authored scheduler commands create tasks",
+                    "claim_path": "reports/leader-commanded.md",
+                },
+            },
+        }
+        with leader_outbox.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(leader_create_task, sort_keys=True) + "\n")
+        leader_scheduler_once = run_json(temp, "run-scheduler", "--project", str(project), "--once", "--interval", "0.1")
+        assert_true(leader_scheduler_once["processed_commands"] == 1, "run-scheduler should execute leader-authored scheduler commands")
+        commanded_status = run_json(temp, "status", "--project", str(project), "--format", "json")
+        assert_true(any(task["title"] == "Leader commanded task" for task in commanded_status["tasks"]), "leader create_task command should create a durable task")
 
         recovery = run_json(temp, "recover", "--project", str(project), "--plan-restarts")
         assert_true(recovery["status"] in {"ok", "degraded"}, "recover should audit without requiring tmux")

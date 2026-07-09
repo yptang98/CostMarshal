@@ -13,10 +13,13 @@ from .scheduler import (
     command_heartbeat,
     command_init,
     command_new_task,
+    command_dashboard,
     command_record_leader_work,
     command_record_result,
+    command_record_usage,
     command_recover,
     command_relay,
+    command_run_scheduler,
     command_send,
     command_start_leader,
     command_stop_actor,
@@ -95,6 +98,16 @@ def build_parser() -> argparse.ArgumentParser:
     relay.add_argument("--dry-run", action="store_true")
     relay.set_defaults(func=command_relay)
 
+    run_scheduler = sub.add_parser("run-scheduler", help="Run the small scheduler loop that relays actor outboxes and executes actor-authored commands")
+    run_scheduler.add_argument("--project", required=True)
+    run_scheduler.add_argument("--interval", type=float, default=2.0)
+    run_scheduler.add_argument("--once", action="store_true", help="Run one cycle and exit")
+    run_scheduler.add_argument("--max-cycles", type=int, default=0, help="Run a bounded number of cycles; 0 means forever unless --once is set")
+    run_scheduler.add_argument("--relay-limit", type=int)
+    run_scheduler.add_argument("--command-limit", type=int)
+    run_scheduler.add_argument("--dry-run", action="store_true")
+    run_scheduler.set_defaults(func=command_run_scheduler)
+
     heartbeat = sub.add_parser("heartbeat", help="Record an actor heartbeat")
     heartbeat.add_argument("--project", required=True)
     heartbeat.add_argument("--actor", required=True)
@@ -152,11 +165,29 @@ def build_parser() -> argparse.ArgumentParser:
     leader_work.add_argument("--note")
     leader_work.set_defaults(func=command_record_leader_work)
 
+    usage = sub.add_parser("record-usage", help="Record actor-reported token usage while work is in progress")
+    usage.add_argument("--project", required=True)
+    usage.add_argument("--actor", required=True)
+    usage.add_argument("--task")
+    usage.add_argument("--model")
+    usage.add_argument("--input-tokens", type=int, default=0)
+    usage.add_argument("--output-tokens", type=int, default=0)
+    usage.add_argument("--estimated-cost-cny", type=float)
+    usage.add_argument("--note")
+    usage.set_defaults(func=command_record_usage)
+
     recover = sub.add_parser("recover", help="Audit v2 session, mailbox, and backend recoverability")
     recover.add_argument("--project", required=True)
     recover.add_argument("--plan-restarts", action="store_true")
     recover.add_argument("--restart-missing", action="store_true", help="Restart missing runtimes for actors that were marked running")
     recover.set_defaults(func=command_recover)
+
+    dashboard = sub.add_parser("dashboard", help="Show a live process board for scheduler, leader, agents, mailboxes, and token totals")
+    dashboard.add_argument("--project", required=True)
+    dashboard.add_argument("--format", choices=["json", "md"], default="md")
+    dashboard.add_argument("--watch", action="store_true")
+    dashboard.add_argument("--interval", type=float, default=2.0)
+    dashboard.set_defaults(func=command_dashboard)
 
     status = sub.add_parser("status", help="Show v2 project status")
     status.add_argument("--project", required=True)

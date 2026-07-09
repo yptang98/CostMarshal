@@ -33,6 +33,10 @@ class ProjectLayout:
         return self.scheduler_dir / "relay-cursors.json"
 
     @property
+    def scheduler_state_json(self) -> Path:
+        return self.scheduler_dir / "state.json"
+
+    @property
     def actors_dir(self) -> Path:
         return self.scheduler_dir / "actors"
 
@@ -55,6 +59,10 @@ class ProjectLayout:
     @property
     def leader_work_jsonl(self) -> Path:
         return self.reports_dir / "leader-work.jsonl"
+
+    @property
+    def usage_jsonl(self) -> Path:
+        return self.reports_dir / "usage.jsonl"
 
     @property
     def transcripts_dir(self) -> Path:
