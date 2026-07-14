@@ -13,16 +13,16 @@
   <img alt="MIT License" src="https://img.shields.io/badge/License-MIT-green">
 </p>
 
-CostMarshal v2 is the official scheduler-first line of CostMarshal: a durable
-control plane for Codex CLI that coordinates leader and worker agents without
-letting the leader context become a crowded dumping ground.
+CostMarshal v2 is the official scheduler-first line of CostMarshal: a durable,
+two-provider control plane that routes bounded work to LongCat and reserves
+Codex for management gates, difficult work, escalation, and final acceptance.
 
-The leader model stays responsible for planning, routing, verification,
-integration, and final acceptance. Task-scoped agent actors work from bounded
-briefs, communicate through durable mailboxes, and leave structured reports,
-token/cost records, write locks, and recovery state behind.
+The scheduler never calls a model. The Codex manager runs on demand instead of
+occupying a persistent management session. Task-scoped actors run through
+independent `codex exec` processes, so each task has an explicit provider,
+profile, model, prompt, report, token record, and escalation history.
 
-Version: `v2.1.0-beta`
+Version: `v2.2.0-beta`
 
 GitHub: https://github.com/yptang98/CostMarshal
 
@@ -53,6 +53,10 @@ CostMarshal v2 turns this into a software-engineered workflow:
 
 - **Scheduler-first control plane:** the scheduler relays messages, launches
   actors, records events, and audits recovery; it does not plan or review.
+- **Real provider rotation:** low-risk bounded tasks default to the `longcat`
+  Codex profile; failures and explicit escalations launch a fresh Codex actor.
+- **On-demand manager:** Codex is invoked for planning, review, integration, or
+  rescue only when the workflow reaches a management gate.
 - **Durable actors:** the leader and every worker have prompt files, mailbox
   files, runtime state, and task bindings on disk.
 - **Leader discipline:** direct leader implementation-like work must be
@@ -112,20 +116,22 @@ After install, restart Codex if the skill list is cached.
 Use the skill directly:
 
 ```text
-$costmarshal start a new scheduler-first research project. Create the v2 project, start the leader in dry-run mode first, create bounded agent tasks, and keep all communication through durable mailboxes.
+  $costmarshal start a cost-aware project. Route bounded work to LongCat, escalate failures to Codex, and invoke the Codex manager only at planning and acceptance gates.
 ```
 
 Natural language works too:
 
 ```text
-Use CostMarshal v2 for this long task. Keep the leader as planner/reviewer, dispatch bounded worker actors, record final acceptance, and preserve recovery state.
+Use CostMarshal v2 for this long task. Prefer LongCat for verifiable bounded work, use Codex for difficult or high-risk work, and preserve recovery and acceptance state.
 ```
 
 ## Quick Start
 
 ```bash
-python scripts/costmarshal.py init --name demo --objective "Try scheduler-first orchestration" --backend auto
-python scripts/costmarshal.py start-leader --project <project-id> --command "codex --prompt {prompt_file}" --dry-run
+python scripts/costmarshal.py configure-profiles
+# Set LONGCAT_API_KEY in the environment or a local secrets file. Never commit it.
+
+python scripts/costmarshal.py init --name demo --objective "Try cost-aware rotation" --workspace . --backend auto
 
 # Keep this running in a scheduler terminal.
 python scripts/costmarshal.py run-scheduler --project <project-id> --interval 2
@@ -133,13 +139,17 @@ python scripts/costmarshal.py run-scheduler --project <project-id> --interval 2
 # Keep this running in a dashboard terminal.
 python scripts/costmarshal.py dashboard --project <project-id> --watch
 
-# Manual commands remain available for setup, recovery, and overrides.
-python scripts/costmarshal.py new-task --project <project-id> --title "Inspect baseline" --purpose "Return a bounded report" --claim-path reports/baseline.md
-python scripts/costmarshal.py dispatch --project <project-id> --task V2-0001 --model gpt-5 --command "codex --model {model} --prompt {prompt_file}" --dry-run
-python scripts/costmarshal.py dispatch --project <project-id> --task V2-0001 --model gpt-5 --command "codex --model {model} --prompt {prompt_file}" --start
-python scripts/costmarshal.py send --project <project-id> --to leader --message "Task V2-0001 is dispatched."
-python scripts/costmarshal.py relay --project <project-id> --actor leader
-python scripts/costmarshal.py record-usage --project <project-id> --actor agent-v2-0001 --input-tokens 100 --output-tokens 40
+# Auto routing chooses LongCat for this low-risk bounded task.
+python scripts/costmarshal.py new-task --project <project-id> --title "Inspect baseline" --purpose "Return a bounded report" --task-type analysis --risk low --provider auto --claim-path reports/baseline.md
+python scripts/costmarshal.py dispatch --project <project-id> --task V2-0001 --start
+
+# LongCat failures or `Status: escalate` reports automatically route to Codex.
+# A manual override is also available:
+python scripts/costmarshal.py escalate --project <project-id> --task V2-0001 --reason "Needs architectural judgment" --start
+
+# Invoke the manager only for a planning/review/integration gate.
+python scripts/costmarshal.py run-manager --project <project-id>
+
 python scripts/costmarshal.py collect --project <project-id> --task V2-0001 --state waiting_leader --summary "Worker report is ready for leader review"
 python scripts/costmarshal.py record-result --project <project-id> --task V2-0001 --status done --quality-score 4 --accepted-by-leader --summary "Accepted after evidence check"
 python scripts/costmarshal.py record-leader-work --project <project-id> --task V2-0001 --work-type verification --risk low --scope "Sampled evidence" --reason "Leader acceptance requires review"
@@ -153,6 +163,26 @@ Use `--root <dir>` or `COSTMARSHAL_V2_HOME` to choose the runtime root. Default
 storage is `$CODEX_HOME/costmarshal-v2` when `CODEX_HOME` is set, otherwise
 `~/.codex/costmarshal-v2`.
 
+### Provider profiles
+
+`configure-profiles` creates a user-level `longcat.config.toml` containing the
+LongCat Responses endpoint and `env_key = "LONGCAT_API_KEY"`. It never writes
+the key itself. The default Codex actor keeps the current user profile and
+authentication. You may also select profiles explicitly with
+`new-task --profile`, `dispatch --profile`, or `run-manager --profile`.
+
+The actor runner loads an optional `init --secrets-file <path>` only into child
+process environments. Secrets are never copied into prompts, actor state,
+reports, or repository files.
+
+Automatic routing is intentionally small:
+
+- low/medium-risk analysis, documentation, extraction, mechanical work,
+  summarization, tests, verification, and small edits default to LongCat
+- high-risk, hard, or unbounded work defaults to Codex
+- a failed LongCat process or a report containing `Status: escalate` creates a
+  new Codex attempt when automatic escalation is enabled
+
 ## Architecture
 
 v2 models each project as durable actors:
@@ -160,8 +190,8 @@ v2 models each project as durable actors:
 | Actor | Responsibility | Must Not Do |
 | --- | --- | --- |
 | `scheduler` | Relay mailboxes, execute structured actor commands, start/stop runtimes, write state, enforce locks, audit recovery | Plan, implement, review, summarize raw reasoning |
-| `leader` | Define goals, split tasks, route agents, verify reports, accept/retry/escalate | Become the hidden default worker |
-| `agent-*` | Execute one bounded task from its brief and explicit context | Broaden context, change write scope, expose secrets, make architecture decisions |
+| `leader` | On-demand Codex manager for goals, task boundaries, review, integration, and acceptance | Poll, stay permanently active, or become the hidden default worker |
+| `agent-*` | Execute one bounded task through an explicit Codex or LongCat profile | Broaden context, change write scope, expose secrets, make architecture decisions |
 
 Actor execution is backend-driven:
 
@@ -217,10 +247,13 @@ from chat memory.
 
 | Command | Purpose |
 | --- | --- |
+| `configure-profiles` | Create `$CODEX_HOME/longcat.config.toml` without storing an API key |
 | `init` | Create a v2 project, scheduler state, leader actor, protocol file, and backend config |
-| `start-leader` | Start or dry-run the persistent leader actor |
+| `run-manager` | Run one on-demand Codex manager turn |
+| `start-leader` | Backward-compatible alias for `run-manager` |
 | `new-task` | Create a bounded task with brief, status, report template, context, and write claims |
-| `dispatch` | Bind a task to an agent actor and optionally start that actor |
+| `dispatch` | Route and start a task through `codex exec --profile ...` |
+| `escalate` | Replace a failed or uncertain LongCat attempt with a Codex attempt |
 | `send` | Write a durable mailbox message, optionally injecting it into the runtime |
 | `relay` | Relay actor-authored outbox messages using durable cursors |
 | `run-scheduler` | Run the waiting loop that relays actor outboxes and executes structured scheduler commands |
@@ -237,8 +270,8 @@ from chat memory.
 
 ## Leader Discipline
 
-The leader should plan, route, verify, integrate, and accept. It should not
-silently become the default worker. If the leader performs direct
+The manager should plan, route, verify, integrate, and accept in bounded
+on-demand turns. It should not silently become the default worker. If it performs direct
 implementation-like work, record it immediately:
 
 ```bash
@@ -274,14 +307,17 @@ own project state under the CostMarshal v2 runtime root.
 processes messages addressed to `scheduler`, executes only validated structured
 commands, writes scheduler heartbeat state, then waits for the next cycle.
 
-Actors ask for scheduler actions by appending JSONL messages to their outbox:
+The default runner records reports, usage, collection, and escalation after the
+model exits, so Codex and LongCat do not spend tokens editing control-plane
+files. Custom or legacy actors can still ask for scheduler actions by appending
+JSONL messages to their outbox:
 
 ```json
-{"from":"leader","to":"scheduler","subject":"scheduler.command","metadata":{"command":"dispatch_task","args":{"task":"V2-0001","model":"gpt-5","start":true}}}
+{"from":"leader","to":"scheduler","subject":"scheduler.command","metadata":{"command":"dispatch_task","args":{"task":"V2-0001","provider":"auto","start":true}}}
 ```
 
 Supported scheduler commands are `create_task`, `dispatch_task`,
-`collect_task`, `record_result`, `record_usage`, `heartbeat`, and
+`escalate_task`, `collect_task`, `record_result`, `record_usage`, `heartbeat`, and
 `stop_actor`. Leader-only commands stay leader-only; agents may report their
 own usage, heartbeat, collection, and stop requests.
 
@@ -293,9 +329,10 @@ totals.
 ## Design Boundary
 
 CostMarshal v2 is deliberately scheduler-first. The scheduler is not another
-thinking agent; it is a small durable control plane. The leader remains
-responsible for decisions, while worker actors remain responsible for bounded
-task work and structured reports.
+thinking agent; it is a small durable control plane. Codex remains responsible
+for management decisions at explicit gates. LongCat receives bounded,
+verifiable work first, and deterministic escalation replaces it with Codex
+when the cheap attempt fails or requests broader judgment.
 
 This boundary is what makes the system useful for long tasks: the leader can
 stay clean and decisive, workers can be restarted or replaced, and the project
@@ -310,6 +347,7 @@ python tests/unit_test.py
 python tests/smoke_test.py
 python tests/local_backend_contract_test.py
 python tests/tmux_contract_test.py
+python tests/model_rotation_contract_test.py
 python scripts/install_smoke_test.py
 ```
 

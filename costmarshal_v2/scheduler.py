@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from .paths import ProjectLayout, actor_runtime_name, actor_target, default_root
 from .session_backend import (
     actor_runtime,
     backend_from_session,
+    command_display,
     command_to_string,
     format_actor_command,
     pid_is_alive,
@@ -69,6 +71,19 @@ SCHEDULER_COMMANDS = {
     "record_usage",
     "heartbeat",
     "stop_actor",
+    "escalate_task",
+}
+
+PROVIDERS = {"auto", "codex", "longcat"}
+LONGCAT_TASK_TYPES = {
+    "analysis",
+    "documentation",
+    "extraction",
+    "mechanical",
+    "small-edit",
+    "summarization",
+    "test",
+    "verification",
 }
 
 
@@ -111,9 +126,50 @@ def update_scheduler_state(layout: ProjectLayout, **fields: Any) -> dict[str, An
 
 
 def default_actor_command(model: str | None) -> str:
+    """Legacy display helper retained for compatibility with existing callers."""
     if not model or model == "inherit":
+        return "codex exec -"
+    return f"codex exec --model {model} -"
+
+
+def default_actor_argv(layout: ProjectLayout, actor: dict[str, Any]) -> list[str]:
+    script = Path(__file__).resolve().parents[1] / "scripts" / "costmarshal_actor.py"
+    return [
+        sys.executable,
+        str(script),
+        "--root",
+        str(layout.root),
+        "--project",
+        str(layout.project_dir),
+        "--actor",
+        str(actor["id"]),
+    ]
+
+
+def actor_launch_command(layout: ProjectLayout, session: dict[str, Any], actor: dict[str, Any]) -> str | list[str]:
+    template = actor.get("command_template")
+    if template:
+        return format_actor_command(str(template), layout=layout, session=session, actor=actor)
+    return default_actor_argv(layout, actor)
+
+
+def route_provider(task: dict[str, Any], requested: str | None = None) -> str:
+    value = str(requested or task.get("provider") or task.get("agent_name") or "auto").lower()
+    if value not in PROVIDERS:
+        value = "auto"
+    if value != "auto":
+        return value
+    if str(task.get("risk") or "low") == "high":
         return "codex"
-    return f"codex --model {model}"
+    if str(task.get("difficulty") or "normal") == "hard":
+        return "codex"
+    return "longcat" if str(task.get("task_type") or "analysis") in LONGCAT_TASK_TYPES else "codex"
+
+
+def provider_defaults(provider: str, model: str | None, profile: str | None) -> tuple[str, str | None]:
+    if provider == "longcat":
+        return (model if model and model != "inherit" else "LongCat-2.0", profile or "longcat")
+    return (model or "inherit", profile)
 
 
 def actor_summary(actor: dict[str, Any]) -> dict[str, Any]:
@@ -123,6 +179,8 @@ def actor_summary(actor: dict[str, Any]) -> dict[str, Any]:
         "role": actor["role"],
         "status": actor.get("status"),
         "model": actor.get("model"),
+        "provider": actor.get("provider"),
+        "profile": actor.get("profile"),
         "task_id": actor.get("task_id"),
         "path": f"scheduler/actors/{slugify(actor['id'], 'actor')}.json",
         "prompt_path": actor.get("prompt_path"),
@@ -318,9 +376,9 @@ def actor_role_contract(role: str) -> list[str]:
     if role == "agent":
         return [
             "Work only on the assigned task and explicit context in the task brief.",
-            "Write status/report artifacts instead of broadening your own context.",
+            "Do the bounded work in the workspace; the runner owns task status, usage, mailbox, and report persistence.",
             "Escalate rather than changing write scope, reading raw transcripts, exposing secrets, or making architectural decisions outside the brief.",
-            "Return concise evidence paths for leader verification.",
+            "Return one concise final report for leader verification; do not spend tokens trying to edit CostMarshal runtime files.",
         ]
     return ["Follow the CostMarshal v2 protocol for this actor role."]
 
@@ -338,6 +396,8 @@ def render_actor_prompt(layout: ProjectLayout, actor: dict[str, Any]) -> str:
         f"Objective: {project.get('objective')}",
         f"Role: `{actor.get('role')}`",
         f"Actor status: `{actor.get('status')}`",
+        f"Provider: `{actor.get('provider') or 'codex'}`",
+        f"Profile: `{actor.get('profile') or 'default'}`",
         f"Model: `{actor.get('model')}`",
         f"Session backend: `{session_backend_kind(session)}`",
         f"Session: `{backend_session_name(session)}`",
@@ -345,21 +405,30 @@ def render_actor_prompt(layout: ProjectLayout, actor: dict[str, Any]) -> str:
         "## Role Contract",
     ]
     lines.extend(f"- {item}" for item in actor_role_contract(actor.get("role", "")))
-    lines.extend(
-        [
-            "",
-            "## Required Files",
-            f"- Protocol: `{relpath(layout.protocol_md, layout.project_dir)}`",
-            f"- Actor state: `{relpath(layout.actors_dir / (slugify(actor['id'], 'actor') + '.json'), layout.project_dir)}`",
-            f"- Inbox: `{mailbox.get('inbox')}`",
-            f"- Outbox: `{mailbox.get('outbox')}`",
-            "",
-            "## Scheduler Command Protocol",
-            "- To ask the scheduler to act, append one JSONL message to your outbox with `to: \"scheduler\"`.",
-            "- Put the action in `metadata.command` and parameters in `metadata.args`.",
-            "- Supported commands: `create_task`, `dispatch_task`, `collect_task`, `record_result`, `record_usage`, `heartbeat`, `stop_actor`.",
-            "- The scheduler validates authority and executes commands; it does not infer project plans from prose.",
-        ]
+    if actor.get("role") == "leader":
+        lines.extend(
+            [
+                "",
+                "## Required Files",
+                f"- Runtime project: `{layout.project_dir}`",
+                f"- Protocol: `{layout.protocol_md}`",
+                f"- Actor state: `{layout.actors_dir / (slugify(actor['id'], 'actor') + '.json')}`",
+                f"- Inbox: `{layout.project_dir / str(mailbox.get('inbox') or '')}`",
+                "",
+                "## Manager Output",
+                "- Review durable task reports and return recommendations in one final response.",
+                "- The runner persists that response as `reports/manager-latest.md`; use the CLI for state-changing decisions.",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "",
+                "## Efficiency Contract",
+                "- The assigned task below is authoritative; do not reread the brief, inbox, status, protocol, or actor files.",
+                "- Use tools only when the bounded task itself requires workspace inspection or edits.",
+                "- Do not manage lifecycle or scheduler state; the deterministic runner does that after your final response.",
+            ]
         )
     if task:
         task_path = task_dir(layout, task_id)
@@ -370,15 +439,27 @@ def render_actor_prompt(layout: ProjectLayout, actor: dict[str, Any]) -> str:
                 f"- Task id: `{task_id}`",
                 f"- Title: {task.get('title')}",
                 f"- State: `{task.get('status')}`",
-                f"- Brief: `{relpath(task_path / 'brief.md', layout.project_dir)}`",
-                f"- Status file: `{relpath(task_path / 'status.json', layout.project_dir)}`",
-                f"- Completion report: `{relpath(task_path / 'completion-report.md', layout.project_dir)}`",
+                f"- Task type: `{task.get('task_type')}`",
+                f"- Risk: `{task.get('risk')}`",
+                f"- Difficulty: `{task.get('difficulty')}`",
+                f"- Purpose: {task.get('purpose')}",
+                f"- Acceptance: {', '.join(task.get('acceptance') or []) or 'Leader acceptance is required.'}",
             ]
         )
         claimed_paths = task.get("claimed_paths") or []
         if claimed_paths:
             lines.extend(["", "## Claimed Write Paths"])
             lines.extend(f"- `{path}`" for path in claimed_paths)
+    workspace = project.get("workspace")
+    if workspace:
+        lines.extend(
+            [
+                "",
+                "## Workspace",
+                f"- `{workspace}`",
+                "- Treat claimed and allowed write paths as relative to this workspace unless they are absolute.",
+            ]
+        )
     source_project = project.get("source_project")
     if source_project:
         lines.extend(
@@ -395,6 +476,9 @@ def render_actor_prompt(layout: ProjectLayout, actor: dict[str, Any]) -> str:
             "## Recovery",
             "- If resumed after disconnect, read this prompt first, then inspect your inbox and assigned task status.",
             "- If task state conflicts with your local memory, trust the durable files and ask the scheduler/leader for a fresh dispatch message.",
+            "- The runner persists your final response as the completion report and updates lifecycle files after you exit.",
+            "- Do not edit `status.json`, `completion-report.md`, or scheduler mailboxes yourself.",
+            "- End with exactly one final report using `Status: done`, `Status: failed`, or `Status: escalate`, plus result, evidence, and blockers.",
             "",
         ]
     )
@@ -414,11 +498,13 @@ def make_actor(
     actor_id: str,
     role: str,
     model: str,
-    command_template: str,
+    command_template: str | None,
     session_name: str,
     backend_kind: str,
     task_id: str | None = None,
     agent_name: str | None = None,
+    provider: str = "codex",
+    profile: str | None = None,
     status: str = "configured",
 ) -> dict[str, Any]:
     mailbox = ensure_mailbox(layout, actor_id)
@@ -429,6 +515,8 @@ def make_actor(
         "role": role,
         "status": status,
         "model": model,
+        "provider": provider,
+        "profile": profile,
         "agent_name": agent_name,
         "task_id": task_id,
         "created_at": now_iso(),
@@ -437,6 +525,11 @@ def make_actor(
         "mailbox": mailbox,
         "prompt_path": relpath(actor_prompt_file(layout, actor_id), layout.project_dir),
         "command_template": command_template,
+        "runner": {
+            "kind": "codex-exec",
+            "sandbox": "workspace-write",
+            "approval_policy": "never",
+        },
         "context_policy": {
             "default": "Use mailbox messages and explicit task briefs only.",
             "raw_transcripts": "Do not read other actors' transcripts unless the leader explicitly authorizes an audit.",
@@ -465,8 +558,8 @@ def protocol_text() -> str:
             "",
             "## Roles",
             "- Scheduler: creates actors, writes mailbox messages, checks heartbeats, records events, and recovers sessions.",
-            "- Leader: plans, decomposes work, routes tasks, verifies reports, and owns final acceptance.",
-            "- Agent: executes one bounded task from its brief and returns structured status/report files.",
+            "- Leader: an on-demand Codex manager that plans, decomposes work, verifies reports, and owns final acceptance.",
+            "- Agent: executes one bounded task through an explicit Codex or LongCat profile and returns structured status/report files.",
             "",
             "## Isolation",
             "- Actors communicate through `scheduler/mailboxes/<actor>/`.",
@@ -475,11 +568,9 @@ def protocol_text() -> str:
             "- The scheduler relays report paths and state, not raw reasoning.",
             "",
             "## Return Protocol",
-            "- Update the task status file.",
-            "- Write `completion-report.md` with result, evidence, blockers, and leader decisions needed.",
-            "- Report usage with a `record_usage` scheduler command when token counts are known.",
-            "- Ask collection with a `collect_task` scheduler command instead of relying on the user to run `collect`.",
-            "- Escalate instead of expanding context or changing write scope on your own.",
+            "- Agents return one structured final response; the actor runner writes `completion-report.md` and task status.",
+            "- The actor runner records usage and asks the scheduler to collect or escalate the task.",
+            "- LongCat escalates to a fresh Codex attempt instead of expanding context or changing write scope on its own.",
             "",
             "## Actor-Authored Scheduler Commands",
             "Append JSONL to your outbox. Example:",
@@ -505,6 +596,14 @@ def command_init(args: Any) -> None:
     source_project = Path(args.source_project).expanduser().resolve() if args.source_project else None
     if source_project and not source_project.is_dir():
         raise SystemExit(f"Source project not found: {source_project}")
+    workspace_arg = getattr(args, "workspace", None)
+    workspace = Path(workspace_arg).expanduser().resolve() if workspace_arg else Path.cwd().resolve()
+    if not workspace.is_dir():
+        raise SystemExit(f"Workspace not found: {workspace}")
+    secrets_arg = getattr(args, "secrets_file", None)
+    secrets_file = Path(secrets_arg).expanduser().resolve() if secrets_arg else None
+    if secrets_file and not secrets_file.is_file():
+        raise SystemExit(f"Secrets file not found: {secrets_file}")
     session_name = args.session_name or f"cmv2-{slugify(project_id)[:42]}"
     requested_backend = getattr(args, "backend", None) or "auto"
     backend_kind = select_backend_kind(requested_backend)
@@ -522,6 +621,10 @@ def command_init(args: Any) -> None:
         "created_at": now_iso(),
         "updated_at": now_iso(),
         "runtime_root": str(root),
+        "workspace": str(workspace),
+        "secrets_file": str(secrets_file) if secrets_file else None,
+        "auto_escalate": bool(getattr(args, "auto_escalate", True)),
+        "manager_mode": "on-demand",
         "source_project": str(source_project) if source_project else None,
         "source_project_mode": "read-only-reference" if source_project else "none",
         "scheduler_contract": {
@@ -557,9 +660,11 @@ def command_init(args: Any) -> None:
         actor_id=LEADER_ID,
         role="leader",
         model=args.leader_model,
-        command_template=args.leader_command,
+        command_template=getattr(args, "leader_command", None),
         session_name=session_name,
         backend_kind=backend_kind,
+        provider="codex",
+        profile=getattr(args, "leader_profile", None),
     )
     save_actor(layout, leader)
     sync_actor_summary(layout, leader)
@@ -575,7 +680,9 @@ def start_actor(layout: ProjectLayout, actor: dict[str, Any], *, dry_run: bool) 
     if not session_name:
         raise SystemExit("v2 session is missing backend.session_name")
     prompt_path = refresh_actor_prompt(layout, actor)
-    command = format_actor_command(actor.get("command_template") or "codex", layout=layout, session=session, actor=actor)
+    save_actor(layout, actor)
+    sync_actor_summary(layout, actor)
+    command = actor_launch_command(layout, session, actor)
     runtime = actor_runtime(actor)
     runtime["backend"] = backend.kind
     runtime_name = runtime.get("actor_name") or actor_runtime_name(actor["id"])
@@ -601,7 +708,7 @@ def start_actor(layout: ProjectLayout, actor: dict[str, Any], *, dry_run: bool) 
     )
     actor["status"] = "running"
     runtime["started_at"] = now_iso()
-    runtime["last_launch_command"] = command
+    runtime["last_launch_command"] = command_display(command)
     runtime["target"] = launch.get("target")
     runtime["pid"] = launch.get("pid")
     runtime["log_path"] = relpath(Path(launch["log_path"]), layout.project_dir) if launch.get("log_path") else None
@@ -625,6 +732,9 @@ def command_start_leader(args: Any) -> None:
     actor = load_actor(layout, LEADER_ID)
     if args.model:
         actor["model"] = args.model
+    if getattr(args, "profile", None):
+        actor["profile"] = args.profile
+    actor["provider"] = "codex"
     if args.command:
         actor["command_template"] = args.command
     payload = start_actor(layout, actor, dry_run=args.dry_run)
@@ -644,6 +754,11 @@ def render_task_brief(task: dict[str, Any]) -> str:
             "## Task Type",
             task["task_type"],
             "",
+            "## Routing",
+            f"- Risk: {task.get('risk') or 'low'}",
+            f"- Difficulty: {task.get('difficulty') or 'normal'}",
+            f"- Requested provider: {task.get('provider') or 'auto'}",
+            "",
             "## Acceptance Criteria",
             "\n".join(f"- {item}" for item in task.get("acceptance", [])) or "- Leader acceptance is required.",
             "",
@@ -657,10 +772,10 @@ def render_task_brief(task: dict[str, Any]) -> str:
             "\n".join(f"- {item}" for item in task.get("claimed_paths", [])) or "- None.",
             "",
             "## Return Protocol",
-            "- Update `status.json`.",
-            "- Write `completion-report.md`.",
-            "- Append `record_usage` to your outbox when token counts are known.",
-            "- Append `collect_task` to your outbox when the report is ready for leader review.",
+            "- Return one final response with `Status: done`, `Status: failed`, or `Status: escalate`.",
+            "- Include result, evidence, blockers, and any decision needed from the manager.",
+            "- The actor runner persists the report, task state, usage, and scheduler command after exit.",
+            "- Do not edit CostMarshal runtime files or mailboxes yourself.",
             "- Stop and escalate if the task requires broader context, new write scope, secrets, or architectural judgment.",
             "",
         ]
@@ -691,6 +806,10 @@ def command_new_task(args: Any) -> None:
         "title": args.title,
         "purpose": args.purpose,
         "task_type": args.task_type,
+        "risk": getattr(args, "risk", "low"),
+        "difficulty": getattr(args, "difficulty", "normal"),
+        "provider": getattr(args, "provider", "auto"),
+        "profile": getattr(args, "profile", None),
         "status": "planned",
         "agent_id": None,
         "agent_name": args.agent,
@@ -703,6 +822,7 @@ def command_new_task(args: Any) -> None:
         "claimed_paths": [normalize_claim_path(path) for path in claim_paths],
         "lock_conflict_override": bool(args.allow_lock_conflict),
         "report_path": relpath(directory / "completion-report.md", layout.project_dir),
+        "attempts": [],
     }
     atomic_write_json(directory / "task.json", task)
     atomic_write_json(
@@ -730,14 +850,21 @@ def command_dispatch(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
     require_task(layout, args.task)
     task = load_task(layout, args.task)
-    if task.get("status") in {"done", "failed", "cancelled"} and not args.force:
+    force = bool(getattr(args, "force", False))
+    if task.get("status") in {"done", "failed", "cancelled"} and not force:
         raise SystemExit(f"Task is already terminal: {args.task}")
     session = load_session(layout)
     actor_id = args.actor_id or f"agent-{args.task.lower()}"
-    if (layout.actors_dir / f"{slugify(actor_id, 'actor')}.json").exists() and not args.force:
+    if (layout.actors_dir / f"{slugify(actor_id, 'actor')}.json").exists() and not force:
         raise SystemExit(f"Actor already exists: {actor_id}")
-    model = args.model or task.get("model") or "inherit"
-    command_template = args.command or default_actor_command(model)
+    provider = route_provider(task, getattr(args, "provider", None))
+    inherited_profile = task.get("profile") if task.get("provider") in {None, "auto", provider} else None
+    model, profile = provider_defaults(
+        provider,
+        getattr(args, "model", None) or task.get("model") or "inherit",
+        getattr(args, "profile", None) or inherited_profile,
+    )
+    command_template = getattr(args, "command", None)
     actor = make_actor(
         layout,
         actor_id=actor_id,
@@ -748,6 +875,8 @@ def command_dispatch(args: Any) -> None:
         backend_kind=session_backend_kind(session),
         task_id=args.task,
         agent_name=args.agent or task.get("agent_name"),
+        provider=provider,
+        profile=profile,
     )
     if args.dry_run:
         plan = start_actor(layout, actor, dry_run=True) if args.start else {"planned_commands": []}
@@ -761,14 +890,27 @@ def command_dispatch(args: Any) -> None:
     task["agent_id"] = actor_id
     task["agent_name"] = args.agent or task.get("agent_name")
     task["model"] = model
+    task["provider"] = provider
+    task["profile"] = profile
+    task.setdefault("attempts", []).append(
+        {
+            "attempt": len(task.get("attempts") or []) + 1,
+            "actor_id": actor_id,
+            "provider": provider,
+            "profile": profile,
+            "model": model,
+            "started_at": now_iso() if args.start else None,
+            "escalation_reason": getattr(args, "escalation_reason", None),
+        }
+    )
     assign_task_claim_actor(layout, args.task, actor_id)
-    set_task_state(layout, task, "dispatched", allow_any_transition=args.force)
+    set_task_state(layout, task, "dispatched", allow_any_transition=force)
     body = "\n".join(
         [
             f"Task: {args.task}",
             f"Brief: {relpath(task_dir(layout, args.task) / 'brief.md', layout.project_dir)}",
             f"Task directory: {relpath(task_dir(layout, args.task), layout.project_dir)}",
-            "Use only the task brief and explicitly listed context. Return status/report files; do not broaden context yourself.",
+            "Use only the bounded prompt and explicitly listed context. Return one final report; the runner owns status and report files.",
         ]
     )
     send_message(layout, sender=SCHEDULER_ID, recipient=actor_id, subject=f"Dispatch {args.task}", body=body, task_id=args.task)
@@ -778,7 +920,16 @@ def command_dispatch(args: Any) -> None:
         start_payload = start_actor(layout, actor, dry_run=False)
         task = load_task(layout, args.task)
         set_task_state(layout, task, "running")
-    append_event(layout, "task_dispatched", task_id=args.task, actor_id=actor_id, started=bool(args.start))
+    append_event(
+        layout,
+        "task_dispatched",
+        task_id=args.task,
+        actor_id=actor_id,
+        provider=provider,
+        profile=profile,
+        model=model,
+        started=bool(args.start),
+    )
     print_json(
         {
             "status": "ok",
@@ -959,7 +1110,7 @@ def require_scheduler_command_authority(layout: ProjectLayout, *, sender: str, c
     leader_only = {"create_task", "dispatch_task", "record_result"}
     if command in leader_only and sender != LEADER_ID:
         raise SystemExit(f"{command} may only be issued by the leader")
-    if command in {"collect_task", "record_usage", "heartbeat", "stop_actor"} and sender != LEADER_ID:
+    if command in {"collect_task", "record_usage", "heartbeat", "stop_actor", "escalate_task"} and sender != LEADER_ID:
         actor = load_actor(layout, sender)
         target_actor = str(command_args.get("actor") or sender)
         if command in {"record_usage", "heartbeat", "stop_actor"} and target_actor != sender:
@@ -968,6 +1119,12 @@ def require_scheduler_command_authority(layout: ProjectLayout, *, sender: str, c
             task_id = str(command_args.get("task") or message.get("task_id") or actor.get("task_id") or "")
             if actor.get("role") == "agent" and task_id and actor.get("task_id") != task_id:
                 raise SystemExit(f"agent {sender} cannot collect task {task_id}")
+        if command == "escalate_task":
+            task_id = str(command_args.get("task") or message.get("task_id") or actor.get("task_id") or "")
+            if actor.get("role") != "agent" or actor.get("task_id") != task_id:
+                raise SystemExit(f"agent {sender} cannot escalate task {task_id}")
+            if actor.get("provider") != "longcat":
+                raise SystemExit("only a LongCat worker may auto-escalate to Codex")
 
 
 def execute_scheduler_command(
@@ -994,6 +1151,10 @@ def execute_scheduler_command(
             task_type=str(command_args.get("task_type") or "analysis"),
             agent=str(command_args.get("agent") or "auto"),
             model=str(command_args.get("model") or "inherit"),
+            risk=str(command_args.get("risk") or "low"),
+            difficulty=str(command_args.get("difficulty") or "normal"),
+            provider=str(command_args.get("provider") or "auto"),
+            profile=command_args.get("profile"),
             acceptance=as_list(command_args.get("acceptance")),
             allowed_context=as_list(command_args.get("allowed_context")),
             allowed_path=as_list(command_args.get("allowed_path")),
@@ -1009,10 +1170,27 @@ def execute_scheduler_command(
             actor_id=command_args.get("actor_id"),
             agent=command_args.get("agent"),
             model=command_args.get("model"),
+            provider=command_args.get("provider"),
+            profile=command_args.get("profile"),
             command=command_args.get("actor_command") or command_args.get("command_template"),
             start=as_bool(command_args.get("start")),
             dry_run=False,
             force=as_bool(command_args.get("force")),
+            escalation_reason=command_args.get("escalation_reason"),
+        )
+    if command == "escalate_task":
+        task_id = str(command_args.get("task") or message.get("task_id") or "")
+        return run_cli_helper(
+            layout,
+            command_escalate,
+            task=task_id,
+            reason=str(command_args.get("reason") or "LongCat requested escalation"),
+            actor_id=command_args.get("actor_id"),
+            profile=command_args.get("profile"),
+            model=command_args.get("model"),
+            start=as_bool(command_args.get("start")),
+            dry_run=False,
+            force=False,
         )
     if command == "collect_task":
         actor = command_args.get("actor") or (sender if sender != LEADER_ID else None)
@@ -1239,6 +1417,35 @@ def command_run_scheduler(args: Any) -> None:
     )
 
 
+def command_escalate(args: Any) -> None:
+    layout = resolve_project(args.root, args.project)
+    require_task(layout, args.task)
+    task = load_task(layout, args.task)
+    attempts = task.get("attempts") or []
+    if attempts and attempts[-1].get("provider") == "codex" and not getattr(args, "force", False):
+        raise SystemExit(f"Task is already assigned to Codex: {args.task}")
+    next_attempt = len(attempts) + 1
+    actor_id = getattr(args, "actor_id", None) or f"agent-{args.task.lower()}-codex-{next_attempt}"
+    append_event(layout, "task_escalation_requested", task_id=args.task, actor_id=actor_id, reason=args.reason)
+    command_dispatch(
+        SimpleNamespace(
+            root=args.root,
+            project=args.project,
+            task=args.task,
+            actor_id=actor_id,
+            agent="codex",
+            provider="codex",
+            profile=getattr(args, "profile", None),
+            model=getattr(args, "model", None) or "inherit",
+            command=None,
+            start=bool(getattr(args, "start", False)),
+            dry_run=bool(getattr(args, "dry_run", False)),
+            force=True,
+            escalation_reason=args.reason,
+        )
+    )
+
+
 def command_heartbeat(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
     if args.status not in ACTOR_STATES:
@@ -1363,6 +1570,8 @@ def command_record_result(args: Any) -> None:
         "task_id": args.task,
         "actor_id": actor_id,
         "agent": agent_name,
+        "provider": task.get("provider"),
+        "profile": task.get("profile"),
         "model": model,
         "task_type": task.get("task_type") or "unknown",
         "status": args.status,
@@ -1465,6 +1674,8 @@ def command_record_usage(args: Any) -> None:
         "role": actor.get("role"),
         "agent": actor.get("agent_name") or ("leader" if actor.get("role") == "leader" else args.actor),
         "task_id": task_id,
+        "provider": actor.get("provider"),
+        "profile": actor.get("profile"),
         "model": args.model or actor.get("model") or "inherit",
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -1742,7 +1953,10 @@ def task_rows(layout: ProjectLayout) -> list[dict[str, Any]]:
                 "title": task.get("title"),
                 "status": task.get("status"),
                 "agent_id": task.get("agent_id"),
+                "provider": task.get("provider"),
+                "profile": task.get("profile"),
                 "model": task.get("model"),
+                "attempts": task.get("attempts") or [],
                 "report_path": task.get("report_path"),
                 "summary": task.get("summary"),
                 "leader_result": task.get("leader_result"),
@@ -1823,6 +2037,8 @@ def scheduler_process_row(layout: ProjectLayout) -> dict[str, Any]:
         "runtime_pid": pid_value,
         "runtime_log_path": None,
         "model": "-",
+        "provider": "-",
+        "profile": "-",
         "task_id": None,
         "heartbeat_at": state.get("heartbeat_at"),
         "mailbox_counts": mailbox_counts(layout, SCHEDULER_ID),
@@ -1864,8 +2080,8 @@ def render_dashboard(payload: dict[str, Any]) -> str:
         f"Scheduler: `{scheduler.get('status')}` pid `{scheduler.get('pid') or '-'}` cycles `{scheduler.get('cycle_count') or 0}` commands `{scheduler.get('processed_commands') or 0}`",
         "",
         "## Process Board",
-        "| Process | Role | State | Alive | PID/Target | Model | Task | Mailbox | Tokens | Cost CNY | Log |",
-        "| --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | --- |",
+        "| Process | Role | State | Alive | PID/Target | Provider/Profile | Model | Task | Mailbox | Tokens | Cost CNY | Log |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | --- |",
     ]
     for row in payload["processes"]:
         counts = row.get("mailbox_counts") or {"inbox": 0, "outbox": 0}
@@ -1874,7 +2090,7 @@ def render_dashboard(payload: dict[str, Any]) -> str:
         log_path = row.get("runtime_log_path") or "-"
         alive = "yes" if row.get("alive") else "no"
         lines.append(
-            f"| {row.get('id')} | {row.get('role')} | {row.get('status')} | {alive} | {target} | {row.get('model') or '-'} | {row.get('task_id') or '-'} | in {counts.get('inbox', 0)} / out {counts.get('outbox', 0)} | {tokens.get('total_tokens', 0)} | {tokens.get('estimated_cost_cny', 0.0)} | {log_path} |"
+            f"| {row.get('id')} | {row.get('role')} | {row.get('status')} | {alive} | {target} | {row.get('provider') or '-'} / {row.get('profile') or 'default'} | {row.get('model') or '-'} | {row.get('task_id') or '-'} | in {counts.get('inbox', 0)} / out {counts.get('outbox', 0)} | {tokens.get('total_tokens', 0)} | {tokens.get('estimated_cost_cny', 0.0)} | {log_path} |"
         )
     lines.extend(
         [
@@ -1908,12 +2124,12 @@ def render_dashboard(payload: dict[str, Any]) -> str:
             f"- Last counts: ok {payload.get('scheduler_commands', {}).get('last_processed_count', 0)} / failed {payload.get('scheduler_commands', {}).get('last_failed_count', 0)}",
             "",
             "## Tasks",
-            "| Task | State | Actor | Model | Report |",
-            "| --- | --- | --- | --- | --- |",
+            "| Task | State | Actor | Provider/Profile | Model | Attempts | Report |",
+            "| --- | --- | --- | --- | --- | ---: | --- |",
         ]
     )
     for task in payload["tasks"]:
-        lines.append(f"| {task.get('id')} | {task.get('status')} | {task.get('agent_id') or '-'} | {task.get('model') or '-'} | {task.get('report_path') or '-'} |")
+        lines.append(f"| {task.get('id')} | {task.get('status')} | {task.get('agent_id') or '-'} | {task.get('provider') or '-'} / {task.get('profile') or 'default'} | {task.get('model') or '-'} | {len(task.get('attempts') or [])} | {task.get('report_path') or '-'} |")
     lines.extend(["", "## Recent Events"])
     if payload["recent_events"]:
         lines.append("| Event | Actor | Task | Time |")
@@ -1957,14 +2173,14 @@ def command_status(args: Any) -> None:
         f"Scheduler state: `{payload.get('scheduler', {}).get('status')}` pid `{payload.get('scheduler', {}).get('pid') or '-'}` cycles `{payload.get('scheduler', {}).get('cycle_count') or 0}`",
         "",
         "## Actors",
-        "| Actor | Role | Status | Backend | Model | Task | Mailbox | Tokens |",
-        "| --- | --- | --- | --- | --- | --- | ---: | ---: |",
+        "| Actor | Role | Status | Backend | Provider/Profile | Model | Task | Mailbox | Tokens |",
+        "| --- | --- | --- | --- | --- | --- | --- | ---: | ---: |",
     ]
     for actor in payload["actors"]:
         counts = actor["mailbox_counts"]
         tokens = actor.get("token_usage") or empty_token_bucket()
         lines.append(
-            f"| {actor['id']} | {actor['role']} | {actor.get('status')} | {actor.get('runtime_backend') or '-'} | {actor.get('model')} | {actor.get('task_id') or '-'} | in {counts['inbox']} / out {counts['outbox']} | {tokens.get('total_tokens', 0)} |"
+            f"| {actor['id']} | {actor['role']} | {actor.get('status')} | {actor.get('runtime_backend') or '-'} | {actor.get('provider') or '-'} / {actor.get('profile') or 'default'} | {actor.get('model')} | {actor.get('task_id') or '-'} | in {counts['inbox']} / out {counts['outbox']} | {tokens.get('total_tokens', 0)} |"
         )
     lines.extend(["", "## Relay Cursors"])
     relay_actors = (payload.get("relay_cursors") or {}).get("actors") or {}
@@ -2071,7 +2287,7 @@ def command_recover(args: Any) -> None:
                 save_actor(layout, actor_data)
                 sync_actor_summary(layout, actor_data)
                 if args.plan_restarts:
-                    command = format_actor_command(actor_data.get("command_template") or "codex", layout=layout, session=session, actor=actor_data)
+                    command = actor_launch_command(layout, session, actor_data)
                     plan = backend.start_plan(session_name=session_name, actor_name=runtime_name, command=command, session_exists=True)
                     planned_restarts.extend(command_to_string(argv) for argv in plan)
                 if args.restart_missing:

@@ -12,10 +12,17 @@ from typing import Any
 from .paths import ProjectLayout
 
 
+ActorCommand = str | list[str]
+
+
 def command_to_string(argv: list[str]) -> str:
     if os.name == "nt":
         return subprocess.list2cmdline(argv)
     return " ".join(shlex.quote(item) for item in argv)
+
+
+def command_display(command: ActorCommand) -> str:
+    return command if isinstance(command, str) else command_to_string(command)
 
 
 def format_actor_command(template: str, *, layout: ProjectLayout, session: dict[str, Any], actor: dict[str, Any]) -> str:
@@ -134,13 +141,14 @@ class TmuxBackend:
             return []
         return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
-    def start_plan(self, *, session_name: str, actor_name: str, command: str, session_exists: bool | None = None) -> list[list[str]]:
+    def start_plan(self, *, session_name: str, actor_name: str, command: ActorCommand, session_exists: bool | None = None) -> list[list[str]]:
+        command_text = command_display(command)
         exists = self.session_exists(session_name) if session_exists is None else session_exists
         if exists:
-            return [[self.executable, "new-window", "-t", session_name, "-n", actor_name, command]]
-        return [[self.executable, "new-session", "-d", "-s", session_name, "-n", actor_name, command]]
+            return [[self.executable, "new-window", "-t", session_name, "-n", actor_name, command_text]]
+        return [[self.executable, "new-session", "-d", "-s", session_name, "-n", actor_name, command_text]]
 
-    def start_actor(self, *, session_name: str, actor_name: str, command: str, cwd: Path, log_path: Path) -> dict[str, Any]:
+    def start_actor(self, *, session_name: str, actor_name: str, command: ActorCommand, cwd: Path, log_path: Path) -> dict[str, Any]:
         if not self.available():
             raise RuntimeError(f"tmux executable not found: {self.executable}")
         commands = self.start_plan(session_name=session_name, actor_name=actor_name, command=command)
@@ -195,10 +203,10 @@ class LocalProcessBackend:
     def list_actors(self, session_name_value: str) -> list[str]:
         return []
 
-    def start_plan(self, *, session_name: str, actor_name: str, command: str, session_exists: bool | None = None) -> list[list[str]]:
-        return [[self.executable, "start", "--session", session_name, "--actor", actor_name, "--", command]]
+    def start_plan(self, *, session_name: str, actor_name: str, command: ActorCommand, session_exists: bool | None = None) -> list[list[str]]:
+        return [[self.executable, "start", "--session", session_name, "--actor", actor_name, "--", command_display(command)]]
 
-    def start_actor(self, *, session_name: str, actor_name: str, command: str, cwd: Path, log_path: Path) -> dict[str, Any]:
+    def start_actor(self, *, session_name: str, actor_name: str, command: ActorCommand, cwd: Path, log_path: Path) -> dict[str, Any]:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_handle = log_path.open("a", encoding="utf-8")
         creationflags = 0
@@ -210,7 +218,7 @@ class LocalProcessBackend:
         process = subprocess.Popen(
             command,
             cwd=str(cwd),
-            shell=True,
+            shell=isinstance(command, str),
             stdin=subprocess.DEVNULL,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
@@ -220,7 +228,7 @@ class LocalProcessBackend:
         )
         log_handle.close()
         return {
-            "commands": [command_to_string([self.executable, "start", "--session", session_name, "--actor", actor_name, "--", command])],
+            "commands": [command_to_string([self.executable, "start", "--session", session_name, "--actor", actor_name, "--", command_display(command)])],
             "target": f"pid:{process.pid}",
             "pid": process.pid,
             "log_path": str(log_path),

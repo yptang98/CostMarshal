@@ -153,7 +153,8 @@ def main() -> int:
         assert_true(Path(dispatch["prompt_file"]).is_file(), "dispatch should create a durable agent prompt")
         agent_prompt = Path(dispatch["prompt_file"]).read_text(encoding="utf-8")
         assert_true("Role: `agent`" in agent_prompt, "agent prompt should declare the agent role")
-        assert_true("Brief: `tasks/V2-0001/brief.md`" in agent_prompt, "agent prompt should point to the task brief")
+        assert_true("## Efficiency Contract" in agent_prompt, "agent prompt should avoid redundant control-plane reads")
+        assert_true("The assigned task below is authoritative" in agent_prompt, "agent prompt should inline bounded task context")
         unknown_send = run(
             temp,
             "send",

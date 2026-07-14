@@ -5,11 +5,13 @@ from pathlib import Path
 
 from . import __version__
 from .paths import default_root
+from .profiles import command_configure_profiles
 from .scheduler import (
     LEADER_WORK_TYPES,
     RISKS,
     command_collect,
     command_dispatch,
+    command_escalate,
     command_heartbeat,
     command_init,
     command_new_task,
@@ -34,24 +36,44 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"CostMarshal v2 {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    configure_profiles = sub.add_parser("configure-profiles", help="Create the user-level LongCat Codex profile without storing an API key")
+    configure_profiles.add_argument("--codex-home")
+    configure_profiles.add_argument("--longcat-profile", default="longcat")
+    configure_profiles.add_argument("--force", action="store_true")
+    configure_profiles.add_argument("--dry-run", action="store_true")
+    configure_profiles.set_defaults(func=command_configure_profiles)
+
     init = sub.add_parser("init", help="Create a v2 project without touching legacy state")
     init.add_argument("--name", default="")
     init.add_argument("--objective", required=True)
     init.add_argument("--source-project", help="Optional existing project to reference read-only")
+    init.add_argument("--workspace", help="Writable workspace used by Codex and LongCat actors; defaults to the current directory")
+    init.add_argument("--secrets-file", help="Optional local env file loaded only into actor subprocesses")
+    init.add_argument("--no-auto-escalate", dest="auto_escalate", action="store_false", default=True, help="Do not automatically route failed LongCat attempts to Codex")
     init.add_argument("--session-name", help="Backend session name; defaults to cmv2-<project>")
     init.add_argument("--backend", choices=["auto", "tmux", "local"], default="auto", help="Actor runtime backend; auto chooses a platform-appropriate backend")
     init.add_argument("--backend-command", help="Backend executable, for example a tmux binary when --backend tmux")
     init.add_argument("--leader-model", default="inherit")
-    init.add_argument("--leader-command", default="codex")
+    init.add_argument("--leader-profile")
+    init.add_argument("--leader-command", help="Legacy custom manager command; default uses the structured codex exec runner")
     init.add_argument("--tmux-command", dest="backend_command", help=argparse.SUPPRESS)
     init.set_defaults(func=command_init)
 
-    start_leader = sub.add_parser("start-leader", help="Start the persistent leader actor with the configured backend")
+    start_leader = sub.add_parser("start-leader", help="Run one on-demand Codex manager turn (legacy command name)")
     start_leader.add_argument("--project", required=True)
     start_leader.add_argument("--model")
+    start_leader.add_argument("--profile")
     start_leader.add_argument("--command")
     start_leader.add_argument("--dry-run", action="store_true")
     start_leader.set_defaults(func=command_start_leader)
+
+    run_manager = sub.add_parser("run-manager", help="Run one on-demand Codex manager turn")
+    run_manager.add_argument("--project", required=True)
+    run_manager.add_argument("--model")
+    run_manager.add_argument("--profile")
+    run_manager.add_argument("--command")
+    run_manager.add_argument("--dry-run", action="store_true")
+    run_manager.set_defaults(func=command_start_leader)
 
     new_task = sub.add_parser("new-task", help="Create a v2 bounded task")
     new_task.add_argument("--project", required=True)
@@ -59,6 +81,10 @@ def build_parser() -> argparse.ArgumentParser:
     new_task.add_argument("--title", required=True)
     new_task.add_argument("--purpose", required=True)
     new_task.add_argument("--task-type", default="analysis")
+    new_task.add_argument("--risk", choices=["low", "medium", "high"], default="low")
+    new_task.add_argument("--difficulty", choices=["simple", "normal", "hard"], default="normal")
+    new_task.add_argument("--provider", choices=["auto", "codex", "longcat"], default="auto")
+    new_task.add_argument("--profile")
     new_task.add_argument("--agent", default="auto")
     new_task.add_argument("--model", default="inherit")
     new_task.add_argument("--acceptance", action="append")
@@ -74,11 +100,25 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch.add_argument("--actor-id")
     dispatch.add_argument("--agent")
     dispatch.add_argument("--model")
+    dispatch.add_argument("--provider", choices=["auto", "codex", "longcat"])
+    dispatch.add_argument("--profile")
     dispatch.add_argument("--command")
     dispatch.add_argument("--start", action="store_true")
     dispatch.add_argument("--dry-run", action="store_true")
     dispatch.add_argument("--force", action="store_true")
     dispatch.set_defaults(func=command_dispatch)
+
+    escalate = sub.add_parser("escalate", help="Route a failed or uncertain task from LongCat to Codex")
+    escalate.add_argument("--project", required=True)
+    escalate.add_argument("--task", required=True)
+    escalate.add_argument("--reason", required=True)
+    escalate.add_argument("--actor-id")
+    escalate.add_argument("--profile")
+    escalate.add_argument("--model")
+    escalate.add_argument("--start", action="store_true")
+    escalate.add_argument("--dry-run", action="store_true")
+    escalate.add_argument("--force", action="store_true")
+    escalate.set_defaults(func=command_escalate)
 
     send = sub.add_parser("send", help="Relay a mailbox message")
     send.add_argument("--project", required=True)
