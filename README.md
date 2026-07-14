@@ -182,6 +182,8 @@ Automatic routing is intentionally small:
 - high-risk, hard, or unbounded work defaults to Codex
 - a failed LongCat process or a report containing `Status: escalate` creates a
   new Codex attempt when automatic escalation is enabled
+- every provider attempt keeps its own report under `tasks/<id>/attempts/`;
+  `completion-report.md` always points to the latest attempt
 
 ## Architecture
 

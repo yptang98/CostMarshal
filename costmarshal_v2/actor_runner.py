@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .mailbox import send_message
-from .paths import ProjectLayout, resolve_project
+from .paths import ProjectLayout, resolve_project, slugify
 from .state import (
     SCHEMA_VERSION,
     append_event,
@@ -96,8 +96,17 @@ def workspace_path(layout: ProjectLayout, project: dict[str, Any]) -> Path:
 def report_path(layout: ProjectLayout, actor: dict[str, Any]) -> Path:
     task_id = actor.get("task_id")
     if task_id:
-        return task_dir(layout, str(task_id)) / "completion-report.md"
+        return task_dir(layout, str(task_id)) / "attempts" / f"{slugify(str(actor['id']), 'actor')}.md"
     return layout.reports_dir / "manager-latest.md"
+
+
+def publish_task_report(layout: ProjectLayout, actor: dict[str, Any], attempt_report: Path) -> None:
+    task_id = actor.get("task_id")
+    if task_id and attempt_report.is_file():
+        atomic_write_text(
+            task_dir(layout, str(task_id)) / "completion-report.md",
+            attempt_report.read_text(encoding="utf-8", errors="replace"),
+        )
 
 
 def build_codex_argv(layout: ProjectLayout, actor: dict[str, Any], project: dict[str, Any], report: Path) -> list[str]:
@@ -233,6 +242,7 @@ def run_actor(layout: ProjectLayout, actor_id: str) -> int:
     input_tokens, output_tokens = usage_from_events(events)
     task_id = actor.get("task_id")
     if task_id:
+        publish_task_report(layout, actor, report)
         final_report_status = report_status(report)
         if returncode != 0:
             collected_state = "failed"

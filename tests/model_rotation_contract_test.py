@@ -125,6 +125,12 @@ print(json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 11, 'outpu
         task = json.loads((project / "tasks" / "V2-0001" / "task.json").read_text(encoding="utf-8"))
         assert [attempt["provider"] for attempt in task["attempts"]] == ["longcat", "codex"], task["attempts"]
         assert task["status"] == "waiting_leader", task
+        attempt_reports = sorted((project / "tasks" / "V2-0001" / "attempts").glob("*.md"))
+        assert len(attempt_reports) == 2, attempt_reports
+        attempt_texts = [path.read_text(encoding="utf-8") for path in attempt_reports]
+        assert any("Status: escalate" in text for text in attempt_texts), attempt_texts
+        assert any("Status: done" in text for text in attempt_texts), attempt_texts
+        assert "Codex completed escalation" in (project / "tasks" / "V2-0001" / "completion-report.md").read_text(encoding="utf-8")
         usage = [json.loads(line) for line in (project / "reports" / "usage.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
         assert {row["model"] for row in usage} >= {"LongCat-2.0", "inherit"}, usage
         print(json.dumps({"status": "ok", "profiles": [row["profile"] for row in rows[:2]]}, indent=2))
