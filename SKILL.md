@@ -1,9 +1,9 @@
 ---
 name: costmarshal
-description: "CostMarshal v2.3: scheduler-first, cost-aware low/medium/high provider orchestration for Codex CLI with conservative route optimization, durable attempts, budget reservations, isolated worker worktrees, recovery, leader acceptance, and optional ArchMarshal governance checks."
+description: "CostMarshal v2.4: scheduler-first, cost-aware low/medium/high provider orchestration for Codex CLI with conservative route optimization, recoverable runtime effects, OCI worker isolation, durable attempts, budget reservations, recovery, leader acceptance, and optional ArchMarshal governance checks."
 ---
 
-# CostMarshal v2.3
+# CostMarshal v2.4
 
 Use this skill for long or decomposable work where multiple API price/capability tiers should cooperate under explicit safety, cost, and recovery controls.
 
@@ -64,6 +64,7 @@ python scripts/costmarshal.py dashboard --project <project-dir>
 python scripts/costmarshal.py providers --project <project-dir>
 python scripts/costmarshal.py budget --project <project-dir>
 python scripts/costmarshal.py governance-status --project <project-dir>
+python scripts/costmarshal.py governance-rebind --project <project-dir>
 python scripts/costmarshal.py validate --project <project-dir>
 python scripts/costmarshal.py recover --project <project-dir> --plan-restarts
 
@@ -107,7 +108,7 @@ Task `--require-capability` values are hard constraints: providers lacking every
 - `required` is the default and may select only Docker/Podman Linux containers.
 - Missing engine/image/canary/network support fails before attempt persistence and budget reservation.
 - Images must be digest pinned and use pull-never, read-only rootfs, non-root UID, dropped capabilities, no-new-privileges, limits, and explicit mounts.
-- The current beta intentionally blocks even an attested required dispatch until the container execution adapter is enabled.
+- Required dispatch uses the attested OCI adapter and bundled digest-buildable worker image; unrestricted bridge networking is forbidden, and missing live engine/image/canary/provider-proxy evidence fails closed.
 - Development compatibility requires `init --allow-unsafe-native-workers` and `dispatch --unsafe-native`; the attestation records `strong_isolation=false`.
 
 ## Worker write policy
@@ -123,14 +124,19 @@ Task `--require-capability` values are hard constraints: providers lacking every
 
 Use `--governance required --archmarshal-wrapper <exact invoke_archmarshal.py>` only after the workspace is explicitly managed by ArchMarshal. CostMarshal stores a binding fingerprint and validates it before dispatch and actor launch. A drift blocks execution.
 
+After a CostMarshal binding-format upgrade, use `governance-rebind` to preview and
+`governance-rebind --apply` to explicitly refresh only the CostMarshal-side
+fingerprint. The prior binding remains in project audit history; ArchMarshal stays
+read-only.
+
 If adoption or repair is required, stop CostMarshal work and use the ArchMarshal skill/workflow explicitly with preview-first safety. Do not infer permission to apply an ArchMarshal plan.
 
 ## Verification before handoff
 
-Run every command listed in README's Verification section. At minimum, compile plus routing, model rotation, security, actor security, reliability, budget, concurrency, backend, ArchMarshal compatibility, and install smoke tests must pass.
+Run every command in README's Required local verification section. At minimum, compile plus routing, model rotation, security, actor security, reliability, budget, concurrency, backend, ArchMarshal compatibility, install smoke, and machine-receipt runtime tests must pass. Non-beta release-evidence commands are separate and are expected to return a machine-readable blocked result when their preregistered external inputs are absent.
 
 ## Transaction and beta boundary
 
-An explicit `migrate-state --apply` cutover makes SQLite WAL authoritative for pure scheduler commands; compatibility views are materialized after commit and repaired on restart. Stable command IDs are payload-hashed. Do not enable cutover while actors are live.
+An explicit `migrate-state --apply` cutover makes SQLite WAL authoritative for scheduler control state; compatibility views are materialized after commit and repaired on restart. Stable command IDs are payload-hashed, while spawn/stop I/O is represented by leased effects outside the transaction. Do not enable cutover while actors are live.
 
-Do not describe v2.3-beta as end-to-end exactly-once or production-isolated yet. Spawn/stop still needs a leased transactional effect worker, and the OCI snapshot/profile/credential/report adapter is not enabled. Runtime-effect commands are blocked after SQLite cutover, while required isolation fails closed before dispatch. These are release gates, not silent fallbacks.
+Do not describe v2.4-beta as economically optimal or universally production-ready yet. Spawn/stop use a leased transactional effect worker and required dispatch uses the OCI snapshot/profile/credential/report adapter, but external effects are fenced/recoverable rather than magically exactly-once. A non-beta release still requires the machine-readable real-provider shadow matrix and live malicious OCI evidence for the reviewed digest. These are explicit release gates, not silent fallbacks.

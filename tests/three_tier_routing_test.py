@@ -34,12 +34,16 @@ class ThreeTierRoutingTest(unittest.TestCase):
             [(row["provider_id"], row["tier"]) for row in new["providers"]],
             [("longcat", "low"), ("deepseek", "medium"), ("codex", "high")],
         )
-        self.assertEqual([row["env_key"] for row in new["providers"]], ["LONGCAT_API_KEY", "DEEPSEEK_API_KEY", None])
+        self.assertEqual(
+            [row["env_key"] for row in new["providers"]],
+            ["LONGCAT_API_KEY", "DEEPSEEK_API_KEY", "CODEX_API_KEY"],
+        )
         legacy = project_provider_catalog({"project_id": "old-v2"})
         self.assertEqual(
             [(row["provider_id"], row["tier"]) for row in legacy["providers"]],
             [("longcat", "low"), ("codex", "high")],
         )
+        self.assertIsNone(legacy["providers"][1]["env_key"])
         explicit = project_provider_catalog({"provider_catalog": new})
         self.assertEqual(len(explicit["providers"]), 3)
 
@@ -127,6 +131,51 @@ class ThreeTierRoutingTest(unittest.TestCase):
             next_stronger_provider(legacy_provider_catalog(), "longcat")["provider_id"],
             "codex",
         )
+
+    def test_next_stronger_provider_honors_capabilities_and_reviewed_chain(self) -> None:
+        catalog = default_provider_catalog()
+        medium_alt = deepcopy(catalog["providers"][1])
+        medium_alt["provider_id"] = "deepseek-value"
+        medium_alt["priority"] = 999
+        catalog["providers"].append(medium_alt)
+        preferred = next_stronger_provider(
+            catalog,
+            "longcat",
+            preferred_provider_ids=("longcat", "deepseek-value", "codex"),
+        )
+        self.assertEqual(preferred["provider_id"], "deepseek-value")
+
+        catalog["providers"][1]["capabilities"] = []
+        medium_alt["capabilities"] = []
+        catalog["providers"][2]["capabilities"] = ["vision"]
+        compatible = next_stronger_provider(
+            catalog,
+            "longcat",
+            required_capabilities=("vision",),
+        )
+        self.assertEqual((compatible["provider_id"], compatible["tier"]), ("codex", "high"))
+
+        catalog["providers"][2]["capabilities"] = ["Vision"]
+        case_preserved = next_stronger_provider(
+            catalog,
+            "longcat",
+            required_capabilities=("Vision",),
+        )
+        self.assertEqual(case_preserved["provider_id"], "codex")
+
+    def test_reviewed_high_never_bypasses_an_available_fallback_medium(self) -> None:
+        catalog = default_provider_catalog()
+        fallback = deepcopy(catalog["providers"][1])
+        catalog["providers"][1]["enabled"] = False
+        fallback.update({"provider_id": "medium-alt", "enabled": True, "priority": 50})
+        catalog["providers"].append(fallback)
+        selected = next_stronger_provider(
+            catalog,
+            "longcat",
+            preferred_provider_ids=("longcat", "deepseek", "codex"),
+        )
+        self.assertIsNotNone(selected)
+        self.assertEqual((selected["provider_id"], selected["tier"]), ("medium-alt", "medium"))
 
     def test_cost_estimation_requires_complete_reviewed_pricing(self) -> None:
         catalog = default_provider_catalog()

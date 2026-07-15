@@ -7,7 +7,10 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 from costmarshal_v2.locking import project_write_lock  # noqa: E402
 from costmarshal_v2.paths import resolve_project  # noqa: E402
+from costmarshal_v2.scheduler import scheduler_cycle  # noqa: E402
 
 
 def run_json(runtime: Path, *args: str) -> dict[str, object]:
@@ -101,6 +105,36 @@ def main() -> int:
         assert len(active) == 1 and active[0]["path"] == "shared/output.txt", claims
         task_dirs = [path for path in (project / "tasks").iterdir() if path.is_dir()]
         assert len(task_dirs) == 1, task_dirs
+
+        run_json(runtime, "migrate-state", "--project", str(project), "--apply")
+        effect_started = threading.Event()
+        release_effect = threading.Event()
+        cycle_error: list[BaseException] = []
+
+        def slow_effects(*args: object, **kwargs: object) -> dict[str, object]:
+            effect_started.set()
+            if not release_effect.wait(timeout=5):
+                raise AssertionError("test did not release the slow effect")
+            return {"status": "ok", "processed": [], "failed": [], "skipped": [], "dry_run": False}
+
+        def run_cycle() -> None:
+            try:
+                scheduler_cycle(layout, command_limit=1)
+            except BaseException as exc:  # noqa: BLE001 - thread assertion handoff
+                cycle_error.append(exc)
+
+        with patch("costmarshal_v2.scheduler.process_runtime_effects", slow_effects):
+            thread = threading.Thread(target=run_cycle, daemon=True)
+            thread.start()
+            assert effect_started.wait(timeout=5)
+            started = time.monotonic()
+            with project_write_lock(layout, timeout_seconds=1):
+                pass
+            assert time.monotonic() - started < 0.9
+            release_effect.set()
+            thread.join(timeout=10)
+        assert not thread.is_alive()
+        assert cycle_error == [], cycle_error
     print("concurrency contract ok")
     return 0
 

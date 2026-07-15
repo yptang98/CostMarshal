@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import hashlib
 import io
 import json
+import math
 import os
+import re
 import secrets
+import stat
 import sys
 import tempfile
 import time
@@ -15,10 +19,14 @@ from typing import Any
 
 from .control_store import (
     ControlStoreError,
+    apply_effect,
     control_store_status,
     control_store_enabled,
     control_transaction,
     current_transaction,
+    fail_effect,
+    lease_effect,
+    observe_effect,
     reconcile_project_views,
 )
 from .mailbox import deliver_outbox_message, inbox_message_ids, send_message
@@ -29,6 +37,7 @@ from .session_backend import (
     command_display,
     command_to_string,
     format_actor_command,
+    pid_start_marker,
     pid_is_alive,
     platform_summary,
     select_backend_kind,
@@ -53,9 +62,11 @@ from .locking import ProjectLockTimeout, project_write_lock, scheduler_instance_
 from .worker_isolation import (
     IsolationError,
     OciCliBackend,
+    OciWorkerExecutionAdapter,
     ResourceLimits,
     UnsafeNativeBackend,
     WorkerExecutionSpec,
+    cleanup_temporary_credential,
     select_worker_isolation_backend,
 )
 from .state import (
@@ -83,6 +94,7 @@ from .state import (
     read_json,
     read_jsonl,
     save_actor,
+    save_project,
     save_session,
     save_task,
     next_task_id,
@@ -108,6 +120,34 @@ SCHEDULER_COMMANDS = {
 }
 
 PROVIDERS = {"auto", "codex", "deepseek", "longcat"}
+SCHEDULER_FAULT_ENV = "COSTMARSHAL_SCHEDULER_FAULT"
+SPAWN_EFFECT_TYPE = "spawn_actor"
+STOP_EFFECT_TYPE = "stop_actor"
+SPAWN_EFFECT_LEASE_SECONDS = 2.0
+SPAWN_EFFECT_MAX_ATTEMPTS = 5
+GOVERNANCE_PREFLIGHT_COMMANDS = frozenset(
+    {
+        "command_start_leader",
+        "command_new_task",
+        "command_dispatch",
+        "command_escalate",
+        "command_relay",
+        "command_recover",
+    }
+)
+GOVERNANCE_SNAPSHOT_ATTEMPTS = 3
+GOVERNANCE_PROJECT_MAX_BYTES = 8 * 1024 * 1024
+
+
+class GovernancePreflightBlocked(SystemExit):
+    """A governance refusal raised before any project-side mutation."""
+
+
+def _scheduler_fault(name: str) -> None:
+    """Crash-only integration hook used to prove effect recovery boundaries."""
+
+    if os.environ.get(SCHEDULER_FAULT_ENV) == name:
+        os._exit(96)
 
 
 def print_json(payload: dict[str, Any]) -> None:
@@ -377,8 +417,8 @@ def require_non_negative_float(value: float | None, label: str) -> float | None:
     if value is None:
         return None
     result = float(value)
-    if result < 0:
-        raise SystemExit(f"{label} must be non-negative")
+    if not math.isfinite(result) or result < 0:
+        raise SystemExit(f"{label} must be finite and non-negative")
     return result
 
 
@@ -630,6 +670,16 @@ def preflight_worker_isolation(
     if unsafe_native and (project.get("governance") or {}).get("mode") == "required":
         raise SystemExit("ArchMarshal required governance forbids unsafe-native workers")
     mode = "unsafe-native" if unsafe_native else "required"
+    if (
+        mode == "required"
+        and str(actor.get("provider") or "").lower() == "codex"
+        and str(actor.get("tier") or "").lower() == "high"
+        and not str(actor.get("env_key") or "").strip()
+    ):
+        raise SystemExit(
+            "required worker preflight failed: built-in codex/high provider is missing env_key "
+            "(expected CODEX_API_KEY); update the explicit provider catalog before dispatch"
+        )
     configured_image = config.get("image")
     if not configured_image and mode == "unsafe-native":
         configured_image = "costmarshal/unsafe-native@sha256:" + ("0" * 64)
@@ -679,18 +729,26 @@ def preflight_worker_isolation(
         except IsolationError as exc:
             raise SystemExit(f"worker isolation preflight failed [{exc.code}]: {exc}") from exc
     attestation = selected.attestation.to_dict()
-    if attestation.get("strong_isolation"):
-        # The isolated execution adapter is deliberately fail-closed until the
-        # attested snapshot/profile/report protocol is used by actor_runner.
-        raise SystemExit(
-            "OCI isolation attested, but the container worker execution adapter is not enabled in this build; "
-            "native fallback is forbidden"
-        )
     return {
         "mode": mode,
         "project_opt_in": project_opt_in,
         "dispatch_opt_in": bool(unsafe_native),
         "attestation": attestation,
+        "execution": {
+            "engine": selected.backend.kind,
+            "image": str(configured_image or ""),
+            "network_mode": network_mode,
+            "network_name": str(network_name) if network_name else None,
+            "workspace_mode": spec.workspace_mode,
+            "limits": {
+                "memory_mb": limits.memory_mb,
+                "cpus": limits.cpus,
+                "pids": limits.pids,
+                "timeout_seconds": limits.timeout_seconds,
+                "tmpfs_mb": limits.tmpfs_mb,
+                "home_tmpfs_mb": limits.home_tmpfs_mb,
+            },
+        },
     }
 
 
@@ -895,7 +953,13 @@ def command_init(args: Any) -> None:
     print_json({"status": "ok", "project": str(project_dir), "project_id": project_id, "session_name": session_name, "backend": backend_kind})
 
 
-def start_actor(layout: ProjectLayout, actor: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
+def start_actor(
+    layout: ProjectLayout,
+    actor: dict[str, Any],
+    *,
+    dry_run: bool,
+    persist_runtime_state: bool = True,
+) -> dict[str, Any]:
     project = load_project(layout)
     governance = project.get("governance") or {"mode": "off"}
     if governance.get("mode") == "required" or governance.get("ready"):
@@ -910,8 +974,11 @@ def start_actor(layout: ProjectLayout, actor: dict[str, Any], *, dry_run: bool) 
             raise SystemExit(f"ArchMarshal governance gate blocked actor launch [{exc.code}]: {exc}") from exc
         if not validation.get("valid"):
             raise SystemExit("ArchMarshal governance gate blocked actor launch: binding is not valid")
-    if actor.get("role") == "agent" and actor.get("command_template") and not project.get("allow_unsafe_custom_worker_commands"):
-        raise SystemExit("Custom worker commands are disabled because they bypass sandbox and secret isolation")
+    if actor.get("role") == "agent" and actor.get("command_template"):
+        if (actor.get("isolation") or {}).get("mode") == "required":
+            raise SystemExit("Custom worker commands cannot bypass required OCI isolation")
+        if not project.get("allow_unsafe_custom_worker_commands"):
+            raise SystemExit("Custom worker commands are disabled because they bypass sandbox and secret isolation")
     session = load_session(layout)
     backend = backend_from_session(session)
     session_name = backend_session_name(session)
@@ -936,8 +1003,9 @@ def start_actor(layout: ProjectLayout, actor: dict[str, Any], *, dry_run: bool) 
             "planned_commands": redact_launch_token([command_to_string(argv) for argv in plan], actor),
         }
     prompt_path = refresh_actor_prompt(layout, actor)
-    save_actor(layout, actor)
-    sync_actor_summary(layout, actor)
+    if persist_runtime_state:
+        save_actor(layout, actor)
+        sync_actor_summary(layout, actor)
     launch = backend.start_actor(
         session_name=session_name,
         actor_name=runtime_name,
@@ -945,17 +1013,27 @@ def start_actor(layout: ProjectLayout, actor: dict[str, Any], *, dry_run: bool) 
         cwd=layout.project_dir,
         log_path=layout.transcripts_dir / f"{slugify(actor['id'], 'actor')}.log",
     )
-    actor = load_actor(layout, actor["id"])
-    runtime = actor_runtime(actor)
-    actor["status"] = "running"
-    runtime["started_at"] = now_iso()
-    runtime["last_launch_command"] = redact_launch_token(command_display(command), actor)
-    runtime["target"] = launch.get("target")
-    runtime["pid"] = launch.get("pid")
-    runtime["log_path"] = relpath(Path(launch["log_path"]), layout.project_dir) if launch.get("log_path") else None
-    save_actor(layout, actor)
-    sync_actor_summary(layout, actor)
-    append_event(layout, "actor_started", actor_id=actor["id"], backend=backend.kind, runtime_target=runtime.get("target"), pid=runtime.get("pid"))
+    process_marker = pid_start_marker(launch.get("pid")) if backend.kind == "local" else None
+    if persist_runtime_state:
+        actor = load_actor(layout, actor["id"])
+        runtime = actor_runtime(actor)
+        actor["status"] = "running"
+        runtime["started_at"] = now_iso()
+        runtime["last_launch_command"] = redact_launch_token(command_display(command), actor)
+        runtime["target"] = launch.get("target")
+        runtime["pid"] = launch.get("pid")
+        runtime["process_start_marker"] = process_marker
+        runtime["log_path"] = relpath(Path(launch["log_path"]), layout.project_dir) if launch.get("log_path") else None
+        save_actor(layout, actor)
+        sync_actor_summary(layout, actor)
+        append_event(layout, "actor_started", actor_id=actor["id"], backend=backend.kind, runtime_target=runtime.get("target"), pid=runtime.get("pid"))
+    else:
+        runtime = {
+            "target": launch.get("target"),
+            "pid": launch.get("pid"),
+            "process_start_marker": process_marker,
+            "log_path": relpath(Path(launch["log_path"]), layout.project_dir) if launch.get("log_path") else None,
+        }
     return {
         "actor": actor["id"],
         "dry_run": False,
@@ -964,6 +1042,609 @@ def start_actor(layout: ProjectLayout, actor: dict[str, Any], *, dry_run: bool) 
         "commands": redact_launch_token(launch.get("commands", []), actor),
         "pid": runtime.get("pid"),
         "runtime_target": runtime.get("target"),
+        "process_start_marker": runtime.get("process_start_marker"),
+    }
+
+
+def _spawn_effect_id(attempt_id: str) -> str:
+    return f"EFF-SPAWN-{attempt_id}"
+
+
+def _spawn_effect_payload(actor: dict[str, Any]) -> dict[str, Any]:
+    launch_token = str(actor.get("launch_token") or "")
+    return {
+        "actor_id": str(actor["id"]),
+        "task_id": str(actor.get("task_id") or ""),
+        "attempt_id": str(actor.get("attempt_id") or ""),
+        "launch_token_sha256": hashlib.sha256(launch_token.encode("utf-8")).hexdigest(),
+    }
+
+
+def _stop_effect_payload(actor: dict[str, Any], *, reason: str | None) -> dict[str, Any]:
+    runtime = actor.get("runtime") or {}
+    return {
+        "actor_id": str(actor["id"]),
+        "attempt_id": str(actor.get("attempt_id") or ""),
+        "process_start_marker": str(runtime.get("process_start_marker") or ""),
+        "container_name": str(runtime.get("container_name") or ""),
+        "reason": str(reason or ""),
+    }
+
+
+def _validate_stop_effect(layout: ProjectLayout, effect: dict[str, Any]) -> dict[str, Any]:
+    payload = effect.get("payload") or {}
+    actor_id = str(payload.get("actor_id") or "")
+    if effect.get("effect_type") != STOP_EFFECT_TYPE or not actor_id or not actor_exists(layout, actor_id):
+        raise ValueError("stop effect references a missing actor")
+    actor = load_actor(layout, actor_id)
+    if str(payload.get("attempt_id") or "") != str(actor.get("attempt_id") or ""):
+        raise ValueError("stop effect attempt fence does not match the actor")
+    expected_marker = str(payload.get("process_start_marker") or "")
+    current_marker = str((actor.get("runtime") or {}).get("process_start_marker") or "")
+    if expected_marker and current_marker and expected_marker != current_marker:
+        raise ValueError("stop effect process marker is stale")
+    return actor
+
+
+def _required_stop_spec(layout: ProjectLayout, actor: dict[str, Any]) -> WorkerExecutionSpec:
+    isolation = actor.get("isolation") or {}
+    execution = isolation.get("execution") or {}
+    runtime = actor.get("runtime") or {}
+    project = load_project(layout)
+    attempt_id = str(actor.get("attempt_id") or "")
+    bundle = (
+        layout.root
+        / "worker-bundles"
+        / slugify(str(project.get("project_id") or "project"), "project")
+        / slugify(attempt_id, "attempt")
+    ).resolve()
+    limits_row = execution.get("limits") or {}
+    credential_cleanup = runtime.get("credential_cleanup") or {}
+    credential_path = (
+        Path(str(credential_cleanup.get("path"))).resolve()
+        if (
+            credential_cleanup.get("required")
+            and credential_cleanup.get("path")
+            and Path(str(credential_cleanup.get("path"))).is_file()
+        )
+        else None
+    )
+    return WorkerExecutionSpec(
+        project_id=str(project.get("project_id") or "project"),
+        actor_id=str(actor["id"]),
+        attempt_id=attempt_id,
+        image=str(execution.get("image") or ""),
+        workspace=Path(str(runtime.get("execution_workspace") or project.get("workspace") or "")).resolve(),
+        workspace_mode="rw" if execution.get("workspace_mode") == "rw" else "ro",
+        profile_path=bundle / "profile.config.toml",
+        output_exchange=bundle / "out",
+        credential_path=credential_path,
+        provider_env_key=str(actor.get("env_key")) if credential_path and actor.get("env_key") else None,
+        credential_cleanup="delete-after-use" if credential_path else "preserve",
+        credential_temp_root=bundle / "credential" if credential_path else None,
+        isolation_mode="required",
+        engine=str(execution.get("engine") or "auto"),
+        network_mode=str(execution.get("network_mode") or "provider-proxy"),
+        network_name=execution.get("network_name"),
+        forbidden_mount_roots=(layout.project_dir.resolve(),),
+        limits=ResourceLimits(
+            memory_mb=int(limits_row.get("memory_mb") or 2048),
+            cpus=float(limits_row.get("cpus") or 2.0),
+            pids=int(limits_row.get("pids") or 256),
+            timeout_seconds=float(limits_row.get("timeout_seconds") or 30.0),
+            tmpfs_mb=int(limits_row.get("tmpfs_mb") or 256),
+            home_tmpfs_mb=int(limits_row.get("home_tmpfs_mb") or 64),
+        ),
+    )
+
+
+def _cleanup_prestart_credential(
+    layout: ProjectLayout,
+    actor: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Delete a crash-left credential before any provider execution started."""
+
+    runtime = actor.get("runtime") or {}
+    cleanup = runtime.get("credential_cleanup") or {}
+    if (
+        runtime.get("provider_execution_state") in {"started", "finished"}
+        or cleanup.get("status") not in {"creating", "pending"}
+        or not cleanup.get("required")
+        or not cleanup.get("path")
+    ):
+        return None
+    raw_path = Path(str(cleanup["path"]))
+    if raw_path.exists():
+        spec = _required_stop_spec(layout, actor)
+        if spec.credential_path is None:
+            raise IsolationError(
+                "credential_cleanup_failed",
+                "pre-start credential is not a safe regular file",
+            )
+        receipt = cleanup_temporary_credential(spec)
+        credential_id = receipt.credential_id
+        bytes_removed = receipt.bytes_removed
+        deleted = receipt.deleted
+    else:
+        credential_id = hashlib.sha256(os.fsencode(raw_path.absolute())).hexdigest()[:24]
+        bytes_removed = 0
+        deleted = True
+    actor_data = load_actor(layout, str(actor["id"]))
+    actor_runtime_data = actor_data.setdefault("runtime", {})
+    actor_runtime_data["credential_generation"] = int(
+        actor_runtime_data.get("credential_generation") or 0
+    ) + 1
+    actor_runtime_data["credential_cleanup"] = {
+        "required": True,
+        "path": str(raw_path),
+        "status": "deleted_recovered",
+        "identifier": credential_id,
+        "bytes_removed": bytes_removed,
+        "recovered_at": now_iso(),
+    }
+    save_actor(layout, actor_data)
+    sync_actor_summary(layout, actor_data)
+    append_event(
+        layout,
+        "prestart_credential_recovered",
+        actor_id=actor_data["id"],
+        attempt_id=actor_data.get("attempt_id"),
+        credential_identifier=credential_id,
+        bytes_removed=bytes_removed,
+    )
+    return {
+        "identifier": credential_id,
+        "deleted": deleted,
+        "bytes_removed": bytes_removed,
+    }
+def _registered_spawn_observation(actor: dict[str, Any]) -> dict[str, Any] | None:
+    """Return durable proof that this exact fenced attempt already entered its runner."""
+
+    payload = _spawn_effect_payload(actor)
+    runtime = actor.get("runtime") or {}
+    if runtime.get("registered_launch_token_sha256") != payload["launch_token_sha256"]:
+        return None
+    if runtime.get("provider_execution_state") not in {"started", "finished"}:
+        return None
+    return {
+        "source": "runner_registration",
+        "actor_id": payload["actor_id"],
+        "task_id": payload["task_id"],
+        "attempt_id": payload["attempt_id"],
+        "launch_token_sha256": payload["launch_token_sha256"],
+        "backend": runtime.get("backend"),
+        "pid": runtime.get("pid") or runtime.get("runner_pid"),
+        "runtime_target": runtime.get("target"),
+        "process_start_marker": runtime.get("process_start_marker"),
+        "container_name": runtime.get("container_name"),
+        "container_id": runtime.get("container_id"),
+        "container_command": runtime.get("container_command"),
+        "container_network_id": runtime.get("container_network_id"),
+    }
+
+
+def _validate_spawn_effect(layout: ProjectLayout, effect: dict[str, Any]) -> dict[str, Any]:
+    payload = effect.get("payload") or {}
+    actor_id = str(payload.get("actor_id") or "")
+    task_id = str(payload.get("task_id") or "")
+    attempt_id = str(payload.get("attempt_id") or "")
+    if effect.get("effect_type") != SPAWN_EFFECT_TYPE or not actor_id or not task_id or not attempt_id:
+        raise ValueError("spawn effect payload is incomplete")
+    if not actor_exists(layout, actor_id) or not task_exists(layout, task_id):
+        raise ValueError("spawn effect references missing actor or task")
+    actor = load_actor(layout, actor_id)
+    expected = _spawn_effect_payload(actor)
+    if any(str(payload.get(key) or "") != str(expected[key]) for key in expected):
+        raise ValueError("spawn effect fence or payload hash does not match the actor")
+    task = load_task(layout, task_id)
+    attempt = next(
+        (row for row in task.get("attempts") or [] if row.get("attempt_id") == attempt_id),
+        None,
+    )
+    if attempt is None or attempt.get("actor_id") != actor_id:
+        raise ValueError("spawn effect attempt is not bound to its actor")
+    if (task.get("attempts") or [])[-1].get("attempt_id") != attempt_id:
+        raise ValueError("spawn effect attempt is stale")
+    return actor
+
+
+def _record_spawn_observation(
+    layout: ProjectLayout,
+    *,
+    effect: dict[str, Any],
+    observation: dict[str, Any],
+) -> None:
+    """Materialize launch metadata idempotently through the canonical control store."""
+
+    effect_id = str(effect["effect_id"])
+    payload = effect.get("payload") or {}
+    with control_transaction(
+        layout,
+        command_name="effect_spawn_observed",
+        command_id=f"EFFECT-STATE-{effect_id}",
+        payload={"effect_id": effect_id, "observation": observation},
+    ) as transaction:
+        if transaction.replay:
+            return
+        actor = _validate_spawn_effect(layout, effect)
+        runtime = actor.setdefault("runtime", {})
+        if runtime.get("provider_execution_state") not in {"started", "finished"}:
+            actor["status"] = "running"
+        runtime["started_at"] = runtime.get("started_at") or now_iso()
+        runtime["target"] = observation.get("runtime_target") or runtime.get("target")
+        runtime["pid"] = observation.get("pid") or runtime.get("pid")
+        runtime["process_start_marker"] = (
+            observation.get("process_start_marker") or runtime.get("process_start_marker")
+        )
+        runtime["log_path"] = observation.get("log_path") or runtime.get("log_path")
+        runtime["spawn_effect_id"] = effect_id
+        save_actor(layout, actor)
+        sync_actor_summary(layout, actor)
+        task = load_task(layout, str(payload["task_id"]))
+        for attempt in task.get("attempts") or []:
+            if attempt.get("attempt_id") == payload["attempt_id"]:
+                if attempt.get("status") in {"preparing", "dispatched", "starting", "launch_pending"}:
+                    attempt["status"] = "running"
+                attempt["started_at"] = attempt.get("started_at") or now_iso()
+                attempt["spawn_effect_id"] = effect_id
+                break
+        if task.get("status") == "dispatched":
+            set_task_state(layout, task, "running")
+        else:
+            save_task(layout, task)
+        append_event(
+            layout,
+            "actor_started",
+            actor_id=actor["id"],
+            task_id=payload["task_id"],
+            attempt_id=payload["attempt_id"],
+            backend=observation.get("backend"),
+            runtime_target=observation.get("runtime_target"),
+            pid=observation.get("pid"),
+            effect_id=effect_id,
+        )
+
+
+def _record_stop_observation(
+    layout: ProjectLayout,
+    *,
+    effect: dict[str, Any],
+    observation: dict[str, Any],
+) -> None:
+    effect_id = str(effect["effect_id"])
+    payload = effect.get("payload") or {}
+    with control_transaction(
+        layout,
+        command_name="effect_stop_observed",
+        command_id=f"EFFECT-STATE-{effect_id}",
+        payload={"effect_id": effect_id, "observation": observation},
+    ) as transaction:
+        if transaction.replay:
+            return
+        actor = _validate_stop_effect(layout, effect)
+        actor["status"] = "stopped"
+        actor["stopped_at"] = actor.get("stopped_at") or now_iso()
+        actor["stop_reason"] = payload.get("reason") or actor.get("stop_reason")
+        actor["stop_effect_id"] = effect_id
+        runtime = actor.setdefault("runtime", {})
+        runtime["stop_observation"] = observation
+        if observation.get("source") in {"oci_stop", "oci_already_absent"}:
+            runtime["oci_lifecycle_state"] = "cleaned"
+            cleanup = runtime.get("credential_cleanup")
+            if isinstance(cleanup, dict):
+                cleanup["status"] = (
+                    "deleted" if observation.get("credential_deleted") else "cleanup_not_confirmed"
+                )
+        save_actor(layout, actor)
+        sync_actor_summary(layout, actor)
+        if actor.get("role") == "agent":
+            send_message(
+                layout,
+                sender=SCHEDULER_ID,
+                recipient=LEADER_ID,
+                subject=f"Actor stopped: {actor['id']}",
+                body=f"{actor['id']} is stopped. Reason: {payload.get('reason') or 'not specified'}.",
+                task_id=actor.get("task_id"),
+            )
+        append_event(
+            layout,
+            "actor_stopped",
+            actor_id=actor["id"],
+            stop_runtime=True,
+            reason=payload.get("reason"),
+            effect_id=effect_id,
+            observation_source=observation.get("source"),
+        )
+
+
+def _record_terminal_effect_failure(
+    layout: ProjectLayout,
+    *,
+    effect: dict[str, Any],
+    error: str,
+    owner: str | None,
+) -> None:
+    """Atomically fail an effect and project recoverable actor/task state."""
+
+    payload = effect.get("payload") or {}
+    actor_id = str(payload.get("actor_id") or "")
+    effect_id = str(effect["effect_id"])
+    with control_transaction(
+        layout,
+        command_name="effect_terminal_failure",
+        command_id=f"EFFECT-FAILURE-STATE-{effect_id}",
+        payload={"effect_id": effect_id, "error": error},
+    ) as transaction:
+        if transaction.replay:
+            return
+        transaction.finalize_dead_effect(effect_id=effect_id, owner=owner, error=error)
+        _scheduler_fault("effect.after_dead_status_before_projection")
+        if not actor_id or not actor_exists(layout, actor_id):
+            return
+        actor = load_actor(layout, actor_id)
+        runtime = actor.setdefault("runtime", {})
+        runtime["effect_failure_id"] = effect_id
+        runtime["effect_failure_error"] = error
+        runtime["effect_failure_at"] = now_iso()
+        task_id = actor.get("task_id")
+        attempt_id = actor.get("attempt_id")
+        stale_attempt = False
+        if task_id and attempt_id and task_exists(layout, str(task_id)):
+            task = load_task(layout, str(task_id))
+            task_attempts = task.get("attempts") or []
+            stale_attempt = bool(
+                task_attempts and task_attempts[-1].get("attempt_id") != attempt_id
+            )
+            for attempt in task_attempts:
+                if attempt.get("attempt_id") != attempt_id:
+                    continue
+                attempt["effect_failure_id"] = effect_id
+                attempt["launch_error"] = error
+                if not stale_attempt:
+                    attempt["status"] = "needs_recovery"
+                break
+            save_task(layout, task)
+        if stale_attempt:
+            actor["status"] = "stopped"
+            actor["stopped_at"] = actor.get("stopped_at") or now_iso()
+            runtime["effect_failure_disposition"] = "stale_attempt_ignored"
+        else:
+            actor["status"] = "needs_recovery"
+        save_actor(layout, actor)
+        sync_actor_summary(layout, actor)
+        append_event(
+            layout,
+            "runtime_effect_stale_ignored" if stale_attempt else "runtime_effect_failed_permanently",
+            effect_id=effect_id,
+            effect_type=effect.get("effect_type"),
+            actor_id=actor_id,
+            task_id=task_id,
+            attempt_id=attempt_id,
+            error=error,
+        )
+
+
+def _execute_stop_effect(
+    layout: ProjectLayout,
+    *,
+    effect: dict[str, Any],
+    owner: str,
+) -> dict[str, Any]:
+    actor = _validate_stop_effect(layout, effect)
+    runtime = actor.get("runtime") or {}
+    payload = effect.get("payload") or {}
+    if effect.get("status") == "observed" or effect.get("observation"):
+        observation = effect.get("observation") or {}
+        if effect.get("status") != "observed":
+            observe_effect(layout, effect_id=str(effect["effect_id"]), owner=owner, observation=observation)
+    else:
+        session = load_session(layout)
+        backend = backend_from_session(session)
+        backend_alive = backend.available() and backend.actor_alive(
+            session_name=backend_session_name(session),
+            actor_name=runtime.get("actor_name") or actor_runtime_name(actor["id"]),
+            target=runtime.get("target"),
+            pid=runtime.get("pid"),
+            process_start_marker=runtime.get("process_start_marker"),
+        )
+        provider_finished = runtime.get("provider_execution_state") == "finished"
+        source = "already_stopped" if provider_finished or not backend_alive else "backend_stop"
+        container_status = None
+        cleanup = None
+        if (
+            (actor.get("isolation") or {}).get("mode") == "required"
+            and runtime.get("container_name")
+            and runtime.get("container_command")
+            and not provider_finished
+        ):
+            spec = _required_stop_spec(layout, actor)
+            adapter = OciWorkerExecutionAdapter(OciCliBackend(spec.engine))
+            durable_container_id = str(runtime.get("container_id") or "")
+            try:
+                handle = adapter.attach(
+                    spec,
+                    container_name=str(runtime["container_name"]),
+                    container_id=durable_container_id or None,
+                    command=tuple(str(item) for item in runtime["container_command"]),
+                )
+                if not durable_container_id:
+                    def persist_stop_identity() -> None:
+                        current_actor = _validate_stop_effect(layout, effect)
+                        current_actor.setdefault("runtime", {})["container_id"] = handle.container_id
+                        save_actor(layout, current_actor)
+
+                    with control_transaction(
+                        layout,
+                        command_name="effect_stop_identity",
+                        command_id=f"EFFECT-STOP-IDENTITY-{effect['effect_id']}",
+                        payload={"effect_id": effect["effect_id"], "container_id": handle.container_id},
+                    ) as identity_transaction:
+                        if not identity_transaction.replay:
+                            persist_stop_identity()
+                    durable_container_id = handle.container_id
+                    runtime["container_id"] = handle.container_id
+                inspection = adapter.stop(handle, grace_seconds=10)
+                cleanup = adapter.cleanup(handle)
+                container_status = inspection.status
+                source = "oci_stop"
+            except IsolationError:
+                if not re.fullmatch(r"[0-9a-f]{64}", durable_container_id):
+                    raise
+                cleanup = adapter.cleanup_confirmed_absent(
+                    spec,
+                    container_name=str(runtime["container_name"]),
+                    container_id=durable_container_id,
+                    command=tuple(str(item) for item in runtime["container_command"]),
+                )
+                container_status = "absent"
+                source = "oci_already_absent"
+        elif backend_alive:
+            backend.stop_actor(
+                target=str(runtime.get("target") or ""),
+                pid=runtime.get("pid"),
+                process_start_marker=runtime.get("process_start_marker"),
+            )
+        _scheduler_fault("effect.after_stop_before_observe")
+        observation = {
+            "source": source,
+            "actor_id": actor["id"],
+            "attempt_id": actor.get("attempt_id"),
+            "process_start_marker": runtime.get("process_start_marker") or payload.get("process_start_marker"),
+            "backend": runtime.get("backend"),
+            "runtime_target": runtime.get("target"),
+            "pid": runtime.get("pid"),
+            "container_name": runtime.get("container_name"),
+            "container_id": runtime.get("container_id"),
+            "container_status": container_status,
+            "container_removed": cleanup.container_removed if cleanup is not None else None,
+            "credential_deleted": cleanup.credential.deleted if cleanup is not None else None,
+        }
+        observe_effect(layout, effect_id=str(effect["effect_id"]), owner=owner, observation=observation)
+    _record_stop_observation(layout, effect=effect, observation=observation)
+    applied = apply_effect(
+        layout,
+        effect_id=str(effect["effect_id"]),
+        owner=owner,
+        result={"status": "stopped", "observation": observation},
+    )
+    return {
+        "effect_id": str(effect["effect_id"]),
+        "effect_type": STOP_EFFECT_TYPE,
+        "actor_id": observation.get("actor_id"),
+        "attempt_id": observation.get("attempt_id"),
+        "status": applied.get("status"),
+        "source": observation.get("source"),
+    }
+
+
+def process_runtime_effects(
+    layout: ProjectLayout,
+    *,
+    limit: int = 16,
+    dry_run: bool = False,
+    _governance_prevalidated: bool = False,
+) -> dict[str, Any]:
+    """Lease and apply recoverable runtime effects without holding a DB transaction over I/O."""
+
+    if not _governance_prevalidated:
+        _validate_governance_preflight(layout, operation="runtime-effects")
+    if not control_store_enabled(layout):
+        return {"status": "disabled", "processed": [], "failed": [], "dry_run": bool(dry_run)}
+    if dry_run:
+        return {"status": "ok", "processed": [], "failed": [], "dry_run": True}
+    owner = f"scheduler:{os.getpid()}:{secrets.token_hex(8)}"
+    processed: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    for _ in range(max(0, int(limit))):
+        effect = lease_effect(
+            layout,
+            owner=owner,
+            ttl_seconds=SPAWN_EFFECT_LEASE_SECONDS,
+            effect_types=(SPAWN_EFFECT_TYPE, STOP_EFFECT_TYPE),
+        )
+        if effect is None:
+            break
+        effect_id = str(effect["effect_id"])
+        try:
+            # The effect lease is canonical SQLite state, while the runtime
+            # executors still validate/load actor and task compatibility
+            # views.  A command can hard-exit after committing the effect but
+            # before materializing those views.  Reconcile after the lease so
+            # we also cover a concurrent command commit that happens while the
+            # scheduler is selecting work; otherwise a valid effect can be
+            # mistaken for corrupt input and marked dead.
+            reconcile_project_views(layout)
+            if effect.get("effect_type") == STOP_EFFECT_TYPE:
+                processed.append(_execute_stop_effect(layout, effect=effect, owner=owner))
+            else:
+                actor = _validate_spawn_effect(layout, effect)
+                if effect.get("status") == "observed":
+                    observation = effect.get("observation") or {}
+                else:
+                    observation = effect.get("observation") or _registered_spawn_observation(actor)
+                    if observation is None:
+                        launch = start_actor(layout, actor, dry_run=False, persist_runtime_state=False)
+                        observation = {
+                            "source": "backend_start",
+                            "actor_id": actor["id"],
+                            "task_id": actor.get("task_id"),
+                            "attempt_id": actor.get("attempt_id"),
+                            "launch_token_sha256": _spawn_effect_payload(actor)["launch_token_sha256"],
+                            "backend": launch.get("backend"),
+                            "pid": launch.get("pid"),
+                            "runtime_target": launch.get("runtime_target"),
+                            "process_start_marker": launch.get("process_start_marker"),
+                            "log_path": relpath(
+                                layout.transcripts_dir / f"{slugify(actor['id'], 'actor')}.log",
+                                layout.project_dir,
+                            ),
+                        }
+                        _scheduler_fault("effect.after_spawn_before_observe")
+                    observe_effect(layout, effect_id=effect_id, owner=owner, observation=observation)
+                _record_spawn_observation(layout, effect=effect, observation=observation)
+                applied = apply_effect(
+                    layout,
+                    effect_id=effect_id,
+                    owner=owner,
+                    result={"status": "started", "observation": observation},
+                )
+                processed.append(
+                    {
+                        "effect_id": effect_id,
+                        "effect_type": SPAWN_EFFECT_TYPE,
+                        "actor_id": observation.get("actor_id"),
+                        "attempt_id": observation.get("attempt_id"),
+                        "status": applied.get("status"),
+                        "source": observation.get("source"),
+                    }
+                )
+        except ValueError as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            _record_terminal_effect_failure(
+                layout,
+                effect=effect,
+                error=error,
+                owner=owner,
+            )
+            failed.append({"effect_id": effect_id, "retryable": False, "error": error})
+        except (Exception, SystemExit) as exc:  # external runtime failures are durable and retryable
+            error = f"{type(exc).__name__}: {exc}"
+            retryable = int(effect.get("attempts") or 0) < SPAWN_EFFECT_MAX_ATTEMPTS
+            if retryable:
+                fail_effect(layout, effect_id=effect_id, owner=owner, error=error, retryable=True)
+            else:
+                _record_terminal_effect_failure(
+                    layout,
+                    effect=effect,
+                    error=error,
+                    owner=owner,
+                )
+            failed.append({"effect_id": effect_id, "retryable": retryable, "error": error})
+    return {
+        "status": "ok" if not failed else "degraded",
+        "processed": processed,
+        "failed": failed,
+        "dry_run": False,
     }
 
 
@@ -1186,28 +1867,46 @@ def command_budget_status(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
     project = load_project(layout)
     limit = (project.get("routing_policy") or {}).get("project_budget_cny")
-    commitment = project_budget_commitment(layout)
-    attempts = [
-        {
-            "task_id": task["id"],
-            "attempt_id": attempt.get("attempt_id"),
-            "provider": attempt.get("provider"),
-            "status": attempt.get("status"),
-            "reserved_cost_cny": attempt.get("reserved_cost_cny"),
-            "actual_cost_cny": attempt.get("actual_cost_cny"),
-            "commitment_cny": attempt_budget_commitment(attempt),
-            "cost_settled": bool(attempt.get("cost_settled")),
-        }
-        for task in task_rows(layout)
-        for attempt in task.get("attempts") or []
-    ]
+    attempts: list[dict[str, Any]] = []
+    reconciliation_errors: list[str] = []
+    commitment = 0.0
+    for task in task_rows(layout):
+        for attempt in task.get("attempts") or []:
+            error = None
+            attempt_commitment = None
+            try:
+                attempt_commitment = attempt_budget_commitment(attempt)
+                commitment += attempt_commitment
+            except ValueError as exc:
+                error = str(exc)
+                reconciliation_errors.append(f"{task['id']}: {error}")
+            attempts.append(
+                {
+                    "task_id": task["id"],
+                    "attempt_id": attempt.get("attempt_id"),
+                    "provider": attempt.get("provider"),
+                    "status": attempt.get("status"),
+                    "reserved_cost_cny": attempt.get("reserved_cost_cny"),
+                    "actual_cost_cny": attempt.get("actual_cost_cny"),
+                    "commitment_cny": attempt_commitment,
+                    "cost_settled": bool(attempt.get("cost_settled")),
+                    "reconciliation_status": "unknown" if error else "ok",
+                    "reconciliation_error": error,
+                }
+            )
+    commitment_value = None if reconciliation_errors else round(commitment, 9)
     print_json(
         {
-            "status": "ok",
+            "status": "blocked" if reconciliation_errors else "ok",
             "project": str(layout.project_dir),
             "limit_cny": limit,
-            "commitment_cny": commitment,
-            "remaining_cny": None if limit is None else round(float(limit) - commitment, 9),
+            "commitment_cny": commitment_value,
+            "remaining_cny": (
+                None
+                if limit is None or commitment_value is None
+                else round(float(limit) - commitment_value, 9)
+            ),
+            "reconciliation_errors": reconciliation_errors,
             "attempts": attempts,
         }
     )
@@ -1240,6 +1939,71 @@ def command_governance_status(args: Any) -> None:
     )
     if error:
         raise SystemExit(1)
+
+
+def command_governance_rebind(args: Any) -> None:
+    """Preview or explicitly replace only CostMarshal's read-only binding."""
+
+    layout = resolve_project(args.root, args.project)
+    project = load_project(layout)
+    governance = project.get("governance") or {"mode": "off", "ready": False}
+    if governance.get("mode") == "off":
+        raise SystemExit("governance rebind requires an existing auto/required integration")
+    wrapper_path = governance.get("wrapper_path")
+    try:
+        inspection = inspect_governance(
+            project.get("workspace"),
+            mode="required",
+            wrapper_path=wrapper_path,
+        )
+    except GovernanceError as exc:
+        raise SystemExit(f"ArchMarshal governance rebind blocked [{exc.code}]: {exc}") from exc
+    new_binding = inspection.get("binding")
+    if not inspection.get("ready") or not isinstance(new_binding, dict):
+        raise SystemExit("ArchMarshal governance rebind blocked: current identity is not ready")
+    old_binding = governance.get("binding")
+    changed = old_binding != new_binding
+    payload = {
+        "status": "ok",
+        "project": str(layout.project_dir),
+        "mode": "apply" if args.apply else "preview",
+        "changed": changed,
+        "old_binding": old_binding,
+        "new_binding": new_binding,
+    }
+    if not args.apply:
+        print_json(payload)
+        return
+    history = list(governance.get("binding_history") or [])
+    if old_binding is not None:
+        history.append(
+            {
+                "binding": old_binding,
+                "replaced_at": now_iso(),
+                "reason": "explicit_costmarshal_rebind",
+            }
+        )
+    governance.update(
+        {
+            "status": "ready",
+            "ready": True,
+            "doctor_state": inspection.get("doctor_state"),
+            "warnings": [],
+            "binding": new_binding,
+            "binding_history": history[-10:],
+            "rebound_at": now_iso(),
+        }
+    )
+    project["governance"] = governance
+    save_project(layout, project)
+    append_event(
+        layout,
+        "governance_binding_rebound",
+        changed=changed,
+        old_format=old_binding.get("format") if isinstance(old_binding, dict) else None,
+        new_format=new_binding.get("format"),
+    )
+    print_json(payload)
 
 
 def command_dispatch(args: Any) -> None:
@@ -1298,23 +2062,34 @@ def command_dispatch(args: Any) -> None:
         )
     except (RoutingValidationError, ValueError) as exc:
         raise SystemExit(f"Unable to route task: {exc}") from exc
-    max_cost = task.get("max_cost_cny")
-    project_budget = (project.get("routing_policy") or {}).get("project_budget_cny")
+    max_cost = require_non_negative_float(task.get("max_cost_cny"), "stored task budget")
+    project_budget = require_non_negative_float(
+        (project.get("routing_policy") or {}).get("project_budget_cny"),
+        "stored project budget",
+    )
     if max_cost is not None or project_budget is not None:
         if not int(task.get("estimated_input_tokens") or 0) and not int(task.get("estimated_output_tokens") or 0):
             raise SystemExit("Budgeted dispatch requires non-zero estimated input or output tokens")
         if decision.estimated_cost_cny is None:
             raise SystemExit(f"Budgeted dispatch requires reviewed prices for provider {decision.provider_id}")
-    task_spend = sum(attempt_budget_commitment(row) for row in task.get("attempts") or [])
-    if max_cost is not None and decision.estimated_cost_cny is not None and task_spend + decision.estimated_cost_cny > float(max_cost):
-        raise SystemExit(
-            f"Task budget exceeded: spent={round(task_spend, 6)} planned={decision.estimated_cost_cny} max={max_cost}"
-        )
-    known_spend = project_budget_commitment(layout)
-    if project_budget is not None and decision.estimated_cost_cny is not None and known_spend + decision.estimated_cost_cny > float(project_budget):
-        raise SystemExit(
-            f"Project budget exceeded: spent={round(known_spend, 6)} planned={decision.estimated_cost_cny} max={project_budget}"
-        )
+    if max_cost is not None:
+        try:
+            task_spend = sum(attempt_budget_commitment(row) for row in task.get("attempts") or [])
+        except ValueError as exc:
+            raise SystemExit(f"Task budget reconciliation failed closed: {exc}") from exc
+        if decision.estimated_cost_cny is not None and task_spend + decision.estimated_cost_cny > max_cost:
+            raise SystemExit(
+                f"Task budget exceeded: spent={round(task_spend, 6)} planned={decision.estimated_cost_cny} max={max_cost}"
+            )
+    if project_budget is not None:
+        try:
+            known_spend = project_budget_commitment(layout)
+        except ValueError as exc:
+            raise SystemExit(f"Project budget reconciliation failed closed: {exc}") from exc
+        if decision.estimated_cost_cny is not None and known_spend + decision.estimated_cost_cny > project_budget:
+            raise SystemExit(
+                f"Project budget exceeded: spent={round(known_spend, 6)} planned={decision.estimated_cost_cny} max={project_budget}"
+            )
     session = load_session(layout)
     attempt_id = new_id("ATT")
     launch_token = secrets.token_urlsafe(32)
@@ -1370,6 +2145,11 @@ def command_dispatch(args: Any) -> None:
             actor_preview["launch_token"] = "<redacted>"
         print_json({"status": "ok", "dry_run": True, "actor": actor_preview, "route_decision": decision.to_dict(), "start_plan": plan})
         return
+    deferred_start = bool(args.start and current_transaction() is not None and control_store_enabled(layout))
+    if deferred_start and actor.get("command_template"):
+        raise SystemExit("custom worker commands cannot use recoverable runtime effects after SQLite cutover")
+    if deferred_start:
+        actor["status"] = "starting"
     save_actor(layout, actor)
     sync_actor_summary(layout, actor)
     session = load_session(layout)
@@ -1392,8 +2172,8 @@ def command_dispatch(args: Any) -> None:
             "tier": tier,
             "profile": profile,
             "model": model,
-            "status": "running" if args.start else "dispatched",
-            "started_at": now_iso() if args.start else None,
+            "status": "launch_pending" if deferred_start else "running" if args.start else "dispatched",
+            "started_at": None if deferred_start else now_iso() if args.start else None,
             "finished_at": None,
             "route_decision": decision.to_dict(),
             "escalation_reason": getattr(args, "escalation_reason", None),
@@ -1417,25 +2197,37 @@ def command_dispatch(args: Any) -> None:
     send_message(layout, sender=SCHEDULER_ID, recipient=LEADER_ID, subject=f"Task dispatched: {args.task}", body=f"{args.task} is assigned to {actor_id}.", task_id=args.task)
     start_payload: dict[str, Any] | None = None
     if args.start:
-        try:
-            start_payload = start_actor(layout, actor, dry_run=False)
-        except BaseException as exc:
-            actor_state = load_actor(layout, actor_id)
-            actor_state["status"] = "needs_recovery"
-            actor_state.setdefault("runtime", {})["launch_error"] = f"{type(exc).__name__}: {exc}"
-            save_actor(layout, actor_state)
-            sync_actor_summary(layout, actor_state)
-            failed_task = load_task(layout, args.task)
-            for attempt in failed_task.get("attempts") or []:
-                if attempt.get("attempt_id") == attempt_id:
-                    attempt["status"] = "needs_recovery"
-                    attempt["launch_error"] = f"{type(exc).__name__}: {exc}"
-                    break
-            save_task(layout, failed_task)
-            append_event(layout, "actor_launch_failed", actor_id=actor_id, task_id=args.task, attempt_id=attempt_id, error=f"{type(exc).__name__}: {exc}")
-            raise
-        task = load_task(layout, args.task)
-        set_task_state(layout, task, "running")
+        transaction = current_transaction()
+        if deferred_start and transaction is not None:
+            effect_id = _spawn_effect_id(attempt_id)
+            transaction.queue_effect(
+                effect_id=effect_id,
+                effect_type=SPAWN_EFFECT_TYPE,
+                aggregate_id=attempt_id,
+                generation=len(task.get("attempts") or []),
+                payload=_spawn_effect_payload(actor),
+            )
+            start_payload = {"status": "queued", "effect_id": effect_id}
+        else:
+            try:
+                start_payload = start_actor(layout, actor, dry_run=False)
+            except BaseException as exc:
+                actor_state = load_actor(layout, actor_id)
+                actor_state["status"] = "needs_recovery"
+                actor_state.setdefault("runtime", {})["launch_error"] = f"{type(exc).__name__}: {exc}"
+                save_actor(layout, actor_state)
+                sync_actor_summary(layout, actor_state)
+                failed_task = load_task(layout, args.task)
+                for attempt in failed_task.get("attempts") or []:
+                    if attempt.get("attempt_id") == attempt_id:
+                        attempt["status"] = "needs_recovery"
+                        attempt["launch_error"] = f"{type(exc).__name__}: {exc}"
+                        break
+                save_task(layout, failed_task)
+                append_event(layout, "actor_launch_failed", actor_id=actor_id, task_id=args.task, attempt_id=attempt_id, error=f"{type(exc).__name__}: {exc}")
+                raise
+            task = load_task(layout, args.task)
+            set_task_state(layout, task, "running")
     append_event(
         layout,
         "task_dispatched",
@@ -1445,7 +2237,8 @@ def command_dispatch(args: Any) -> None:
         tier=tier,
         profile=profile,
         model=model,
-        started=bool(args.start),
+        started=bool(args.start and not deferred_start),
+        start_queued=deferred_start,
     )
     print_json(
         {
@@ -1453,7 +2246,8 @@ def command_dispatch(args: Any) -> None:
             "task_id": args.task,
             "actor_id": actor_id,
             "prompt_file": str(layout.project_dir / actor.get("prompt_path", "")),
-            "started": bool(args.start),
+            "started": bool(args.start and not deferred_start),
+            "start_queued": deferred_start,
             "start": start_payload,
         }
     )
@@ -1904,13 +2698,19 @@ def process_scheduler_inbox(layout: ProjectLayout, *, limit: int | None = None, 
 
 
 def scheduler_cycle(layout: ProjectLayout, *, relay_limit: int | None = None, command_limit: int | None = None, dry_run: bool = False) -> dict[str, Any]:
+    effects = process_runtime_effects(
+        layout,
+        limit=command_limit or 16,
+        dry_run=dry_run,
+        _governance_prevalidated=True,
+    )
     relays: list[dict[str, Any]] = []
     for actor in actor_rows(layout):
         payload = relay_actor_outbox(layout, actor_id=actor["id"], limit=relay_limit, dry_run=dry_run)
         if payload["processed"] or payload["delivered"] or payload["skipped"]:
             relays.append(payload)
     commands = process_scheduler_inbox(layout, limit=command_limit, dry_run=dry_run)
-    changed = bool(relays or commands["processed"] or commands["failed"])
+    changed = bool(effects["processed"] or effects["failed"] or relays or commands["processed"] or commands["failed"])
     if not dry_run:
         state = load_scheduler_state(layout)
         state["status"] = "running"
@@ -1923,14 +2723,17 @@ def scheduler_cycle(layout: ProjectLayout, *, relay_limit: int | None = None, co
         append_event(
             layout,
             "scheduler_cycle",
+            processed_effect_count=len(effects["processed"]),
+            failed_effect_count=len(effects["failed"]),
             relayed_actor_count=len(relays),
             processed_command_count=len(commands["processed"]),
             failed_command_count=len(commands["failed"]),
             changed=changed,
         )
     return {
-        "status": "ok" if commands["status"] == "ok" else "degraded",
+        "status": "ok" if commands["status"] == "ok" and effects["status"] in {"ok", "disabled"} else "degraded",
         "changed": changed,
+        "effects": effects,
         "relays": relays,
         "commands": commands,
     }
@@ -1938,6 +2741,7 @@ def scheduler_cycle(layout: ProjectLayout, *, relay_limit: int | None = None, co
 
 def _command_run_scheduler_with_instance_lock(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
+    _validate_governance_preflight(layout, operation="run-scheduler")
     ensure_runtime_dirs(layout)
     ensure_mailbox(layout, SCHEDULER_ID)
     started_at = now_iso()
@@ -1954,6 +2758,7 @@ def _command_run_scheduler_with_instance_lock(args: Any) -> None:
     max_cycles = 1 if args.once else int(args.max_cycles or 0)
     cycles: list[dict[str, Any]] = []
     completed_status = "idle" if args.once or max_cycles else "stopped"
+    governance_blocked = False
     try:
         while True:
             cycle = scheduler_cycle(layout, relay_limit=args.relay_limit, command_limit=args.command_limit, dry_run=bool(args.dry_run))
@@ -1965,8 +2770,11 @@ def _command_run_scheduler_with_instance_lock(args: Any) -> None:
             time.sleep(interval)
     except KeyboardInterrupt:
         completed_status = "stopped"
+    except GovernancePreflightBlocked:
+        governance_blocked = True
+        raise
     finally:
-        if not args.dry_run:
+        if not args.dry_run and not governance_blocked:
             update_scheduler_state(
                 layout,
                 status=completed_status,
@@ -1980,6 +2788,9 @@ def _command_run_scheduler_with_instance_lock(args: Any) -> None:
             "project": str(layout.project_dir),
             "cycles": len(cycles),
             "changed_cycles": sum(1 for cycle in cycles if cycle["changed"]),
+            "processed_effects": sum(len(cycle["effects"]["processed"]) for cycle in cycles),
+            "failed_effects": sum(len(cycle["effects"]["failed"]) for cycle in cycles),
+            "last_effects": cycles[-1]["effects"] if cycles else None,
             "processed_commands": sum(len(cycle["commands"]["processed"]) for cycle in cycles),
             "failed_commands": sum(len(cycle["commands"]["failed"]) for cycle in cycles),
             "scheduler_state": load_scheduler_state(layout),
@@ -1989,6 +2800,7 @@ def _command_run_scheduler_with_instance_lock(args: Any) -> None:
 
 def command_run_scheduler(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
+    _validate_governance_preflight(layout, operation="run-scheduler")
     try:
         with scheduler_instance_lock(layout):
             _command_run_scheduler_with_instance_lock(args)
@@ -2036,9 +2848,22 @@ def command_escalate(args: Any) -> None:
             )
             target = provider_by_id(catalog, decision.provider_id)
         else:
+            preferred_chain: list[str] = []
+            for prior_attempt in attempts:
+                route = prior_attempt.get("route_decision") or {}
+                chain = route.get("planned_provider_ids") if isinstance(route, dict) else None
+                if (
+                    isinstance(chain, list)
+                    and current_provider in chain
+                    and chain.index(current_provider) < len(chain) - 1
+                ):
+                    preferred_chain = [str(provider_id) for provider_id in chain]
+                    break
             target = next_stronger_provider(
                 catalog,
                 current_provider,
+                required_capabilities=task.get("required_capabilities") or (),
+                preferred_provider_ids=preferred_chain,
                 history=result_rows(layout),
                 task_type=str(task.get("task_type") or "analysis"),
                 difficulty=str(task.get("difficulty") or "normal"),
@@ -2141,10 +2966,42 @@ def command_stop_actor(args: Any) -> None:
                 "backend": backend.kind,
                 "planned_commands": [command_to_string(argv) for argv in backend.stop_plan(target=target, pid=pid)],
             }
+        elif current_transaction() is not None and control_store_enabled(layout):
+            transaction = current_transaction()
+            assert transaction is not None
+            effect_id = f"EFF-STOP-{transaction.command_id}"
+            transaction.queue_effect(
+                effect_id=effect_id,
+                effect_type=STOP_EFFECT_TYPE,
+                aggregate_id=str(actor["id"]),
+                generation=1,
+                payload=_stop_effect_payload(actor, reason=args.reason),
+            )
+            actor["stop_requested_at"] = now_iso()
+            actor["stop_effect_id"] = effect_id
+            save_actor(layout, actor)
+            append_event(
+                layout,
+                "actor_stop_requested",
+                actor_id=actor["id"],
+                reason=args.reason,
+                effect_id=effect_id,
+            )
+            runtime_payload = {"status": "queued", "effect_id": effect_id, "backend": backend.kind}
         else:
-            runtime_payload = {"backend": backend.kind, **backend.stop_actor(target=target, pid=pid)}
+            runtime_payload = {
+                "backend": backend.kind,
+                **backend.stop_actor(
+                    target=target,
+                    pid=pid,
+                    process_start_marker=runtime.get("process_start_marker"),
+                ),
+            }
     if args.dry_run:
         print_json({"status": "ok", "dry_run": True, "actor": args.actor, "runtime": runtime_payload})
+        return
+    if stop_runtime and current_transaction() is not None and runtime_payload and runtime_payload.get("status") == "queued":
+        print_json({"status": "ok", "actor": args.actor, "actor_status": actor.get("status"), "runtime": runtime_payload})
         return
     actor["status"] = "stopped"
     actor["stopped_at"] = now_iso()
@@ -2250,15 +3107,20 @@ def command_record_result(args: Any) -> None:
     estimated_cost_cny = require_non_negative_float(args.estimated_cost_cny, "estimated-cost-cny")
     provider_id = (attempt or {}).get("provider") or task.get("provider")
     pricing_source = "caller" if estimated_cost_cny is not None else "not_provided"
+    cost_verified = estimated_cost_cny is not None
     if estimated_cost_cny is None and attempt and attempt.get("estimated_cost_cny") is not None:
         estimated_cost_cny = float(attempt["estimated_cost_cny"])
         pricing_source = str(attempt.get("cost_source") or "attempt_usage")
+        cost_verified = bool(attempt.get("actual_cost_verified"))
     elif estimated_cost_cny is None and provider_id:
         try:
             spec = provider_by_id(project_provider_catalog(project), str(provider_id))
             estimated_cost_cny = estimate_provider_cost(spec, input_tokens=input_tokens, output_tokens=output_tokens)
             if estimated_cost_cny is not None:
                 pricing_source = "provider_catalog"
+                # A zero-token estimate is not proof that a provider request
+                # was free; it commonly means the usage event was missing.
+                cost_verified = input_tokens + output_tokens > 0
         except RoutingValidationError as exc:
             raise SystemExit(f"Unable to price result: {exc}") from exc
     actor_id = args.actor or (attempt or {}).get("actor_id") or task.get("agent_id")
@@ -2303,7 +3165,12 @@ def command_record_result(args: Any) -> None:
         attempt["quality_score"] = row["quality_score"]
         if estimated_cost_cny is not None:
             attempt["actual_cost_cny"] = max(float(attempt.get("actual_cost_cny") or 0.0), estimated_cost_cny)
-        attempt["cost_settled"] = True
+        attempt["actual_cost_verified"] = bool(cost_verified)
+        attempt["cost_settled"] = bool(cost_verified)
+        if cost_verified:
+            attempt.pop("cost_settlement_blocked_reason", None)
+        else:
+            attempt["cost_settlement_blocked_reason"] = "actual cost is not verified"
         attempt["estimated_cost_cny"] = estimated_cost_cny
         attempt["cost_source"] = pricing_source
     task["leader_result"] = {
@@ -2389,12 +3256,14 @@ def command_record_usage(args: Any) -> None:
     estimated_cost_cny = require_non_negative_float(getattr(args, "estimated_cost_cny", None), "estimated-cost-cny")
     project = load_project(layout)
     pricing_source = "caller" if estimated_cost_cny is not None else "not_provided"
+    cost_verified = estimated_cost_cny is not None
     if estimated_cost_cny is None and actor.get("provider"):
         try:
             spec = provider_by_id(project_provider_catalog(project), str(actor.get("provider")))
             estimated_cost_cny = estimate_provider_cost(spec, input_tokens=input_tokens, output_tokens=output_tokens)
             if estimated_cost_cny is not None:
                 pricing_source = "provider_catalog"
+                cost_verified = input_tokens + output_tokens > 0
         except RoutingValidationError as exc:
             raise SystemExit(f"Unable to price usage: {exc}") from exc
     attempt_id = getattr(args, "attempt", None) or actor.get("attempt_id")
@@ -2432,8 +3301,14 @@ def command_record_usage(args: Any) -> None:
                 if estimated_cost_cny is not None:
                     attempt["actual_cost_cny"] = round(float(attempt.get("actual_cost_cny") or 0.0) + estimated_cost_cny, 9)
                     attempt["estimated_cost_cny"] = attempt["actual_cost_cny"]
+                if cost_verified:
+                    attempt["actual_cost_verified"] = True
                 if bool(getattr(args, "final_usage", False)):
-                    attempt["cost_settled"] = True
+                    attempt["cost_settled"] = bool(cost_verified)
+                    if cost_verified:
+                        attempt.pop("cost_settlement_blocked_reason", None)
+                    else:
+                        attempt["cost_settlement_blocked_reason"] = "final usage did not contain verifiable cost"
                 attempt["cost_source"] = pricing_source
                 break
         save_task(layout, task)
@@ -2486,9 +3361,31 @@ def usage_rows(layout: ProjectLayout) -> list[dict[str, Any]]:
 
 
 def attempt_budget_commitment(attempt: dict[str, Any]) -> float:
-    actual = float(attempt.get("actual_cost_cny") or 0.0)
-    reserved = float(attempt.get("reserved_cost_cny") or 0.0)
-    if attempt.get("status") in {"preparing", "dispatched", "running", "starting", "needs_recovery"} or not attempt.get("cost_settled"):
+    active_or_unsettled = (
+        attempt.get("status")
+        in {"preparing", "dispatched", "launch_pending", "running", "starting", "needs_recovery"}
+        or not attempt.get("cost_settled")
+    )
+
+    def amount(field: str, *, required: bool, default: float = 0.0) -> float:
+        raw = attempt.get(field)
+        if raw is None:
+            if required:
+                raise ValueError(f"attempt {attempt.get('attempt_id') or attempt.get('attempt') or '?'} is missing {field}")
+            return default
+        if isinstance(raw, bool):
+            raise ValueError(f"attempt {attempt.get('attempt_id') or '?'} has invalid {field}")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"attempt {attempt.get('attempt_id') or '?'} has invalid {field}") from exc
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"attempt {attempt.get('attempt_id') or '?'} has non-finite or negative {field}")
+        return value
+
+    actual = amount("actual_cost_cny", required=True)
+    reserved = amount("reserved_cost_cny", required=active_or_unsettled)
+    if active_or_unsettled:
         return actual + max(0.0, reserved - actual)
     return actual
 
@@ -2784,6 +3681,7 @@ def process_liveness(layout: ProjectLayout, actor: dict[str, Any]) -> dict[str, 
             actor_name=runtime_name,
             target=runtime.get("target"),
             pid=runtime.get("pid"),
+            process_start_marker=runtime.get("process_start_marker"),
         )
         reason = "alive" if alive else "not_found"
     return {"alive": alive, "reason": reason, "backend_available": backend_available}
@@ -3024,6 +3922,22 @@ def command_status(args: Any) -> None:
 
 def command_recover(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
+    project = load_project(layout)
+    governance = project.get("governance") or {"mode": "off"}
+    if governance.get("mode") == "required" or governance.get("ready"):
+        try:
+            validation = validate_governance_binding(
+                governance.get("binding"),
+                project.get("workspace"),
+                mode="required",
+                wrapper_path=governance.get("wrapper_path"),
+            )
+        except GovernanceError as exc:
+            raise SystemExit(
+                f"ArchMarshal governance gate blocked recovery [{exc.code}]: {exc}"
+            ) from exc
+        if not validation.get("valid"):
+            raise SystemExit("ArchMarshal governance gate blocked recovery: binding is not valid")
     ensure_runtime_dirs(layout)
     session = load_session(layout)
     backend = backend_from_session(session)
@@ -3031,6 +3945,7 @@ def command_recover(args: Any) -> None:
     issues: list[str] = []
     planned_restarts: list[str] = []
     restarted: list[str] = []
+    recovered_reports: list[str] = []
     for actor in actor_rows(layout):
         ensure_mailbox(layout, actor["id"])
         prompt_path = actor.get("prompt_path")
@@ -3051,8 +3966,117 @@ def command_recover(args: Any) -> None:
                 actor_name=runtime_name,
                 target=runtime.get("target"),
                 pid=runtime.get("pid"),
+                process_start_marker=runtime.get("process_start_marker"),
             )
             if actor.get("status") in {"running", "starting", "needs_recovery"} and not is_alive:
+                if runtime.get("oci_lifecycle_state") == "uncertain_start":
+                    issues.append(
+                        f"uncertain OCI start requires stop-actor --stop-runtime before restart: {actor['id']}"
+                    )
+                    actor_data = load_actor(layout, actor["id"])
+                    actor_data["status"] = "needs_recovery"
+                    save_actor(layout, actor_data)
+                    sync_actor_summary(layout, actor_data)
+                    continue
+                try:
+                    credential_receipt = _cleanup_prestart_credential(layout, actor)
+                except IsolationError as exc:
+                    issues.append(
+                        f"pre-start credential cleanup failed for {actor['id']} [{exc.code}]: {exc}"
+                    )
+                    actor_data = load_actor(layout, actor["id"])
+                    actor_data["status"] = "needs_recovery"
+                    save_actor(layout, actor_data)
+                    sync_actor_summary(layout, actor_data)
+                    continue
+                if credential_receipt is not None:
+                    actor = load_actor(layout, actor["id"])
+                    runtime = actor_runtime(actor)
+                if runtime.get("provider_execution_state") == "started" and actor.get("task_id"):
+                    attempt_report = task_dir(layout, str(actor["task_id"])) / "attempts" / f"{slugify(actor['id'], 'actor')}.md"
+                    try:
+                        resolved_report = attempt_report.resolve(strict=True)
+                        resolved_report.relative_to(task_dir(layout, str(actor["task_id"])).resolve())
+                        if attempt_report.is_symlink() or not attempt_report.is_file():
+                            raise ValueError("attempt report is not a regular file")
+                        report_bytes = attempt_report.read_bytes()
+                        if len(report_bytes) > 1024 * 1024:
+                            raise ValueError("attempt report exceeds 1 MiB")
+                        report_text = report_bytes.decode("utf-8")
+                        report_text = report_text.replace("\r\n", "\n").replace("\r", "\n")
+                        status_match = re.search(
+                            r"(?im)^\s*(?:[*_]{1,2})?status\s*:\s*(done|failed|escalate)\b",
+                            report_text,
+                        )
+                        if status_match is None:
+                            raise ValueError("attempt report has no valid Status field")
+                    except (OSError, UnicodeDecodeError, ValueError) as exc:
+                        issues.append(f"provider outcome unknown for {actor['id']}: {exc}")
+                        status_match = None
+                    if status_match is not None:
+                        report_status = status_match.group(1).lower()
+                        recovered_task = load_task(layout, str(actor["task_id"]))
+                        attempts = recovered_task.get("attempts") or []
+                        current_attempt = attempts[-1] if attempts else None
+                        if not current_attempt or current_attempt.get("attempt_id") != actor.get("attempt_id"):
+                            issues.append(f"stale recovered report ignored for {actor['id']}")
+                            stale_actor = load_actor(layout, actor["id"])
+                            stale_actor["status"] = "stopped"
+                            stale_actor.setdefault("runtime", {})["provider_execution_state"] = "finished_stale_ignored"
+                            stale_actor["runtime"]["recovered_at"] = now_iso()
+                            save_actor(layout, stale_actor)
+                            sync_actor_summary(layout, stale_actor)
+                            continue
+                        actor_data = load_actor(layout, actor["id"])
+                        actor_data["status"] = "failed" if report_status == "failed" else "stopped"
+                        actor_runtime_data = actor_data.setdefault("runtime", {})
+                        actor_runtime_data["provider_execution_state"] = "finished_recovered"
+                        actor_runtime_data["report_sha256"] = hashlib.sha256(report_bytes).hexdigest()
+                        actor_runtime_data["report_size"] = len(report_bytes)
+                        actor_runtime_data["recovered_at"] = now_iso()
+                        save_actor(layout, actor_data)
+                        sync_actor_summary(layout, actor_data)
+                        current_attempt["report_path"] = relpath(attempt_report, layout.project_dir)
+                        current_attempt["report_sha256"] = actor_runtime_data["report_sha256"]
+                        current_attempt["report_size"] = len(report_bytes)
+                        current_attempt["provider_execution_state"] = "finished_recovered"
+                        save_task(layout, recovered_task)
+                        collected_state = report_status if report_status in {"failed", "escalate"} else "waiting_leader"
+                        canonical_report = task_dir(layout, str(actor["task_id"])) / "completion-report.md"
+                        # Publish exactly the bytes that passed containment,
+                        # type, size, encoding, and Status validation. This
+                        # replaces any stale canonical report from an earlier
+                        # attempt before collect is queued.
+                        atomic_write_text(canonical_report, report_text)
+                        send_message(
+                            layout,
+                            sender=actor["id"],
+                            recipient=SCHEDULER_ID,
+                            subject="scheduler.command",
+                            body="Recover a completed provider report without re-running the provider.",
+                            task_id=str(actor["task_id"]),
+                            metadata={
+                                "command": "collect_task",
+                                "args": {
+                                    "task": actor["task_id"],
+                                    "actor": actor["id"],
+                                    "attempt": actor.get("attempt_id"),
+                                    "state": collected_state,
+                                    "report": str(canonical_report),
+                                    "summary": "Recovered an attempt-specific report after runner interruption.",
+                                },
+                            },
+                        )
+                        append_event(
+                            layout,
+                            "actor_report_recovered",
+                            actor_id=actor["id"],
+                            task_id=actor["task_id"],
+                            attempt_id=actor.get("attempt_id"),
+                            report_sha256=actor_runtime_data["report_sha256"],
+                        )
+                        recovered_reports.append(actor["id"])
+                        continue
                 issues.append(f"recoverable actor missing runtime: {actor['id']} ({actor.get('status')})")
                 actor_data = load_actor(layout, actor["id"])
                 actor_data["status"] = "needs_recovery"
@@ -3062,30 +4086,63 @@ def command_recover(args: Any) -> None:
                     command = actor_launch_command(layout, session, actor_data)
                     plan = backend.start_plan(session_name=session_name, actor_name=runtime_name, command=command, session_exists=True)
                     planned_restarts.extend(command_to_string(argv) for argv in plan)
-                if args.restart_missing:
-                    actor_data["status"] = "starting"
-                    save_actor(layout, actor_data)
-                    sync_actor_summary(layout, actor_data)
-                    start_payload = start_actor(layout, actor_data, dry_run=False)
-                    restarted.extend(start_payload.get("commands", []))
-                    if actor_data.get("task_id") and actor_data.get("attempt_id"):
-                        recovered_task = load_task(layout, actor_data["task_id"])
+                if args.restart_missing and runtime.get("provider_execution_state") != "started":
+                    transaction = current_transaction()
+                    if transaction is not None and control_store_enabled(layout):
+                        attempt_id = str(actor_data.get("attempt_id") or "")
+                        if not attempt_id:
+                            issues.append(f"recoverable actor has no attempt id: {actor_data['id']}")
+                            continue
+                        actor_runtime_data = actor_data.setdefault("runtime", {})
+                        recovery_generation = int(actor_runtime_data.get("recovery_generation") or 0) + 1
+                        effect_id = (
+                            f"EFF-SPAWN-RECOVER-{slugify(attempt_id, 'attempt')}-{recovery_generation}"
+                        )
+                        actor_runtime_data["recovery_generation"] = recovery_generation
+                        actor_runtime_data["recovery_effect_id"] = effect_id
+                        actor_data["status"] = "starting"
+                        save_actor(layout, actor_data)
+                        sync_actor_summary(layout, actor_data)
+                        recovered_task = load_task(layout, str(actor_data["task_id"]))
                         for attempt in recovered_task.get("attempts") or []:
-                            if attempt.get("attempt_id") == actor_data.get("attempt_id"):
-                                attempt["status"] = "running"
-                                attempt["started_at"] = attempt.get("started_at") or now_iso()
+                            if attempt.get("attempt_id") == attempt_id:
+                                attempt["status"] = "launch_pending"
+                                attempt["recovery_effect_id"] = effect_id
                                 attempt.pop("launch_error", None)
                                 break
-                        if recovered_task.get("status") == "dispatched":
-                            set_task_state(layout, recovered_task, "running")
-                        else:
-                            save_task(layout, recovered_task)
+                        save_task(layout, recovered_task)
+                        transaction.queue_effect(
+                            effect_id=effect_id,
+                            effect_type=SPAWN_EFFECT_TYPE,
+                            aggregate_id=attempt_id,
+                            generation=recovery_generation,
+                            payload=_spawn_effect_payload(actor_data),
+                        )
+                        restarted.append(f"queued:{effect_id}")
+                    else:
+                        actor_data["status"] = "starting"
+                        save_actor(layout, actor_data)
+                        sync_actor_summary(layout, actor_data)
+                        start_payload = start_actor(layout, actor_data, dry_run=False)
+                        restarted.extend(start_payload.get("commands", []))
+                        if actor_data.get("task_id") and actor_data.get("attempt_id"):
+                            recovered_task = load_task(layout, actor_data["task_id"])
+                            for attempt in recovered_task.get("attempts") or []:
+                                if attempt.get("attempt_id") == actor_data.get("attempt_id"):
+                                    attempt["status"] = "running"
+                                    attempt["started_at"] = attempt.get("started_at") or now_iso()
+                                    attempt.pop("launch_error", None)
+                                    break
+                            if recovered_task.get("status") == "dispatched":
+                                set_task_state(layout, recovered_task, "running")
+                            else:
+                                save_task(layout, recovered_task)
     status = "ok" if not issues else "degraded"
     session = load_session(layout)
     session["recovery"] = {"last_recovered_at": now_iso(), "last_status": status, "issues": issues}
     save_session(layout, session)
     append_event(layout, "recovery_audit", status=status, issue_count=len(issues))
-    print_json({"status": status, "issues": issues, "planned_restarts": planned_restarts, "restarted": restarted})
+    print_json({"status": status, "issues": issues, "planned_restarts": planned_restarts, "restarted": restarted, "recovered_reports": recovered_reports})
 
 
 def read_rows_for_validation(path: Path, label: str, issues: list[str]) -> list[dict[str, Any]]:
@@ -3311,22 +4368,143 @@ def command_validate(args: Any) -> None:
         raise SystemExit(1)
 
 
+def _governance_project_file_state(path: Path) -> tuple[int, int, int, int]:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise ControlStoreError("governance preflight could not inspect project.json") from exc
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or bool(getattr(info, "st_file_attributes", 0) & reparse_flag)
+    ):
+        raise ControlStoreError("governance preflight rejected unsafe project.json")
+    if info.st_size < 0 or info.st_size > GOVERNANCE_PROJECT_MAX_BYTES:
+        raise ControlStoreError("governance preflight rejected oversized project.json")
+    return (
+        int(info.st_size),
+        int(info.st_mtime_ns),
+        int(getattr(info, "st_ctime_ns", 0)),
+        int(getattr(info, "st_ino", 0)),
+    )
+
+
+def _capture_governance_project(path: Path) -> tuple[tuple[tuple[int, int, int, int], str], bytes]:
+    before = _governance_project_file_state(path)
+    try:
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise ControlStoreError("governance preflight could not read project.json") from exc
+    after = _governance_project_file_state(path)
+    if before != after or len(payload) != before[0]:
+        raise ControlStoreError("governance preflight project.json changed while read")
+    return (before, hashlib.sha256(payload).hexdigest()), payload
+
+
+def _stable_governance_project_snapshot(layout: ProjectLayout) -> bytes:
+    last_error: ControlStoreError | None = None
+    for _ in range(GOVERNANCE_SNAPSHOT_ATTEMPTS):
+        try:
+            first_signature, _ = _capture_governance_project(layout.project_json)
+            second_signature, second_payload = _capture_governance_project(layout.project_json)
+        except ControlStoreError as exc:
+            last_error = exc
+            continue
+        if first_signature == second_signature:
+            return second_payload
+        last_error = ControlStoreError(
+            "governance preflight project.json was not stable across reads"
+        )
+    raise last_error or ControlStoreError("governance preflight could not snapshot project.json")
+
+
+def _load_authoritative_project_for_governance(layout: ProjectLayout) -> dict[str, Any]:
+    # project.json is intentionally excluded from the transactional compatibility
+    # views, so it remains the authoritative governance source after SQLite
+    # cutover. Validate the marker/database relationship read-only, then take a
+    # stable double-read without opening the source DB/WAL or acknowledging dirty
+    # views.
+    try:
+        control_store_enabled(layout)
+    except ControlStoreError:
+        raise
+    content = _stable_governance_project_snapshot(layout)
+    try:
+        project = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ControlStoreError("governance preflight authoritative project document is invalid") from exc
+    if not isinstance(project, dict):
+        raise ControlStoreError("governance preflight authoritative project document is invalid")
+    return project
+
+
+def _validate_governance_preflight(layout: ProjectLayout, *, operation: str) -> None:
+    try:
+        project = _load_authoritative_project_for_governance(layout)
+    except ControlStoreError as exc:
+        raise GovernancePreflightBlocked(
+            f"ArchMarshal governance gate blocked {operation}: authoritative project state is unavailable ({exc})"
+        ) from exc
+    governance = project.get("governance") or {"mode": "off", "ready": False}
+    if not isinstance(governance, dict):
+        raise GovernancePreflightBlocked(
+            f"ArchMarshal governance gate blocked {operation}: governance state is invalid"
+        )
+    if governance.get("mode") != "required" and not governance.get("ready"):
+        return
+    try:
+        validation = validate_governance_binding(
+            governance.get("binding"),
+            project.get("workspace"),
+            mode="required",
+            wrapper_path=governance.get("wrapper_path"),
+        )
+    except GovernanceError as exc:
+        raise GovernancePreflightBlocked(
+            f"ArchMarshal governance gate blocked {operation} [{exc.code}]: {exc}"
+        ) from exc
+    if not validation.get("valid"):
+        raise GovernancePreflightBlocked(
+            f"ArchMarshal governance gate blocked {operation}: binding is not valid"
+        )
+
+
+def _command_requires_governance_preflight(function: Any, args: Any) -> bool:
+    if function.__name__ in GOVERNANCE_PREFLIGHT_COMMANDS:
+        return True
+    return function.__name__ == "command_send" and bool(
+        getattr(args, "runtime_send", False) or getattr(args, "tmux_send", False)
+    )
+
+
 def _locked_project_command(function: Any) -> Any:
     @functools.wraps(function)
     def wrapped(args: Any) -> Any:
         layout = resolve_project(args.root, args.project)
+        governance_preflight = _command_requires_governance_preflight(function, args)
         try:
+            if governance_preflight:
+                _validate_governance_preflight(
+                    layout,
+                    operation=function.__name__.removeprefix("command_").replace("_", "-"),
+                )
             with project_write_lock(layout):
+                # Nested scheduler commands already share the outer SQLite
+                # transaction.  Opening a second reconciliation connection
+                # while BEGIN IMMEDIATE is held self-deadlocks the process.
+                if current_transaction() is not None:
+                    return function(args)
+                if governance_preflight:
+                    _validate_governance_preflight(
+                        layout,
+                        operation=function.__name__.removeprefix("command_").replace("_", "-"),
+                    )
                 if not control_store_enabled(layout):
                     return function(args)
                 reconcile_project_views(layout)
-                if current_transaction() is not None:
-                    return function(args)
                 external_effect = (
-                    (function.__name__ in {"command_dispatch", "command_escalate"} and bool(getattr(args, "start", False)))
-                    or (function.__name__ == "command_send" and bool(getattr(args, "runtime_send", False)))
-                    or (function.__name__ == "command_stop_actor" and bool(getattr(args, "stop_runtime", False)))
-                    or (function.__name__ == "command_recover" and bool(getattr(args, "restart_missing", False)))
+                    (function.__name__ == "command_send" and bool(getattr(args, "runtime_send", False)))
                     or function.__name__ == "command_start_leader"
                 )
                 if external_effect:
@@ -3347,6 +4525,12 @@ def _locked_project_command(function: Any) -> Any:
                     payload=payload,
                 ) as transaction:
                     if transaction.replay:
+                        if transaction.replay_status == "permanent_failed":
+                            detail = transaction.replay_error_detail or "external effect failed permanently"
+                            code = transaction.replay_error_code or "command_permanent_failed"
+                            raise SystemExit(
+                                f"Durable command {command_id} failed [{code}]: {detail}"
+                            )
                         replay = transaction.replay_result or {}
                         output = replay.get("stdout") if isinstance(replay, dict) else None
                         if output:
@@ -3372,7 +4556,16 @@ def _locked_layout_operation(function: Any) -> Any:
     @functools.wraps(function)
     def wrapped(layout: ProjectLayout, *args: Any, **kwargs: Any) -> Any:
         try:
+            if function.__name__ == "scheduler_cycle":
+                _validate_governance_preflight(layout, operation="scheduler-cycle")
+            # SQLite effect leasing/observation is the cross-process writer
+            # fence. Holding the legacy project file lock across slow OCI I/O
+            # would starve a freshly spawned runner before it can register.
+            if function.__name__ == "scheduler_cycle" and control_store_enabled(layout):
+                return function(layout, *args, **kwargs)
             with project_write_lock(layout):
+                if function.__name__ == "scheduler_cycle":
+                    _validate_governance_preflight(layout, operation="scheduler-cycle")
                 return function(layout, *args, **kwargs)
         except ProjectLockTimeout as exc:
             raise SystemExit(str(exc)) from exc
@@ -3395,6 +4588,7 @@ for _command_name in (
     "command_record_result",
     "command_record_leader_work",
     "command_record_usage",
+    "command_governance_rebind",
     "command_recover",
 ):
     globals()[_command_name] = _locked_project_command(globals()[_command_name])

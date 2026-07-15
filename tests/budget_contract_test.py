@@ -105,6 +105,25 @@ def main() -> int:
         assert not attempt.get("cost_settled")
         data(
             temp,
+            "record-usage",
+            "--project",
+            str(project),
+            "--actor",
+            actor,
+            "--task",
+            "V2-0001",
+            "--attempt",
+            actor_state["attempt_id"],
+            "--final",
+        )
+        task = json.loads((project / "tasks" / "V2-0001" / "task.json").read_text(encoding="utf-8"))
+        attempt = task["attempts"][0]
+        assert not attempt.get("cost_settled")
+        assert attempt["cost_settlement_blocked_reason"]
+        rejected = run(temp, "dispatch", "--project", str(project), "--task", "V2-0002", "--provider", "longcat", "--unsafe-native", ok=False)
+        assert rejected.returncode != 0
+        data(
+            temp,
             "record-result",
             "--project",
             str(project),

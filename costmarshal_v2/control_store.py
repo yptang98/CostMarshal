@@ -18,14 +18,14 @@ import threading
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
 from .paths import ProjectLayout
 
 
-STORE_SCHEMA_VERSION = 1
+STORE_SCHEMA_VERSION = 2
 BACKEND_NAME = "sqlite-wal"
 DB_NAME = "state.db"
 MARKER_NAME = "state-backend.json"
@@ -50,6 +50,18 @@ _LOCAL = threading.local()
 
 def _now() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def _lease_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _lease_deadline(ttl_seconds: float) -> str:
+    if ttl_seconds <= 0:
+        raise ValueError("effect lease ttl must be positive")
+    return (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat(
+        timespec="microseconds"
+    )
 
 
 def _canonical_json(value: Any) -> str:
@@ -161,6 +173,7 @@ def _schema(connection: sqlite3.Connection) -> None:
             aggregate_id TEXT NOT NULL,
             generation INTEGER NOT NULL,
             payload_json TEXT NOT NULL,
+            payload_sha256 TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL CHECK(status IN (
                 'pending', 'leased', 'observed', 'applied',
                 'retryable_failed', 'dead'
@@ -169,6 +182,7 @@ def _schema(connection: sqlite3.Connection) -> None:
             lease_expires_at TEXT,
             attempts INTEGER NOT NULL DEFAULT 0,
             result_json TEXT,
+            observation_json TEXT,
             last_error TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -218,12 +232,42 @@ def _schema(connection: sqlite3.Connection) -> None:
             ON outbox(status, created_at);
         """
     )
-    connection.execute(f"PRAGMA user_version={STORE_SCHEMA_VERSION}")
-    connection.execute(
-        "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (str(STORE_SCHEMA_VERSION),),
-    )
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        previous_user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(effects)").fetchall()
+        }
+        if "payload_sha256" not in columns:
+            connection.execute("ALTER TABLE effects ADD COLUMN payload_sha256 TEXT")
+        # Recompute every hash even when the column already exists. This makes
+        # a legacy partially-backfilled database self-healing, while the
+        # explicit transaction makes the DDL/backfill/version bump one crash
+        # boundary.
+        if previous_user_version < STORE_SCHEMA_VERSION:
+            for row in connection.execute(
+                "SELECT effect_id, payload_json, payload_sha256 FROM effects"
+            ).fetchall():
+                expected = _sha256_text(str(row["payload_json"]))
+                if row["payload_sha256"] != expected:
+                    connection.execute(
+                        "UPDATE effects SET payload_sha256=? WHERE effect_id=?",
+                        (expected, str(row["effect_id"])),
+                    )
+                    _fault("schema.after_effect_hash_backfill_row")
+        if "observation_json" not in columns:
+            connection.execute("ALTER TABLE effects ADD COLUMN observation_json TEXT")
+        connection.execute(f"PRAGMA user_version={STORE_SCHEMA_VERSION}")
+        connection.execute(
+            "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(STORE_SCHEMA_VERSION),),
+        )
+        connection.commit()
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
 
 
 def _relative(layout: ProjectLayout, path: Path) -> str:
@@ -541,9 +585,37 @@ def _read_marker(layout: ProjectLayout) -> dict[str, Any]:
         raise ControlStoreError(f"unsupported control store backend: {marker.get('backend')}")
     if marker.get("database") != f"scheduler/{DB_NAME}":
         raise ControlStoreError("control store marker database path is not canonical")
-    if int(marker.get("schema_version") or 0) != STORE_SCHEMA_VERSION:
-        raise ControlStoreError("control store marker schema version mismatch")
+    marker_version = int(marker.get("schema_version") or 0)
+    if marker_version <= 0 or marker_version > STORE_SCHEMA_VERSION:
+        raise ControlStoreError("control store marker schema version is unsupported")
     return marker
+
+
+def upgrade_control_store(layout: ProjectLayout) -> dict[str, Any]:
+    """Forward-migrate an enabled store and then advance its marker.
+
+    Database DDL is applied before the marker.  A crash between those steps is
+    safe because older markers are accepted and the migration is repeatable.
+    """
+
+    marker = _read_marker(layout)
+    if not database_path(layout).is_file():
+        raise ControlStoreError("SQLite cutover marker exists but the control database is missing")
+    previous = int(marker["schema_version"])
+    connection = _connect(layout)
+    try:
+        _schema(connection)
+        issues = _validate_connection(connection)
+        if issues:
+            raise ControlStoreError("control store upgrade validation failed: " + "; ".join(issues))
+    finally:
+        connection.close()
+    if previous != STORE_SCHEMA_VERSION:
+        marker = dict(marker)
+        marker["schema_version"] = STORE_SCHEMA_VERSION
+        marker["upgraded_at"] = _now()
+        _write_atomic(marker_path(layout), json.dumps(marker, ensure_ascii=False, indent=2) + "\n")
+    return {"status": "ok", "previous_version": previous, "schema_version": STORE_SCHEMA_VERSION}
 
 
 def _validate_connection(connection: sqlite3.Connection) -> list[str]:
@@ -578,6 +650,15 @@ def _validate_connection(connection: sqlite3.Connection) -> list[str]:
     ).fetchall():
         if _sha256_text(str(row["content"])) != row["content_sha256"]:
             issues.append(f"ledger hash mismatch: {row['path']}#{row['sequence']}")
+    effect_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(effects)").fetchall()
+    }
+    if "payload_sha256" in effect_columns:
+        for row in connection.execute(
+            "SELECT effect_id, payload_json, payload_sha256 FROM effects"
+        ).fetchall():
+            if not row["payload_sha256"] or _sha256_text(str(row["payload_json"])) != row["payload_sha256"]:
+                issues.append(f"effect payload hash mismatch: {row['effect_id']}")
     return issues
 
 
@@ -592,6 +673,7 @@ def migrate_legacy_store(layout: ProjectLayout) -> dict[str, Any]:
 
     layout.scheduler_dir.mkdir(parents=True, exist_ok=True)
     if marker_path(layout).is_file():
+        upgrade_control_store(layout)
         validation = validate_control_store(layout)
         if validation["status"] != "ok":
             raise ControlStoreError("enabled control store failed validation")
@@ -696,7 +778,7 @@ def _materialize_one(
 def reconcile_project_views(layout: ProjectLayout) -> dict[str, Any]:
     """Rebuild every dirty compatibility view; safe after a hard crash."""
 
-    _read_marker(layout)
+    upgrade_control_store(layout)
     materialized: list[str] = []
     while True:
         connection = _connect(layout)
@@ -732,7 +814,11 @@ class ActiveTransaction:
     payload_sha256: str
     replay: bool = False
     replay_result: Any = None
+    replay_status: str | None = None
+    replay_error_code: str | None = None
+    replay_error_detail: str | None = None
     result: Any = None
+    final_status: str = "completed"
 
     def owns(self, path: Path) -> bool:
         return _transaction_owns(self.layout, path)
@@ -837,6 +923,95 @@ class ActiveTransaction:
             ),
         )
 
+    def queue_effect(
+        self,
+        *,
+        effect_id: str,
+        effect_type: str,
+        aggregate_id: str,
+        generation: int,
+        payload: dict[str, Any],
+    ) -> str:
+        """Persist one external-effect intent and fence its command."""
+
+        self._ensure_mutable()
+        if generation <= 0:
+            raise ValueError("effect generation must be positive")
+        payload_json = _canonical_json(payload)
+        payload_sha256 = _sha256_text(payload_json)
+        existing = self.connection.execute(
+            "SELECT effect_id, effect_type, aggregate_id, generation, payload_sha256 "
+            "FROM effects WHERE effect_id=? OR "
+            "(command_id=? AND effect_type=? AND aggregate_id=? AND generation=?)",
+            (
+                effect_id,
+                self.command_id,
+                effect_type,
+                aggregate_id,
+                generation,
+            ),
+        ).fetchone()
+        if existing is not None:
+            if (
+                str(existing["effect_id"]) != effect_id
+                or str(existing["effect_type"]) != effect_type
+                or str(existing["aggregate_id"]) != aggregate_id
+                or int(existing["generation"]) != generation
+                or str(existing["payload_sha256"]) != payload_sha256
+            ):
+                raise ControlStoreConflict(
+                    f"effect identity/generation was reused with different payload: {effect_id}"
+                )
+            self.final_status = "awaiting_effect"
+            return effect_id
+        now = _now()
+        self.connection.execute(
+            "INSERT INTO effects(effect_id, command_id, effect_type, aggregate_id, generation, "
+            "payload_json, payload_sha256, status, created_at, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+            (
+                effect_id,
+                self.command_id,
+                effect_type,
+                aggregate_id,
+                generation,
+                payload_json,
+                payload_sha256,
+                now,
+                now,
+            ),
+        )
+        self.final_status = "awaiting_effect"
+        return effect_id
+
+    def finalize_dead_effect(self, *, effect_id: str, owner: str | None, error: str) -> None:
+        """Fail an effect/command inside the same transaction as its state projection."""
+
+        self._ensure_mutable()
+        row = self.connection.execute(
+            "SELECT * FROM effects WHERE effect_id=?",
+            (effect_id,),
+        ).fetchone()
+        if row is None:
+            raise ControlStoreError(f"effect not found: {effect_id}")
+        status = str(row["status"])
+        if status == "applied":
+            raise ControlStoreConflict(f"applied effect cannot fail: {effect_id}")
+        if status == "dead" and str(row["last_error"] or "") == error:
+            return
+        if owner is not None and status in {"leased", "observed"} and row["lease_owner"] != owner:
+            raise ControlStoreConflict(f"effect lease is not owned by {owner}: {effect_id}")
+        self.connection.execute(
+            "UPDATE effects SET status='dead', lease_owner=NULL, lease_expires_at=NULL, "
+            "last_error=?, updated_at=? WHERE effect_id=?",
+            (error, _now(), effect_id),
+        )
+        self.connection.execute(
+            "UPDATE commands SET status='permanent_failed', error_code='effect_dead', "
+            "error_detail=?, updated_at=?, completed_at=? WHERE command_id=?",
+            (error, _now(), _now(), str(row["command_id"])),
+        )
+
     def emit_event(
         self,
         *,
@@ -878,7 +1053,7 @@ def control_transaction(
 
     if current_transaction() is not None:
         raise ControlStoreError("nested control transactions are not supported in phase one")
-    _read_marker(layout)
+    upgrade_control_store(layout)
     reconcile_project_views(layout)
     connection = _connect(layout)
     payload_json = _canonical_json(payload or {})
@@ -894,7 +1069,8 @@ def control_transaction(
         _schema(connection)
         connection.execute("BEGIN IMMEDIATE")
         existing = connection.execute(
-            "SELECT command_name, payload_sha256, status, result_json FROM commands WHERE command_id=?",
+            "SELECT command_name, payload_sha256, status, result_json, error_code, error_detail "
+            "FROM commands WHERE command_id=?",
             (command_id,),
         ).fetchone()
         if existing is not None:
@@ -903,14 +1079,16 @@ def control_transaction(
                 raise ControlStoreConflict(
                     f"command id {command_id} was reused with a different name or payload"
                 )
-            if existing["status"] != "completed":
-                connection.rollback()
-                raise ControlStoreError(
-                    f"command {command_id} is not replayable in status {existing['status']}"
-                )
             transaction.replay = True
+            transaction.replay_status = str(existing["status"])
             transaction.replay_result = (
                 json.loads(str(existing["result_json"])) if existing["result_json"] is not None else None
+            )
+            transaction.replay_error_code = (
+                str(existing["error_code"]) if existing["error_code"] is not None else None
+            )
+            transaction.replay_error_detail = (
+                str(existing["error_detail"]) if existing["error_detail"] is not None else None
             )
             connection.rollback()
             yield transaction
@@ -928,10 +1106,10 @@ def control_transaction(
             connection.rollback()
             raise
         result_json = None if transaction.result is None else _canonical_json(transaction.result)
+        completed_at = _now() if transaction.final_status == "completed" else None
         connection.execute(
-            "UPDATE commands SET status='completed', result_json=?, updated_at=?, completed_at=? "
-            "WHERE command_id=?",
-            (result_json, _now(), _now(), command_id),
+            "UPDATE commands SET status=?, result_json=?, updated_at=?, completed_at=? WHERE command_id=?",
+            (transaction.final_status, result_json, _now(), completed_at, command_id),
         )
         connection.commit()
     finally:
@@ -971,9 +1149,275 @@ def transactional_read_jsonl(path: Path) -> tuple[bool, list[dict[str, Any]]]:
     return True, transaction.read_ledger(path)
 
 
+def _effect_payload(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "effect_id": str(row["effect_id"]),
+        "command_id": str(row["command_id"]),
+        "effect_type": str(row["effect_type"]),
+        "aggregate_id": str(row["aggregate_id"]),
+        "generation": int(row["generation"]),
+        "payload": json.loads(str(row["payload_json"])),
+        "payload_sha256": str(row["payload_sha256"]),
+        "status": str(row["status"]),
+        "lease_owner": row["lease_owner"],
+        "lease_expires_at": row["lease_expires_at"],
+        "attempts": int(row["attempts"]),
+        "observation": (
+            json.loads(str(row["observation_json"])) if row["observation_json"] is not None else None
+        ),
+        "result": json.loads(str(row["result_json"])) if row["result_json"] is not None else None,
+        "last_error": row["last_error"],
+    }
+
+
+def effect_status(layout: ProjectLayout, effect_id: str) -> dict[str, Any]:
+    upgrade_control_store(layout)
+    connection = _connect(layout)
+    try:
+        row = connection.execute("SELECT * FROM effects WHERE effect_id=?", (effect_id,)).fetchone()
+        if row is None:
+            raise ControlStoreError(f"effect not found: {effect_id}")
+        return _effect_payload(row)
+    finally:
+        connection.close()
+
+
+def lease_effect(
+    layout: ProjectLayout,
+    *,
+    owner: str,
+    ttl_seconds: float,
+    effect_types: tuple[str, ...] | None = None,
+) -> dict[str, Any] | None:
+    """Atomically lease one pending/retryable/expired effect."""
+
+    if not owner.strip():
+        raise ValueError("effect lease owner is required")
+    upgrade_control_store(layout)
+    connection = _connect(layout)
+    leased: dict[str, Any] | None = None
+    now = _lease_now()
+    deadline = _lease_deadline(float(ttl_seconds))
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        parameters: list[Any] = [now]
+        type_clause = ""
+        if effect_types:
+            normalized = tuple(str(item) for item in effect_types)
+            type_clause = " AND effect_type IN (" + ",".join("?" for _ in normalized) + ")"
+            parameters.extend(normalized)
+        row = connection.execute(
+            "SELECT * FROM effects WHERE "
+            "(status IN ('pending', 'retryable_failed') OR "
+            "(status IN ('leased', 'observed') AND lease_expires_at IS NOT NULL AND lease_expires_at<=?))"
+            + type_clause
+            + " ORDER BY created_at, effect_id LIMIT 1",
+            tuple(parameters),
+        ).fetchone()
+        if row is None:
+            connection.commit()
+            return None
+        effect_id = str(row["effect_id"])
+        renewed_status = "observed" if str(row["status"]) == "observed" else "leased"
+        connection.execute(
+            "UPDATE effects SET status=?, lease_owner=?, lease_expires_at=?, "
+            "attempts=attempts+1, last_error=NULL, updated_at=? WHERE effect_id=?",
+            (renewed_status, owner, deadline, _now(), effect_id),
+        )
+        updated = connection.execute("SELECT * FROM effects WHERE effect_id=?", (effect_id,)).fetchone()
+        connection.commit()
+        if updated is None:
+            raise ControlStoreError(f"leased effect disappeared: {effect_id}")
+        leased = _effect_payload(updated)
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    if leased is not None:
+        _fault("effect.after_lease_commit_before_spawn")
+    return leased
+
+
+def observe_effect(
+    layout: ProjectLayout,
+    *,
+    effect_id: str,
+    owner: str,
+    observation: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist runtime registration before any effect finalization."""
+
+    upgrade_control_store(layout)
+    observation_json = _canonical_json(observation)
+    connection = _connect(layout)
+    result: dict[str, Any]
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute("SELECT * FROM effects WHERE effect_id=?", (effect_id,)).fetchone()
+        if row is None:
+            raise ControlStoreError(f"effect not found: {effect_id}")
+        status = str(row["status"])
+        if status in {"observed", "applied"}:
+            if row["observation_json"] != observation_json:
+                raise ControlStoreConflict(f"effect observation changed on replay: {effect_id}")
+            connection.commit()
+            return _effect_payload(row)
+        if status != "leased" or row["lease_owner"] != owner:
+            raise ControlStoreConflict(f"effect lease is not owned by {owner}: {effect_id}")
+        if row["lease_expires_at"] is None or str(row["lease_expires_at"]) <= _lease_now():
+            raise ControlStoreConflict(f"effect lease expired before observation: {effect_id}")
+        connection.execute(
+            "UPDATE effects SET status='observed', observation_json=?, updated_at=? WHERE effect_id=?",
+            (observation_json, _now(), effect_id),
+        )
+        updated = connection.execute("SELECT * FROM effects WHERE effect_id=?", (effect_id,)).fetchone()
+        connection.commit()
+        if updated is None:
+            raise ControlStoreError(f"observed effect disappeared: {effect_id}")
+        result = _effect_payload(updated)
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    _fault("effect.after_registration_before_finalize")
+    return result
+
+
+def apply_effect(
+    layout: ProjectLayout,
+    *,
+    effect_id: str,
+    owner: str,
+    result: dict[str, Any],
+    command_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Atomically apply an observed effect and complete its command."""
+
+    upgrade_control_store(layout)
+    result_json = _canonical_json(result)
+    connection = _connect(layout)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute("SELECT * FROM effects WHERE effect_id=?", (effect_id,)).fetchone()
+        if row is None:
+            raise ControlStoreError(f"effect not found: {effect_id}")
+        if str(row["status"]) == "applied":
+            if row["result_json"] != result_json:
+                raise ControlStoreConflict(f"effect result changed on replay: {effect_id}")
+            connection.commit()
+            return _effect_payload(row)
+        if str(row["status"]) != "observed" or row["lease_owner"] != owner:
+            raise ControlStoreConflict(f"effect is not observed by owner {owner}: {effect_id}")
+        connection.execute(
+            "UPDATE effects SET status='applied', result_json=?, lease_owner=NULL, "
+            "lease_expires_at=NULL, updated_at=? WHERE effect_id=?",
+            (result_json, _now(), effect_id),
+        )
+        command_value = None if command_result is None else _canonical_json(command_result)
+        if command_value is None:
+            connection.execute(
+                "UPDATE commands SET status='completed', error_code=NULL, error_detail=NULL, "
+                "updated_at=?, completed_at=? WHERE command_id=?",
+                (_now(), _now(), str(row["command_id"])),
+            )
+        else:
+            connection.execute(
+                "UPDATE commands SET status='completed', result_json=?, error_code=NULL, "
+                "error_detail=NULL, updated_at=?, completed_at=? WHERE command_id=?",
+                (command_value, _now(), _now(), str(row["command_id"])),
+            )
+        updated = connection.execute("SELECT * FROM effects WHERE effect_id=?", (effect_id,)).fetchone()
+        connection.commit()
+        if updated is None:
+            raise ControlStoreError(f"applied effect disappeared: {effect_id}")
+        return _effect_payload(updated)
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def fail_effect(
+    layout: ProjectLayout,
+    *,
+    effect_id: str,
+    owner: str | None,
+    error: str,
+    retryable: bool,
+) -> dict[str, Any]:
+    """Release a failed effect for retry or make it durably dead."""
+
+    upgrade_control_store(layout)
+    connection = _connect(layout)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute("SELECT * FROM effects WHERE effect_id=?", (effect_id,)).fetchone()
+        if row is None:
+            raise ControlStoreError(f"effect not found: {effect_id}")
+        status = str(row["status"])
+        target = "retryable_failed" if retryable else "dead"
+        if status == "applied":
+            raise ControlStoreConflict(f"applied effect cannot fail: {effect_id}")
+        if status == target and str(row["last_error"] or "") == error:
+            connection.commit()
+            return _effect_payload(row)
+        if owner is not None and status in {"leased", "observed"} and row["lease_owner"] != owner:
+            raise ControlStoreConflict(f"effect lease is not owned by {owner}: {effect_id}")
+        connection.execute(
+            "UPDATE effects SET status=?, lease_owner=NULL, lease_expires_at=NULL, "
+            "last_error=?, updated_at=? WHERE effect_id=?",
+            (target, error, _now(), effect_id),
+        )
+        if retryable:
+            connection.execute(
+                "UPDATE commands SET status='awaiting_effect', error_code='effect_retryable', "
+                "error_detail=?, updated_at=? WHERE command_id=?",
+                (error, _now(), str(row["command_id"])),
+            )
+        else:
+            connection.execute(
+                "UPDATE commands SET status='permanent_failed', error_code='effect_dead', "
+                "error_detail=?, updated_at=?, completed_at=? WHERE command_id=?",
+                (error, _now(), _now(), str(row["command_id"])),
+            )
+        updated = connection.execute("SELECT * FROM effects WHERE effect_id=?", (effect_id,)).fetchone()
+        connection.commit()
+        if updated is None:
+            raise ControlStoreError(f"failed effect disappeared: {effect_id}")
+        return _effect_payload(updated)
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def dead_effect(
+    layout: ProjectLayout,
+    *,
+    effect_id: str,
+    owner: str | None,
+    error: str,
+) -> dict[str, Any]:
+    """Permanently fail an effect and its command in one transaction."""
+
+    return fail_effect(
+        layout,
+        effect_id=effect_id,
+        owner=owner,
+        error=error,
+        retryable=False,
+    )
+
+
 def validate_control_store(layout: ProjectLayout) -> dict[str, Any]:
     marker: dict[str, Any] | None = None
     issues: list[str] = []
+    warnings: list[str] = []
+    expired_effect_leases: list[str] = []
     if marker_path(layout).is_file():
         try:
             marker = _read_marker(layout)
@@ -1006,18 +1450,48 @@ def validate_control_store(layout: ProjectLayout) -> dict[str, Any]:
             journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
             if marker is not None and journal_mode != "wal":
                 issues.append(f"journal_mode must be WAL, got {journal_mode}")
+            expired_effect_leases = [
+                str(row["effect_id"])
+                for row in connection.execute(
+                    "SELECT effect_id FROM effects WHERE status IN ('leased', 'observed') AND "
+                    "lease_expires_at IS NOT NULL AND lease_expires_at<=? ORDER BY effect_id",
+                    (_lease_now(),),
+                ).fetchall()
+            ]
+            if expired_effect_leases:
+                warnings.append(
+                    "expired effect leases are recoverable: " + ", ".join(expired_effect_leases)
+                )
+            effect_status_counts = {
+                str(row["status"]): int(row["count"])
+                for row in connection.execute(
+                    "SELECT status, COUNT(*) AS count FROM effects GROUP BY status"
+                ).fetchall()
+            }
         finally:
             connection.close()
     except (sqlite3.Error, ControlStoreError) as exc:
         issues.append(f"database validation error: {type(exc).__name__}: {exc}")
         counts = {}
         journal_mode = None
+        effect_status_counts = {}
+    if issues:
+        status = "invalid"
+    elif marker is None:
+        status = "staged"
+    elif warnings:
+        status = "degraded"
+    else:
+        status = "ok"
     return {
-        "status": "ok" if not issues and marker is not None else ("staged" if not issues else "invalid"),
+        "status": status,
         "issues": issues,
+        "warnings": warnings,
         "schema_version": STORE_SCHEMA_VERSION,
         "journal_mode": journal_mode,
         "counts": counts,
+        "effect_status_counts": effect_status_counts,
+        "expired_effect_leases": expired_effect_leases,
     }
 
 
@@ -1078,14 +1552,21 @@ __all__ = [
     "control_transaction",
     "current_transaction",
     "database_path",
+    "dead_effect",
+    "effect_status",
+    "fail_effect",
     "initialize_control_store",
     "marker_path",
+    "lease_effect",
     "migrate_legacy_store",
     "preview_legacy_migration",
     "reconcile_project_views",
+    "observe_effect",
+    "apply_effect",
     "transactional_append_jsonl",
     "transactional_read_jsonl",
     "transactional_read_text",
     "transactional_write_text",
+    "upgrade_control_store",
     "validate_control_store",
 ]

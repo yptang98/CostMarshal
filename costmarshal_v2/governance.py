@@ -19,8 +19,9 @@ from typing import Any
 
 
 GOVERNANCE_MODES = frozenset({"off", "auto", "required"})
-BINDING_FORMAT = "costmarshal-archmarshal-binding-v1"
+BINDING_FORMAT = "costmarshal-archmarshal-binding-v2"
 MAX_WRAPPER_OUTPUT_BYTES = 8 * 1024 * 1024
+MAX_WRAPPER_BYTES = 2 * 1024 * 1024
 MAX_OWNERSHIP_BYTES = 64 * 1024
 MAX_SKILL_HEAD_BYTES = 1024
 _BINDING_FIELDS = (
@@ -29,6 +30,8 @@ _BINDING_FIELDS = (
     "engine_api",
     "engine_version",
     "engine_source_sha256",
+    "wrapper_sha256",
+    "wrapper_size",
     "workspace_root",
     "ownership_marker_sha256",
     "skill_index_head",
@@ -73,13 +76,24 @@ def inspect_governance(
     try:
         workspace_path = _workspace_path(workspace)
         wrapper = _explicit_wrapper_path(wrapper_path)
+        wrapper_identity = _wrapper_identity(wrapper)
         bootstrap = _invoke_wrapper(wrapper, ["--bootstrap-status"], timeout_seconds)
         bootstrap_identity = _bootstrap_identity(bootstrap)
         doctor = _invoke_wrapper(wrapper, ["doctor", str(workspace_path)], timeout_seconds)
         doctor_state, doctor_issues = _doctor_readiness(doctor, workspace_path)
         workspace_identity, identity_issues = _workspace_identity(workspace_path)
+        if _wrapper_identity(wrapper) != wrapper_identity:
+            raise GovernanceError(
+                "archmarshal_wrapper_changed",
+                "The reviewed ArchMarshal wrapper changed during inspection.",
+            )
         issues = [*doctor_issues, *identity_issues]
-        binding = _make_binding(bootstrap_identity, workspace_path, workspace_identity)
+        binding = _make_binding(
+            bootstrap_identity,
+            workspace_path,
+            workspace_identity,
+            wrapper_identity,
+        )
         if doctor_state != "healthy":
             issues.insert(
                 0,
@@ -225,8 +239,14 @@ def _explicit_wrapper_path(wrapper_path: Path | str | None) -> Path:
             "archmarshal_wrapper_required",
             "An explicit reviewed ArchMarshal wrapper path is required.",
         )
+    lexical = Path(wrapper_path).expanduser()
+    if lexical.is_symlink():
+        raise GovernanceError(
+            "archmarshal_wrapper_unsafe",
+            "The explicit ArchMarshal wrapper path must not be a symbolic link.",
+        )
     try:
-        path = Path(wrapper_path).expanduser().resolve(strict=True)
+        path = lexical.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
         raise GovernanceError(
             "archmarshal_wrapper_unavailable",
@@ -238,6 +258,42 @@ def _explicit_wrapper_path(wrapper_path: Path | str | None) -> Path:
             "The explicit ArchMarshal wrapper path is not a file.",
         )
     return path
+
+
+def _wrapper_identity(wrapper: Path) -> dict[str, Any]:
+    try:
+        before = wrapper.stat()
+        if before.st_size > MAX_WRAPPER_BYTES:
+            raise GovernanceError(
+                "archmarshal_wrapper_invalid",
+                "The explicit ArchMarshal wrapper exceeds the bounded size.",
+            )
+        raw = wrapper.read_bytes()
+        after = wrapper.stat()
+    except GovernanceError:
+        raise
+    except OSError as exc:
+        raise GovernanceError(
+            "archmarshal_wrapper_unreadable",
+            "The explicit ArchMarshal wrapper could not be read safely.",
+        ) from exc
+    if len(raw) > MAX_WRAPPER_BYTES or (
+        before.st_size,
+        before.st_mtime_ns,
+        getattr(before, "st_ino", None),
+    ) != (
+        after.st_size,
+        after.st_mtime_ns,
+        getattr(after, "st_ino", None),
+    ):
+        raise GovernanceError(
+            "archmarshal_wrapper_changed",
+            "The reviewed ArchMarshal wrapper changed while it was read.",
+        )
+    return {
+        "wrapper_sha256": hashlib.sha256(raw).hexdigest(),
+        "wrapper_size": len(raw),
+    }
 
 
 def _invoke_wrapper(wrapper: Path, arguments: list[str], timeout_seconds: float) -> dict[str, Any]:
@@ -505,11 +561,13 @@ def _make_binding(
     bootstrap: dict[str, str],
     workspace: Path,
     identity: dict[str, str | None],
+    wrapper_identity: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "format": BINDING_FORMAT,
         "provider": "archmarshal",
         **bootstrap,
+        **wrapper_identity,
         "workspace_root": str(workspace),
         "ownership_marker_sha256": identity["ownership_marker_sha256"],
         "skill_index_head": identity["skill_index_head"],

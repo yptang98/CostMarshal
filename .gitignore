@@ -14,3 +14,7 @@ multi-model-conductor/
 projects/
 memory/
 config/
+
+# Release evidence is generated against the checked-out commit and must not be committed.
+artifacts/*.json
+artifacts/*.tmp*

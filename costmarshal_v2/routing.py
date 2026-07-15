@@ -174,7 +174,11 @@ def default_provider_catalog() -> dict[str, Any]:
         "providers": [
             _provider("longcat", "low", profile="longcat", model="LongCat-2.0", env_key="LONGCAT_API_KEY"),
             _provider("deepseek", "medium", profile="deepseek", model="inherit", env_key="DEEPSEEK_API_KEY"),
-            _provider("codex", "high", profile=None, model="inherit", env_key=None),
+            # `CODEX_API_KEY` is scoped to one non-interactive `codex exec`
+            # invocation. Required OCI workers cannot and must not inherit the
+            # host's persisted auth.json, so new projects declare the selected
+            # high-tier credential explicitly.
+            _provider("codex", "high", profile=None, model="inherit", env_key="CODEX_API_KEY"),
         ],
     }
 
@@ -186,6 +190,12 @@ def legacy_provider_catalog() -> dict[str, Any]:
     catalog["providers"] = [
         row for row in catalog["providers"] if row["provider_id"] != "deepseek"
     ]
+    # Projects that predate explicit catalogs inherited the host Codex login
+    # for their high tier. Preserve that read behavior; only newly initialized
+    # catalogs opt into the single-run CODEX_API_KEY contract.
+    for row in catalog["providers"]:
+        if row["provider_id"] == "codex":
+            row["env_key"] = None
     return catalog
 
 
@@ -1050,6 +1060,8 @@ def next_stronger_provider(
     catalog: Mapping[str, Any],
     current_provider_id: str,
     *,
+    required_capabilities: Iterable[str] = (),
+    preferred_provider_ids: Sequence[str] | None = None,
     history: Iterable[Mapping[str, Any]] | None = None,
     task_type: str = "analysis",
     difficulty: str = "normal",
@@ -1074,10 +1086,63 @@ def next_stronger_provider(
         )
     if not isinstance(task_type, str) or not task_type.strip():
         raise RoutingValidationError("task_type must be a non-empty string")
-    enabled = [provider for provider in normalized["providers"] if provider["enabled"]]
+    if isinstance(required_capabilities, (str, bytes)):
+        raise RoutingValidationError("required_capabilities must be a sequence of strings")
+    capabilities: set[str] = set()
+    for raw in required_capabilities:
+        if not isinstance(raw, str) or not raw.strip():
+            raise RoutingValidationError("required_capabilities must contain non-empty strings")
+        capabilities.add(raw.strip())
+    enabled = [
+        provider
+        for provider in normalized["providers"]
+        if provider["enabled"] and capabilities.issubset(set(provider["capabilities"]))
+    ]
+
+    def selected(provider: dict[str, Any], reason: str) -> dict[str, Any]:
+        pricing_ready, pricing_status, pricing_currency = _economic_pricing_gate(
+            [provider],
+            now=now,
+        )
+        ranked = _rank_candidates(
+            [provider],
+            history=history,
+            task_type=task_type.strip().lower(),
+            difficulty=difficulty,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            allow_costs=pricing_ready,
+        )
+        chosen, prior, cost = ranked[0]
+        snapshot = _snapshot_from_provider(chosen) if pricing_ready else None
+        return {
+            **deepcopy(chosen),
+            "estimated_cost_cny": cost,
+            "acceptance_prior": prior.to_dict(),
+            "pricing_status": pricing_status,
+            "pricing_currency": pricing_currency,
+            "price_snapshot": snapshot.to_dict() if snapshot else None,
+            "reason": reason,
+        }
+
     for tier in TIERS[TIER_RANK[current["tier"]] + 1 :]:
         candidates = [provider for provider in enabled if provider["tier"] == tier]
         if candidates:
+            if preferred_provider_ids:
+                preferred = [str(provider_id) for provider_id in preferred_provider_ids]
+                try:
+                    current_index = preferred.index(current_provider_id)
+                except ValueError:
+                    current_index = -1
+                eligible_by_id = {provider["provider_id"]: provider for provider in candidates}
+                if current_index >= 0:
+                    for provider_id in preferred[current_index + 1 :]:
+                        provider = eligible_by_id.get(provider_id)
+                        if provider is not None:
+                            return selected(
+                                provider,
+                                f"continued reviewed cost-performance chain at the next available tier after {current_provider_id}",
+                            )
             pricing_ready, pricing_status, pricing_currency = _economic_pricing_gate(
                 candidates,
                 now=now,
@@ -1091,15 +1156,9 @@ def next_stronger_provider(
                 output_tokens=output_tokens,
                 allow_costs=pricing_ready,
             )
-            provider, prior, cost = ranked[0]
-            snapshot = _snapshot_from_provider(provider) if pricing_ready else None
-            return {
-                **deepcopy(provider),
-                "estimated_cost_cny": cost,
-                "acceptance_prior": prior.to_dict(),
-                "pricing_status": pricing_status,
-                "pricing_currency": pricing_currency,
-                "price_snapshot": snapshot.to_dict() if snapshot else None,
-                "reason": f"next available stronger tier after {current['tier']} is {tier}",
-            }
+            provider, _, _ = ranked[0]
+            return selected(
+                provider,
+                f"next capability-compatible stronger tier after {current['tier']} is {tier}",
+            )
     return None

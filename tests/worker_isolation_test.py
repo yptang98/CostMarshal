@@ -45,6 +45,7 @@ def canary_payload(**overrides) -> str:
         "workspace_writable": True,
         "output_writable": True,
         "runtime_visible": False,
+        "aggregate_secrets_visible": False,
         "engine_socket_visible": False,
     }
     payload.update(overrides)
@@ -52,21 +53,26 @@ def canary_payload(**overrides) -> str:
 
 
 class FakeRunner:
-    def __init__(self, engine: str, *, endpoint: str = "unix:///var/run/docker.sock", system: str = "linux", remote: bool = False, machine_state: str = "running", canary: str | None = None) -> None:
+    def __init__(self, engine: str, *, endpoint: str = "unix:///var/run/docker.sock", system: str = "linux", remote: bool = False, machine_state: str = "running", canary: str | None = None, network_internal: bool = True, network_label: str | None = "true", network_id: str = "d" * 64) -> None:
         self.engine = engine
         self.endpoint = endpoint
         self.system = system
         self.remote = remote
         self.machine_state = machine_state
         self.canary = canary or canary_payload()
+        self.network_internal = network_internal
+        self.network_label = network_label
+        self.network_id = network_id
         self.calls: list[tuple[str, ...]] = []
 
     def __call__(self, argv: Sequence[str], *, timeout: float) -> CommandResult:
         call = tuple(argv)
         self.calls.append(call)
+        if self.engine == "docker" and call[1:] == ("context", "show"):
+            return CommandResult(0, "default\n")
         if self.engine == "docker" and "version" in call:
             return CommandResult(0, json.dumps({"Server": {"Os": self.system, "Version": "27.1.0"}}))
-        if self.engine == "docker" and "context" in call:
+        if self.engine == "docker" and call[1:3] == ("context", "inspect"):
             return CommandResult(0, json.dumps({"Endpoints": {"docker": {"Host": self.endpoint}}}))
         if self.engine == "podman" and "info" in call:
             return CommandResult(
@@ -82,7 +88,27 @@ class FakeRunner:
         if self.engine == "podman" and "machine" in call:
             return CommandResult(0, json.dumps({"State": self.machine_state}))
         if "image" in call and "inspect" in call:
-            return CommandResult(0, json.dumps({"RepoDigests": [IMAGE], "Digest": f"sha256:{DIGEST}"}))
+            return CommandResult(
+                0,
+                json.dumps(
+                    {
+                        "RepoDigests": [IMAGE],
+                        "Digest": f"sha256:{DIGEST}",
+                        "Config": {"Entrypoint": []},
+                    }
+                ),
+            )
+        if "network" in call and "inspect" in call:
+            return CommandResult(
+                0,
+                json.dumps(
+                    {
+                        "Internal": self.network_internal,
+                        "Labels": {"io.costmarshal.provider-proxy": self.network_label},
+                        "Id": self.network_id,
+                    }
+                ),
+            )
         if "costmarshal-isolation-canary" in call:
             return CommandResult(0, self.canary)
         return CommandResult(2, "", "unexpected mocked command: " + " ".join(call))
@@ -145,6 +171,10 @@ class WorkerIsolationTest(unittest.TestCase):
             validate_execution_spec(self.spec(network_mode="host"))  # type: ignore[arg-type]
         self.assertEqual(unsafe_network.exception.code, "network_invalid")
 
+        with self.assertRaises(IsolationValidationError) as bridge_network:
+            validate_execution_spec(self.spec(network_mode="bridge"))
+        self.assertEqual(bridge_network.exception.code, "network_invalid")
+
         with self.assertRaises(IsolationValidationError) as unpaired_credential:
             validate_execution_spec(self.spec(credential_path=None))
         self.assertEqual(unpaired_credential.exception.code, "credential_contract_invalid")
@@ -174,6 +204,11 @@ class WorkerIsolationTest(unittest.TestCase):
         self.assertTrue(attestation.strong_isolation)
         self.assertEqual(attestation.image_digest, f"sha256:{DIGEST}")
         self.assertEqual(attestation.endpoint, "unix:///var/run/docker.sock")
+        self.assertEqual(
+            attestation.probe_provenance,
+            "image-internal-digest-bound-scratch-no-network",
+        )
+        self.assertTrue(any("cryptographic build provenance" in item for item in attestation.warnings))
         argv = backend.build_run_argv(spec, ["codex", "exec", "-"])
         rendered = "\n".join(argv)
         self.assertNotIn(SECRET_VALUE, rendered)
@@ -182,9 +217,20 @@ class WorkerIsolationTest(unittest.TestCase):
         self.assertIn("ALL", argv)
         self.assertIn("never", argv)
         self.assertIn("/run/secrets/provider", rendered)
-        canary_argv = backend.build_canary_argv(spec)
-        self.assertNotIn("/run/secrets/provider", "\n".join(canary_argv))
-        self.assertNotIn(str(self.profile), "\n".join(canary_argv))
+        canary_argv = next(call for call in runner.calls if "costmarshal-isolation-canary" in call)
+        canary_rendered = "\n".join(canary_argv)
+        self.assertNotIn("/run/secrets/provider", canary_rendered)
+        self.assertNotIn(str(self.profile), canary_rendered)
+        self.assertNotIn(str(self.workspace), canary_rendered)
+        self.assertNotIn(str(self.output), canary_rendered)
+        self.assertEqual(canary_argv[canary_argv.index("--network") + 1], "none")
+        self.assertEqual(argv[:4], ["docker", "--host", "unix:///var/run/docker.sock", "run"])
+        self.assertTrue(any(call[:4] == ("docker", "--host", "unix:///var/run/docker.sock", "version") for call in runner.calls))
+        context_inspect_index = next(
+            index for index, call in enumerate(runner.calls) if call[1:3] == ("context", "inspect")
+        )
+        for call in runner.calls[context_inspect_index + 1 :]:
+            self.assertEqual(call[:3], ("docker", "--host", "unix:///var/run/docker.sock"))
 
     def test_remote_docker_context_is_rejected(self) -> None:
         backend = OciCliBackend(
@@ -234,6 +280,29 @@ class WorkerIsolationTest(unittest.TestCase):
             backend.preflight(self.spec(engine="docker"))
         self.assertEqual(caught.exception.code, "isolation_canary_failed")
         self.assertIn("engine_socket_hidden", caught.exception.details["failed"])
+
+    def test_provider_proxy_network_requires_internal_trusted_network(self) -> None:
+        spec = self.spec(
+            engine="docker",
+            network_mode="provider-proxy",
+            network_name="costmarshal-provider-proxy",
+        )
+        backend = OciCliBackend("docker", runner=FakeRunner("docker"), host_system="Linux")
+        attestation = backend.preflight(spec)
+        self.assertEqual(dict(attestation.network_policy)["mode"], "provider-proxy")
+        self.assertFalse(dict(attestation.network_policy)["external_egress"])
+        self.assertEqual(dict(attestation.network_policy)["network_id"], "d" * 64)
+        argv = backend.build_run_argv(spec, ["codex", "exec", "-"], network_id="d" * 64)
+        self.assertEqual(argv[argv.index("--network") + 1], "d" * 64)
+
+        for runner, code in (
+            (FakeRunner("docker", network_internal=False), "provider_proxy_network_not_internal"),
+            (FakeRunner("docker", network_label=None), "provider_proxy_network_untrusted"),
+            (FakeRunner("docker", network_id="mutable-name"), "provider_proxy_network_id_invalid"),
+        ):
+            with self.assertRaises(IsolationUnavailableError) as caught:
+                OciCliBackend("docker", runner=runner, host_system="Linux").preflight(spec)
+            self.assertEqual(caught.exception.code, code)
 
     def test_required_mode_never_falls_back_to_native(self) -> None:
         docker = RejectingBackend("docker")

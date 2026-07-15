@@ -1,0 +1,97 @@
+{
+  "release": "v2.0.0",
+  "source_commit": "19d2179",
+  "documents": {
+    "project.json": {
+      "schema_version": 2,
+      "project_id": "20260301-120000-v2-0-fixture",
+      "name": "v2-0-fixture",
+      "objective": "Preserve a v2.0 scheduler project",
+      "status": "active",
+      "created_at": "2026-03-01T12:00:00+00:00",
+      "updated_at": "2026-03-01T12:03:00+00:00",
+      "source_project_mode": "none",
+      "scheduler_contract": {
+        "role": "relay-only"
+      }
+    },
+    "scheduler/session.json": {
+      "schema_version": 2,
+      "project_id": "20260301-120000-v2-0-fixture",
+      "status": "configured",
+      "leader_actor_id": "leader",
+      "actors": {},
+      "task_bindings": {},
+      "recovery": {
+        "last_recovered_at": null,
+        "last_status": "not_run",
+        "issues": []
+      }
+    },
+    "scheduler/relay-cursors.json": {
+      "schema_version": 2,
+      "updated_at": "2026-03-01T12:00:00+00:00",
+      "actors": {}
+    },
+    "locks/claims.json": {
+      "schema_version": 2,
+      "updated_at": "2026-03-01T12:01:00+00:00",
+      "claims": [
+        {
+          "path": "src/legacy.py",
+          "task_id": "V2-0001",
+          "actor_id": null,
+          "status": "planned"
+        }
+      ]
+    },
+    "tasks/V2-0001/task.json": {
+      "schema_version": 2,
+      "id": "V2-0001",
+      "title": "Legacy relay task",
+      "purpose": "Exercise the v2.0 document shape",
+      "task_type": "implementation",
+      "status": "planned",
+      "agent_id": null,
+      "agent_name": null,
+      "model": "inherit",
+      "acceptance": [
+        "state survives migration"
+      ],
+      "allowed_context": [],
+      "allowed_paths": [
+        "src/legacy.py"
+      ],
+      "claimed_paths": [
+        "src/legacy.py"
+      ],
+      "lock_conflict_override": false,
+      "report_path": "tasks/V2-0001/completion-report.md"
+    },
+    "tasks/V2-0001/status.json": {
+      "schema_version": 2,
+      "task_id": "V2-0001",
+      "state": "planned",
+      "updated_at": "2026-03-01T12:01:00+00:00",
+      "error": null
+    }
+  },
+  "ledgers": {
+    "scheduler/events.jsonl": [
+      {
+        "id": "EVT-v20-init",
+        "timestamp": "2026-03-01T12:00:00+00:00",
+        "event_type": "project_initialized",
+        "project_id": "20260301-120000-v2-0-fixture"
+      },
+      {
+        "id": "EVT-v20-task",
+        "timestamp": "2026-03-01T12:01:00+00:00",
+        "event_type": "task_created",
+        "task_id": "V2-0001"
+      }
+    ],
+    "reports/results.jsonl": [],
+    "reports/usage.jsonl": []
+  }
+}

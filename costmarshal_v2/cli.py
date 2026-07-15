@@ -26,6 +26,7 @@ from .scheduler import (
     command_dashboard,
     command_budget_status,
     command_governance_status,
+    command_governance_rebind,
     command_providers,
     command_record_leader_work,
     command_record_result,
@@ -123,7 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--worker-isolation", choices=["required"], default="required", help="Require attested Linux OCI isolation for task workers")
     init.add_argument("--container-engine", choices=["auto", "docker", "podman"], default="auto")
     init.add_argument("--worker-image", help="Digest-pinned worker image, name@sha256:<64 hex>")
-    init.add_argument("--worker-network", choices=["none", "bridge", "provider-proxy"], default="provider-proxy")
+    init.add_argument("--worker-network", choices=["none", "provider-proxy"], default="provider-proxy")
     init.add_argument("--worker-network-name", default="costmarshal-provider-proxy")
     init.add_argument("--allow-unsafe-native-workers", action="store_true", help="Project-level half of the explicit development-only native worker escape hatch")
     init.add_argument("--tmux-command", dest="backend_command", help=argparse.SUPPRESS)
@@ -195,6 +196,15 @@ def build_parser() -> argparse.ArgumentParser:
     governance_status = sub.add_parser("governance-status", help="Validate the stored ArchMarshal governance binding without mutation")
     governance_status.add_argument("--project", required=True)
     governance_status.set_defaults(func=command_governance_status)
+
+    governance_rebind = sub.add_parser(
+        "governance-rebind",
+        help="Preview or explicitly refresh only CostMarshal's read-only ArchMarshal binding",
+    )
+    governance_rebind.add_argument("--project", required=True)
+    governance_rebind.add_argument("--apply", action="store_true")
+    _add_command_id(governance_rebind)
+    governance_rebind.set_defaults(func=command_governance_rebind)
 
     dispatch = sub.add_parser("dispatch", help="Assign a task to an agent actor and optionally start it")
     dispatch.add_argument("--project", required=True)
@@ -275,6 +285,7 @@ def build_parser() -> argparse.ArgumentParser:
     stop_actor.add_argument("--stop-runtime", action="store_true")
     stop_actor.add_argument("--kill-window", dest="stop_runtime", action="store_true", help=argparse.SUPPRESS)
     stop_actor.add_argument("--dry-run", action="store_true")
+    _add_command_id(stop_actor)
     stop_actor.set_defaults(func=command_stop_actor)
 
     collect = sub.add_parser("collect", help="Relay task report availability to the leader")
@@ -341,6 +352,7 @@ def build_parser() -> argparse.ArgumentParser:
     recover.add_argument("--project", required=True)
     recover.add_argument("--plan-restarts", action="store_true")
     recover.add_argument("--restart-missing", action="store_true", help="Restart missing runtimes for actors that were marked running")
+    _add_command_id(recover)
     recover.set_defaults(func=command_recover)
 
     dashboard = sub.add_parser("dashboard", help="Show a live process board for scheduler, leader, agents, mailboxes, and token totals")

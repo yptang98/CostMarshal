@@ -29,6 +29,7 @@ IGNORED_DIRS = {
     "projects",
     "memory",
     "config",
+    "artifacts",
 }
 
 
@@ -87,9 +88,14 @@ def main() -> int:
         assert_true((backup_dir / ".env").is_file(), "backup should preserve old local files")
         assert_true((install_dir / "SKILL.md").is_file(), "installed skill should include SKILL.md")
         assert_true((install_dir / "scripts" / "costmarshal.py").is_file(), "installed skill should include CLI")
+        assert_true((install_dir / "container" / "worker" / "Dockerfile").is_file(), "installed skill should include worker image source")
+        assert_true((install_dir / "references" / "backtest.md").is_file(), "installed skill should include release references")
+        assert_true((install_dir / "tests" / "release" / "run_release_gates.py").is_file(), "installed skill should include release gates")
+        assert_true((install_dir / "release" / "evidence-policy.json").is_file(), "installed skill should include release trust policy")
         assert_true((install_dir / "VERSION").read_text(encoding="utf-8").strip() != old_version, "update should install the new version")
         assert_true(not (install_dir / ".git").exists(), "install copy should not include .git")
         assert_true(not any(install_dir.rglob("*.env")), "install copy should not include .env files")
+        assert_true(not (install_dir / "artifacts").exists(), "install copy should not include generated evidence")
 
         env = os.environ.copy()
         env["CODEX_HOME"] = str(codex_home)

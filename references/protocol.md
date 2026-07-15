@@ -1,4 +1,4 @@
-# CostMarshal v2.3 Protocol
+# CostMarshal v2.4 Protocol
 
 This is the canonical v2 protocol. Legacy `scripts/mc.py` commands are not part of it.
 
@@ -49,7 +49,7 @@ snapshot.
 
 Production worker dispatch uses `required` isolation and may select only an attested local Docker/Podman Linux engine with a digest-pinned image. Native execution is never a fallback. Unsafe native development execution requires two explicit opt-ins and records a weak attestation. Required governance forbids it.
 
-The beta OCI contract validates mounts, rootfs, UID, capabilities, no-new-privileges, engine locality, image digest, resources, and canary output before state or budget reservation. Required execution remains fail-closed until the container snapshot/profile/credential/report exchange adapter is enabled.
+The beta OCI contract validates mounts, rootfs, UID, capabilities, no-new-privileges, engine locality, image digest, resources, and canary output before state or budget reservation. Required execution uses a bounded JSONL worker adapter with one selected credential, a sanitized profile, stdin-only prompts, a strict output exchange, immutable container identity, and cleanup receipts. Unrestricted bridge networking is forbidden. A `provider-proxy` network must be engine-attested as internal, carry the CostMarshal trust label, and be paired with a separately reviewed dual-homed proxy for controlled egress.
 
 ## Write isolation
 
@@ -76,4 +76,4 @@ ArchMarshal checks are explicit and read-only. Required binding drift blocks dis
 
 Legacy projects use atomic JSON/JSONL until an explicit offline `migrate-state --apply`. Cutover creates a full backup and staged SQLite database, validates integrity and foreign keys, installs the database, then writes `state-backend.json` last. After the marker, SQLite WAL is authoritative for mutable JSON/JSONL control views; a missing or malformed enabled database fails closed.
 
-Pure commands commit their state, ledger, event, and mailbox view mutations together under a payload-hashed command ID. Dirty compatibility views are rebuilt after a post-commit crash. OS spawn/stop remains a separate effect boundary; those commands are blocked on SQLite-backed projects until the leased effect outbox and runner self-registration path are complete.
+Pure commands commit their state, ledger, event, and mailbox view mutations together under a payload-hashed command ID. Dirty compatibility views are rebuilt after a post-commit crash. OS spawn/stop uses a leased transactional effect outbox: intent and command state commit first, external I/O occurs outside the database transaction, observation is durably recorded, and final materialization atomically applies the effect and completes the command. Attempt lifetime locks, launch tokens, process/container identity, lease expiry, and actor report recovery prevent a replay from silently duplicating provider work.

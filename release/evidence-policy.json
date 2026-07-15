@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "backtest": {
+    "allowed_signers_sha256": null,
+    "signer_identities": [],
+    "policy_manifest_sha256": null,
+    "preregistered_commit": null
+  },
+  "oci": {
+    "worker_image": null,
+    "provider_proxy_image_id": null,
+    "provider_proxy_config_sha256": null,
+    "provider_proxy_health_url_sha256": null,
+    "provider_proxy_health_response_sha256": null
+  }
+}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import hmac
 import json
@@ -10,8 +11,11 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from urllib.parse import urlsplit
 
 from .control_store import control_store_enabled, control_transaction
 from .mailbox import send_message
@@ -26,6 +30,18 @@ from .security import (
     redact_secret_values,
 )
 from .routing import RoutingValidationError, project_provider_catalog
+from .session_backend import pid_start_marker
+from .worker_isolation import (
+    IsolationError,
+    OciCliBackend,
+    OciWorkerExecutionAdapter,
+    ResourceLimits,
+    WorkerExecutionError,
+    WorkerExecutionSpec,
+    cleanup_temporary_credential,
+    validate_execution_spec,
+    validate_output_exchange,
+)
 from .state import (
     SCHEMA_VERSION,
     append_event,
@@ -40,6 +56,14 @@ from .state import (
     save_task,
     task_dir,
 )
+
+
+ACTOR_FAULT_ENV = "COSTMARSHAL_ACTOR_FAULT"
+
+
+def _actor_fault(name: str) -> None:
+    if os.environ.get(ACTOR_FAULT_ENV) == name:
+        os._exit(87)  # intentionally bypass runner cleanup for crash recovery tests
 
 
 def load_env_file(path: Path | None, env: dict[str, str]) -> dict[str, str]:
@@ -300,7 +324,15 @@ def actor_execution_workspace(
         raise SystemExit(f"writable worker dispatch requires a git workspace: {detail}") from exc
 
     attempt = str(actor.get("attempt_id") or actor["id"])
-    staging = (layout.project_dir / "worktrees" / slugify(attempt, "attempt")).resolve()
+    if (actor.get("isolation") or {}).get("mode") == "required":
+        staging = (
+            layout.root
+            / "worker-worktrees"
+            / slugify(str(project.get("project_id") or "project"), "project")
+            / slugify(attempt, "attempt")
+        ).resolve()
+    else:
+        staging = (layout.project_dir / "worktrees" / slugify(attempt, "attempt")).resolve()
     metadata_path = layout.project_dir / "worktrees" / f"{slugify(attempt, 'attempt')}.json"
     if metadata_path.is_file():
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -319,6 +351,17 @@ def actor_execution_workspace(
             )
         except subprocess.CalledProcessError as exc:
             raise SystemExit(f"unable to create isolated worker worktree: {(exc.stdout or '').strip()}") from exc
+    if (
+        (actor.get("isolation") or {}).get("mode") == "required"
+        and hasattr(os, "getuid")
+        and os.getuid() == 0
+    ):
+        try:
+            os.chown(staging, 65532, 65532)
+            for child in staging.rglob("*"):
+                os.chown(child, 65532, 65532, follow_symlinks=False)
+        except OSError as exc:
+            raise SystemExit("unable to assign the isolated worktree to the non-root OCI worker") from exc
     return staging, "workspace-write", write_paths, base_sha
 
 
@@ -476,19 +519,289 @@ def report_status(report: Path) -> str | None:
     return match.group(1).lower() if match else None
 
 
+def _required_worker_bundle(
+    layout: ProjectLayout,
+    project: dict[str, Any],
+    actor: dict[str, Any],
+    *,
+    execution_workspace: Path,
+    workspace_mode: str,
+) -> tuple[WorkerExecutionSpec, list[str], tuple[str, ...]]:
+    """Build the durable, attempt-scoped host side of the OCI exchange contract."""
+
+    isolation = actor.get("isolation") or {}
+    execution = isolation.get("execution") or {}
+    attestation = isolation.get("attestation") or {}
+    if isolation.get("mode") != "required" or attestation.get("strong_isolation") is not True:
+        raise SystemExit("required worker bundle rejected: strong OCI attestation is missing")
+    engine = str(execution.get("engine") or attestation.get("backend") or "")
+    if engine not in {"docker", "podman"} or engine != str(attestation.get("backend") or ""):
+        raise SystemExit("required worker bundle rejected: OCI backend attestation mismatch")
+    attempt_id = str(actor.get("attempt_id") or "")
+    if not attempt_id:
+        raise SystemExit("required worker bundle rejected: attempt id is missing")
+    bundle = (
+        layout.root
+        / "worker-bundles"
+        / slugify(str(project.get("project_id") or "project"), "project")
+        / slugify(attempt_id, "attempt")
+    ).resolve()
+    profile_path = bundle / "profile.config.toml"
+    output_exchange = bundle / "out"
+    credential_root = bundle / "credential"
+    bundle.mkdir(parents=True, exist_ok=True)
+    output_exchange.mkdir(exist_ok=True)
+    credential_root.mkdir(exist_ok=True)
+    if credential_root.is_symlink() or not credential_root.is_dir():
+        raise SystemExit("required worker credential root is invalid")
+    with contextlib.suppress(OSError):
+        bundle.chmod(0o700)
+        output_exchange.chmod(0o733)
+        credential_root.chmod(0o700)
+    runtime = actor.get("runtime") or {}
+    recovering_existing_container = bool(
+        runtime.get("container_name")
+        and runtime.get("container_command")
+        and (
+            runtime.get("oci_lifecycle_state") in {"prepared", "started", "finished"}
+            or runtime.get("container_id")
+        )
+    )
+    if any(output_exchange.iterdir()) and not recovering_existing_container:
+        raise SystemExit("required worker output exchange is not empty for this attempt")
+
+    profile = actor.get("profile")
+    profile_text = "# CostMarshal isolated default profile\n"
+    if profile:
+        source_home = os.environ.get("CODEX_HOME")
+        if not source_home:
+            raise SystemExit(f"required worker profile is unavailable: {profile}")
+        source = Path(source_home).expanduser() / f"{profile}.config.toml"
+        if not source.is_file() or source.is_symlink():
+            raise SystemExit(f"required worker profile is unavailable: {profile}")
+        payload = source.read_bytes()
+        if len(payload) > 256 * 1024:
+            raise SystemExit("required worker profile exceeds 256 KiB")
+        try:
+            profile_text = payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SystemExit("required worker profile must be UTF-8") from exc
+        if "\x00" in profile_text:
+            raise SystemExit("required worker profile contains a NUL byte")
+        try:
+            profile_data = tomllib.loads(profile_text)
+        except tomllib.TOMLDecodeError as exc:
+            raise SystemExit("required worker profile is invalid TOML") from exc
+        allowed_top = {
+            "model_provider",
+            "model",
+            "model_reasoning_effort",
+            "disable_response_storage",
+            "web_search",
+            "model_providers",
+        }
+        unknown_top = sorted(set(profile_data) - allowed_top)
+        providers = profile_data.get("model_providers")
+        provider_id = profile_data.get("model_provider")
+        if unknown_top or not isinstance(provider_id, str) or not isinstance(providers, dict):
+            raise SystemExit("required worker profile contains unsupported settings")
+        provider_row = providers.get(provider_id)
+        allowed_provider = {"name", "base_url", "wire_api", "env_key"}
+        if not isinstance(provider_row, dict) or set(provider_row) - allowed_provider:
+            raise SystemExit("required worker profile contains unsupported provider settings")
+        if provider_row.get("env_key") != provider_env_key(actor):
+            raise SystemExit("required worker profile env_key does not match the routed provider")
+        parsed_url = urlsplit(str(provider_row.get("base_url") or ""))
+        network_mode = str(execution.get("network_mode") or "provider-proxy")
+        if (
+            parsed_url.scheme not in {"http", "https"}
+            or not parsed_url.netloc
+            or parsed_url.username
+            or parsed_url.password
+            or parsed_url.query
+            or parsed_url.fragment
+            or (parsed_url.scheme == "http" and network_mode != "provider-proxy")
+        ):
+            raise SystemExit("required worker profile base_url is invalid")
+    atomic_write_text(profile_path, profile_text)
+
+    limits_row = execution.get("limits") or {}
+    try:
+        limits = ResourceLimits(
+            memory_mb=int(limits_row.get("memory_mb") or 2048),
+            cpus=float(limits_row.get("cpus") or 2.0),
+            pids=int(limits_row.get("pids") or 256),
+            timeout_seconds=float(limits_row.get("timeout_seconds") or 30.0),
+            tmpfs_mb=int(limits_row.get("tmpfs_mb") or 256),
+            home_tmpfs_mb=int(limits_row.get("home_tmpfs_mb") or 64),
+        )
+    except (TypeError, ValueError) as exc:
+        raise SystemExit("required worker resource limits are invalid") from exc
+    forbidden_mount_roots = [layout.project_dir.resolve()]
+    aggregate_secrets = project.get("secrets_file")
+    if aggregate_secrets:
+        forbidden_mount_roots.append(Path(str(aggregate_secrets)).expanduser().resolve())
+    network_mode = str(execution.get("network_mode") or "provider-proxy")
+    preflight_spec = WorkerExecutionSpec(
+        project_id=str(project.get("project_id") or "project"),
+        actor_id=str(actor["id"]),
+        attempt_id=attempt_id,
+        image=str(execution.get("image") or attestation.get("image") or ""),
+        workspace=execution_workspace,
+        workspace_mode="rw" if workspace_mode == "workspace-write" else "ro",
+        profile_path=profile_path,
+        output_exchange=output_exchange,
+        isolation_mode="required",
+        engine=engine,
+        network_mode=network_mode,
+        network_name=execution.get("network_name"),
+        forbidden_mount_roots=tuple(forbidden_mount_roots),
+        limits=limits,
+    )
+    try:
+        validate_execution_spec(
+            preflight_spec,
+            require_empty_output=not recovering_existing_container,
+        )
+    except IsolationError as exc:
+        raise SystemExit(f"required worker execution spec is invalid [{exc.code}]: {exc}") from exc
+
+    # No provider secret is materialized until every credential-free execution
+    # invariant has passed.  From this point onward cleanup is part of the
+    # persisted OCI lifecycle contract.
+    isolated_env, secret_values = isolated_actor_env(project, actor, layout=layout)
+    env_key = provider_env_key(actor)
+    credential_path: Path | None = None
+    if env_key and isolated_env.get(env_key):
+        credential_path = credential_root / "provider.secret"
+        if credential_path.exists():
+            if credential_path.is_symlink() or not credential_path.is_file():
+                raise SystemExit("required worker temporary credential is invalid")
+            cleanup = runtime.get("credential_cleanup") or {}
+            resumable_preparation = (
+                cleanup.get("status") in {"creating", "pending"}
+                and str(cleanup.get("path") or "") == str(credential_path)
+                and runtime.get("oci_lifecycle_state")
+                in {None, "credential_preparing", "prepared"}
+            )
+            if (
+                not (
+                    resumable_preparation
+                    or (
+                        recovering_existing_container
+                        and cleanup.get("status") == "pending"
+                        and str(cleanup.get("path") or "") == str(credential_path)
+                    )
+                )
+                or not hmac.compare_digest(
+                    credential_path.read_text(encoding="utf-8"),
+                    str(isolated_env[env_key]),
+                )
+            ):
+                raise SystemExit("required worker temporary credential already exists")
+        else:
+            def prepare_credential_cleanup() -> None:
+                current_actor = _validate_worker_fence(
+                    layout,
+                    str(actor["id"]),
+                    attempt_id=str(actor.get("attempt_id") or ""),
+                    launch_token=str(actor.get("launch_token") or ""),
+                )
+                current_actor.setdefault("runtime", {})["credential_cleanup"] = {
+                    "required": True,
+                    "path": str(credential_path),
+                    "status": "creating",
+                }
+                save_actor(layout, current_actor)
+
+            _control_mutation(
+                layout,
+                command_name="runner_prepare_credential",
+                command_id=(
+                    f"RUNNER-CREDENTIAL-PREPARE-{attempt_id}-"
+                    f"{int(runtime.get('credential_generation') or 0)}"
+                ),
+                payload={
+                    "actor_id": actor["id"],
+                    "attempt_id": attempt_id,
+                    "credential_generation": int(runtime.get("credential_generation") or 0),
+                    "credential_identifier": hashlib.sha256(
+                        os.fsencode(credential_path)
+                    ).hexdigest(),
+                },
+                mutate=prepare_credential_cleanup,
+            )
+            runtime["credential_cleanup"] = {
+                "required": True,
+                "path": str(credential_path),
+                "status": "creating",
+            }
+            atomic_write_text(credential_path, str(isolated_env[env_key]))
+            _actor_fault("after_credential_before_oci_prepare")
+        with contextlib.suppress(OSError):
+            credential_path.chmod(0o404 if hasattr(os, "getuid") and os.getuid() == 0 else 0o600)
+    elif env_key:
+        raise SystemExit(f"required worker credential is unavailable for {env_key}")
+
+    spec = replace(
+        preflight_spec,
+        credential_path=credential_path,
+        provider_env_key=env_key if credential_path else None,
+        credential_cleanup="delete-after-use" if credential_path else "preserve",
+        credential_temp_root=credential_root if credential_path else None,
+    )
+    try:
+        validate_execution_spec(
+            spec,
+            require_empty_output=not recovering_existing_container,
+        )
+    except IsolationError as exc:
+        with contextlib.suppress(IsolationError):
+            cleanup_temporary_credential(spec)
+        raise SystemExit(f"required worker execution spec is invalid [{exc.code}]: {exc}") from exc
+    command = ["costmarshal-worker", "--jsonl"]
+    model = actor.get("model")
+    if model and model != "inherit":
+        command.extend(["--model", str(model)])
+    return spec, command, secret_values
+
+
+def _expected_oci_container_name(spec: WorkerExecutionSpec) -> str:
+    """Mirror the adapter's stable attempt identity for pre-start recovery state."""
+
+    identity = f"{spec.project_id}\0{spec.actor_id}\0{spec.attempt_id}".encode("utf-8")
+    suffix = hashlib.sha256(identity).hexdigest()[:16]
+    stem = re.sub(
+        r"[^a-z0-9_.-]+",
+        "-",
+        f"{spec.project_id}-{spec.actor_id}".lower(),
+    ).strip("-.")
+    return f"costmarshal-{stem[:72]}-{suffix}"
+
+
 def _validate_worker_fence(
     layout: ProjectLayout,
     actor_id: str,
     *,
     attempt_id: str | None,
     launch_token: str | None,
+    allow_provider_started: bool = False,
 ) -> dict[str, Any]:
     actor = load_actor(layout, actor_id)
     if actor.get("role") != "agent":
         return actor
     isolation = actor.get("isolation") or {}
     attestation = isolation.get("attestation") or {}
-    if (
+    if isolation.get("mode") == "required":
+        execution = isolation.get("execution") or {}
+        if (
+            attestation.get("strong_isolation") is not True
+            or attestation.get("backend") not in {"docker", "podman"}
+            or execution.get("engine") != attestation.get("backend")
+            or execution.get("image") != attestation.get("image")
+        ):
+            raise SystemExit("required worker runner rejected: OCI attestation is incomplete or inconsistent")
+    elif (
         isolation.get("mode") != "unsafe-native"
         or not isolation.get("project_opt_in")
         or not isolation.get("dispatch_opt_in")
@@ -504,7 +817,10 @@ def _validate_worker_fence(
         raise SystemExit("worker launch rejected: launch token mismatch")
     if actor.get("status") in {"stopped", "failed", "idle", "waiting"}:
         raise SystemExit(f"worker launch rejected: actor is {actor.get('status')}")
-    if (actor.get("runtime") or {}).get("provider_execution_state") == "started":
+    if (
+        not allow_provider_started
+        and (actor.get("runtime") or {}).get("provider_execution_state") == "started"
+    ):
         raise SystemExit("worker launch rejected: prior provider execution outcome is unknown")
     task_id = actor.get("task_id")
     if not task_id:
@@ -514,7 +830,7 @@ def _validate_worker_fence(
     current = attempts[-1] if attempts else None
     if not current or current.get("attempt_id") != expected_attempt or current.get("actor_id") != actor_id:
         raise SystemExit("worker launch rejected: attempt is no longer current")
-    if current.get("status") not in {"preparing", "dispatched", "starting", "running", "needs_recovery"}:
+    if current.get("status") not in {"preparing", "dispatched", "starting", "launch_pending", "running", "needs_recovery"}:
         raise SystemExit(f"worker launch rejected: attempt is {current.get('status')}")
     return actor
 
@@ -545,16 +861,33 @@ def _run_actor_once(
     report = report_path(layout, actor)
     report.parent.mkdir(parents=True, exist_ok=True)
     execution_workspace, sandbox, write_scopes, base_sha = actor_execution_workspace(layout, project, actor)
-    argv = build_codex_argv(
-        layout,
-        actor,
-        project,
-        report,
-        execution_workspace=execution_workspace,
-        sandbox=sandbox,
-    )
-    env, secret_values = isolated_actor_env(project, actor, layout=layout)
+    required_isolation = (actor.get("isolation") or {}).get("mode") == "required"
+    argv: list[str] = []
+    env: dict[str, str] = {}
+    required_spec: WorkerExecutionSpec | None = None
+    required_command: list[str] = []
+    if required_isolation:
+        required_spec, required_command, secret_values = _required_worker_bundle(
+            layout,
+            project,
+            actor,
+            execution_workspace=execution_workspace,
+            workspace_mode=sandbox,
+        )
+    else:
+        argv = build_codex_argv(
+            layout,
+            actor,
+            project,
+            report,
+            execution_workspace=execution_workspace,
+            sandbox=sandbox,
+        )
+        env, secret_values = isolated_actor_env(project, actor, layout=layout)
     events: list[dict[str, Any]] = []
+    usage_known = not required_isolation
+    runtime_registration: dict[str, Any] = {}
+
     def register_runner() -> None:
         current_actor = _validate_worker_fence(
             layout,
@@ -567,9 +900,18 @@ def _run_actor_once(
         runtime["execution_workspace"] = str(execution_workspace)
         runtime["sandbox"] = sandbox
         runtime["runner_pid"] = os.getpid()
-        runtime["process_start_marker"] = f"{os.getpid()}:{time.time_ns()}"
+        runtime["pid"] = os.getpid()
+        if runtime.get("backend") == "local":
+            runtime["target"] = f"pid:{os.getpid()}"
+            runtime["log_path"] = runtime.get("log_path") or str(
+                (layout.transcripts_dir / f"{slugify(actor_id, 'actor')}.log").relative_to(layout.project_dir)
+            ).replace("\\", "/")
+        runtime["process_start_marker"] = (
+            pid_start_marker(os.getpid()) or f"unverified:{os.getpid()}:{time.time_ns()}"
+        )
         runtime["registered_launch_token_sha256"] = hashlib.sha256(str(launch_token).encode("utf-8")).hexdigest()
         runtime["provider_execution_state"] = "started"
+        runtime.update(runtime_registration)
         save_actor(layout, current_actor)
         if current_actor.get("task_id") and current_actor.get("attempt_id"):
             current_task = load_task(layout, str(current_actor["task_id"]))
@@ -591,42 +933,386 @@ def _run_actor_once(
             model=actor.get("model"),
             execution_workspace=str(execution_workspace),
             sandbox=sandbox,
+            isolation_backend=runtime_registration.get("isolation_backend") or "unsafe-native",
+            container_name=runtime_registration.get("container_name"),
         )
-    _control_mutation(
-        layout,
-        command_name="runner_register",
-        command_id=f"RUNNER-REGISTER-{attempt_id or actor_id}",
-        payload={"actor_id": actor_id, "attempt_id": attempt_id, "launch_token_sha256": hashlib.sha256(str(launch_token).encode("utf-8")).hexdigest()},
-        mutate=register_runner,
-    )
-    try:
-        with prompt.open("r", encoding="utf-8") as prompt_handle:
-            process = subprocess.Popen(
-                process_argv(argv),
-                cwd=str(execution_workspace),
-                env=env,
-                stdin=prompt_handle,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+    registration_payload = {
+        "actor_id": actor_id,
+        "attempt_id": attempt_id,
+        "launch_token_sha256": hashlib.sha256(str(launch_token).encode("utf-8")).hexdigest(),
+    }
+    if required_isolation:
+        assert required_spec is not None
+        adapter = OciWorkerExecutionAdapter(OciCliBackend(required_spec.engine))
+        handle = None
+        returncode = 125
+        failure: IsolationError | None = None
+        expected_container_name = _expected_oci_container_name(required_spec)
+        existing_runtime = actor.get("runtime") or {}
+        existing_container_name = str(existing_runtime.get("container_name") or "")
+        existing_container_command = existing_runtime.get("container_command") or []
+        prepared_identity = bool(
+            existing_container_name == expected_container_name
+            and isinstance(existing_container_command, list)
+            and existing_container_command
+        )
+        existing_lifecycle = str(existing_runtime.get("oci_lifecycle_state") or "")
+        recovering_existing = bool(
+            prepared_identity
+            and (
+                existing_lifecycle in {"started", "finished"}
+                or existing_runtime.get("container_id")
             )
-            assert process.stdout is not None
-            for line in process.stdout:
-                safe_line = redact_secret_values(line, secret_values)
-                sys.stdout.write(safe_line)
-                sys.stdout.flush()
+        )
+        recovering_prepared = bool(prepared_identity and existing_lifecycle == "prepared")
+        pending_report_text: str | None = None
+        cleanup_unconfirmed = False
+        cleanup_error_code: str | None = None
+
+        def prepare_oci_runtime() -> None:
+            current_actor = _validate_worker_fence(
+                layout,
+                actor_id,
+                attempt_id=attempt_id,
+                launch_token=launch_token,
+            )
+            runtime = current_actor.setdefault("runtime", {})
+            runtime["isolation_backend"] = required_spec.engine
+            runtime["container_name"] = expected_container_name
+            runtime["container_command"] = list(required_command)
+            runtime["output_exchange"] = str(required_spec.output_exchange)
+            runtime["oci_lifecycle_state"] = "prepared"
+            runtime["credential_cleanup"] = {
+                "required": required_spec.credential_path is not None,
+                "path": str(required_spec.credential_path) if required_spec.credential_path else None,
+                "status": "pending" if required_spec.credential_path else "not_required",
+            }
+            save_actor(layout, current_actor)
+
+        _control_mutation(
+            layout,
+            command_name="runner_prepare_oci",
+            command_id=(
+                f"RUNNER-PREPARE-OCI-{attempt_id or actor_id}-"
+                f"{int(existing_runtime.get('credential_generation') or 0)}"
+            ),
+            payload={
+                **registration_payload,
+                "container_name": expected_container_name,
+                "credential_cleanup_required": required_spec.credential_path is not None,
+                "credential_generation": int(
+                    existing_runtime.get("credential_generation") or 0
+                ),
+            },
+            mutate=prepare_oci_runtime,
+        )
+        _actor_fault("after_oci_prepare_before_start")
+        try:
+            if recovering_existing:
+                handle = adapter.attach(
+                    required_spec,
+                    container_name=existing_container_name,
+                    container_id=(
+                        str(existing_runtime["container_id"])
+                        if existing_runtime.get("container_id")
+                        else None
+                    ),
+                    command=tuple(str(item) for item in existing_container_command),
+                )
+            elif recovering_prepared:
+                handle = adapter.recover_or_start(
+                    required_spec,
+                    tuple(str(item) for item in existing_container_command),
+                    container_name=existing_container_name,
+                    container_id=(
+                        str(existing_runtime["container_id"])
+                        if existing_runtime.get("container_id")
+                        else None
+                    ),
+                    stdin_prompt=prompt.read_text(encoding="utf-8"),
+                )
+            else:
+                handle = adapter.start(
+                    required_spec,
+                    required_command,
+                    stdin_prompt=prompt.read_text(encoding="utf-8"),
+                )
+            recovered_execution = bool(getattr(handle, "recovered", False))
+            if handle.container_name != expected_container_name:
+                raise SystemExit("OCI worker returned an unexpected deterministic container identity")
+            runtime_registration.update(
+                {
+                    "isolation_backend": required_spec.engine,
+                    "container_name": handle.container_name,
+                    "container_id": handle.container_id,
+                    "container_command": list(handle.command),
+                    "container_network_id": handle.network_id,
+                    "isolation_attestation": handle.attestation.to_dict(),
+                    "output_exchange": str(required_spec.output_exchange),
+                    "oci_lifecycle_state": "started",
+                }
+            )
+
+            def persist_oci_identity() -> None:
+                current_actor = _validate_worker_fence(
+                    layout,
+                    actor_id,
+                    attempt_id=attempt_id,
+                    launch_token=launch_token,
+                )
+                runtime = current_actor.setdefault("runtime", {})
+                runtime.update(runtime_registration)
+                save_actor(layout, current_actor)
+
+            _control_mutation(
+                layout,
+                command_name="runner_register_oci_identity",
+                command_id=f"RUNNER-OCI-IDENTITY-{attempt_id or actor_id}",
+                payload={
+                    **registration_payload,
+                    "container_name": handle.container_name,
+                    "container_id": handle.container_id,
+                    "container_command": list(handle.command),
+                    "network_id": handle.network_id,
+                },
+                mutate=persist_oci_identity,
+            )
+            _actor_fault("after_oci_start_before_register")
+            _control_mutation(
+                layout,
+                command_name="runner_register",
+                command_id=f"RUNNER-REGISTER-{attempt_id or actor_id}",
+                payload=registration_payload,
+                mutate=register_runner,
+            )
+            if recovering_existing or recovered_execution:
+                receipt = adapter.recover_wait(handle)
+                events.extend(dict(event) for event in receipt.stdout_events)
+                returncode = receipt.exit_code
+                usage_known = True
+            else:
+                receipt = adapter.wait(handle)
+                events.extend(dict(event) for event in receipt.stdout_events)
+                returncode = receipt.exit_code
+                usage_known = True
+            validated = validate_output_exchange(required_spec.output_exchange)
+            pending_report_text = redact_secret_values(validated.text, secret_values)
+        except IsolationError as exc:
+            failure = exc
+            if exc.details.get("container_cleanup_unconfirmed"):
+
+                def persist_uncertain_oci_start() -> None:
+                    current_actor = _validate_worker_fence(
+                        layout,
+                        actor_id,
+                        attempt_id=attempt_id,
+                        launch_token=launch_token,
+                    )
+                    uncertain_runtime = current_actor.setdefault("runtime", {})
+                    uncertain_runtime["oci_lifecycle_state"] = "uncertain_start"
+                    uncertain_runtime["container_name"] = exc.details.get(
+                        "container_name"
+                    ) or expected_container_name
+                    if exc.details.get("container_id"):
+                        uncertain_runtime["container_id"] = exc.details["container_id"]
+                    uncertain_runtime["container_command"] = list(required_command)
+                    save_actor(layout, current_actor)
+
+                _control_mutation(
+                    layout,
+                    command_name="runner_record_uncertain_oci_start",
+                    command_id=f"RUNNER-OCI-UNCERTAIN-{attempt_id or actor_id}",
+                    payload={
+                        **registration_payload,
+                        "container_name": exc.details.get("container_name"),
+                        "container_id": exc.details.get("container_id"),
+                    },
+                    mutate=persist_uncertain_oci_start,
+                )
+            pending_report_text = (
+                "# Completion Report\n\nStatus: failed\n\n## Result\n"
+                f"OCI worker failed safely [{exc.code}]: {exc}\n"
+            )
+        finally:
+            cleanup_container_removed = False
+            cleanup_credential = None
+            cleanup_identity_drift: tuple[str, ...] = ()
+            try:
+                if handle is not None:
+                    cleanup_receipt = adapter.cleanup(handle)
+                    cleanup_container_removed = cleanup_receipt.container_removed
+                    cleanup_credential = cleanup_receipt.credential
+                    cleanup_identity_drift = cleanup_receipt.identity_drift
+                else:
+                    if failure is not None and failure.details.get(
+                        "container_cleanup_unconfirmed"
+                    ):
+                        raise WorkerExecutionError(
+                            "credential_cleanup_deferred",
+                            "temporary credential is preserved until uncertain container cleanup is confirmed",
+                            details={"container_cleanup_unconfirmed": True},
+                        )
+                    cleanup_credential = cleanup_temporary_credential(required_spec)
+            except IsolationError as exc:
+                failure = failure or exc
+                returncode = 125
+                cleanup_unconfirmed = bool(exc.details.get("container_cleanup_unconfirmed"))
+                cleanup_error_code = exc.code
+                existing = pending_report_text or "# Completion Report\n"
+                pending_report_text = (
+                    existing.rstrip()
+                    + "\n\nStatus: failed\n\n## Cleanup Failure\n"
+                    + f"OCI cleanup failed safely [{exc.code}]: {exc}\n"
+                )
+            else:
+                assert cleanup_credential is not None
+
+                def persist_oci_cleanup() -> None:
+                    current_actor = _validate_worker_fence(
+                        layout,
+                        actor_id,
+                        attempt_id=attempt_id,
+                        launch_token=launch_token,
+                        allow_provider_started=True,
+                    )
+                    cleanup_runtime = current_actor.setdefault("runtime", {})
+                    cleanup_runtime["oci_lifecycle_state"] = (
+                        "cleaned" if cleanup_container_removed else "not_started_cleaned"
+                    )
+                    cleanup_runtime["container_removed"] = cleanup_container_removed
+                    cleanup_runtime["cleanup_identity_drift"] = list(cleanup_identity_drift)
+                    cleanup_runtime["credential_cleanup"] = {
+                        "required": cleanup_credential.requested,
+                        "path": (
+                            str(required_spec.credential_path)
+                            if required_spec.credential_path is not None
+                            else None
+                        ),
+                        "status": "deleted" if cleanup_credential.deleted else "not_required",
+                        "identifier": cleanup_credential.credential_id,
+                        "bytes_removed": cleanup_credential.bytes_removed,
+                        "cleaned_at": now_iso(),
+                    }
+                    save_actor(layout, current_actor)
+
                 try:
-                    payload = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(payload, dict):
-                    events.append(payload)
-            returncode = process.wait()
-    except OSError as exc:
-        returncode = 127
-        atomic_write_text(report, f"# Completion Report\n\nStatus: failed\n\n## Result\n{type(exc).__name__}: {exc}\n")
+                    _control_mutation(
+                        layout,
+                        command_name="runner_record_oci_cleanup",
+                        command_id=f"RUNNER-OCI-CLEANUP-{attempt_id or actor_id}",
+                        payload={
+                            **registration_payload,
+                            "container_id": handle.container_id if handle is not None else None,
+                            "container_removed": cleanup_container_removed,
+                            "credential_identifier": cleanup_credential.credential_id,
+                        },
+                        mutate=persist_oci_cleanup,
+                    )
+                except Exception as exc:  # noqa: BLE001 - cleanup fact must be durable
+                    failure = WorkerExecutionError(
+                        "cleanup_state_persist_failed",
+                        "OCI cleanup completed but its durable receipt could not be recorded",
+                    )
+                    returncode = 125
+                    existing = pending_report_text or "# Completion Report\n"
+                    pending_report_text = (
+                        existing.rstrip()
+                        + "\n\nStatus: failed\n\n## Cleanup Receipt Failure\n"
+                        + f"OCI cleanup receipt persistence failed safely: {type(exc).__name__}\n"
+                    )
+        if cleanup_unconfirmed:
+
+            def persist_uncertain_cleanup() -> None:
+                current_actor = _validate_worker_fence(
+                    layout,
+                    actor_id,
+                    attempt_id=attempt_id,
+                    launch_token=launch_token,
+                    allow_provider_started=True,
+                )
+                current_actor["status"] = "needs_recovery"
+                uncertain_runtime = current_actor.setdefault("runtime", {})
+                if uncertain_runtime.get("oci_lifecycle_state") != "uncertain_start":
+                    uncertain_runtime["oci_lifecycle_state"] = "uncertain_cleanup"
+                uncertain_runtime["container_cleanup_unconfirmed"] = True
+                uncertain_runtime["cleanup_error"] = cleanup_error_code
+                # Deliberately retain provider_execution_state=started (or its
+                # pre-registration absence).  A cleanup uncertainty is not a
+                # durable provider-finished observation.
+                save_actor(layout, current_actor)
+                if current_actor.get("task_id") and current_actor.get("attempt_id"):
+                    current_task = load_task(layout, str(current_actor["task_id"]))
+                    for current_attempt in current_task.get("attempts") or []:
+                        if current_attempt.get("attempt_id") == current_actor.get("attempt_id"):
+                            current_attempt["status"] = "needs_recovery"
+                            current_attempt["cleanup_error"] = cleanup_error_code
+                            break
+                    current_task["status"] = "needs_recovery"
+                    save_task(layout, current_task)
+                append_event(
+                    layout,
+                    "oci_cleanup_uncertain",
+                    actor_id=actor_id,
+                    task_id=current_actor.get("task_id"),
+                    attempt_id=current_actor.get("attempt_id"),
+                    container_name=uncertain_runtime.get("container_name"),
+                    container_id=uncertain_runtime.get("container_id"),
+                    cleanup_error=cleanup_error_code,
+                )
+
+            _control_mutation(
+                layout,
+                command_name="runner_record_uncertain_oci_cleanup",
+                command_id=f"RUNNER-OCI-CLEANUP-UNCERTAIN-{attempt_id or actor_id}",
+                payload={
+                    **registration_payload,
+                    "container_name": expected_container_name,
+                    "container_id": handle.container_id if handle is not None else None,
+                    "cleanup_error": cleanup_error_code,
+                },
+                mutate=persist_uncertain_cleanup,
+            )
+            return 125
+        if pending_report_text is not None:
+            atomic_write_text(report, pending_report_text)
+        if failure is not None:
+            returncode = 125
+    else:
+        _control_mutation(
+            layout,
+            command_name="runner_register",
+            command_id=f"RUNNER-REGISTER-{attempt_id or actor_id}",
+            payload=registration_payload,
+            mutate=register_runner,
+        )
+        try:
+            with prompt.open("r", encoding="utf-8") as prompt_handle:
+                process = subprocess.Popen(
+                    process_argv(argv),
+                    cwd=str(execution_workspace),
+                    env=env,
+                    stdin=prompt_handle,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                assert process.stdout is not None
+                for line in process.stdout:
+                    safe_line = redact_secret_values(line, secret_values)
+                    sys.stdout.write(safe_line)
+                    sys.stdout.flush()
+                    try:
+                        payload = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(payload, dict):
+                        events.append(payload)
+                returncode = process.wait()
+        except OSError as exc:
+            returncode = 127
+            atomic_write_text(report, f"# Completion Report\n\nStatus: failed\n\n## Result\n{type(exc).__name__}: {exc}\n")
 
     changed_paths: tuple[str, ...] = ()
     if write_scopes:
@@ -663,9 +1349,11 @@ def _run_actor_once(
         else "waiting_leader"
     )
     if task_id:
+        _actor_fault("after_attempt_report_before_publish")
         publish_task_report(layout, actor, report)
     report_bytes = report.read_bytes() if report.is_file() else b""
     report_sha256 = hashlib.sha256(report_bytes).hexdigest() if report_bytes else None
+    _actor_fault("after_report_before_finalize")
 
     def finalize_runner() -> None:
         if task_id:
@@ -696,27 +1384,31 @@ def _run_actor_once(
                     current_attempt["report_sha256"] = report_sha256
                     current_attempt["report_size"] = len(report_bytes)
                     current_attempt["provider_exit_code"] = returncode
+                    current_attempt["usage_status"] = (
+                        "captured" if usage_known else "unknown_recovery_logs"
+                    )
                     break
             save_task(layout, current_task)
-            usage_args = {
-                "actor": actor_id,
-                "task": task_id,
-                "attempt": actor.get("attempt_id"),
-                "model": actor.get("model"),
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "final_usage": True,
-                "note": f"provider={actor.get('provider')} profile={actor.get('profile') or '-'} exit={returncode}",
-            }
-            send_message(
-                layout,
-                sender=actor_id,
-                recipient="scheduler",
-                subject="scheduler.command",
-                body="Record usage captured from codex exec JSONL.",
-                task_id=str(task_id),
-                metadata={"command": "record_usage", "args": usage_args},
-            )
+            if usage_known:
+                usage_args = {
+                    "actor": actor_id,
+                    "task": task_id,
+                    "attempt": actor.get("attempt_id"),
+                    "model": actor.get("model"),
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "final_usage": True,
+                    "note": f"provider={actor.get('provider')} profile={actor.get('profile') or '-'} exit={returncode}",
+                }
+                send_message(
+                    layout,
+                    sender=actor_id,
+                    recipient="scheduler",
+                    subject="scheduler.command",
+                    body="Record usage captured from codex exec JSONL.",
+                    task_id=str(task_id),
+                    metadata={"command": "record_usage", "args": usage_args},
+                )
             needs_escalation = returncode != 0 or final_report_status in {"failed", "escalate"}
             actor_tier = actor.get("tier") or ("low" if actor.get("provider") == "longcat" else "high")
             if actor_tier in {"low", "medium"} and needs_escalation and project.get("auto_escalate", True):
@@ -754,6 +1446,9 @@ def _run_actor_once(
         current_actor["runtime"]["finished_at"] = now_iso()
         current_actor["runtime"]["changed_paths"] = list(changed_paths)
         current_actor["runtime"]["provider_execution_state"] = "finished"
+        current_actor["runtime"]["usage_status"] = (
+            "captured" if usage_known else "unknown_recovery_logs"
+        )
         current_actor["runtime"]["report_sha256"] = report_sha256
         save_actor(layout, current_actor)
         append_event(

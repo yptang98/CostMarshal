@@ -2,22 +2,22 @@
 
 CostMarshal is a scheduler-first, cost-aware multi-provider control plane for Codex CLI. It coordinates low-, medium-, and high-tier APIs, keeps task and attempt state durable, and reserves the strongest provider for work that needs it.
 
-Current version: `v2.3.0-beta`
+Current version: `v2.4.0-beta`
 
-> v2.3 adds real low/medium/high routing and product hardening. It does not claim that every deployment is economically optimal by default: reviewed prices, token estimates, and leader acceptance history are required before the cross-tier optimizer is enabled.
+> v2.4 adds recoverable spawn/stop effects and an enabled digest-pinned OCI worker path on top of real low/medium/high routing. It does not claim that every deployment is economically optimal by default: reviewed prices, token estimates, leader acceptance history, and the release evidence gates are still required.
 
-## What v2.3 does
+## What v2.4 does
 
 - Routes bounded tasks across three capability tiers: low, medium, and high.
 - Keeps provider identity separate from capability tier, so providers can be replaced without changing policy.
 - Applies a fail-closed safety floor from risk, difficulty, and task type.
 - Filters providers by explicit required capabilities before cost optimization.
-- Compares priced execution chains such as `low → medium → high`, `medium → high`, and `high` by expected cost per leader-accepted result.
+- Compares priced execution chains such as `low -> medium -> high`, `medium -> high`, and `high` by expected cost per leader-accepted result.
 - Escalates one tier at a time and fences stale actor attempts.
 - Uses durable actors, mailboxes, reports, claims, usage records, and recovery state.
 - Reserves task/project budget at dispatch and settles it from usage or leader results.
 - Requires an attested OCI boundary for production workers and never silently falls back to a native process.
-- Provides an explicit SQLite WAL cutover for crash-atomic pure control-plane commands and recoverable compatibility views.
+- Provides an explicit SQLite WAL cutover for crash-atomic control state, leased runtime effects, and recoverable compatibility views.
 - Supports ArchMarshal governance through explicit, read-only binding checks. It never runs ArchMarshal adopt/apply/lifecycle mutations automatically.
 
 ## Routing model
@@ -65,11 +65,15 @@ python scripts/costmarshal.py governance-status --project <project-dir>
 
 ## Install
 
-Clone or install this repository into the Codex skills directory, then restart Codex if its skill list is cached.
+Use [`INSTALL_PROMPT.md`](INSTALL_PROMPT.md) for both first install and update. It resolves
+`$CODEX_HOME` with a `~/.codex` fallback, backs up an existing skill, filters
+Git metadata, generated evidence, runtime state, bytecode, and secrets, and
+leaves both current and legacy runtime roots untouched. Restart Codex if its
+skill list is cached, then run the installed smoke test.
 
 ```powershell
-git clone https://github.com/yptang98/CostMarshal.git "$env:CODEX_HOME\skills\costmarshal"
-python "$env:CODEX_HOME\skills\costmarshal\scripts\install_smoke_test.py"
+$CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
+python "$CodexHome\skills\costmarshal\scripts\install_smoke_test.py"
 ```
 
 CostMarshal uses only Python's standard library at runtime. `git` is required for writable worker worktrees. `tmux` is optional; Windows defaults to the local process backend.
@@ -84,7 +88,7 @@ The default catalog contains:
 | --- | --- | --- | --- |
 | `longcat` | low | `longcat` | `LONGCAT_API_KEY` |
 | `deepseek` | medium | `deepseek` | `DEEPSEEK_API_KEY` |
-| `codex` | high | current Codex profile | current Codex authentication |
+| `codex` | high | built-in Codex provider | `CODEX_API_KEY` for each isolated `codex exec` |
 
 Create the legacy LongCat profile:
 
@@ -105,7 +109,7 @@ python scripts/costmarshal.py configure-provider `
   --env-key DEEPSEEK_API_KEY
 ```
 
-Provide credentials through the process environment or a secrets file outside the actor workspace. CostMarshal injects only the selected low/medium provider key into that actor and creates a credential-free actor-specific `CODEX_HOME` containing only its profile.
+Provide credentials through the process environment or a secrets file outside the actor workspace. CostMarshal injects only the selected provider key into that actor and creates a credential-free actor-specific `CODEX_HOME` containing only its profile. New required-mode projects use `CODEX_API_KEY` for the high tier; persisted host login state such as `auth.json` is never mounted into the OCI worker.
 
 ## Reviewed provider catalog
 
@@ -122,74 +126,46 @@ canonical/legacy, or non-CNY snapshots cannot produce a CNY estimate. Routing
 falls back explicitly to the safe tier, and a budgeted dispatch fails closed
 because no eligible estimate exists.
 
-The flat price fields in the compatibility example below remain readable for
-existing v2.3-beta projects only. They have no provenance or freshness metadata,
-cannot price cached input or fixed request fees, and do not produce an immutable
-snapshot. New deployments should replace them with canonical nested `pricing`
-objects.
+Generate a complete new-project catalog rather than hand-writing snapshot
+hashes. Review the provider endpoints/profiles separately, then update the
+timestamps, sources, IDs, and rates below before writing `providers.json`:
 
 ```python
-from costmarshal_v2.routing import build_pricing_snapshot
+import json
+from pathlib import Path
+from costmarshal_v2.routing import build_pricing_snapshot, default_provider_catalog
 
-provider["pricing"] = build_pricing_snapshot(
-    currency="CNY",
-    source="https://vendor.example/reviewed-pricing",
-    reviewed_at="2026-07-16T00:00:00Z",
-    effective_at="2026-07-16T00:00:00Z",
-    expires_at="2026-08-16T00:00:00Z",
-    snapshot_id="vendor-2026-07",
-    input_per_1m=2.0,
-    cached_input_per_1m=0.5,
-    output_per_1m=8.0,
-    fixed_request=0.0,
+catalog = default_provider_catalog()
+rates = {
+    "longcat":  (0.8, 0.2, 2.0),
+    "deepseek": (2.0, 0.5, 8.0),
+    "codex":    (12.0, 3.0, 48.0),
+}
+for provider in catalog["providers"]:
+    input_rate, cached_rate, output_rate = rates[provider["provider_id"]]
+    provider["pricing"] = build_pricing_snapshot(
+        currency="CNY",
+        source=f"https://reviewed.example/{provider['provider_id']}/pricing",
+        reviewed_at="2026-07-16T00:00:00Z",
+        effective_at="2026-07-16T00:00:00Z",
+        expires_at="2026-08-16T00:00:00Z",
+        snapshot_id=f"{provider['provider_id']}-2026-07",
+        input_per_1m=input_rate,
+        cached_input_per_1m=cached_rate,
+        output_per_1m=output_rate,
+        fixed_request=0.0,
+    )
+Path("providers.json").write_text(
+    json.dumps(catalog, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
 )
 ```
 
-```json
-{
-  "schema_version": 1,
-  "providers": [
-    {
-      "provider_id": "low-api",
-      "tier": "low",
-      "profile": "low-api",
-      "model": "model-low",
-      "env_key": "LOW_API_KEY",
-      "enabled": true,
-      "priority": 100,
-      "input_cny_per_1m": 0.8,
-      "output_cny_per_1m": 2.0,
-      "capabilities": ["text"]
-    },
-    {
-      "provider_id": "medium-api",
-      "tier": "medium",
-      "profile": "medium-api",
-      "model": "model-medium",
-      "env_key": "MEDIUM_API_KEY",
-      "enabled": true,
-      "priority": 100,
-      "input_cny_per_1m": 2.0,
-      "output_cny_per_1m": 8.0,
-      "capabilities": []
-    },
-    {
-      "provider_id": "codex",
-      "tier": "high",
-      "profile": null,
-      "model": "inherit",
-      "env_key": null,
-      "enabled": true,
-      "priority": 100,
-      "input_cny_per_1m": 12.0,
-      "output_cny_per_1m": 48.0,
-      "capabilities": []
-    }
-  ]
-}
-```
-
-Unknown fields, duplicate IDs, invalid tiers, negative prices, malformed environment keys, and explicitly malformed catalogs are rejected.
+This preserves the required `CODEX_API_KEY` high-tier contract. Flat price
+fields remain readable only for migration of existing pre-v2.4 beta projects;
+they are not a valid onboarding example for new budgeted deployments. Unknown
+fields, duplicate IDs, invalid tiers, negative prices, malformed environment
+keys, and explicitly malformed catalogs are rejected.
 
 ## Start a project
 
@@ -224,9 +200,21 @@ python scripts/costmarshal.py run-scheduler --project <project-dir>
 python scripts/costmarshal.py dashboard --project <project-dir>
 ```
 
-Worker dispatch defaults to `worker_isolation.mode=required`. Docker/Podman selection may fail over only between supported OCI engines; it never falls back to a host process. Preflight rejects missing daemons, remote contexts, non-Linux engines, unpinned images, unsafe mounts, failed canaries, and unsupported network policy before an attempt or budget reservation is persisted.
+Worker dispatch defaults to `worker_isolation.mode=required`. Docker/Podman selection may fail over only between supported OCI engines; it never falls back to a host process. Preflight rejects missing daemons, remote contexts, non-Linux engines, unpinned images, unsafe mounts, failed canaries, unrestricted bridge networking, and unsupported network policy before an attempt or budget reservation is persisted.
 
-The current beta contains the OCI contract and fail-closed preflight, but the final container execution adapter/image distribution is still gated. For trusted development tests only, both project initialization and each dispatch must opt in:
+The required path now supervises the attested container through the bundled execution adapter: prompt over stdin, at most one selected credential file, a credential-free provider profile, bounded JSONL, strict `final.md` exchange validation, deterministic container labels, timeout/stop/cleanup, and a path-free credential deletion receipt. The reviewed image is built from [`container/worker`](container/worker/README.md); both the base image digest and Codex CLI version are mandatory build inputs, and dispatch still requires the resulting immutable image digest.
+
+Production API access uses an externally provisioned `provider-proxy` topology:
+the worker attaches only to an internal, CostMarshal-labelled network, while a
+separately reviewed proxy is dual-homed to that network and an egress network.
+The live evidence harness requires `COSTMARSHAL_OCI_IMAGE`,
+`COSTMARSHAL_OCI_PROVIDER_NETWORK`, `COSTMARSHAL_OCI_PROXY_CONTAINER`,
+`COSTMARSHAL_OCI_PROXY_HEALTH_URL`, and `COSTMARSHAL_OCI_PROXY_HEALTH_SHA256`.
+It verifies the running proxy, an independently inspected non-internal egress
+network, immutable identities, and a bounded credential-free allowlisted
+response reached through the proxy rather than trusting topology alone.
+
+For trusted development tests only, both project initialization and each dispatch may instead opt in to the unisolated host path:
 
 ```powershell
 python scripts/costmarshal.py init ... --allow-unsafe-native-workers
@@ -235,7 +223,7 @@ python scripts/costmarshal.py dispatch --project <project-dir> --task V2-0001 --
 
 This records `strong_isolation=false`; it is forbidden when ArchMarshal governance is required. It does not protect host files from the model process.
 
-Custom worker command templates are rejected by default because they bypass the controlled runner. `init --allow-unsafe-custom-worker-commands` exists only as an explicit compatibility escape hatch for trusted test/backends; it forfeits sandbox and secret-isolation guarantees.
+Custom worker command templates are rejected by default because they bypass the controlled runner. `init --allow-unsafe-custom-worker-commands` exists only as an explicit compatibility escape hatch for trusted legacy tests/backends; it forfeits sandbox and secret-isolation guarantees and cannot be recoverably started after SQLite cutover.
 
 ## Leader acceptance
 
@@ -252,6 +240,16 @@ python scripts/costmarshal.py record-result `
 ```
 
 Only these explicit records train provider acceptance priors.
+
+If the leader rejects an attempt but wants the reviewed chain to continue, record the
+decision and then explicitly queue the next stronger tier. `record-result` does not
+silently spend more budget:
+
+```powershell
+python scripts/costmarshal.py record-result --project <project-dir> --task V2-0001 --attempt <attempt-id> --status escalate --quality-score 2
+python scripts/costmarshal.py escalate --project <project-dir> --task V2-0001 --reason "Leader rejected the current result" --start
+python scripts/costmarshal.py run-scheduler --project <project-dir> --once
+```
 
 ## Budget behavior
 
@@ -277,6 +275,15 @@ The adapter runs only ArchMarshal bootstrap-status/doctor-style read checks, sto
 
 CostMarshal never automatically adopts a workspace, applies an ArchMarshal plan, starts/ends a managed session, or edits ArchMarshal itself. Perform those lifecycle operations explicitly through ArchMarshal, preview first, then initialize or rebind CostMarshal.
 
+After upgrading CostMarshal's binding format, preview and explicitly apply a fresh
+read-only fingerprint. This changes only CostMarshal project state and retains the
+previous binding in bounded audit history; it never mutates ArchMarshal:
+
+```powershell
+python scripts/costmarshal.py governance-rebind --project <project-dir>
+python scripts/costmarshal.py governance-rebind --project <project-dir> --apply --command-id CMD-GOVERNANCE-REBIND-001
+```
+
 ## Recovery and validation
 
 ```powershell
@@ -297,9 +304,40 @@ python scripts/costmarshal.py state-store --project <project-dir>
 python scripts/costmarshal.py state-store --project <project-dir> --repair-views
 ```
 
-After cutover, pure scheduler mutations use SQLite WAL transactions and stable `--command-id` values. A reused ID with a different payload is rejected. JSON/JSONL files are compatibility views rebuilt after a commit-time crash. Commands that spawn or stop an OS runtime are currently blocked after cutover until the recoverable effect worker is complete; this prevents a false exactly-once claim.
+After cutover, scheduler mutations use SQLite WAL transactions and stable `--command-id` values. A reused ID with a different payload is rejected. JSON/JSONL files are compatibility views rebuilt after a commit-time crash. `dispatch --start`, escalation starts, and `stop-actor --stop-runtime` commit a fenced effect intent first; the scheduler leases the effect, performs OS/OCI I/O outside the database transaction, persists its observation, and atomically marks the effect and command complete. Expired leased or observed effects are recoverable. Launch tokens plus the attempt lifetime lock prevent a duplicate runner from calling the provider when a start observation is uncertain.
 
-## Verification
+## Offline blind backtest
+
+`scripts/backtest_shadow_matrix.py` evaluates an already collected real-provider
+low/medium/high blind shadow matrix. It never reads credentials or calls a
+provider. Without at least 200 attested real tasks it writes an honest blocked
+`artifacts/backtest-report.json` and exits `2`. Dataset schema, checkpoint resume,
+paired bootstrap confidence intervals, and budget rules are documented in
+[`references/backtest.md`](references/backtest.md).
+
+The non-beta release gate accepts no pre-existing evidence by itself. Invoke it
+with `--reproduce-evidence`; that same process regenerates the complete local
+test report, runtime crash report, offline backtest, and live OCI report before
+evaluating their commit-bound contents. Without reproduction the gate remains
+`blocked` even if hand-written artifact files claim success.
+
+Release trust roots live in [`release/evidence-policy.json`](release/evidence-policy.json).
+The beta ships them intentionally unset. A reviewed release must preregister
+the blind policy manifest and signer allowlist in an earlier commit, and must
+pin the worker repository digest plus provider-proxy image/configuration hashes.
+Environment variables may supply evidence files and local object references;
+they cannot replace the committed trust roots.
+
+Real backtest reproduction also requires the source dataset, a detached
+collection signature, and a trusted signer policy. Set
+`COSTMARSHAL_BACKTEST_DATASET`, `COSTMARSHAL_BACKTEST_ALLOWED_SIGNERS`,
+`COSTMARSHAL_BACKTEST_ATTESTATION_SIGNATURE`, and
+`COSTMARSHAL_BACKTEST_SIGNER_IDENTITY` before invoking the release gate. Test
+fixtures may exercise statistics with the harness's explicit unsigned-test
+flag, but their report is permanently marked `test-only` and cannot satisfy a
+release gate.
+
+## Required local verification
 
 ```powershell
 python -m compileall -q costmarshal_v2 tests
@@ -309,25 +347,53 @@ python tests/local_backend_contract_test.py
 python tests/tmux_contract_test.py
 python tests/model_rotation_contract_test.py
 python tests/three_tier_routing_test.py
+python tests/route_oracle_test.py
+python tests/backtest_harness_test.py
 python tests/pricing_metadata_test.py
 python tests/control_store_test.py
 python tests/transactional_scheduler_test.py
+python tests/runtime_effect_store_test.py
+python tests/runtime_effect_scheduler_test.py
 python tests/worker_isolation_test.py
+python tests/worker_execution_adapter_test.py
+python tests/container_worker_contract_test.py
+python tests/oci_actor_runner_test.py
 python tests/isolation_scheduler_gate_test.py
+python tests/actor_crash_recovery_test.py
+python tests/runtime_recovery_reliability_test.py
+python tests/pid_identity_test.py
+python tests/required_credential_preflight_test.py
 python tests/actor_fencing_test.py
 python tests/security_contract_test.py
 python tests/actor_security_contract_test.py
 python tests/reliability_contract_test.py
+python tests/release_gate_test.py
 python tests/budget_contract_test.py
+python tests/budget_reconciliation_oracle_test.py
+python tests/historical_state_migration_test.py
 python tests/archmarshal_compat_test.py
 python tests/profile_config_test.py
 python tests/concurrency_contract_test.py
 python scripts/install_smoke_test.py
+python tests/release/run_local_test_evidence.py
+python tests/release/run_runtime_effect_evidence.py
+```
+
+## Non-beta release evidence
+
+These commands require the preregistered real-provider dataset/signature policy and
+the reviewed live OCI/proxy topology. Without those external inputs, exit status 2
+and a machine-readable `blocked` artifact are the expected safe result, not a local
+test failure.
+
+```powershell
+python tests/oci_live_evidence.py
+python tests/release/run_release_gates.py --reproduce-evidence
 ```
 
 ## Current hardening boundary
 
-v2.3-beta now has an opt-in SQLite WAL authority for pure commands, marker-last migration with backups, dirty-view recovery, command payload hashing, launch tokens, lifetime attempt locks, pricing freshness snapshots, and required-mode OCI preflight. It still remains beta because OS spawn/stop effects are not yet processed through the transactional effect outbox, and the attested OCI execution/image/report exchange path is not enabled. Required isolation therefore fails closed; only explicitly audited unsafe-native development dispatches can run today.
+v2.4-beta has an opt-in SQLite WAL authority, marker-last migration with backups, dirty-view recovery, payload-hashed commands, leased spawn/stop effects, launch-token and lifetime-lock fencing, crash recovery after report publication, pricing snapshots, an independent 10,000-case route oracle, and an enabled required-mode OCI adapter plus reproducible worker-image source. Cached-input pricing is supported in immutable price snapshots, but task routing currently estimates cached tokens as zero; this is conservative and leaves cache-aware forecasting as a follow-up. It remains beta until the machine-readable release gates have real low/medium/high shadow-backtest evidence and live malicious OCI escape evidence for a reviewed image digest. A unit or mocked adapter test is not treated as that external proof.
 
 ## License
 

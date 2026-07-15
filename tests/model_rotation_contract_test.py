@@ -72,6 +72,9 @@ print(json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 11, 'outpu
         )
         env = dict(os.environ)
         env["COSTMARSHAL_CODEX_COMMAND_JSON"] = json.dumps([sys.executable, str(fake_codex)])
+        # The built-in high tier is credential-bound.  Keep this contract test
+        # hermetic while exercising the provider rotation rather than host auth.
+        env["CODEX_API_KEY"] = "rotation-test-codex-key"
 
         profile_home = temp / "codex-home"
         configured = run_json(temp, env, "configure-profiles", "--codex-home", str(profile_home))

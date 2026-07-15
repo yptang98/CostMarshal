@@ -13,7 +13,7 @@ Requirements:
   - Read <skills-dir>/costmarshal/VERSION if it exists and report the old version.
   - Move the old installed skill folder to <skills-dir>/costmarshal.backup-<timestamp>.
   - Copy the new CostMarshal skill folder to <skills-dir>/costmarshal.
-  - Do not copy .git, __pycache__, .env files, local runtime folders, or secret files.
+  - Do not copy .git, __pycache__, .env files, generated `artifacts/`, local runtime folders, or secret files.
   - Preserve $CODEX_HOME/costmarshal-v2 or ~/.codex/costmarshal-v2 runtime state exactly as-is.
   - Preserve legacy $CODEX_HOME/costmarshal or ~/.codex/costmarshal runtime state exactly as-is.
   - Preserve local secret files exactly as-is; do not print secret values.
@@ -22,10 +22,8 @@ Requirements:
 - If python is unavailable on Windows, try: py -3 --version
 - CostMarshal v2 uses scheduler actors and pluggable runtime backends; do not run legacy v1 initialization unless I explicitly ask for it.
 - Run: python <installed-skill>/scripts/costmarshal.py --help
-- Run: python <installed-skill>/scripts/costmarshal.py init --name install-smoke --objective "Validate CostMarshal v2 install" --backend local
-- Run: python <installed-skill>/scripts/costmarshal.py run-scheduler --project <created-project-dir> --once
-- Run: python <installed-skill>/scripts/costmarshal.py dashboard --project <created-project-dir> --format json
-- Run: python <installed-skill>/scripts/costmarshal.py validate --project <created-project-dir>
+- Run: python <installed-skill>/scripts/install_smoke_test.py
+- The smoke test must use and remove its own temporary root; do not create a project under the user's persistent CostMarshal runtime.
 - Tell me I can invoke it with `$costmarshal`, for example: `$costmarshal start a new Arbor project for ...`
 - Run skill validation if quick_validate.py is available.
 - Report the installed path, old version if updated, new version, backup path if created, and validation result.

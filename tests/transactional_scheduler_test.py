@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+from copy import deepcopy
 import shutil
 import sqlite3
 import subprocess
@@ -15,6 +16,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "scripts" / "costmarshal.py"
+sys.path.insert(0, str(ROOT))
+
+from costmarshal_v2.routing import default_provider_catalog  # noqa: E402
 
 
 def run(temp: Path, *args: str, ok: bool = True, fault: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -46,6 +50,20 @@ def main() -> int:
     try:
         workspace = temp / "workspace"
         workspace.mkdir()
+        catalog = default_provider_catalog()
+        prices = {"longcat": 0.01, "deepseek": 5.0, "codex": 10.0}
+        for provider in catalog["providers"]:
+            provider["input_cny_per_1m"] = prices[provider["provider_id"]]
+            provider["output_cny_per_1m"] = prices[provider["provider_id"]]
+        medium_value = deepcopy(catalog["providers"][1])
+        medium_value["provider_id"] = "deepseek-value"
+        medium_value["profile"] = "deepseek-value"
+        medium_value["priority"] = 999
+        medium_value["input_cny_per_1m"] = 0.1
+        medium_value["output_cny_per_1m"] = 0.1
+        catalog["providers"].append(medium_value)
+        catalog_path = temp / "providers.json"
+        catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
         project = Path(
             run_json(
                 temp,
@@ -61,6 +79,8 @@ def main() -> int:
                 "--governance",
                 "off",
                 "--allow-unsafe-native-workers",
+                "--provider-catalog",
+                str(catalog_path),
             )["project"]
         )
         run_json(
@@ -72,6 +92,10 @@ def main() -> int:
             "first",
             "--purpose",
             "replay dispatch",
+            "--estimated-input-tokens",
+            "500000",
+            "--estimated-output-tokens",
+            "500000",
         )
         preview = run_json(temp, "migrate-state", "--project", str(project))
         assert preview["status"] == "preview"
@@ -103,6 +127,26 @@ def main() -> int:
         assert replay == first
         task = json.loads((project / "tasks" / "V2-0001" / "task.json").read_text(encoding="utf-8"))
         assert len(task["attempts"]) == 1
+
+        escalated = run_json(
+            temp,
+            "escalate",
+            "--project",
+            str(project),
+            "--task",
+            "V2-0001",
+            "--reason",
+            "exercise nested transactional dispatch",
+            "--command-id",
+            "CMD-escalate-first",
+            "--unsafe-native",
+        )
+        assert escalated["task_id"] == "V2-0001"
+        task = json.loads((project / "tasks" / "V2-0001" / "task.json").read_text(encoding="utf-8"))
+        assert len(task["attempts"]) == 2
+        assert task["attempts"][1]["tier"] == "medium"
+        assert task["attempts"][0]["route_decision"]["planned_provider_ids"][1] == "deepseek-value"
+        assert task["attempts"][1]["provider"] == "deepseek-value"
 
         conflict = run(
             temp,
@@ -184,6 +228,51 @@ def main() -> int:
         assert recovered["task_id"] == "V2-0002"
         second = json.loads((project / "tasks" / "V2-0002" / "task.json").read_text(encoding="utf-8"))
         assert len(second["attempts"]) == 1
+
+        run_json(
+            temp,
+            "new-task",
+            "--project",
+            str(project),
+            "--title",
+            "nested-start",
+            "--purpose",
+            "queue escalation start in outer transaction",
+            "--command-id",
+            "CMD-new-nested-start",
+        )
+        initial_nested = run_json(
+            temp,
+            "dispatch",
+            "--project",
+            str(project),
+            "--task",
+            "V2-0003",
+            "--unsafe-native",
+            "--command-id",
+            "CMD-dispatch-nested-start",
+        )
+        nested_started = run_json(
+            temp,
+            "escalate",
+            "--project",
+            str(project),
+            "--task",
+            "V2-0003",
+            "--reason",
+            "exercise nested effect queue",
+            "--start",
+            "--unsafe-native",
+            "--command-id",
+            "CMD-escalate-nested-start",
+        )
+        nested_task = json.loads((project / "tasks" / "V2-0003" / "task.json").read_text(encoding="utf-8"))
+        assert len(nested_task["attempts"]) == 2
+        assert nested_task["attempts"][-1]["status"] == "launch_pending"
+        with sqlite3.connect(project / "scheduler" / "state.db") as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM effects WHERE command_id='CMD-escalate-nested-start' AND status='pending'"
+            ).fetchone()[0] == 1
 
         store = run_json(temp, "state-store", "--project", str(project))
         assert store["status"] == "ok"

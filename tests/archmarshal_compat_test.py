@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -15,6 +17,7 @@ from typing import Iterator
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CLI = ROOT / "scripts" / "costmarshal.py"
 sys.path.insert(0, str(ROOT))
 
 from costmarshal_v2.governance import (  # noqa: E402
@@ -23,6 +26,14 @@ from costmarshal_v2.governance import (  # noqa: E402
     inspect_governance,
     validate_governance_binding,
 )
+from costmarshal_v2.control_store import control_transaction  # noqa: E402
+from costmarshal_v2.paths import ProjectLayout  # noqa: E402
+from costmarshal_v2.scheduler import (  # noqa: E402
+    GovernancePreflightBlocked,
+    process_runtime_effects,
+    scheduler_cycle,
+)
+from costmarshal_v2.state import load_project, save_project  # noqa: E402
 
 
 SOURCE_HASH = "a" * 64
@@ -165,6 +176,32 @@ def tree_state(root: Path) -> dict[str, tuple[int, int, bytes | None]]:
     return state
 
 
+def tree_digest(root: Path) -> str:
+    """Hash every project path and byte payload, including DB/WAL/SHM and views."""
+
+    digest = hashlib.sha256()
+    for path in sorted([root, *root.rglob("*")], key=lambda item: item.relative_to(root).as_posix()):
+        relative = path.relative_to(root).as_posix() or "."
+        info = path.lstat()
+        if stat.S_ISREG(info.st_mode) and not path.is_symlink():
+            kind = b"file"
+            payload = path.read_bytes()
+        elif stat.S_ISDIR(info.st_mode):
+            kind = b"directory"
+            payload = b""
+        elif stat.S_ISLNK(info.st_mode):
+            kind = b"symlink"
+            payload = os.fsencode(os.readlink(path))
+        else:
+            kind = b"other"
+            payload = b""
+        digest.update(os.fsencode(relative))
+        digest.update(b"\0" + kind + b"\0")
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+    return digest.hexdigest()
+
+
 def inspect_without_workspace_changes(
     workspace: Path,
     wrapper: Path,
@@ -208,6 +245,8 @@ def main() -> int:
             assert_true(binding["engine_api"] == "archmarshal-engine-api-v1", "engine API missing")
             assert_true(binding["engine_version"] == "0.14.0", "engine version missing")
             assert_true(binding["engine_source_sha256"] == SOURCE_HASH, "engine source hash missing")
+            assert_true(binding["wrapper_sha256"], "wrapper hash missing")
+            assert_true(binding["wrapper_size"] == wrapper.stat().st_size, "wrapper size missing")
             assert_true(binding["skill_index_head"] == INITIAL_HEAD, "Skill HEAD missing")
             assert_true(binding["ownership_marker_sha256"], "ownership marker hash missing")
             assert_true(binding["workspace_root"] == str(healthy_workspace.resolve()), "root mismatch")
@@ -342,6 +381,351 @@ def main() -> int:
                 "HEAD drift must be precise",
             )
             assert_true(tree_state(head_workspace) == before_head_drift, "HEAD validation changed workspace")
+
+            wrapper.write_text(
+                wrapper.read_text(encoding="utf-8") + "\n# reviewed wrapper drift\n",
+                encoding="utf-8",
+            )
+            with environment(FAKE_ARCHMARSHAL_STATE="healthy"):
+                wrapper_auto = validate_governance_binding(
+                    binding,
+                    healthy_workspace,
+                    mode="auto",
+                    wrapper_path=wrapper,
+                )
+                assert_raises(
+                    "governance_binding_drift",
+                    lambda: validate_governance_binding(
+                        binding,
+                        healthy_workspace,
+                        mode="required",
+                        wrapper_path=wrapper,
+                    ),
+                )
+            assert_true(wrapper_auto["valid"] is False, "wrapper drift must invalidate")
+            assert_true(
+                {row["field"] for row in wrapper_auto["drift"]}
+                == {"wrapper_sha256", "wrapper_size"},
+                "wrapper drift must be byte-bound",
+            )
+
+            rebind_wrapper = temp / "invoke_archmarshal_rebind.py"
+            write_fake_wrapper(rebind_wrapper)
+            runtime = temp / "runtime"
+            command = [
+                sys.executable,
+                str(CLI),
+                "--root",
+                str(runtime),
+                "init",
+                "--name",
+                "governance-rebind",
+                "--objective",
+                "explicitly refresh CostMarshal binding",
+                "--workspace",
+                str(healthy_workspace),
+                "--backend",
+                "local",
+                "--governance",
+                "required",
+                "--archmarshal-wrapper",
+                str(rebind_wrapper),
+                "--allow-unsafe-native-workers",
+            ]
+            created = subprocess.run(
+                command,
+                env={**os.environ, "FAKE_ARCHMARSHAL_STATE": "healthy"},
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            assert_true(created.returncode == 0, created.stderr)
+            project_dir = Path(json.loads(created.stdout)["project"])
+            project_path = project_dir / "project.json"
+            project_payload = json.loads(project_path.read_text(encoding="utf-8"))
+            project_payload["governance"]["binding"]["format"] = "costmarshal-archmarshal-binding-v1"
+            project_payload["governance"]["binding"].pop("wrapper_sha256", None)
+            project_payload["governance"]["binding"].pop("wrapper_size", None)
+            project_path.write_text(json.dumps(project_payload, indent=2) + "\n", encoding="utf-8")
+            stale_bytes = project_path.read_bytes()
+
+            recover = subprocess.run(
+                [*command[:4], "recover", "--project", str(project_dir)],
+                env={**os.environ, "FAKE_ARCHMARSHAL_STATE": "healthy"},
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            assert_true(recover.returncode != 0, "required recovery accepted a stale binding")
+            assert_true(project_path.read_bytes() == stale_bytes, "blocked recovery changed project state")
+
+            preview = subprocess.run(
+                [*command[:4], "governance-rebind", "--project", str(project_dir)],
+                env={**os.environ, "FAKE_ARCHMARSHAL_STATE": "healthy"},
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            assert_true(preview.returncode == 0, preview.stderr)
+            assert_true(json.loads(preview.stdout)["mode"] == "preview", "rebind preview missing")
+            assert_true(project_path.read_bytes() == stale_bytes, "rebind preview changed project state")
+            applied = subprocess.run(
+                [
+                    *command[:4],
+                    "governance-rebind",
+                    "--project",
+                    str(project_dir),
+                    "--apply",
+                    "--command-id",
+                    "CMD-GOVERNANCE-REBIND",
+                ],
+                env={**os.environ, "FAKE_ARCHMARSHAL_STATE": "healthy"},
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            assert_true(applied.returncode == 0, applied.stderr)
+            rebound = json.loads(project_path.read_text(encoding="utf-8"))["governance"]
+            assert_true(rebound["binding"]["format"] == BINDING_FORMAT, "binding was not upgraded")
+            assert_true(rebound["binding_history"][-1]["binding"]["format"].endswith("-v1"), "old binding was not retained")
+
+            # Build one real pending spawn effect while governance is explicitly
+            # off, then restore the reviewed required binding transactionally.
+            # This lets the drift test prove that run-scheduler cannot lease or
+            # execute an already-committed provider effect.
+            required_governance = json.loads(json.dumps(rebound))
+            project_payload = json.loads(project_path.read_text(encoding="utf-8"))
+            project_payload["governance"] = {
+                "mode": "off",
+                "status": "off",
+                "ready": False,
+                "binding": None,
+                "wrapper_path": None,
+            }
+            project_path.write_text(json.dumps(project_payload, indent=2) + "\n", encoding="utf-8")
+            fixture_task = subprocess.run(
+                [
+                    *command[:4],
+                    "new-task",
+                    "--project",
+                    str(project_dir),
+                    "--title",
+                    "pending governed spawn",
+                    "--purpose",
+                    "prove governance blocks an existing provider effect",
+                    "--provider",
+                    "codex",
+                ],
+                env={**os.environ, "FAKE_ARCHMARSHAL_STATE": "healthy"},
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            assert_true(fixture_task.returncode == 0, fixture_task.stderr)
+            migrated = subprocess.run(
+                [*command[:4], "migrate-state", "--project", str(project_dir), "--apply"],
+                env={**os.environ, "FAKE_ARCHMARSHAL_STATE": "healthy"},
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            assert_true(migrated.returncode == 0, migrated.stderr)
+            queued = subprocess.run(
+                [
+                    *command[:4],
+                    "dispatch",
+                    "--project",
+                    str(project_dir),
+                    "--task",
+                    "V2-0001",
+                    "--provider",
+                    "codex",
+                    "--unsafe-native",
+                    "--start",
+                    "--command-id",
+                    "CMD-GOVERNANCE-PENDING-SPAWN",
+                ],
+                env={**os.environ, "FAKE_ARCHMARSHAL_STATE": "healthy"},
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            assert_true(queued.returncode == 0, queued.stderr)
+            queued_payload = json.loads(queued.stdout)
+            assert_true(
+                queued_payload["started"] is False and queued_payload["start_queued"] is True,
+                "fixture dispatch did not leave a pending spawn effect",
+            )
+
+            layout = ProjectLayout(root=runtime.resolve(), project_dir=project_dir.resolve())
+            with control_transaction(
+                layout,
+                command_name="test_restore_required_governance",
+                command_id="TEST-RESTORE-REQUIRED-GOVERNANCE",
+                payload={"project": str(project_dir)},
+            ) as transaction:
+                assert_true(not transaction.replay, "governance fixture transaction replayed")
+                authoritative_project = load_project(layout)
+                authoritative_project["governance"] = required_governance
+                save_project(layout, authoritative_project)
+
+            # Commit a second command and crash after commit but before view
+            # materialization. A rejected command must not reconcile that dirty
+            # view, acknowledge dirty_views, lease the spawn, or touch locks.
+            dirty_commit = subprocess.run(
+                [
+                    *command[:4],
+                    "new-task",
+                    "--project",
+                    str(project_dir),
+                    "--title",
+                    "dirty committed view",
+                    "--purpose",
+                    "leave an after-commit-before-materialize state",
+                    "--command-id",
+                    "CMD-GOVERNANCE-DIRTY-VIEW",
+                ],
+                env={
+                    **os.environ,
+                    "FAKE_ARCHMARSHAL_STATE": "healthy",
+                    "COSTMARSHAL_CONTROL_STORE_FAULT": "transaction.after_commit_before_materialize",
+                },
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            assert_true(dirty_commit.returncode == 86, "fixture did not stop at the dirty-view fault")
+
+            fake_provider = temp / "must-not-call-provider.py"
+            provider_counter = temp / "governance-provider-calls.txt"
+            fake_provider.write_text(
+                "from pathlib import Path\n"
+                f"Path({str(provider_counter)!r}).write_text('called\\n', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            (healthy_workspace / ".agent" / "skill-overlays" / ".archmarshal" / "HEAD").write_text(
+                "d" * 64 + "\n",
+                encoding="ascii",
+            )
+            blocked_environment = {
+                **os.environ,
+                "FAKE_ARCHMARSHAL_STATE": "healthy",
+                "COSTMARSHAL_CODEX_COMMAND_JSON": json.dumps([sys.executable, str(fake_provider)]),
+            }
+            unchanged_digest = tree_digest(project_dir)
+
+            blocked_scheduler = subprocess.run(
+                [*command[:4], "run-scheduler", "--project", str(project_dir), "--once"],
+                env=blocked_environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            assert_true(blocked_scheduler.returncode != 0, "run-scheduler accepted stale governance")
+            assert_true("governance gate blocked" in blocked_scheduler.stderr.lower(), blocked_scheduler.stderr)
+            assert_true(tree_digest(project_dir) == unchanged_digest, "blocked scheduler changed project bytes")
+            assert_true(not provider_counter.exists(), "blocked scheduler called the provider")
+
+            blocked_recover = subprocess.run(
+                [*command[:4], "recover", "--project", str(project_dir)],
+                env=blocked_environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            assert_true(blocked_recover.returncode != 0, "required recovery accepted stale governance")
+            assert_true(tree_digest(project_dir) == unchanged_digest, "blocked recovery changed project bytes")
+
+            blocked_task = subprocess.run(
+                [
+                    *command[:4],
+                    "new-task",
+                    "--project",
+                    str(project_dir),
+                    "--title",
+                    "must be rejected",
+                    "--purpose",
+                    "generic governed mutation",
+                ],
+                env=blocked_environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            assert_true(blocked_task.returncode != 0, "generic governed command accepted stale governance")
+            assert_true(tree_digest(project_dir) == unchanged_digest, "blocked generic command changed project bytes")
+            assert_true(not provider_counter.exists(), "a blocked governance path called the provider")
+
+            blocked_relay = subprocess.run(
+                [
+                    *command[:4],
+                    "relay",
+                    "--project",
+                    str(project_dir),
+                    "--actor",
+                    "leader",
+                    "--dry-run",
+                ],
+                env=blocked_environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            assert_true(blocked_relay.returncode != 0, "relay accepted stale governance")
+            assert_true(tree_digest(project_dir) == unchanged_digest, "blocked relay changed project bytes")
+
+            blocked_runtime_send = subprocess.run(
+                [
+                    *command[:4],
+                    "send",
+                    "--project",
+                    str(project_dir),
+                    "--to",
+                    "leader",
+                    "--message",
+                    "must not reach the runtime",
+                    "--runtime-send",
+                ],
+                env=blocked_environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            assert_true(blocked_runtime_send.returncode != 0, "runtime send accepted stale governance")
+            assert_true(
+                tree_digest(project_dir) == unchanged_digest,
+                "blocked runtime send changed project bytes",
+            )
+
+            with environment(FAKE_ARCHMARSHAL_STATE="healthy"):
+                for label, callback in (
+                    ("scheduler cycle", lambda: scheduler_cycle(layout)),
+                    ("runtime effect worker", lambda: process_runtime_effects(layout)),
+                ):
+                    try:
+                        callback()
+                    except GovernancePreflightBlocked:
+                        pass
+                    else:
+                        raise AssertionError(f"{label} accepted stale governance")
+                    assert_true(
+                        tree_digest(project_dir) == unchanged_digest,
+                        f"blocked {label} changed project bytes",
+                    )
+            assert_true(not provider_counter.exists(), "a direct scheduler entry called the provider")
 
         calls = call_log.read_text(encoding="utf-8").splitlines()
         assert_true(calls, "fake wrapper should have recorded read-only calls")

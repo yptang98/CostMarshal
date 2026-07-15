@@ -1,0 +1,207 @@
+{
+  "release": "v2.3.0-beta",
+  "source_commit": "a7ae8c6",
+  "documents": {
+    "project.json": {
+      "schema_version": 2,
+      "project_id": "20260304-120000-v2-3-fixture",
+      "name": "v2-3-fixture",
+      "objective": "Preserve a v2.3 three-tier governed project",
+      "status": "active",
+      "created_at": "2026-03-04T12:00:00+00:00",
+      "updated_at": "2026-03-04T12:09:00+00:00",
+      "workspace": "C:/workspace/costmarshal-fixture",
+      "auto_escalate": true,
+      "allow_unsafe_custom_worker_commands": false,
+      "provider_catalog": {
+        "schema_version": 1,
+        "providers": [
+          {
+            "id": "economy",
+            "tier": "low"
+          },
+          {
+            "id": "balanced",
+            "tier": "medium"
+          },
+          {
+            "id": "premium",
+            "tier": "high"
+          }
+        ]
+      },
+      "routing_policy": {
+        "version": 1,
+        "mode": "cost-performance",
+        "tier_order": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "project_budget_cny": 20.0,
+        "prices_require_review": true
+      },
+      "governance": {
+        "provider": "archmarshal",
+        "mode": "advisory",
+        "status": "ready",
+        "ready": true,
+        "doctor_state": "healthy",
+        "warnings": [],
+        "binding": {
+          "project_id": "arch-fixture"
+        }
+      },
+      "manager_mode": "on-demand",
+      "source_project_mode": "none",
+      "scheduler_contract": {
+        "role": "relay-only"
+      }
+    },
+    "scheduler/session.json": {
+      "schema_version": 2,
+      "project_id": "20260304-120000-v2-3-fixture",
+      "status": "configured",
+      "leader_actor_id": "leader",
+      "actors": {},
+      "task_bindings": {
+        "V2-0001": "agent-v2-0001-economy"
+      },
+      "recovery": {
+        "last_recovered_at": null,
+        "last_status": "not_run",
+        "issues": []
+      }
+    },
+    "scheduler/state.json": {
+      "schema_version": 2,
+      "id": "scheduler",
+      "role": "scheduler",
+      "status": "idle",
+      "pid": null,
+      "started_at": null,
+      "heartbeat_at": "2026-03-04T12:09:00+00:00",
+      "last_cycle_at": "2026-03-04T12:09:00+00:00",
+      "cycle_count": 11,
+      "processed_commands": 3
+    },
+    "scheduler/relay-cursors.json": {
+      "schema_version": 2,
+      "updated_at": "2026-03-04T12:09:00+00:00",
+      "actors": {}
+    },
+    "locks/claims.json": {
+      "schema_version": 2,
+      "updated_at": "2026-03-04T12:02:00+00:00",
+      "claims": []
+    },
+    "tasks/V2-0001/task.json": {
+      "schema_version": 2,
+      "id": "V2-0001",
+      "title": "Three-tier attempt",
+      "purpose": "Exercise v2.3 route and reservation fields",
+      "task_type": "implementation",
+      "risk": "low",
+      "difficulty": "normal",
+      "provider": "economy",
+      "tier": "low",
+      "provider_request": "auto",
+      "tier_request": "auto",
+      "profile": "default",
+      "status": "waiting_leader",
+      "agent_id": "agent-v2-0001-economy",
+      "agent_name": "worker",
+      "model": "economy-model",
+      "estimated_input_tokens": 4000,
+      "estimated_output_tokens": 1000,
+      "max_cost_cny": 2.0,
+      "acceptance": [
+        "route reservation survives migration"
+      ],
+      "allowed_context": [],
+      "allowed_paths": [],
+      "claimed_paths": [],
+      "lock_conflict_override": false,
+      "report_path": "tasks/V2-0001/completion-report.md",
+      "route_decision": {
+        "provider_id": "economy",
+        "tier": "low",
+        "estimated_cost_cny": 0.75,
+        "score": 0.91
+      },
+      "attempts": [
+        {
+          "attempt": 1,
+          "attempt_id": "ATT-v23-1",
+          "actor_id": "agent-v2-0001-economy",
+          "provider": "economy",
+          "tier": "low",
+          "profile": "default",
+          "model": "economy-model",
+          "status": "waiting_leader",
+          "started_at": "2026-03-04T12:03:00+00:00",
+          "finished_at": "2026-03-04T12:08:00+00:00",
+          "route_decision": {
+            "provider_id": "economy",
+            "tier": "low",
+            "estimated_cost_cny": 0.75,
+            "score": 0.91
+          },
+          "escalation_reason": null,
+          "dispatch_command_id": "CMD-v23-dispatch",
+          "reserved_cost_cny": 0.75,
+          "actual_cost_cny": 0.42
+        }
+      ]
+    },
+    "tasks/V2-0001/status.json": {
+      "schema_version": 2,
+      "task_id": "V2-0001",
+      "state": "waiting_leader",
+      "updated_at": "2026-03-04T12:08:00+00:00",
+      "error": null
+    }
+  },
+  "ledgers": {
+    "scheduler/events.jsonl": [
+      {
+        "id": "EVT-v23-dispatch",
+        "timestamp": "2026-03-04T12:03:00+00:00",
+        "event_type": "task_dispatched",
+        "task_id": "V2-0001",
+        "provider": "economy",
+        "tier": "low",
+        "reserved_cost_cny": 0.75
+      }
+    ],
+    "reports/results.jsonl": [
+      {
+        "id": "RES-v23",
+        "timestamp": "2026-03-04T12:08:00+00:00",
+        "task_id": "V2-0001",
+        "attempt_id": "ATT-v23-1",
+        "provider": "economy",
+        "tier": "low",
+        "status": "waiting_leader",
+        "estimated_cost_cny": 0.42,
+        "pricing_source": "usage"
+      }
+    ],
+    "reports/usage.jsonl": [
+      {
+        "id": "USG-v23",
+        "timestamp": "2026-03-04T12:07:00+00:00",
+        "actor_id": "agent-v2-0001-economy",
+        "task_id": "V2-0001",
+        "attempt_id": "ATT-v23-1",
+        "provider": "economy",
+        "tier": "low",
+        "input_tokens": 3500,
+        "output_tokens": 800,
+        "total_tokens": 4300,
+        "estimated_cost_cny": 0.42,
+        "pricing_source": "catalog"
+      }
+    ]
+  }
+}
