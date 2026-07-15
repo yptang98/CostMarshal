@@ -221,7 +221,7 @@ python scripts/costmarshal.py init ... --allow-unsafe-native-workers
 python scripts/costmarshal.py dispatch --project <project-dir> --task V2-0001 --unsafe-native --start
 ```
 
-This records `strong_isolation=false`; it is forbidden when ArchMarshal governance is required. It does not protect host files from the model process.
+This records `strong_isolation=false`; it is forbidden when ArchMarshal governance is required or its binding is ready. Governed provider work must use required OCI isolation. The native path does not protect host files from the model process.
 
 Custom worker command templates are rejected by default because they bypass the controlled runner. `init --allow-unsafe-custom-worker-commands` exists only as an explicit compatibility escape hatch for trusted legacy tests/backends; it forfeits sandbox and secret-isolation guarantees and cannot be recoverably started after SQLite cutover.
 
@@ -273,7 +273,7 @@ python scripts/costmarshal.py init `
 
 The adapter runs only ArchMarshal bootstrap-status/doctor-style read checks, stores a binding fingerprint, and blocks dispatch/launch/recovery when a required binding drifts. Protected paths include `.agent`, `.agents`, `AGENTS.md`, `AGENTS.override.md`, `.git`, `.codex`, and `.codex-plugin`.
 
-Governance drift also blocks scheduler spawn, relay, and actor direct-entry paths before provider side effects. The sole emergency exception is an explicit `stop-actor --stop-runtime`: after SQLite cutover it drains only that durable STOP effect and never leases a pending SPAWN. If the stop command crashes after the OS/OCI stop but before applying its observation, repeat the same `--command-id` to recover it.
+Governance drift also blocks scheduler spawn, relay, and actor direct-entry paths before provider side effects. The sole emergency exception is an explicit `stop-actor --stop-runtime`: after SQLite cutover it drains only that exact durable STOP effect and never leases a pending SPAWN. If another scheduler owns the runtime-effect fence, the command reports `drain_deferred=true` and that scheduler completes the queued stop. If the stop command crashes after the OS/OCI stop but before applying its observation, repeat the same `--command-id` to recover it.
 
 CostMarshal never automatically adopts a workspace, applies an ArchMarshal plan, starts/ends a managed session, or edits ArchMarshal itself. Perform those lifecycle operations explicitly through ArchMarshal, preview first, then initialize or rebind CostMarshal.
 
@@ -306,7 +306,7 @@ python scripts/costmarshal.py state-store --project <project-dir>
 python scripts/costmarshal.py state-store --project <project-dir> --repair-views
 ```
 
-After cutover, scheduler mutations use SQLite WAL transactions and stable `--command-id` values. A reused ID with a different payload is rejected. JSON/JSONL files are compatibility views rebuilt after a commit-time crash, including cycles with no pending runtime effect. `dispatch --start`, escalation starts, and `stop-actor --stop-runtime` commit a fenced effect intent first; the scheduler leases the effect, performs OS/OCI I/O outside the database transaction, persists its observation, and atomically marks the effect and command complete. Expired leased or observed effects are recoverable. Launch tokens plus the attempt lifetime lock prevent a duplicate runner from calling the provider when a start observation is uncertain.
+After cutover, scheduler mutations use SQLite WAL transactions and stable `--command-id` values. A reused ID with a different payload is rejected. JSON/JSONL files are compatibility views rebuilt after a commit-time crash, including cycles with no pending runtime effect; a dedicated materializer lock prevents concurrent revision ABA, and bounded atomic-replace retries tolerate transient Windows reader sharing conflicts without hiding persistent permission failures. `dispatch --start`, escalation starts, and `stop-actor --stop-runtime` commit a fenced effect intent first; the scheduler leases the effect, renews that owner-bound lease during slow OS/OCI I/O, persists its observation, and atomically marks the effect and command complete. A crashed owner stops renewing, so the expired leased or observed effect becomes recoverable. Launch tokens plus the attempt lifetime lock prevent a duplicate runner from calling the provider when a start observation is uncertain.
 
 ## Offline blind backtest
 

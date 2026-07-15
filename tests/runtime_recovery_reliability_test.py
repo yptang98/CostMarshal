@@ -28,7 +28,12 @@ from costmarshal_v2.control_store import (  # noqa: E402
     lease_effect,
 )
 from costmarshal_v2.paths import ProjectLayout, slugify  # noqa: E402
-from costmarshal_v2.scheduler import SPAWN_EFFECT_TYPE, process_runtime_effects  # noqa: E402
+from costmarshal_v2.scheduler import (  # noqa: E402
+    SPAWN_EFFECT_TYPE,
+    STOP_EFFECT_TYPE,
+    _stop_effect_payload,
+    process_runtime_effects,
+)
 from costmarshal_v2.session_backend import pid_is_alive  # noqa: E402
 from costmarshal_v2.state import load_actor, load_project, save_actor  # noqa: E402
 from costmarshal_v2.worker_isolation import (  # noqa: E402
@@ -196,7 +201,6 @@ def main() -> int:
             "CMD-RUNNER-EARLY-EXIT",
         )
         actor_id = queued_retry["actor_id"]
-        actor_path = project / "scheduler" / "actors" / f"{actor_id}.json"
         run_json(temp, "run-scheduler", "--project", str(project), "--once", env_extra=provider_env)
         failed_actor = wait_for_dead_actor(project, actor_id)
         assert (failed_actor.get("runtime") or {}).get("provider_execution_state") is None
@@ -287,17 +291,21 @@ def main() -> int:
             payload={"actor_id": oci_actor_id},
         ):
             save_actor(layout, oci_actor)
-        stop = run_json(
-            temp,
-            "stop-actor",
-            "--project",
-            str(project),
-            "--actor",
-            oci_actor_id,
-            "--stop-runtime",
-            "--command-id",
-            "CMD-OCI-STOP-ABSENT",
-        )
+        stop_effect_id = "EFF-STOP-CMD-OCI-STOP-ABSENT"
+        with control_transaction(
+            layout,
+            command_name="command_stop_actor",
+            command_id="CMD-OCI-STOP-ABSENT",
+            payload={"actor": oci_actor_id, "stop_runtime": True},
+        ) as transaction:
+            transaction.queue_effect(
+                effect_id=stop_effect_id,
+                effect_type=STOP_EFFECT_TYPE,
+                aggregate_id=oci_actor_id,
+                generation=1,
+                payload=_stop_effect_payload(oci_actor, reason="already absent"),
+            )
+            transaction.set_result({"effect_id": stop_effect_id})
 
         class AbsentAdapter:
             def __init__(self, backend: object) -> None:
@@ -317,7 +325,7 @@ def main() -> int:
         ):
             stop_cycle = process_runtime_effects(layout, limit=1)
         assert stop_cycle["processed"][0]["source"] == "oci_already_absent", stop_cycle
-        assert effect_status(layout, stop["runtime"]["effect_id"])["status"] == "applied"
+        assert effect_status(layout, stop_effect_id)["status"] == "applied"
         assert load_actor(layout, oci_actor_id)["status"] == "stopped"
         assert not credential.exists()
 

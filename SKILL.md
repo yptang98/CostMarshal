@@ -109,7 +109,7 @@ Task `--require-capability` values are hard constraints: providers lacking every
 - Missing engine/image/canary/network support fails before attempt persistence and budget reservation.
 - Images must be digest pinned and use pull-never, read-only rootfs, non-root UID, dropped capabilities, no-new-privileges, limits, and explicit mounts.
 - Required dispatch uses the attested OCI adapter and bundled digest-buildable worker image; unrestricted bridge networking is forbidden, and missing live engine/image/canary/provider-proxy evidence fails closed.
-- Development compatibility requires `init --allow-unsafe-native-workers` and `dispatch --unsafe-native`; the attestation records `strong_isolation=false`.
+- Development compatibility requires `init --allow-unsafe-native-workers` and `dispatch --unsafe-native`; the attestation records `strong_isolation=false`. Required or ready ArchMarshal governance forbids new native provider launches, so governed work must use required OCI isolation.
 
 ## Worker write policy
 
@@ -139,6 +139,6 @@ Run every command in README's Required local verification section. At minimum, c
 
 ## Transaction and beta boundary
 
-An explicit `migrate-state --apply` cutover makes SQLite WAL authoritative for scheduler control state; compatibility views are materialized after commit and repaired on restart. Stable command IDs are payload-hashed, while spawn/stop I/O is represented by leased effects outside the transaction. Do not enable cutover while actors are live.
+An explicit `migrate-state --apply` cutover makes SQLite WAL authoritative for scheduler control state; compatibility views are materialized after commit under a cross-process materializer lock and repaired on restart. Stable command IDs are payload-hashed, while spawn/stop I/O is represented by owner-leased effects outside the transaction; slow effects renew their lease and a crashed owner becomes recoverable after expiry. Do not enable cutover while actors are live.
 
 Do not describe v2.4-beta as economically optimal or universally production-ready yet. Spawn/stop use a leased transactional effect worker and required dispatch uses the OCI snapshot/profile/credential/report adapter, but external effects are fenced/recoverable rather than magically exactly-once. A non-beta release still requires the machine-readable real-provider shadow matrix and live malicious OCI evidence for the reviewed digest. These are explicit release gates, not silent fallbacks.

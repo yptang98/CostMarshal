@@ -12,6 +12,7 @@ import secrets
 import stat
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +30,7 @@ from .control_store import (
     lease_effect,
     observe_effect,
     reconcile_project_views,
+    renew_effect_lease,
 )
 from .mailbox import deliver_outbox_message, inbox_message_ids, send_message
 from .paths import ProjectLayout, actor_runtime_name, actor_target, default_root, make_project_id, relpath, resolve_project, slugify
@@ -149,6 +151,65 @@ def _scheduler_fault(name: str) -> None:
 
     if os.environ.get(SCHEDULER_FAULT_ENV) == name:
         os._exit(96)
+
+
+@contextlib.contextmanager
+def _effect_lease_guard(
+    layout: ProjectLayout,
+    *,
+    effect_id: str,
+    owner: str,
+) -> Any:
+    """Keep one owner fenced across external runtime I/O.
+
+    A daemon heartbeat extends only the still-live lease owned by this drainer.
+    A process crash releases the scheduler instance lock and stops heartbeats;
+    the unchanged expiry then remains the recovery boundary for a new owner.
+    """
+
+    stopped = threading.Event()
+    failures: list[BaseException] = []
+    interval = max(0.05, SPAWN_EFFECT_LEASE_SECONDS / 4.0)
+    renew_effect_lease(
+        layout,
+        effect_id=effect_id,
+        owner=owner,
+        ttl_seconds=SPAWN_EFFECT_LEASE_SECONDS,
+    )
+
+    def heartbeat() -> None:
+        while not stopped.wait(interval):
+            try:
+                renew_effect_lease(
+                    layout,
+                    effect_id=effect_id,
+                    owner=owner,
+                    ttl_seconds=SPAWN_EFFECT_LEASE_SECONDS,
+                )
+            except BaseException as exc:  # captured and re-raised on the drainer thread
+                failures.append(exc)
+                stopped.set()
+                return
+
+    thread = threading.Thread(
+        target=heartbeat,
+        name=f"costmarshal-effect-lease-{effect_id}",
+        daemon=True,
+    )
+    thread.start()
+    body_failed = False
+    try:
+        yield
+    except BaseException:
+        body_failed = True
+        raise
+    finally:
+        stopped.set()
+        thread.join(timeout=max(1.0, SPAWN_EFFECT_LEASE_SECONDS))
+        if failures and not body_failed:
+            current = effect_status(layout, effect_id)
+            if current.get("status") != "applied":
+                raise failures[0]
 
 
 def print_json(payload: dict[str, Any]) -> None:
@@ -671,8 +732,11 @@ def preflight_worker_isolation(
 
     config = project.get("worker_isolation") or {}
     project_opt_in = bool(config.get("allow_unsafe_native_workers"))
-    if unsafe_native and (project.get("governance") or {}).get("mode") == "required":
-        raise SystemExit("ArchMarshal required governance forbids unsafe-native workers")
+    governance = project.get("governance") or {}
+    if unsafe_native and (
+        governance.get("mode") == "required" or governance.get("ready") is True
+    ):
+        raise SystemExit("ArchMarshal active governance forbids unsafe-native workers")
     mode = "unsafe-native" if unsafe_native else "required"
     if (
         mode == "required"
@@ -1094,12 +1158,20 @@ def _required_stop_spec(layout: ProjectLayout, actor: dict[str, Any]) -> WorkerE
     isolation = actor.get("isolation") or {}
     execution = isolation.get("execution") or {}
     runtime = actor.get("runtime") or {}
-    project = load_project(layout)
+    session = load_session(layout)
+    project_id = str(session.get("project_id") or layout.project_dir.name or "project")
+    execution_workspace = runtime.get("execution_workspace")
+    if not execution_workspace:
+        # Older, pre-runtime-identity projects may still need their immutable
+        # project configuration.  Recoverable OCI actors persist the execution
+        # workspace before start, so corrupt project.json does not block STOP.
+        project = load_project(layout)
+        execution_workspace = project.get("workspace")
     attempt_id = str(actor.get("attempt_id") or "")
     bundle = (
         layout.root
         / "worker-bundles"
-        / slugify(str(project.get("project_id") or "project"), "project")
+        / slugify(project_id, "project")
         / slugify(attempt_id, "attempt")
     ).resolve()
     limits_row = execution.get("limits") or {}
@@ -1114,11 +1186,11 @@ def _required_stop_spec(layout: ProjectLayout, actor: dict[str, Any]) -> WorkerE
         else None
     )
     return WorkerExecutionSpec(
-        project_id=str(project.get("project_id") or "project"),
+        project_id=project_id,
         actor_id=str(actor["id"]),
         attempt_id=attempt_id,
         image=str(execution.get("image") or ""),
-        workspace=Path(str(runtime.get("execution_workspace") or project.get("workspace") or "")).resolve(),
+        workspace=Path(str(execution_workspace or "")).resolve(),
         workspace_mode="rw" if execution.get("workspace_mode") == "rw" else "ro",
         profile_path=bundle / "profile.config.toml",
         output_exchange=bundle / "out",
@@ -1542,13 +1614,14 @@ def _execute_stop_effect(
     }
 
 
-def process_runtime_effects(
+def _process_runtime_effects_under_instance_lock(
     layout: ProjectLayout,
     *,
     limit: int = 16,
     dry_run: bool = False,
     _governance_prevalidated: bool = False,
     _emergency_stop_only: bool = False,
+    _effect_ids: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Lease and apply recoverable runtime effects without holding a DB transaction over I/O."""
 
@@ -1567,63 +1640,65 @@ def process_runtime_effects(
             owner=owner,
             ttl_seconds=SPAWN_EFFECT_LEASE_SECONDS,
             effect_types=(STOP_EFFECT_TYPE,) if _emergency_stop_only else (SPAWN_EFFECT_TYPE, STOP_EFFECT_TYPE),
+            effect_ids=_effect_ids,
         )
         if effect is None:
             break
         effect_id = str(effect["effect_id"])
         try:
-            # The effect lease is canonical SQLite state, while the runtime
-            # executors still validate/load actor and task compatibility
-            # views.  A command can hard-exit after committing the effect but
-            # before materializing those views.  Reconcile after the lease so
-            # we also cover a concurrent command commit that happens while the
-            # scheduler is selecting work; otherwise a valid effect can be
-            # mistaken for corrupt input and marked dead.
-            reconcile_project_views(layout)
-            if effect.get("effect_type") == STOP_EFFECT_TYPE:
-                processed.append(_execute_stop_effect(layout, effect=effect, owner=owner))
-            else:
-                actor = _validate_spawn_effect(layout, effect)
-                if effect.get("status") == "observed":
-                    observation = effect.get("observation") or {}
+            with _effect_lease_guard(layout, effect_id=effect_id, owner=owner):
+                # The effect lease is canonical SQLite state, while the runtime
+                # executors still validate/load actor and task compatibility
+                # views.  A command can hard-exit after committing the effect but
+                # before materializing those views.  Reconcile after the lease so
+                # we also cover a concurrent command commit that happens while the
+                # scheduler is selecting work; otherwise a valid effect can be
+                # mistaken for corrupt input and marked dead.
+                reconcile_project_views(layout)
+                if effect.get("effect_type") == STOP_EFFECT_TYPE:
+                    processed.append(_execute_stop_effect(layout, effect=effect, owner=owner))
                 else:
-                    observation = effect.get("observation") or _registered_spawn_observation(actor)
-                    if observation is None:
-                        launch = start_actor(layout, actor, dry_run=False, persist_runtime_state=False)
-                        observation = {
-                            "source": "backend_start",
-                            "actor_id": actor["id"],
-                            "task_id": actor.get("task_id"),
-                            "attempt_id": actor.get("attempt_id"),
-                            "launch_token_sha256": _spawn_effect_payload(actor)["launch_token_sha256"],
-                            "backend": launch.get("backend"),
-                            "pid": launch.get("pid"),
-                            "runtime_target": launch.get("runtime_target"),
-                            "process_start_marker": launch.get("process_start_marker"),
-                            "log_path": relpath(
-                                layout.transcripts_dir / f"{slugify(actor['id'], 'actor')}.log",
-                                layout.project_dir,
-                            ),
+                    actor = _validate_spawn_effect(layout, effect)
+                    if effect.get("status") == "observed":
+                        observation = effect.get("observation") or {}
+                    else:
+                        observation = effect.get("observation") or _registered_spawn_observation(actor)
+                        if observation is None:
+                            launch = start_actor(layout, actor, dry_run=False, persist_runtime_state=False)
+                            observation = {
+                                "source": "backend_start",
+                                "actor_id": actor["id"],
+                                "task_id": actor.get("task_id"),
+                                "attempt_id": actor.get("attempt_id"),
+                                "launch_token_sha256": _spawn_effect_payload(actor)["launch_token_sha256"],
+                                "backend": launch.get("backend"),
+                                "pid": launch.get("pid"),
+                                "runtime_target": launch.get("runtime_target"),
+                                "process_start_marker": launch.get("process_start_marker"),
+                                "log_path": relpath(
+                                    layout.transcripts_dir / f"{slugify(actor['id'], 'actor')}.log",
+                                    layout.project_dir,
+                                ),
+                            }
+                            _scheduler_fault("effect.after_spawn_before_observe")
+                        observe_effect(layout, effect_id=effect_id, owner=owner, observation=observation)
+                    _record_spawn_observation(layout, effect=effect, observation=observation)
+                    applied = apply_effect(
+                        layout,
+                        effect_id=effect_id,
+                        owner=owner,
+                        result={"status": "started", "observation": observation},
+                    )
+                    processed.append(
+                        {
+                            "effect_id": effect_id,
+                            "effect_type": SPAWN_EFFECT_TYPE,
+                            "actor_id": observation.get("actor_id"),
+                            "attempt_id": observation.get("attempt_id"),
+                            "status": applied.get("status"),
+                            "source": observation.get("source"),
                         }
-                        _scheduler_fault("effect.after_spawn_before_observe")
-                    observe_effect(layout, effect_id=effect_id, owner=owner, observation=observation)
-                _record_spawn_observation(layout, effect=effect, observation=observation)
-                applied = apply_effect(
-                    layout,
-                    effect_id=effect_id,
-                    owner=owner,
-                    result={"status": "started", "observation": observation},
-                )
-                processed.append(
-                    {
-                        "effect_id": effect_id,
-                        "effect_type": SPAWN_EFFECT_TYPE,
-                        "actor_id": observation.get("actor_id"),
-                        "attempt_id": observation.get("attempt_id"),
-                        "status": applied.get("status"),
-                        "source": observation.get("source"),
-                    }
-                )
+                    )
         except ValueError as exc:
             error = f"{type(exc).__name__}: {exc}"
             _record_terminal_effect_failure(
@@ -1654,6 +1729,29 @@ def process_runtime_effects(
     }
 
 
+def process_runtime_effects(
+    layout: ProjectLayout,
+    *,
+    limit: int = 16,
+    dry_run: bool = False,
+    _governance_prevalidated: bool = False,
+    _emergency_stop_only: bool = False,
+    _effect_ids: tuple[str, ...] | None = None,
+    _instance_timeout_seconds: float = 15.0,
+) -> dict[str, Any]:
+    """Run one mutually-exclusive normal or emergency runtime-effect drainer."""
+
+    with scheduler_instance_lock(layout, timeout_seconds=_instance_timeout_seconds):
+        return _process_runtime_effects_under_instance_lock(
+            layout,
+            limit=limit,
+            dry_run=dry_run,
+            _governance_prevalidated=_governance_prevalidated,
+            _emergency_stop_only=_emergency_stop_only,
+            _effect_ids=_effect_ids,
+        )
+
+
 def _drain_emergency_stop_effect(layout: ProjectLayout, *, effect_id: str) -> dict[str, Any]:
     """Apply one user-authorized STOP while governance blocks every start path.
 
@@ -1675,12 +1773,25 @@ def _drain_emergency_stop_effect(layout: ProjectLayout, *, effect_id: str) -> di
                 f"Emergency stop effect {effect_id} failed permanently: "
                 f"{current.get('last_error') or 'unknown error'}"
             )
-        batch = process_runtime_effects(
-            layout,
-            limit=16,
-            dry_run=False,
-            _emergency_stop_only=True,
-        )
+        try:
+            batch = process_runtime_effects(
+                layout,
+                limit=1,
+                dry_run=False,
+                _emergency_stop_only=True,
+                _effect_ids=(effect_id,),
+                _instance_timeout_seconds=0.25,
+            )
+        except ProjectLockTimeout:
+            # A healthy daemon owns the drainer mutex.  It will observe this
+            # committed STOP in its next cycle; never steal or re-lease from it.
+            current = effect_status(layout, effect_id)
+            if current.get("status") == "applied":
+                return current
+            if time.monotonic() >= deadline:
+                return current
+            time.sleep(0.05)
+            continue
         target_failure = next(
             (row for row in batch.get("failed") or [] if row.get("effect_id") == effect_id),
             None,
@@ -2096,6 +2207,11 @@ def command_dispatch(args: Any) -> None:
             raise SystemExit(f"ArchMarshal governance gate blocked dispatch [{exc.code}]: {exc}") from exc
         if not validation.get("valid"):
             raise SystemExit("ArchMarshal governance gate blocked dispatch: binding is not valid")
+    unsafe_native = bool(getattr(args, "unsafe_native", False))
+    if unsafe_native and (
+        governance_mode == "required" or governance.get("ready") is True
+    ):
+        raise SystemExit("ArchMarshal active governance forbids unsafe-native workers")
     try:
         catalog = project_provider_catalog(project)
         raw_provider = getattr(args, "provider", None)
@@ -2182,7 +2298,6 @@ def command_dispatch(args: Any) -> None:
         attempt_id=attempt_id,
         launch_token=launch_token,
     )
-    unsafe_native = bool(getattr(args, "unsafe_native", False))
     isolation = preflight_worker_isolation(
         layout,
         project,
@@ -4549,24 +4664,11 @@ def _locked_project_command(function: Any) -> Any:
             and (getattr(args, "stop_runtime", False) or getattr(args, "kill_window", False))
             and not getattr(args, "dry_run", False)
         )
-        emergency_stop = False
-        if stop_runtime_requested:
-            try:
-                stop_project = _load_authoritative_project_for_governance(layout)
-            except ControlStoreError:
-                stop_project = {}
-            stop_governance = stop_project.get("governance") or {}
-            # Never invoke the external governance wrapper before an emergency
-            # stop: the wrapper itself may be the unavailable/drifted component.
-            # A project configured as required/ready therefore always uses the
-            # post-commit STOP-only drain, whether its binding is healthy or not.
-            emergency_stop = bool(
-                isinstance(stop_governance, dict)
-                and (
-                    stop_governance.get("mode") == "required"
-                    or stop_governance.get("ready") is True
-                )
-            )
+        # An explicit SQLite-backed stop is always a safety operation.  It must
+        # not depend on project.json being readable, nor race a governance mode
+        # change between command commit and effect drain.  The post-commit path
+        # leases exactly this command's STOP effect and no SPAWN work.
+        emergency_stop = bool(stop_runtime_requested and control_store_enabled(layout))
         output = ""
         result: Any = None
         command_id: str | None = None
@@ -4653,15 +4755,18 @@ def _locked_project_command(function: Any) -> Any:
                 if not isinstance(runtime, dict):
                     runtime = {}
                     response["runtime"] = runtime
+                effect_applied = applied.get("status") == "applied"
                 runtime.update(
                     {
-                        "status": "applied",
+                        "status": "applied" if effect_applied else "queued",
                         "effect_id": effect_id,
                         "effect_status": applied.get("status"),
                         "emergency_stop": True,
+                        "drain_deferred": not effect_applied,
                     }
                 )
-                response["actor_status"] = "stopped"
+                if effect_applied:
+                    response["actor_status"] = "stopped"
                 output = json.dumps(response, ensure_ascii=False, indent=2) + "\n"
             if output:
                 print(output, end="" if output.endswith("\n") else "\n")

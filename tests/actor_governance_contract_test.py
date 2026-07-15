@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from pathlib import Path
 
 
@@ -44,24 +45,10 @@ def write_wrapper(path: Path) -> None:
         textwrap.dedent(
             f"""\
             import json
-            import os
             import sys
             from pathlib import Path
 
             arguments = sys.argv[1:]
-            counter_path = os.environ.get("FAKE_ARCHMARSHAL_CALL_COUNTER")
-            if counter_path:
-                counter = Path(counter_path)
-                count = int(counter.read_text(encoding="utf-8").strip()) if counter.exists() else 0
-                count += 1
-                counter.write_text(str(count), encoding="utf-8")
-                drift_at = int(os.environ.get("FAKE_ARCHMARSHAL_DRIFT_AT", "0"))
-                marker_path = os.environ.get("FAKE_ARCHMARSHAL_DRIFT_MARKER")
-                if marker_path and count == drift_at:
-                    marker = Path(marker_path)
-                    ownership = json.loads(marker.read_text(encoding="utf-8"))
-                    ownership["workspace_id"] = "workspace-drifted-during-actor"
-                    marker.write_text(json.dumps(ownership, sort_keys=True) + "\\n", encoding="utf-8")
             if arguments == ["--bootstrap-status"]:
                 print(json.dumps({{
                     "api_version": "archmarshal-plugin-bootstrap-v2",
@@ -132,18 +119,21 @@ def tree_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
-def tree_manifest(root: Path) -> dict[str, tuple[int, int, str | None]]:
-    manifest: dict[str, tuple[int, int, str | None]] = {}
-    for path in sorted([root, *root.rglob("*")], key=lambda item: item.relative_to(root).as_posix()):
-        relative = path.relative_to(root).as_posix() or "."
-        info = path.lstat()
-        payload_hash = (
-            hashlib.sha256(path.read_bytes()).hexdigest()
-            if stat.S_ISREG(info.st_mode) and not path.is_symlink()
-            else None
-        )
-        manifest[relative] = (int(info.st_mode), int(info.st_mtime_ns), payload_hash)
-    return manifest
+def wait_for_file(path: Path, process: subprocess.Popen[str], timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not path.is_file():
+        if process.poll() is not None:
+            stdout, stderr = process.communicate()
+            raise AssertionError(
+                f"actor exited before creating {path.name}:\n{stdout}\n{stderr}"
+            )
+        if time.monotonic() >= deadline:
+            process.kill()
+            stdout, stderr = process.communicate()
+            raise AssertionError(
+                f"timed out waiting for {path.name}:\n{stdout}\n{stderr}"
+            )
+        time.sleep(0.01)
 
 
 def main() -> int:
@@ -180,6 +170,7 @@ def main() -> int:
         project_payload = json.loads((project / "project.json").read_text(encoding="utf-8"))
         assert project_payload["governance"]["ready"] is True
         assert project_payload["governance"]["binding"]
+        ready_governance = json.loads(json.dumps(project_payload["governance"]))
 
         cli(
             temp,
@@ -193,6 +184,46 @@ def main() -> int:
             "--risk",
             "low",
         )
+        before_auto_ready_dispatch = tree_digest(project)
+        dispatch_environment = os.environ.copy()
+        dispatch_environment["COSTMARSHAL_V2_HOME"] = str(temp / "runtime")
+        rejected_auto_ready = subprocess.run(
+            [
+                sys.executable,
+                str(CLI),
+                "--root",
+                str(temp / "runtime"),
+                "dispatch",
+                "--project",
+                str(project),
+                "--task",
+                "V2-0001",
+                "--unsafe-native",
+            ],
+            text=True,
+            capture_output=True,
+            env=dispatch_environment,
+            check=False,
+        )
+        assert rejected_auto_ready.returncode != 0
+        assert "active governance forbids unsafe-native" in (
+            rejected_auto_ready.stdout + rejected_auto_ready.stderr
+        )
+        assert tree_digest(project) == before_auto_ready_dispatch
+
+        # Build a direct-entry fixture under governance off, then restore the
+        # original ready binding.  New native attempts are forbidden; this
+        # pre-existing fixture is used only to prove actor-entry drift gates.
+        project_payload["governance"] = {
+            "mode": "off",
+            "ready": False,
+            "status": "off",
+            "binding": None,
+        }
+        (project / "project.json").write_text(
+            json.dumps(project_payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
         dispatched = cli(
             temp,
             "dispatch",
@@ -202,6 +233,11 @@ def main() -> int:
             "V2-0001",
             "--unsafe-native",
         )
+        project_payload["governance"] = ready_governance
+        (project / "project.json").write_text(
+            json.dumps(project_payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
         actor_id = dispatched["actor_id"]
         actor_path = project / "scheduler" / "actors" / f"{actor_id}.json"
         actor = json.loads(
@@ -210,12 +246,17 @@ def main() -> int:
         native_isolation = json.loads(json.dumps(actor["isolation"]))
 
         provider_counter = temp / "provider-calls.txt"
+        provider_started = temp / "provider-started.pid"
         fake_provider = temp / "fake_provider.py"
         fake_provider.write_text(
             "\n".join(
                 [
+                    "import os",
                     "import pathlib",
                     "import sys",
+                    f"pathlib.Path({str(provider_started)!r}).write_text(str(os.getpid()), encoding='ascii')",
+                    "prompt = sys.stdin.read()",
+                    "if not prompt: raise SystemExit(0)",
                     f"pathlib.Path({str(provider_counter)!r}).write_text('called\\n', encoding='utf-8')",
                     "output = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])",
                     "output.write_text('# Completion Report\\n\\nStatus: done\\n', encoding='utf-8')",
@@ -250,7 +291,7 @@ def main() -> int:
         assert blocked.returncode != 0, "direct actor entry accepted stale governance"
         error = blocked.stdout + blocked.stderr
         assert "governance gate blocked actor launch" in error.lower(), error
-        assert "governance_binding_drift" in error, error
+        assert "forbid unsafe-native provider launch" in error, error
         assert not provider_counter.exists(), "stale governance reached the native provider"
         assert after == before, "governance failure mutated the CostMarshal project"
 
@@ -301,10 +342,17 @@ def main() -> int:
         assert not list((temp / "runtime" / "worker-bundles").rglob("provider.secret"))
         assert not provider_counter.exists(), "required governance reached a provider"
 
-        # The entry gate is repeated immediately before native registration and
-        # Popen.  Drift injected by the third wrapper call happens after the
-        # first actor-entry inspection, so only the second gate can catch it.
-        project_payload["governance"]["mode"] = "auto"
+        # Native execution is permitted only while governance is off. Pause
+        # after Popen but before post-spawn authorization, then make the
+        # project governed and drift ownership. The child counts a provider
+        # call only after receiving its prompt, so zero calls verifies the
+        # stdin authorization fence across process creation.
+        project_payload["governance"] = {
+            **ready_governance,
+            "mode": "off",
+            "ready": False,
+            "status": "off",
+        }
         (project / "project.json").write_text(
             json.dumps(project_payload, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
@@ -315,47 +363,69 @@ def main() -> int:
             encoding="utf-8",
         )
         marker.write_bytes(ownership_bytes("workspace-original"))
-        wrapper_counter = temp / "actor-wrapper-calls.txt"
-        second_gate_env = dict(env)
-        second_gate_env.pop("CODEX_HOME", None)
-        second_gate_env.update(
+        barrier_ready = temp / "native-launch.ready"
+        barrier_release = temp / "native-launch.release"
+        barrier_env = dict(env)
+        barrier_env.pop("CODEX_HOME", None)
+        barrier_env.update(
             {
-                "FAKE_ARCHMARSHAL_CALL_COUNTER": str(wrapper_counter),
-                "FAKE_ARCHMARSHAL_DRIFT_AT": "3",
-                "FAKE_ARCHMARSHAL_DRIFT_MARKER": str(marker),
+                "COSTMARSHAL_NATIVE_LAUNCH_BARRIER_STAGE": (
+                    "after_popen_before_governance"
+                ),
+                "COSTMARSHAL_NATIVE_LAUNCH_BARRIER_READY": str(barrier_ready),
+                "COSTMARSHAL_NATIVE_LAUNCH_BARRIER_RELEASE": str(barrier_release),
             }
         )
-        second_gate_before = tree_manifest(project)
-        second_gate_blocked = subprocess.run(
+        barrier_process = subprocess.Popen(
             command,
             text=True,
-            capture_output=True,
-            env=second_gate_env,
-            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=barrier_env,
         )
-        second_gate_error = second_gate_blocked.stdout + second_gate_blocked.stderr
-        assert second_gate_blocked.returncode != 0, "native pre-Popen drift reached the provider"
-        assert "governance gate blocked actor launch" in second_gate_error.lower(), second_gate_error
-        assert "governance_binding_drift" in second_gate_error, second_gate_error
-        assert int(wrapper_counter.read_text(encoding="utf-8")) >= 3
-        second_gate_after = tree_manifest(project)
-        changed_project_paths = sorted(
-            path
-            for path in set(second_gate_before) | set(second_gate_after)
-            if second_gate_before.get(path) != second_gate_after.get(path)
+        wait_for_file(barrier_ready, barrier_process)
+        wait_for_file(provider_started, barrier_process)
+        project_payload["governance"] = ready_governance
+        (project / "project.json").write_text(
+            json.dumps(project_payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
         )
-        unexpected_project_paths = [
-            path
-            for path in changed_project_paths
-            if path not in {".", "locks", "locks/attempts"}
-            and not path.startswith("locks/attempts/")
-        ]
-        assert not unexpected_project_paths, (
-            "native second gate mutated non-fence project state: "
-            + ", ".join(unexpected_project_paths)
+        marker.write_bytes(ownership_bytes("workspace-drifted-during-launch"))
+        barrier_release.write_text("release\n", encoding="ascii")
+        try:
+            barrier_stdout, barrier_stderr = barrier_process.communicate(timeout=20.0)
+        except subprocess.TimeoutExpired:
+            barrier_process.kill()
+            barrier_stdout, barrier_stderr = barrier_process.communicate()
+            raise AssertionError(
+                "native governance barrier actor did not exit:\n"
+                + barrier_stdout
+                + "\n"
+                + barrier_stderr
+            )
+        barrier_error = barrier_stdout + barrier_stderr
+        assert barrier_process.returncode != 0, "post-Popen governance drift reached provider"
+        assert "governance gate blocked actor launch" in barrier_error.lower(), barrier_error
+        assert "forbid unsafe-native provider launch" in barrier_error, barrier_error
+        assert not provider_counter.exists(), "governance drift delivered the provider prompt"
+        blocked_actor = json.loads(actor_path.read_text(encoding="utf-8"))
+        blocked_task = json.loads(
+            (project / "tasks" / "V2-0001" / "task.json").read_text(encoding="utf-8")
         )
-        assert not (project / "actor-homes").exists(), "second gate allowed credential-home setup"
-        assert not provider_counter.exists(), "native second gate called the provider"
+        assert blocked_actor["status"] == "needs_recovery"
+        blocked_runtime = blocked_actor["runtime"]
+        assert (
+            blocked_runtime["provider_execution_state"]
+            == "not_started_governance_blocked"
+        )
+        assert blocked_runtime["governance_launch_block"]["stage"] == "after_popen"
+        assert blocked_runtime["governance_launch_block"]["child_terminated"] is True
+        assert blocked_task["status"] == "needs_recovery"
+        assert blocked_task["attempts"][-1]["status"] == "needs_recovery"
+        assert (
+            blocked_task["attempts"][-1]["provider_execution_state"]
+            == "not_started_governance_blocked"
+        )
         print("actor governance contract ok")
         return 0
     finally:

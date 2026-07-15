@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Opt-in SQLite control store and crash-safe legacy view materialization.
 
 The scheduler activates these transaction hooks only after an explicit
@@ -8,6 +6,8 @@ JSON/JSONL remains authoritative even if a fully built database was left
 behind by a crash. A malformed marker or missing enabled database fails closed.
 """
 
+from __future__ import annotations
+
 import hashlib
 import json
 import os
@@ -15,6 +15,7 @@ import shutil
 import sqlite3
 import tempfile
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from .locking import materializer_lock
 from .paths import ProjectLayout
 
 
@@ -31,6 +33,9 @@ DB_NAME = "state.db"
 MARKER_NAME = "state-backend.json"
 MIGRATION_BACKUP_DIR = "migration-backups"
 FAULT_ENV = "COSTMARSHAL_CONTROL_STORE_FAULT"
+ATOMIC_REPLACE_RETRY_SECONDS = 2.0
+ATOMIC_REPLACE_INITIAL_DELAY_SECONDS = 0.01
+ATOMIC_REPLACE_MAX_DELAY_SECONDS = 0.1
 
 
 class ControlStoreError(RuntimeError):
@@ -450,7 +455,23 @@ def _write_atomic(path: Path, content: str) -> None:
             handle.flush()
             os.fsync(handle.fileno())
             temporary = Path(handle.name)
-        os.replace(temporary, path)
+        # Windows readers that omit delete sharing can briefly reject an
+        # otherwise valid atomic replacement with WinError 5/32. Compatibility
+        # views are read concurrently by status monitors and actor processes,
+        # so retry the same fully-fsynced temporary file for a bounded interval.
+        # Persistent permission failures still fail closed.
+        deadline = time.monotonic() + ATOMIC_REPLACE_RETRY_SECONDS
+        delay = ATOMIC_REPLACE_INITIAL_DELAY_SECONDS
+        while True:
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(min(delay, remaining))
+                delay = min(delay * 2, ATOMIC_REPLACE_MAX_DELAY_SECONDS)
         temporary = None
         if os.name != "nt":
             descriptor = os.open(path.parent, os.O_RDONLY)
@@ -780,28 +801,29 @@ def reconcile_project_views(layout: ProjectLayout) -> dict[str, Any]:
 
     upgrade_control_store(layout)
     materialized: list[str] = []
-    while True:
-        connection = _connect(layout)
-        try:
-            _schema(connection)
-            row = connection.execute(
-                "SELECT path, kind, revision FROM dirty_views ORDER BY path LIMIT 1"
-            ).fetchone()
-            if row is None:
-                break
-            relative = str(row["path"])
-            kind = str(row["kind"])
-            revision = int(row["revision"])
-            _materialize_one(connection, layout, relative, kind)
-            _fault("materialize.after_file_before_ack")
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
-                "DELETE FROM dirty_views WHERE path=? AND revision=?", (relative, revision)
-            )
-            connection.commit()
-            materialized.append(relative)
-        finally:
-            connection.close()
+    with materializer_lock(layout):
+        while True:
+            connection = _connect(layout)
+            try:
+                _schema(connection)
+                row = connection.execute(
+                    "SELECT path, kind, revision FROM dirty_views ORDER BY path LIMIT 1"
+                ).fetchone()
+                if row is None:
+                    break
+                relative = str(row["path"])
+                kind = str(row["kind"])
+                revision = int(row["revision"])
+                _materialize_one(connection, layout, relative, kind)
+                _fault("materialize.after_file_before_ack")
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    "DELETE FROM dirty_views WHERE path=? AND revision=?", (relative, revision)
+                )
+                connection.commit()
+                materialized.append(relative)
+            finally:
+                connection.close()
     return {"status": "ok", "materialized": materialized}
 
 
@@ -1188,6 +1210,7 @@ def lease_effect(
     owner: str,
     ttl_seconds: float,
     effect_types: tuple[str, ...] | None = None,
+    effect_ids: tuple[str, ...] | None = None,
 ) -> dict[str, Any] | None:
     """Atomically lease one pending/retryable/expired effect."""
 
@@ -1206,11 +1229,17 @@ def lease_effect(
             normalized = tuple(str(item) for item in effect_types)
             type_clause = " AND effect_type IN (" + ",".join("?" for _ in normalized) + ")"
             parameters.extend(normalized)
+        id_clause = ""
+        if effect_ids:
+            normalized_ids = tuple(str(item) for item in effect_ids)
+            id_clause = " AND effect_id IN (" + ",".join("?" for _ in normalized_ids) + ")"
+            parameters.extend(normalized_ids)
         row = connection.execute(
             "SELECT * FROM effects WHERE "
             "(status IN ('pending', 'retryable_failed') OR "
             "(status IN ('leased', 'observed') AND lease_expires_at IS NOT NULL AND lease_expires_at<=?))"
             + type_clause
+            + id_clause
             + " ORDER BY created_at, effect_id LIMIT 1",
             tuple(parameters),
         ).fetchone()
@@ -1237,6 +1266,46 @@ def lease_effect(
     if leased is not None:
         _fault("effect.after_lease_commit_before_spawn")
     return leased
+
+
+def renew_effect_lease(
+    layout: ProjectLayout,
+    *,
+    effect_id: str,
+    owner: str,
+    ttl_seconds: float,
+) -> dict[str, Any]:
+    """Atomically extend one live lease without changing its owner or attempt."""
+
+    if not owner.strip():
+        raise ValueError("effect lease owner is required")
+    upgrade_control_store(layout)
+    connection = _connect(layout)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute("SELECT * FROM effects WHERE effect_id=?", (effect_id,)).fetchone()
+        if row is None:
+            raise ControlStoreError(f"effect not found: {effect_id}")
+        status = str(row["status"])
+        if status not in {"leased", "observed"} or row["lease_owner"] != owner:
+            raise ControlStoreConflict(f"effect lease is not owned by {owner}: {effect_id}")
+        now = _lease_now()
+        if row["lease_expires_at"] is None or str(row["lease_expires_at"]) <= now:
+            raise ControlStoreConflict(f"effect lease expired before renewal: {effect_id}")
+        connection.execute(
+            "UPDATE effects SET lease_expires_at=?, updated_at=? WHERE effect_id=?",
+            (_lease_deadline(float(ttl_seconds)), _now(), effect_id),
+        )
+        updated = connection.execute("SELECT * FROM effects WHERE effect_id=?", (effect_id,)).fetchone()
+        connection.commit()
+        if updated is None:
+            raise ControlStoreError(f"renewed effect disappeared: {effect_id}")
+        return _effect_payload(updated)
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def observe_effect(
@@ -1561,6 +1630,7 @@ __all__ = [
     "migrate_legacy_store",
     "preview_legacy_migration",
     "reconcile_project_views",
+    "renew_effect_lease",
     "observe_effect",
     "apply_effect",
     "transactional_append_jsonl",

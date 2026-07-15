@@ -112,4 +112,27 @@ def scheduler_instance_lock(layout: ProjectLayout, *, timeout_seconds: float = 0
         yield
 
 
-__all__ = ["ProjectLockTimeout", "advisory_file_lock", "project_write_lock", "scheduler_instance_lock"]
+@contextmanager
+def materializer_lock(layout: ProjectLayout, *, timeout_seconds: float = 15.0) -> Iterator[None]:
+    """Serialize compatibility-view materialization across processes.
+
+    The lock spans the dirty revision read, file replacement, conditional
+    acknowledgement, and the next revision check.  This prevents a deleted
+    revision number from being reused while an older materializer is still
+    able to acknowledge it (the classic ABA window).
+    """
+
+    with advisory_file_lock(
+        layout.project_dir / "locks" / "materializer.lock",
+        timeout_seconds=timeout_seconds,
+    ):
+        yield
+
+
+__all__ = [
+    "ProjectLockTimeout",
+    "advisory_file_lock",
+    "materializer_lock",
+    "project_write_lock",
+    "scheduler_instance_lock",
+]

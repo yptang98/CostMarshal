@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -19,7 +20,12 @@ ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "scripts" / "costmarshal.py"
 sys.path.insert(0, str(ROOT))
 
+from costmarshal_v2.control_store import control_transaction, effect_status  # noqa: E402
+from costmarshal_v2.locking import scheduler_instance_lock  # noqa: E402
+from costmarshal_v2.paths import resolve_project  # noqa: E402
 from costmarshal_v2.session_backend import pid_is_alive  # noqa: E402
+from costmarshal_v2.state import load_actor  # noqa: E402
+import costmarshal_v2.scheduler as scheduler_module  # noqa: E402
 
 
 def run(
@@ -70,7 +76,12 @@ def wait_for_count(
                     pid = runtime.get("pid")
                     provider_state = runtime.get("provider_execution_state")
                     if pid and provider_state != "finished" and not pid_is_alive(int(pid)):
-                        transcript = project / "scheduler" / "transcripts" / f"{actor_id}.log"
+                        log_path = runtime.get("log_path")
+                        transcript = (
+                            project / str(log_path)
+                            if log_path
+                            else project / "transcripts" / f"{actor_id}.log"
+                        )
                         transcript_tail = (
                             transcript.read_text(encoding="utf-8", errors="replace")[-4000:]
                             if transcript.is_file()
@@ -355,7 +366,24 @@ def main() -> int:
         run_json(temp, "run-scheduler", "--project", str(project), "--once", env_extra=long_env)
         wait_for_count(counter, 3, project=project, actor_id=stop_target["actor_id"])
         wait_for_actor_started(project, stop_target["actor_id"])
-        stop_queued = run_json(
+        stop_crash = run(
+            temp,
+            "stop-actor",
+            "--project",
+            str(project),
+            "--actor",
+            stop_target["actor_id"],
+            "--stop-runtime",
+            "--reason",
+            "fault injection",
+            "--command-id",
+            "CMD-STOP-CRASH",
+            env_extra={"COSTMARSHAL_SCHEDULER_FAULT": "effect.after_stop_before_observe"},
+            ok=False,
+        )
+        assert stop_crash.returncode == 96
+        time.sleep(2.8)
+        stop_recovered = run_json(
             temp,
             "stop-actor",
             "--project",
@@ -368,21 +396,8 @@ def main() -> int:
             "--command-id",
             "CMD-STOP-CRASH",
         )
-        assert stop_queued["runtime"]["status"] == "queued"
-        stop_crash = run(
-            temp,
-            "run-scheduler",
-            "--project",
-            str(project),
-            "--once",
-            env_extra={"COSTMARSHAL_SCHEDULER_FAULT": "effect.after_stop_before_observe"},
-            ok=False,
-        )
-        assert stop_crash.returncode == 96
-        time.sleep(2.8)
-        stop_recovered = run_json(temp, "run-scheduler", "--project", str(project), "--once")
-        assert stop_recovered["processed_effects"] == 1
-        assert stop_recovered["last_effects"]["processed"][0]["source"] == "already_stopped"
+        assert stop_recovered["runtime"]["status"] == "applied"
+        assert stop_recovered["runtime"]["emergency_stop"] is True
         time.sleep(0.3)
         assert counter.read_text(encoding="utf-8").splitlines() == ["once", "once", "once"]
         stopped_actor = json.loads(
@@ -395,8 +410,15 @@ def main() -> int:
             ).fetchone()[0] == "completed"
             assert connection.execute(
                 "SELECT status FROM effects WHERE effect_id=?",
-                (stop_queued["runtime"]["effect_id"],),
+                (stop_recovered["runtime"]["effect_id"],),
             ).fetchone()[0] == "applied"
+            stop_observation = json.loads(
+                connection.execute(
+                    "SELECT observation_json FROM effects WHERE effect_id=?",
+                    (stop_recovered["runtime"]["effect_id"],),
+                ).fetchone()[0]
+            )
+            assert stop_observation["source"] == "already_stopped"
             orphan_effects = int(
                 connection.execute(
                     "SELECT COUNT(*) FROM effects WHERE status NOT IN ('applied', 'dead')"
@@ -477,6 +499,159 @@ def main() -> int:
         assert main_provider_calls == 4
         assert main_provider_calls - provider_calls_before_dirty == 1
         assert orphan_effects == 0
+
+        slow_workspace = temp / "slow-stop-workspace"
+        slow_workspace.mkdir()
+        slow_project = Path(
+            run_json(
+                temp,
+                "init",
+                "--name",
+                "slow-stop-lease",
+                "--objective",
+                "renew stop leases across external I/O",
+                "--workspace",
+                str(slow_workspace),
+                "--backend",
+                "local",
+                "--governance",
+                "off",
+            )["project"]
+        )
+        slow_actor_path = slow_project / "scheduler" / "actors" / "leader.json"
+        slow_actor_seed = json.loads(slow_actor_path.read_text(encoding="utf-8"))
+        slow_actor_seed["runtime"].update(
+            {
+                "target": "pid:999999",
+                "pid": 999999,
+                "process_start_marker": "slow-stop-marker",
+            }
+        )
+        slow_actor_path.write_text(
+            json.dumps(slow_actor_seed, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        run_json(temp, "migrate-state", "--project", str(slow_project), "--apply")
+        slow_layout = resolve_project(temp / "runtime", str(slow_project))
+        slow_actor = load_actor(slow_layout, "leader")
+        slow_effect_id = "EFF-STOP-CMD-SLOW-STOP"
+        with control_transaction(
+            slow_layout,
+            command_name="command_stop_actor",
+            command_id="CMD-SLOW-STOP",
+            payload={"actor": "leader", "stop_runtime": True},
+        ) as transaction:
+            transaction.queue_effect(
+                effect_id=slow_effect_id,
+                effect_type=scheduler_module.STOP_EFFECT_TYPE,
+                aggregate_id="leader",
+                generation=1,
+                payload=scheduler_module._stop_effect_payload(slow_actor, reason="slow audit"),
+            )
+            transaction.set_result({"effect_id": slow_effect_id})
+
+        stop_started = threading.Event()
+        stop_calls: list[str] = []
+
+        class SlowStopBackend:
+            kind = "local"
+
+            def available(self) -> bool:
+                return True
+
+            def actor_alive(self, **kwargs: object) -> bool:
+                return True
+
+            def stop_actor(self, **kwargs: object) -> dict[str, str]:
+                stop_calls.append(threading.current_thread().name)
+                stop_started.set()
+                time.sleep(3.25)
+                return {"status": "stopped"}
+
+        original_backend_from_session = scheduler_module.backend_from_session
+        scheduler_module.backend_from_session = lambda session: SlowStopBackend()
+        slow_results: list[dict] = []
+        slow_errors: list[BaseException] = []
+
+        def normal_stop_drainer() -> None:
+            try:
+                slow_results.append(
+                    scheduler_module.process_runtime_effects(
+                        slow_layout,
+                        limit=1,
+                        _governance_prevalidated=True,
+                    )
+                )
+            except BaseException as exc:
+                slow_errors.append(exc)
+
+        def emergency_stop_drainer() -> None:
+            try:
+                slow_results.append(
+                    scheduler_module._drain_emergency_stop_effect(
+                        slow_layout,
+                        effect_id=slow_effect_id,
+                    )
+                )
+            except BaseException as exc:
+                slow_errors.append(exc)
+
+        normal_thread = threading.Thread(target=normal_stop_drainer, name="normal-drainer")
+        emergency_thread = threading.Thread(target=emergency_stop_drainer, name="emergency-drainer")
+        try:
+            normal_thread.start()
+            assert stop_started.wait(5)
+            emergency_thread.start()
+            normal_thread.join(10)
+            emergency_thread.join(10)
+        finally:
+            scheduler_module.backend_from_session = original_backend_from_session
+        assert not normal_thread.is_alive() and not emergency_thread.is_alive()
+        assert slow_errors == []
+        assert stop_calls == ["normal-drainer"]
+        assert effect_status(slow_layout, slow_effect_id)["status"] == "applied"
+        with sqlite3.connect(slow_project / "scheduler" / "state.db") as connection:
+            assert connection.execute(
+                "SELECT status FROM commands WHERE command_id='CMD-SLOW-STOP'"
+            ).fetchone()[0] == "completed"
+
+        daemon_acquired = threading.Event()
+        daemon_release = threading.Event()
+
+        def hold_daemon_lock() -> None:
+            with scheduler_instance_lock(slow_layout, timeout_seconds=5):
+                daemon_acquired.set()
+                daemon_release.wait(10)
+
+        daemon_thread = threading.Thread(target=hold_daemon_lock, name="existing-daemon")
+        daemon_thread.start()
+        assert daemon_acquired.wait(5)
+        daemon_stop = run_json(
+            temp,
+            "stop-actor",
+            "--project",
+            str(slow_project),
+            "--actor",
+            "leader",
+            "--stop-runtime",
+            "--reason",
+            "existing daemon owns drainer",
+            "--command-id",
+            "CMD-DAEMON-DEFERRED-STOP",
+        )
+        assert daemon_stop["runtime"]["status"] == "queued"
+        assert daemon_stop["runtime"]["drain_deferred"] is True
+        assert daemon_stop["runtime"]["effect_status"] == "pending"
+        daemon_release.set()
+        daemon_thread.join(5)
+        assert not daemon_thread.is_alive()
+        daemon_cycle = scheduler_module.process_runtime_effects(
+            slow_layout,
+            limit=1,
+            _governance_prevalidated=True,
+        )
+        assert daemon_cycle["processed"][0]["effect_id"] == daemon_stop["runtime"]["effect_id"]
+        assert effect_status(slow_layout, daemon_stop["runtime"]["effect_id"])["status"] == "applied"
 
         emergency_workspace = temp / "emergency-workspace"
         emergency_workspace.mkdir()
@@ -616,6 +791,11 @@ def main() -> int:
         assert tree_digest(emergency_project) == before_blocked_scheduler
         assert emergency_counter.read_text(encoding="utf-8").splitlines() == ["once"]
 
+        # Even if the authoritative governance document becomes unreadable,
+        # an explicit SQLite STOP remains a fail-safe STOP-only operation.
+        # The already queued SPAWN must remain untouched.
+        project_file.write_text("{corrupt-project-json\n", encoding="utf-8")
+
         emergency_stop_crash = run(
             temp,
             "stop-actor",
@@ -709,7 +889,10 @@ def main() -> int:
                         "transaction.after_commit_before_materialize",
                     ],
                     "recovery_scenarios": [
+                        "corrupt_project_emergency_stop_only",
                         "governance_drift_emergency_stop_replay",
+                        "slow_stop_lease_heartbeat_single_execution",
+                        "daemon_owned_stop_drain_deferred_without_duplicate",
                         "no_effect_commit_view_reconciled_by_scheduler",
                     ],
                     "provider_calls": provider_calls,

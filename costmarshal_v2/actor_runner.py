@@ -64,11 +64,60 @@ from .state import (
 
 
 ACTOR_FAULT_ENV = "COSTMARSHAL_ACTOR_FAULT"
+NATIVE_LAUNCH_BARRIER_STAGE_ENV = "COSTMARSHAL_NATIVE_LAUNCH_BARRIER_STAGE"
+NATIVE_LAUNCH_BARRIER_READY_ENV = "COSTMARSHAL_NATIVE_LAUNCH_BARRIER_READY"
+NATIVE_LAUNCH_BARRIER_RELEASE_ENV = "COSTMARSHAL_NATIVE_LAUNCH_BARRIER_RELEASE"
 
 
 def _actor_fault(name: str) -> None:
     if os.environ.get(ACTOR_FAULT_ENV) == name:
         os._exit(87)  # intentionally bypass runner cleanup for crash recovery tests
+
+
+def _native_launch_barrier(stage: str) -> None:
+    """Expose a deterministic test seam without forwarding it to the provider."""
+
+    if os.environ.get(NATIVE_LAUNCH_BARRIER_STAGE_ENV) != stage:
+        return
+    ready_value = os.environ.get(NATIVE_LAUNCH_BARRIER_READY_ENV)
+    release_value = os.environ.get(NATIVE_LAUNCH_BARRIER_RELEASE_ENV)
+    if not ready_value or not release_value:
+        raise SystemExit("native launch barrier requires ready and release paths")
+    ready = Path(ready_value).resolve()
+    release = Path(release_value).resolve()
+    ready.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(ready, f"{stage}\n")
+    deadline = time.monotonic() + 15.0
+    while not release.is_file():
+        if time.monotonic() >= deadline:
+            raise SystemExit(f"native launch barrier timed out at {stage}")
+        time.sleep(0.01)
+
+
+def _terminate_unreleased_native_child(process: subprocess.Popen[str]) -> bool:
+    """Close the authorization pipe and synchronously reap an untrusted child."""
+
+    if process.stdin is not None:
+        with contextlib.suppress(BrokenPipeError, OSError):
+            process.stdin.close()
+    terminated = process.poll() is not None
+    if not terminated:
+        with contextlib.suppress(OSError):
+            process.terminate()
+        try:
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                process.kill()
+            try:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                return False
+        terminated = process.poll() is not None
+    if process.stdout is not None:
+        with contextlib.suppress(OSError):
+            process.stdout.close()
+    return terminated
 
 
 def load_env_file(path: Path | None, env: dict[str, str]) -> dict[str, str]:
@@ -896,7 +945,26 @@ def _validate_actor_governance_before_side_effect(
         raise SystemExit(
             "ArchMarshal governance gate blocked actor launch: governance state is invalid"
         )
-    if governance.get("mode") != "required" and not governance.get("ready"):
+    governance_mode = governance.get("mode")
+    governance_ready = governance.get("ready")
+    if governance_mode not in {"off", "auto", "required"} or not isinstance(
+        governance_ready,
+        bool,
+    ):
+        raise SystemExit(
+            "ArchMarshal governance gate blocked actor launch: governance state is invalid"
+        )
+    governed = governance_mode == "required" or governance_ready is True
+    if (
+        governed
+        and actor.get("role") == "agent"
+        and (actor.get("isolation") or {}).get("mode") == "unsafe-native"
+    ):
+        raise SystemExit(
+            "ArchMarshal governance gate blocked actor launch: governed projects "
+            "forbid unsafe-native provider launch; use required OCI isolation"
+        )
+    if governance_mode != "required" and not governance_ready:
         return False
     try:
         validation = validate_governance_binding(
@@ -959,6 +1027,12 @@ def _run_actor_once(
     report.parent.mkdir(parents=True, exist_ok=True)
     execution_workspace, sandbox, write_scopes, base_sha = actor_execution_workspace(layout, project, actor)
     required_isolation = (actor.get("isolation") or {}).get("mode") == "required"
+    recovery_generation_value = (actor.get("runtime") or {}).get("recovery_generation")
+    native_recovery_generation = (
+        recovery_generation_value
+        if isinstance(recovery_generation_value, int) and recovery_generation_value >= 0
+        else 0
+    )
     argv: list[str] = []
     env: dict[str, str] = {}
     required_spec: WorkerExecutionSpec | None = None
@@ -1008,7 +1082,9 @@ def _run_actor_once(
             pid_start_marker(os.getpid()) or f"unverified:{os.getpid()}:{time.time_ns()}"
         )
         runtime["registered_launch_token_sha256"] = hashlib.sha256(str(launch_token).encode("utf-8")).hexdigest()
-        runtime["provider_execution_state"] = "started"
+        runtime["provider_execution_state"] = (
+            "started" if required_isolation else "launch_pending_authorization"
+        )
         runtime.update(runtime_registration)
         save_actor(layout, current_actor)
         if current_actor.get("task_id") and current_actor.get("attempt_id"):
@@ -1034,6 +1110,103 @@ def _run_actor_once(
             isolation_backend=runtime_registration.get("isolation_backend") or "unsafe-native",
             container_name=runtime_registration.get("container_name"),
         )
+
+    def record_native_governance_block(
+        *,
+        stage: str,
+        error: BaseException,
+        child_terminated: bool | None,
+    ) -> None:
+        blocked_at = now_iso()
+        reason = str(error)[:1024]
+
+        def persist_block() -> None:
+            current_actor = _validate_worker_fence(
+                layout,
+                actor_id,
+                attempt_id=attempt_id,
+                launch_token=launch_token,
+                allow_provider_started=True,
+            )
+            current_actor["status"] = "needs_recovery"
+            runtime = current_actor.setdefault("runtime", {})
+            runtime["provider_execution_state"] = "not_started_governance_blocked"
+            runtime["governance_launch_block"] = {
+                "stage": stage,
+                "blocked_at": blocked_at,
+                "reason": reason,
+                "child_terminated": child_terminated,
+            }
+            save_actor(layout, current_actor)
+            task_id = current_actor.get("task_id")
+            if task_id:
+                current_task = load_task(layout, str(task_id))
+                attempts = current_task.get("attempts") or []
+                if attempts:
+                    current_attempt = attempts[-1]
+                    if (
+                        current_attempt.get("attempt_id") == current_actor.get("attempt_id")
+                        and current_attempt.get("actor_id") == actor_id
+                    ):
+                        current_attempt["status"] = "needs_recovery"
+                        current_attempt["provider_execution_state"] = (
+                            "not_started_governance_blocked"
+                        )
+                        current_attempt["governance_launch_block"] = {
+                            "stage": stage,
+                            "blocked_at": blocked_at,
+                            "child_terminated": child_terminated,
+                        }
+                current_task["status"] = "needs_recovery"
+                save_task(layout, current_task)
+            append_event(
+                layout,
+                "actor_native_launch_governance_blocked",
+                actor_id=actor_id,
+                task_id=current_actor.get("task_id"),
+                attempt_id=current_actor.get("attempt_id"),
+                stage=stage,
+                child_terminated=child_terminated,
+            )
+
+        _control_mutation(
+            layout,
+            command_name="runner_record_native_governance_block",
+            command_id=(
+                "RUNNER-NATIVE-GOVERNANCE-BLOCK-"
+                f"{attempt_id or actor_id}-{native_recovery_generation}-{stage}"
+            ),
+            payload={
+                "actor_id": actor_id,
+                "attempt_id": attempt_id,
+                "stage": stage,
+                "child_terminated": child_terminated,
+            },
+            mutate=persist_block,
+        )
+
+    def authorize_native_provider() -> None:
+        current_actor = _validate_worker_fence(
+            layout,
+            actor_id,
+            attempt_id=attempt_id,
+            launch_token=launch_token,
+        )
+        runtime = current_actor.setdefault("runtime", {})
+        if runtime.get("provider_execution_state") != "launch_pending_authorization":
+            raise SystemExit("native provider authorization state is invalid")
+        runtime["provider_execution_state"] = "started"
+        runtime["provider_authorized_at"] = now_iso()
+        save_actor(layout, current_actor)
+        append_event(
+            layout,
+            "actor_native_launch_authorized",
+            actor_id=actor_id,
+            task_id=current_actor.get("task_id"),
+            attempt_id=current_actor.get("attempt_id"),
+            recovery_generation=native_recovery_generation,
+        )
+
     registration_payload = {
         "actor_id": actor_id,
         "attempt_id": attempt_id,
@@ -1422,36 +1595,96 @@ def _run_actor_once(
         _control_mutation(
             layout,
             command_name="runner_register",
-            command_id=f"RUNNER-REGISTER-{attempt_id or actor_id}",
-            payload=registration_payload,
+            command_id=(
+                f"RUNNER-REGISTER-{attempt_id or actor_id}-{native_recovery_generation}"
+            ),
+            payload={
+                **registration_payload,
+                "recovery_generation": native_recovery_generation,
+            },
             mutate=register_runner,
         )
         try:
-            with prompt.open("r", encoding="utf-8") as prompt_handle:
-                process = subprocess.Popen(
-                    process_argv(argv),
-                    cwd=str(execution_workspace),
-                    env=env,
-                    stdin=prompt_handle,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
+            if _validate_actor_governance_before_side_effect(
+                layout,
+                load_actor(layout, actor_id),
+            ):
+                raise SystemExit(
+                    "governance recovery-only mode is unavailable for native provider launch"
                 )
-                assert process.stdout is not None
-                for line in process.stdout:
-                    safe_line = redact_secret_values(line, secret_values)
-                    sys.stdout.write(safe_line)
-                    sys.stdout.flush()
-                    try:
-                        payload = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if isinstance(payload, dict):
-                        events.append(payload)
-                returncode = process.wait()
+        except SystemExit as exc:
+            record_native_governance_block(
+                stage="before_popen",
+                error=exc,
+                child_terminated=None,
+            )
+            raise
+        process: subprocess.Popen[str] | None = None
+        try:
+            prompt_text = prompt.read_text(encoding="utf-8")
+            process = subprocess.Popen(
+                process_argv(argv),
+                cwd=str(execution_workspace),
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            try:
+                _native_launch_barrier("after_popen_before_governance")
+                if _validate_actor_governance_before_side_effect(
+                    layout,
+                    load_actor(layout, actor_id),
+                ):
+                    raise SystemExit(
+                        "governance recovery-only mode is unavailable for native provider launch"
+                    )
+                _control_mutation(
+                    layout,
+                    command_name="runner_authorize_native_provider",
+                    command_id=(
+                        "RUNNER-AUTHORIZE-NATIVE-"
+                        f"{attempt_id or actor_id}-{native_recovery_generation}"
+                    ),
+                    payload={
+                        "actor_id": actor_id,
+                        "attempt_id": attempt_id,
+                        "recovery_generation": native_recovery_generation,
+                    },
+                    mutate=authorize_native_provider,
+                )
+            except SystemExit as exc:
+                child_terminated = _terminate_unreleased_native_child(process)
+                record_native_governance_block(
+                    stage="after_popen",
+                    error=exc,
+                    child_terminated=child_terminated,
+                )
+                raise
+            except BaseException:
+                _terminate_unreleased_native_child(process)
+                raise
+            assert process.stdin is not None
+            process.stdin.write(prompt_text)
+            process.stdin.close()
+            assert process.stdout is not None
+            for line in process.stdout:
+                safe_line = redact_secret_values(line, secret_values)
+                sys.stdout.write(safe_line)
+                sys.stdout.flush()
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict):
+                    events.append(payload)
+            returncode = process.wait()
         except OSError as exc:
+            if process is not None:
+                _terminate_unreleased_native_child(process)
             returncode = 127
             atomic_write_text(report, f"# Completion Report\n\nStatus: failed\n\n## Result\n{type(exc).__name__}: {exc}\n")
 

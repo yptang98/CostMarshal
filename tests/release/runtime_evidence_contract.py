@@ -26,9 +26,14 @@ REQUIRED_RUNTIME_CRASH_POINTS = (
     "effect.after_dead_status_before_projection",
 )
 REQUIRED_RUNTIME_RECOVERY_SCENARIOS = (
+    "corrupt_project_emergency_stop_only",
+    "daemon_owned_stop_drain_deferred_without_duplicate",
     "governance_drift_emergency_stop_replay",
+    "materializer_revision_aba_serialized",
+    "materializer_transient_sharing_retry_bounded",
     "runner_exit_before_provider_start",
     "no_effect_commit_view_reconciled_by_scheduler",
+    "slow_stop_lease_heartbeat_single_execution",
     "oci_stop_after_rm_before_observe",
     "credential_after_create_before_oci_prepare",
     "oci_prepared_before_start",
