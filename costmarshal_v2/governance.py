@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -24,6 +25,8 @@ MAX_WRAPPER_OUTPUT_BYTES = 8 * 1024 * 1024
 MAX_WRAPPER_BYTES = 2 * 1024 * 1024
 MAX_OWNERSHIP_BYTES = 64 * 1024
 MAX_SKILL_HEAD_BYTES = 1024
+MAX_PROJECT_BYTES = 8 * 1024 * 1024
+PROJECT_SNAPSHOT_ATTEMPTS = 3
 _BINDING_FIELDS = (
     "format",
     "provider",
@@ -45,6 +48,97 @@ class GovernanceError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.details = details or {}
+
+
+def load_stable_governance_project(path: Path | str) -> dict[str, Any]:
+    """Read the authoritative governance document without mutating runtime state.
+
+    Actor entrypoints cannot rely on the scheduler's earlier check: the binding
+    may drift after the spawn effect is emitted.  A bounded double-read rejects
+    symlinks/reparse points and any project document changing under inspection.
+    """
+
+    project_path = Path(path)
+    last_error: GovernanceError | None = None
+    for _ in range(PROJECT_SNAPSHOT_ATTEMPTS):
+        try:
+            first_signature, _ = _capture_project(project_path)
+            second_signature, payload = _capture_project(project_path)
+        except GovernanceError as exc:
+            last_error = exc
+            continue
+        if first_signature != second_signature:
+            last_error = GovernanceError(
+                "governance_project_unstable",
+                "The CostMarshal governance project document was not stable across reads.",
+            )
+            continue
+        try:
+            project = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise GovernanceError(
+                "governance_project_invalid",
+                "The CostMarshal governance project document is invalid.",
+            ) from exc
+        if not isinstance(project, dict):
+            raise GovernanceError(
+                "governance_project_invalid",
+                "The CostMarshal governance project document is invalid.",
+            )
+        return project
+    raise last_error or GovernanceError(
+        "governance_project_unavailable",
+        "The CostMarshal governance project document is unavailable.",
+    )
+
+
+def _project_file_state(path: Path) -> tuple[int, int, int, int]:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise GovernanceError(
+            "governance_project_unavailable",
+            "The CostMarshal governance project document is unavailable.",
+        ) from exc
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or bool(getattr(info, "st_file_attributes", 0) & reparse_flag)
+    ):
+        raise GovernanceError(
+            "governance_project_unsafe",
+            "The CostMarshal governance project document is not a regular file.",
+        )
+    if info.st_size < 0 or info.st_size > MAX_PROJECT_BYTES:
+        raise GovernanceError(
+            "governance_project_invalid",
+            "The CostMarshal governance project document exceeds the bounded size.",
+        )
+    return (
+        int(info.st_size),
+        int(info.st_mtime_ns),
+        int(getattr(info, "st_ctime_ns", 0)),
+        int(getattr(info, "st_ino", 0)),
+    )
+
+
+def _capture_project(path: Path) -> tuple[tuple[tuple[int, int, int, int], str], bytes]:
+    before = _project_file_state(path)
+    try:
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise GovernanceError(
+            "governance_project_unavailable",
+            "The CostMarshal governance project document could not be read.",
+        ) from exc
+    after = _project_file_state(path)
+    if before != after or len(payload) != before[0]:
+        raise GovernanceError(
+            "governance_project_unstable",
+            "The CostMarshal governance project document changed while it was read.",
+        )
+    return (before, hashlib.sha256(payload).hexdigest()), payload
 
 
 def inspect_governance(
@@ -643,5 +737,6 @@ __all__ = [
     "GOVERNANCE_MODES",
     "GovernanceError",
     "inspect_governance",
+    "load_stable_governance_project",
     "validate_governance_binding",
 ]

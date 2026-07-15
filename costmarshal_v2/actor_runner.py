@@ -17,7 +17,12 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit
 
-from .control_store import control_store_enabled, control_transaction
+from .control_store import ControlStoreError, control_store_enabled, control_transaction
+from .governance import (
+    GovernanceError,
+    load_stable_governance_project,
+    validate_governance_binding,
+)
 from .mailbox import send_message
 from .locking import ProjectLockTimeout, advisory_file_lock, project_write_lock
 from .paths import ProjectLayout, resolve_project, slugify
@@ -526,6 +531,7 @@ def _required_worker_bundle(
     *,
     execution_workspace: Path,
     workspace_mode: str,
+    allow_credential_creation: bool = True,
 ) -> tuple[WorkerExecutionSpec, list[str], tuple[str, ...]]:
     """Build the durable, attempt-scoped host side of the OCI exchange contract."""
 
@@ -700,6 +706,11 @@ def _required_worker_bundle(
             ):
                 raise SystemExit("required worker temporary credential already exists")
         else:
+            if not allow_credential_creation:
+                raise SystemExit(
+                    "governance recovery-only launch rejected: an existing OCI credential is unavailable"
+                )
+
             def prepare_credential_cleanup() -> None:
                 current_actor = _validate_worker_fence(
                     layout,
@@ -835,12 +846,91 @@ def _validate_worker_fence(
     return actor
 
 
+def _provider_execution_needs_recovery(actor: dict[str, Any]) -> bool:
+    """Return whether an external provider may already have started.
+
+    Governance drift blocks new provider effects, but it must not strand an OCI
+    container or temporary credential whose external start is already durable
+    or outcome-unknown.  Existing fencing still decides whether a particular
+    recovery invocation is valid.
+    """
+
+    if actor.get("role") != "agent":
+        return False
+    runtime = actor.get("runtime") or {}
+    if (actor.get("isolation") or {}).get("mode") != "required":
+        return False
+    if runtime.get("container_id"):
+        return True
+    lifecycle = runtime.get("oci_lifecycle_state")
+    return bool(
+        (
+            runtime.get("container_cleanup_unconfirmed")
+            or lifecycle
+            in {"prepared", "started", "finished", "uncertain_start", "uncertain_cleanup"}
+        )
+        and runtime.get("container_name")
+        and runtime.get("container_command")
+    )
+
+
+def _validate_actor_governance_before_side_effect(
+    layout: ProjectLayout,
+    actor: dict[str, Any],
+) -> bool:
+    """Fail closed before locks, project writes, credentials, or provider calls."""
+
+    recovery_possible = _provider_execution_needs_recovery(actor)
+    try:
+        # Validate an explicit SQLite marker read-only before trusting the
+        # project.json governance authority retained across cutover.
+        control_store_enabled(layout)
+        project = load_stable_governance_project(layout.project_json)
+    except (ControlStoreError, GovernanceError) as exc:
+        code = getattr(exc, "code", "governance_project_unavailable")
+        raise SystemExit(
+            f"ArchMarshal governance gate blocked actor launch [{code}]: {exc}"
+        ) from exc
+    governance = project.get("governance") or {"mode": "off", "ready": False}
+    if not isinstance(governance, dict):
+        raise SystemExit(
+            "ArchMarshal governance gate blocked actor launch: governance state is invalid"
+        )
+    if governance.get("mode") != "required" and not governance.get("ready"):
+        return False
+    try:
+        validation = validate_governance_binding(
+            governance.get("binding"),
+            project.get("workspace"),
+            mode="required",
+            wrapper_path=governance.get("wrapper_path"),
+        )
+    except GovernanceError as exc:
+        if recovery_possible:
+            # A prepared deterministic container may already exist after a
+            # hard exit between external create and identity persistence.  The
+            # caller must attach/clean only; it may not fresh-start or create a
+            # missing credential while governance is stale.
+            return True
+        raise SystemExit(
+            f"ArchMarshal governance gate blocked actor launch [{exc.code}]: {exc}"
+        ) from exc
+    if not validation.get("valid"):
+        if recovery_possible:
+            return True
+        raise SystemExit(
+            "ArchMarshal governance gate blocked actor launch: binding is not valid"
+        )
+    return False
+
+
 def _run_actor_once(
     layout: ProjectLayout,
     actor_id: str,
     *,
     attempt_id: str | None,
     launch_token: str | None,
+    governance_recovery_only: bool = False,
 ) -> int:
     with project_write_lock(layout):
         actor = _validate_worker_fence(
@@ -858,6 +948,13 @@ def _run_actor_once(
         raise SystemExit(f"Actor prompt is outside the runtime: {exc}") from exc
     if prompt != expected_prompt or not prompt.is_file():
         raise SystemExit(f"Actor prompt not found: {prompt}")
+    governance_recovery_only = (
+        _validate_actor_governance_before_side_effect(
+            layout,
+            load_actor(layout, actor_id),
+        )
+        or governance_recovery_only
+    )
     report = report_path(layout, actor)
     report.parent.mkdir(parents=True, exist_ok=True)
     execution_workspace, sandbox, write_scopes, base_sha = actor_execution_workspace(layout, project, actor)
@@ -873,6 +970,7 @@ def _run_actor_once(
             actor,
             execution_workspace=execution_workspace,
             workspace_mode=sandbox,
+            allow_credential_creation=not governance_recovery_only,
         )
     else:
         argv = build_codex_argv(
@@ -1008,7 +1106,29 @@ def _run_actor_once(
         )
         _actor_fault("after_oci_prepare_before_start")
         try:
+            governance_recovery_only = (
+                _validate_actor_governance_before_side_effect(
+                    layout,
+                    load_actor(layout, actor_id),
+                )
+                or governance_recovery_only
+            )
             if recovering_existing:
+                handle = adapter.attach(
+                    required_spec,
+                    container_name=existing_container_name,
+                    container_id=(
+                        str(existing_runtime["container_id"])
+                        if existing_runtime.get("container_id")
+                        else None
+                    ),
+                    command=tuple(str(item) for item in existing_container_command),
+                )
+            elif governance_recovery_only:
+                if not prepared_identity:
+                    raise SystemExit(
+                        "governance recovery-only launch rejected: durable OCI identity is unavailable"
+                    )
                 handle = adapter.attach(
                     required_spec,
                     container_name=existing_container_name,
@@ -1098,8 +1218,21 @@ def _run_actor_once(
             validated = validate_output_exchange(required_spec.output_exchange)
             pending_report_text = redact_secret_values(validated.text, secret_values)
         except IsolationError as exc:
-            failure = exc
-            if exc.details.get("container_cleanup_unconfirmed"):
+            if governance_recovery_only and handle is None:
+                failure = WorkerExecutionError(
+                    "governance_recovery_attach_unconfirmed",
+                    "governance recovery-only attach could not confirm the durable container identity",
+                    details={
+                        **exc.details,
+                        "container_cleanup_unconfirmed": True,
+                        "container_name": exc.details.get("container_name")
+                        or expected_container_name,
+                    },
+                )
+            else:
+                failure = exc
+            failure_details = failure.details
+            if failure_details.get("container_cleanup_unconfirmed"):
 
                 def persist_uncertain_oci_start() -> None:
                     current_actor = _validate_worker_fence(
@@ -1107,14 +1240,15 @@ def _run_actor_once(
                         actor_id,
                         attempt_id=attempt_id,
                         launch_token=launch_token,
+                        allow_provider_started=True,
                     )
                     uncertain_runtime = current_actor.setdefault("runtime", {})
                     uncertain_runtime["oci_lifecycle_state"] = "uncertain_start"
-                    uncertain_runtime["container_name"] = exc.details.get(
+                    uncertain_runtime["container_name"] = failure_details.get(
                         "container_name"
                     ) or expected_container_name
-                    if exc.details.get("container_id"):
-                        uncertain_runtime["container_id"] = exc.details["container_id"]
+                    if failure_details.get("container_id"):
+                        uncertain_runtime["container_id"] = failure_details["container_id"]
                     uncertain_runtime["container_command"] = list(required_command)
                     save_actor(layout, current_actor)
 
@@ -1124,14 +1258,14 @@ def _run_actor_once(
                     command_id=f"RUNNER-OCI-UNCERTAIN-{attempt_id or actor_id}",
                     payload={
                         **registration_payload,
-                        "container_name": exc.details.get("container_name"),
-                        "container_id": exc.details.get("container_id"),
+                        "container_name": failure_details.get("container_name"),
+                        "container_id": failure_details.get("container_id"),
                     },
                     mutate=persist_uncertain_oci_start,
                 )
             pending_report_text = (
                 "# Completion Report\n\nStatus: failed\n\n## Result\n"
-                f"OCI worker failed safely [{exc.code}]: {exc}\n"
+                f"OCI worker failed safely [{failure.code}]: {failure}\n"
             )
         finally:
             cleanup_container_removed = False
@@ -1278,6 +1412,13 @@ def _run_actor_once(
         if failure is not None:
             returncode = 125
     else:
+        if _validate_actor_governance_before_side_effect(
+            layout,
+            load_actor(layout, actor_id),
+        ):
+            raise SystemExit(
+                "governance recovery-only mode is unavailable for native provider launch"
+            )
         _control_mutation(
             layout,
             command_name="runner_register",
@@ -1490,6 +1631,8 @@ def run_actor(
 ) -> int:
     """Run one actor, fencing task workers for their entire provider lifetime."""
 
+    actor = load_actor(layout, actor_id)
+    governance_recovery_only = _validate_actor_governance_before_side_effect(layout, actor)
     with project_write_lock(layout):
         actor = _validate_worker_fence(
             layout,
@@ -1507,6 +1650,7 @@ def run_actor(
                 actor_id,
                 attempt_id=attempt_id,
                 launch_token=launch_token,
+                governance_recovery_only=governance_recovery_only,
             )
     except ProjectLockTimeout as exc:
         raise SystemExit("worker launch rejected: another runner owns this attempt") from exc

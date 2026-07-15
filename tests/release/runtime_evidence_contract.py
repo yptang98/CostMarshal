@@ -17,6 +17,7 @@ REQUIRED_RUNTIME_CRASH_POINTS = (
     "schema.after_effect_hash_backfill_row",
     "effect.after_spawn_before_observe",
     "effect.after_stop_before_observe",
+    "effect.after_stop_observe_before_apply",
     "transaction.after_commit_before_materialize",
     "after_attempt_report_before_publish",
     "after_credential_before_oci_prepare",
@@ -25,7 +26,9 @@ REQUIRED_RUNTIME_CRASH_POINTS = (
     "effect.after_dead_status_before_projection",
 )
 REQUIRED_RUNTIME_RECOVERY_SCENARIOS = (
+    "governance_drift_emergency_stop_replay",
     "runner_exit_before_provider_start",
+    "no_effect_commit_view_reconciled_by_scheduler",
     "oci_stop_after_rm_before_observe",
     "credential_after_create_before_oci_prepare",
     "oci_prepared_before_start",

@@ -24,6 +24,7 @@ from .control_store import (
     control_store_enabled,
     control_transaction,
     current_transaction,
+    effect_status,
     fail_effect,
     lease_effect,
     observe_effect,
@@ -210,7 +211,10 @@ def default_actor_argv(layout: ProjectLayout, actor: dict[str, Any]) -> list[str
     if actor.get("attempt_id"):
         argv.extend(["--attempt", str(actor["attempt_id"])])
     if actor.get("launch_token"):
-        argv.extend(["--launch-token", str(actor["launch_token"])])
+        # urlsafe tokens may legally begin with "-".  Keep the capability in
+        # the same argv element as its option so argparse cannot reinterpret a
+        # random token as a new flag and kill the detached runner at startup.
+        argv.append(f"--launch-token={actor['launch_token']}")
     return argv
 
 
@@ -1520,6 +1524,7 @@ def _execute_stop_effect(
             "credential_deleted": cleanup.credential.deleted if cleanup is not None else None,
         }
         observe_effect(layout, effect_id=str(effect["effect_id"]), owner=owner, observation=observation)
+        _scheduler_fault("effect.after_stop_observe_before_apply")
     _record_stop_observation(layout, effect=effect, observation=observation)
     applied = apply_effect(
         layout,
@@ -1543,10 +1548,11 @@ def process_runtime_effects(
     limit: int = 16,
     dry_run: bool = False,
     _governance_prevalidated: bool = False,
+    _emergency_stop_only: bool = False,
 ) -> dict[str, Any]:
     """Lease and apply recoverable runtime effects without holding a DB transaction over I/O."""
 
-    if not _governance_prevalidated:
+    if not _emergency_stop_only and not _governance_prevalidated:
         _validate_governance_preflight(layout, operation="runtime-effects")
     if not control_store_enabled(layout):
         return {"status": "disabled", "processed": [], "failed": [], "dry_run": bool(dry_run)}
@@ -1560,7 +1566,7 @@ def process_runtime_effects(
             layout,
             owner=owner,
             ttl_seconds=SPAWN_EFFECT_LEASE_SECONDS,
-            effect_types=(SPAWN_EFFECT_TYPE, STOP_EFFECT_TYPE),
+            effect_types=(STOP_EFFECT_TYPE,) if _emergency_stop_only else (SPAWN_EFFECT_TYPE, STOP_EFFECT_TYPE),
         )
         if effect is None:
             break
@@ -1646,6 +1652,53 @@ def process_runtime_effects(
         "failed": failed,
         "dry_run": False,
     }
+
+
+def _drain_emergency_stop_effect(layout: ProjectLayout, *, effect_id: str) -> dict[str, Any]:
+    """Apply one user-authorized STOP while governance blocks every start path.
+
+    A crashed prior drainer can leave the effect leased/observed for the short
+    recovery TTL.  Poll only that durable status, lease only STOP effects, and
+    reuse the normal stop executor once the old lease expires.  Spawn effects,
+    relay, scheduler inbox, and scheduler-cycle mutations are never entered.
+    """
+
+    deadline = time.monotonic() + SPAWN_EFFECT_LEASE_SECONDS + 2.0
+    while True:
+        current = effect_status(layout, effect_id)
+        if current.get("effect_type") != STOP_EFFECT_TYPE:
+            raise SystemExit(f"emergency stop rejected non-stop effect: {effect_id}")
+        if current.get("status") == "applied":
+            return current
+        if current.get("status") == "dead":
+            raise SystemExit(
+                f"Emergency stop effect {effect_id} failed permanently: "
+                f"{current.get('last_error') or 'unknown error'}"
+            )
+        batch = process_runtime_effects(
+            layout,
+            limit=16,
+            dry_run=False,
+            _emergency_stop_only=True,
+        )
+        target_failure = next(
+            (row for row in batch.get("failed") or [] if row.get("effect_id") == effect_id),
+            None,
+        )
+        if target_failure is not None:
+            raise SystemExit(
+                f"Emergency stop effect {effect_id} remains retryable: "
+                f"{target_failure.get('error') or 'unknown error'}"
+            )
+        current = effect_status(layout, effect_id)
+        if current.get("status") == "applied":
+            return current
+        if time.monotonic() >= deadline:
+            raise SystemExit(
+                f"Emergency stop effect {effect_id} is still {current.get('status')}; "
+                "retry the same command id"
+            )
+        time.sleep(0.05)
 
 
 def command_start_leader(args: Any) -> None:
@@ -2698,6 +2751,14 @@ def process_scheduler_inbox(layout: ProjectLayout, *, limit: int | None = None, 
 
 
 def scheduler_cycle(layout: ProjectLayout, *, relay_limit: int | None = None, command_limit: int | None = None, dry_run: bool = False) -> dict[str, Any]:
+    # The wrapper has already passed the read-only governance gate.  Repair
+    # committed compatibility views before actor/outbox/inbox reads even when
+    # there is no runtime effect to lease.  This closes the crash window for
+    # runner finalization, usage, collect, and mailbox-only transactions.  The
+    # second reconciliation after an effect lease remains necessary to cover a
+    # command that commits concurrently with effect selection.
+    if not dry_run and control_store_enabled(layout):
+        reconcile_project_views(layout)
     effects = process_runtime_effects(
         layout,
         limit=command_limit or 16,
@@ -4483,6 +4544,32 @@ def _locked_project_command(function: Any) -> Any:
     def wrapped(args: Any) -> Any:
         layout = resolve_project(args.root, args.project)
         governance_preflight = _command_requires_governance_preflight(function, args)
+        stop_runtime_requested = bool(
+            function.__name__ == "command_stop_actor"
+            and (getattr(args, "stop_runtime", False) or getattr(args, "kill_window", False))
+            and not getattr(args, "dry_run", False)
+        )
+        emergency_stop = False
+        if stop_runtime_requested:
+            try:
+                stop_project = _load_authoritative_project_for_governance(layout)
+            except ControlStoreError:
+                stop_project = {}
+            stop_governance = stop_project.get("governance") or {}
+            # Never invoke the external governance wrapper before an emergency
+            # stop: the wrapper itself may be the unavailable/drifted component.
+            # A project configured as required/ready therefore always uses the
+            # post-commit STOP-only drain, whether its binding is healthy or not.
+            emergency_stop = bool(
+                isinstance(stop_governance, dict)
+                and (
+                    stop_governance.get("mode") == "required"
+                    or stop_governance.get("ready") is True
+                )
+            )
+        output = ""
+        result: Any = None
+        command_id: str | None = None
         try:
             if governance_preflight:
                 _validate_governance_preflight(
@@ -4532,20 +4619,53 @@ def _locked_project_command(function: Any) -> Any:
                                 f"Durable command {command_id} failed [{code}]: {detail}"
                             )
                         replay = transaction.replay_result or {}
-                        output = replay.get("stdout") if isinstance(replay, dict) else None
-                        if output:
-                            print(str(output), end="" if str(output).endswith("\n") else "\n")
+                        replay_output = replay.get("stdout") if isinstance(replay, dict) else None
+                        if replay_output:
+                            output = str(replay_output)
                         else:
-                            print_json({"status": "ok", "idempotent_replay": True, "command_id": command_id})
-                        return None
-                    buffer = io.StringIO()
-                    with contextlib.redirect_stdout(buffer):
-                        result = function(args)
-                    output = buffer.getvalue()
-                    transaction.set_result({"stdout": output})
-                if output:
-                    print(output, end="" if output.endswith("\n") else "\n")
-                return result
+                            buffer = io.StringIO()
+                            with contextlib.redirect_stdout(buffer):
+                                print_json({"status": "ok", "idempotent_replay": True, "command_id": command_id})
+                            output = buffer.getvalue()
+                        if not emergency_stop:
+                            if output:
+                                print(output, end="" if output.endswith("\n") else "\n")
+                            return None
+                    else:
+                        buffer = io.StringIO()
+                        with contextlib.redirect_stdout(buffer):
+                            result = function(args)
+                        output = buffer.getvalue()
+                        transaction.set_result({"stdout": output})
+                if not emergency_stop:
+                    if output:
+                        print(output, end="" if output.endswith("\n") else "\n")
+                    return result
+            assert command_id is not None
+            effect_id = f"EFF-STOP-{command_id}"
+            applied = _drain_emergency_stop_effect(layout, effect_id=effect_id)
+            try:
+                response = json.loads(output) if output else {}
+            except json.JSONDecodeError:
+                response = {}
+            if isinstance(response, dict):
+                runtime = response.get("runtime")
+                if not isinstance(runtime, dict):
+                    runtime = {}
+                    response["runtime"] = runtime
+                runtime.update(
+                    {
+                        "status": "applied",
+                        "effect_id": effect_id,
+                        "effect_status": applied.get("status"),
+                        "emergency_stop": True,
+                    }
+                )
+                response["actor_status"] = "stopped"
+                output = json.dumps(response, ensure_ascii=False, indent=2) + "\n"
+            if output:
+                print(output, end="" if output.endswith("\n") else "\n")
+            return result
         except (ProjectLockTimeout, ControlStoreError) as exc:
             raise SystemExit(str(exc)) from exc
 

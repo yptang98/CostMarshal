@@ -124,6 +124,8 @@ Task `--require-capability` values are hard constraints: providers lacking every
 
 Use `--governance required --archmarshal-wrapper <exact invoke_archmarshal.py>` only after the workspace is explicitly managed by ArchMarshal. CostMarshal stores a binding fingerprint and validates it before dispatch and actor launch. A drift blocks execution.
 
+When a required binding drifts, new spawn, relay, scheduler, and direct actor entry paths fail closed. An explicit `stop-actor --stop-runtime` remains available as a STOP-only emergency path; reuse its `--command-id` if recovery is needed. It must never drain a pending SPAWN.
+
 After a CostMarshal binding-format upgrade, use `governance-rebind` to preview and
 `governance-rebind --apply` to explicitly refresh only the CostMarshal-side
 fingerprint. The prior binding remains in project audit history; ArchMarshal stays

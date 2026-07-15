@@ -17,6 +17,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "scripts" / "costmarshal.py"
 ACTOR = ROOT / "scripts" / "costmarshal_actor.py"
+sys.path.insert(0, str(ROOT))
+
+from costmarshal_v2.paths import resolve_project  # noqa: E402
+from costmarshal_v2.scheduler import default_actor_argv  # noqa: E402
 
 
 def cli(temp: Path, *args: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
@@ -84,8 +88,12 @@ def main() -> int:
         actor_id = dispatched["actor_id"]
         actor_file = project / "scheduler" / "actors" / f"{actor_id}.json"
         actor = json.loads(actor_file.read_text(encoding="utf-8"))
-        attempt_id = actor["attempt_id"]
-        launch_token = actor["launch_token"]
+        launch_token = "-leading-url-safe-launch-token"
+        actor["launch_token"] = launch_token
+        actor_file.write_text(
+            json.dumps(actor, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
         counter = temp / "provider-invocations.txt"
         ready = temp / "provider-ready"
@@ -107,25 +115,23 @@ def main() -> int:
             + "\n",
             encoding="utf-8",
         )
-        command = [
-            sys.executable,
-            str(ACTOR),
-            "--root",
-            str(temp / "runtime"),
-            "--project",
-            str(project),
-            "--actor",
-            actor_id,
-            "--attempt",
-            attempt_id,
-            "--launch-token",
-            launch_token,
-        ]
+        layout = resolve_project(temp / "runtime", str(project))
+        command = default_actor_argv(layout, actor)
+        assert command[0] == sys.executable
+        assert command[1] == str(ACTOR)
+        assert f"--launch-token={launch_token}" in command
+        assert "--launch-token" not in command
         env = os.environ.copy()
         env["COSTMARSHAL_V2_HOME"] = str(temp / "runtime")
         env["COSTMARSHAL_CODEX_COMMAND_JSON"] = json.dumps([sys.executable, str(fake)])
 
-        wrong = subprocess.run(command[:-1] + ["wrong-token"], text=True, capture_output=True, env=env, check=False)
+        wrong = subprocess.run(
+            command[:-1] + ["--launch-token=wrong-token"],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
         assert wrong.returncode != 0
         assert "launch token mismatch" in (wrong.stdout + wrong.stderr)
         assert not counter.exists()

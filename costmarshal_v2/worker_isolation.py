@@ -33,6 +33,9 @@ CANARY_SCHEMA = "costmarshal-worker-isolation-canary-v1"
 OUTPUT_MAX_BYTES = 1024 * 1024
 STDOUT_JSONL_MAX_BYTES = 1024 * 1024
 STDERR_CAPTURE_MAX_BYTES = 64 * 1024
+DOCKER_LOG_MAX_SIZE = "2m"
+DOCKER_LOG_MAX_FILE = "2"
+PODMAN_LOG_MAX_SIZE = "2mb"
 
 
 class IsolationError(RuntimeError):
@@ -398,6 +401,14 @@ class OciCliBackend:
             gid = os.getgid()
         return uid, gid
 
+    def _log_contract(self) -> tuple[str, dict[str, str]]:
+        if self.kind == "docker":
+            return "local", {
+                "max-size": DOCKER_LOG_MAX_SIZE,
+                "max-file": DOCKER_LOG_MAX_FILE,
+            }
+        return "k8s-file", {"max-size": PODMAN_LOG_MAX_SIZE}
+
     def __init__(
         self,
         engine: Literal["docker", "podman"],
@@ -597,6 +608,7 @@ class OciCliBackend:
     ) -> list[str]:
         limits = spec.limits
         container_uid, container_gid = self._container_user()
+        log_driver, log_options = self._log_contract()
         argv = [
             *self._engine_argv("run"),
             "--pull",
@@ -614,7 +626,7 @@ class OciCliBackend:
             format(limits.cpus, "g"),
             "--init",
             "--log-driver",
-            "local" if self.kind == "docker" else "k8s-file",
+            log_driver,
             "--user",
             f"{container_uid}:{container_gid}",
             "--tmpfs",
@@ -630,6 +642,8 @@ class OciCliBackend:
             "--network",
             network_arg or spec.network_mode,
         ]
+        for key, value in sorted(log_options.items()):
+            argv.extend(["--log-opt", f"{key}={value}"])
         if auto_remove:
             argv.insert(len(self._engine_argv("run")), "--rm")
         if container_name is not None:
@@ -906,6 +920,18 @@ class CapturedProcessResult:
     stderr_truncated: bool = False
 
 
+class BoundedCommandRunner(Protocol):
+    def __call__(
+        self,
+        argv: Sequence[str],
+        *,
+        timeout: float,
+        max_stdout_bytes: int,
+        max_stderr_bytes: int,
+    ) -> CapturedProcessResult:
+        """Execute an argv vector while retaining at most the configured bytes."""
+
+
 class ManagedProcess(Protocol):
     pid: int
 
@@ -998,6 +1024,10 @@ class _SubprocessManagedProcess:
         finally:
             stdout_thread.join(timeout=5)
             stderr_thread.join(timeout=5)
+            for stream in (self._process.stdout, self._process.stderr):
+                if stream is not None:
+                    with contextlib.suppress(OSError):
+                        stream.close()
         return CapturedProcessResult(
             exit_code=exit_code,
             stdout=b"".join(stdout_parts),
@@ -1045,6 +1075,32 @@ def subprocess_process_factory(argv: Sequence[str], stdin_source: BinaryIO) -> M
         shell=False,
     )
     return _SubprocessManagedProcess(process)
+
+
+def subprocess_bounded_command_runner(
+    argv: Sequence[str],
+    *,
+    timeout: float,
+    max_stdout_bytes: int,
+    max_stderr_bytes: int,
+) -> CapturedProcessResult:
+    """Run a lifecycle/log command without ever accumulating unbounded output."""
+
+    if min(max_stdout_bytes, max_stderr_bytes) <= 0:
+        raise ValueError("bounded command byte limits must be positive")
+    process = subprocess.Popen(
+        list(argv),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False,
+    )
+    return _SubprocessManagedProcess(process).communicate_bounded(
+        b"",
+        timeout=timeout,
+        max_stdout_bytes=max_stdout_bytes,
+        max_stderr_bytes=max_stderr_bytes,
+    )
 
 
 @dataclass(frozen=True)
@@ -1185,6 +1241,22 @@ def _redact_json(value: Any, secrets: Sequence[str]) -> Any:
     return value
 
 
+def _parse_log_size_bytes(value: Any) -> int | None:
+    match = re.fullmatch(r"([1-9][0-9]*)([kmgt]?i?b?|b)", str(value or "").strip().lower())
+    if match is None:
+        return None
+    amount = int(match.group(1))
+    unit = match.group(2)
+    if unit in {"", "b"}:
+        return amount
+    binary = "i" in unit
+    prefix = unit[0]
+    power = {"k": 1, "m": 2, "g": 3, "t": 4}.get(prefix)
+    if power is None:
+        return None
+    return amount * ((1024 if binary else 1000) ** power)
+
+
 def _credential_identifier(path: Path | None) -> str | None:
     if path is None:
         return None
@@ -1285,12 +1357,14 @@ class OciWorkerExecutionAdapter:
         backend: OciCliBackend,
         *,
         process_factory: Callable[[Sequence[str], BinaryIO], ManagedProcess] = subprocess_process_factory,
+        bounded_runner: BoundedCommandRunner = subprocess_bounded_command_runner,
         max_stdout_bytes: int = STDOUT_JSONL_MAX_BYTES,
         max_stderr_bytes: int = STDERR_CAPTURE_MAX_BYTES,
         max_prompt_bytes: int = 2 * 1024 * 1024,
     ) -> None:
         self.backend = backend
         self.process_factory = process_factory
+        self.bounded_runner = bounded_runner
         self.max_stdout_bytes = max_stdout_bytes
         self.max_stderr_bytes = max_stderr_bytes
         self.max_prompt_bytes = max_prompt_bytes
@@ -1299,18 +1373,31 @@ class OciWorkerExecutionAdapter:
 
     def _run_lifecycle(self, argv: Sequence[str], *, timeout: float, label: str) -> str:
         try:
-            result = self.backend.runner(tuple(argv), timeout=timeout)
+            result = self.bounded_runner(
+                tuple(argv),
+                timeout=timeout,
+                max_stdout_bytes=2 * 1024 * 1024,
+                max_stderr_bytes=self.max_stderr_bytes,
+            )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise WorkerExecutionError("lifecycle_command_failed", f"{label} could not run") from exc
-        if result.returncode != 0:
+        if result.stdout_truncated or result.stderr_truncated:
+            raise WorkerExecutionError("lifecycle_output_too_large", f"{label} output exceeded its byte limit")
+        if result.timed_out:
+            raise WorkerExecutionError("lifecycle_command_failed", f"{label} timed out")
+        if result.exit_code != 0:
             raise WorkerExecutionError(
                 "lifecycle_command_failed",
                 f"{label} failed",
-                details={"returncode": result.returncode},
+                details={"returncode": result.exit_code},
             )
-        if len(result.stdout.encode("utf-8", errors="replace")) > 2 * 1024 * 1024:
-            raise WorkerExecutionError("lifecycle_output_too_large", f"{label} output exceeded 2 MiB")
-        return result.stdout
+        try:
+            return result.stdout.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise WorkerExecutionError(
+                "lifecycle_output_invalid",
+                f"{label} output was not valid UTF-8",
+            ) from exc
 
     def _inspect_payload(self, reference: str, *, timeout: float) -> dict[str, Any]:
         try:
@@ -1394,13 +1481,26 @@ class OciWorkerExecutionAdapter:
         if host.get("Init") is not True:
             unsafe.append("init_process")
         log_config = host.get("LogConfig") if isinstance(host.get("LogConfig"), dict) else {}
-        recoverable_log_drivers = (
-            {"local", "json-file"}
-            if self.backend.kind == "docker"
-            else {"k8s-file", "json-file"}
-        )
-        if str(log_config.get("Type") or "") not in recoverable_log_drivers:
+        expected_log_driver, expected_log_options = self.backend._log_contract()
+        actual_log_driver = str(log_config.get("Type") or "")
+        actual_log_options = log_config.get("Config")
+        if actual_log_driver != expected_log_driver:
             unsafe.append("recoverable_log_driver")
+        elif self.backend.kind == "docker":
+            if not isinstance(actual_log_options, dict) or actual_log_options != expected_log_options:
+                unsafe.append("bounded_log_config")
+        else:
+            # Podman exposes max-size either as Config["max-size"] or as the
+            # normalized LogConfig.Size field, depending on engine version.
+            configured_size = None
+            if isinstance(actual_log_options, dict) and set(actual_log_options) == {"max-size"}:
+                configured_size = _parse_log_size_bytes(actual_log_options.get("max-size"))
+            elif actual_log_options is not None and actual_log_options != {}:
+                configured_size = None
+            else:
+                configured_size = _parse_log_size_bytes(log_config.get("Size"))
+            if configured_size != _parse_log_size_bytes(PODMAN_LOG_MAX_SIZE):
+                unsafe.append("bounded_log_config")
         tmpfs = host.get("Tmpfs") if isinstance(host.get("Tmpfs"), dict) else {}
 
         def tmpfs_matches(path: str, size_mb: int, required: set[str]) -> bool:
@@ -2020,33 +2120,40 @@ class OciWorkerExecutionAdapter:
                 )
             time.sleep(0.1)
         try:
-            result = self.backend.runner(
+            result = self.bounded_runner(
                 tuple(self.backend._engine_argv("logs", handle.container_id)),
                 timeout=effective_timeout,
+                max_stdout_bytes=self.max_stdout_bytes,
+                max_stderr_bytes=self.max_stderr_bytes,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise WorkerExecutionError(
                 "worker_recovery_logs_unavailable",
                 "recovered worker logs could not be read; usage remains unknown",
             ) from exc
-        if result.returncode != 0:
-            raise WorkerExecutionError(
-                "worker_recovery_logs_unavailable",
-                "recovered worker logs could not be read; usage remains unknown",
-                details={"returncode": result.returncode},
-            )
-        stdout = result.stdout.encode("utf-8")
-        stderr = result.stderr.encode("utf-8")
-        if len(stdout) > self.max_stdout_bytes:
+        if result.stdout_truncated:
             raise WorkerExecutionError(
                 "worker_stdout_limit_exceeded",
                 "recovered worker stdout exceeded its byte limit; usage remains unknown",
             )
-        if len(stderr) > self.max_stderr_bytes:
+        if result.stderr_truncated:
             raise WorkerExecutionError(
                 "worker_stderr_limit_exceeded",
                 "recovered worker stderr exceeded its byte limit; usage remains unknown",
             )
+        if result.timed_out:
+            raise WorkerExecutionError(
+                "worker_recovery_logs_unavailable",
+                "recovered worker logs timed out; usage remains unknown",
+            )
+        if result.exit_code != 0:
+            raise WorkerExecutionError(
+                "worker_recovery_logs_unavailable",
+                "recovered worker logs could not be read; usage remains unknown",
+                details={"returncode": result.exit_code},
+            )
+        stdout = result.stdout
+        stderr = result.stderr
         events = self._parse_stdout_events(handle, stdout)
         exit_code = int(inspection.exit_code) if inspection.exit_code is not None else 125
         handle.state = "finished"
@@ -2142,6 +2249,7 @@ class OciWorkerExecutionAdapter:
 
 __all__ = [
     "CANARY_SCHEMA",
+    "BoundedCommandRunner",
     "CapturedProcessResult",
     "CommandResult",
     "ContainerInspection",
@@ -2169,6 +2277,7 @@ __all__ = [
     "cleanup_temporary_credential",
     "select_worker_isolation_backend",
     "subprocess_command_runner",
+    "subprocess_bounded_command_runner",
     "subprocess_process_factory",
     "validate_execution_spec",
     "validate_output_exchange",

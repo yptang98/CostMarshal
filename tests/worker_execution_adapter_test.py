@@ -5,7 +5,6 @@ import shutil
 import sys
 import tempfile
 import unittest
-from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
@@ -24,6 +23,7 @@ from costmarshal_v2.worker_isolation import (  # noqa: E402
     OciWorkerExecutionAdapter,
     WorkerExecutionError,
     WorkerExecutionSpec,
+    subprocess_bounded_command_runner,
     validate_output_exchange,
 )
 
@@ -114,6 +114,11 @@ class LifecycleRunner:
         image_index = argv.index(IMAGE)
         network_mode = option("--network")
         networks = {} if network_mode == "none" else {"provider-proxy": {"NetworkID": network_mode}}
+        log_options: dict[str, str] = {}
+        for index, item in enumerate(argv[:-1]):
+            if item == "--log-opt":
+                key, value = argv[index + 1].split("=", 1)
+                log_options[key] = value
         payload: dict[str, object] = {
             "Id": "c" * 64,
             "Name": "/" + option("--name"),
@@ -137,7 +142,7 @@ class LifecycleRunner:
                 "Memory": int(option("--memory")[:-1]) * 1024 * 1024,
                 "NanoCpus": int(float(option("--cpus")) * 1_000_000_000),
                 "Init": "--init" in argv,
-                "LogConfig": {"Type": option("--log-driver"), "Config": {}},
+                "LogConfig": {"Type": option("--log-driver"), "Config": log_options},
                 "Tmpfs": {
                     argv[index + 1].split(":", 1)[0]: argv[index + 1].split(":", 1)[1]
                     for index, item in enumerate(argv[:-1])
@@ -205,6 +210,25 @@ class LifecycleRunner:
                 self.listed_present = False
             return CommandResult(0, call[-1] + "\n")
         return CommandResult(2, "", "unexpected mocked command")
+
+    def bounded(
+        self,
+        argv: Sequence[str],
+        *,
+        timeout: float,
+        max_stdout_bytes: int,
+        max_stderr_bytes: int,
+    ) -> CapturedProcessResult:
+        result = self(argv, timeout=timeout)
+        stdout = result.stdout.encode("utf-8")
+        stderr = result.stderr.encode("utf-8")
+        return CapturedProcessResult(
+            exit_code=result.returncode,
+            stdout=stdout[:max_stdout_bytes],
+            stderr=stderr[:max_stderr_bytes],
+            stdout_truncated=len(stdout) > max_stdout_bytes,
+            stderr_truncated=len(stderr) > max_stderr_bytes,
+        )
 
 
 class FakeManagedProcess:
@@ -297,6 +321,7 @@ class WorkerExecutionAdapterTest(unittest.TestCase):
         process = FakeManagedProcess(result)
         factory = FakeProcessFactory(process, runner)
         backend = OciCliBackend(engine, runner=runner, host_system="Linux")
+        kwargs.setdefault("bounded_runner", runner.bounded)
         adapter = OciWorkerExecutionAdapter(backend, process_factory=factory, **kwargs)
         return adapter, runner, process, factory
 
@@ -315,6 +340,12 @@ class WorkerExecutionAdapterTest(unittest.TestCase):
         self.assertIn("--label", factory.argv)
         self.assertIn("--log-driver", factory.argv)
         self.assertEqual(factory.argv[factory.argv.index("--log-driver") + 1], "local")
+        rendered_log_options = {
+            factory.argv[index + 1]
+            for index, item in enumerate(factory.argv[:-1])
+            if item == "--log-opt"
+        }
+        self.assertEqual(rendered_log_options, {"max-size=2m", "max-file=2"})
         self.assertNotIn("--rm", factory.argv)
         self.assertNotIn(SECRET, json.dumps(handle.attestation.to_dict(), default=str))
         self.assertNotIn(SECRET, repr(handle))
@@ -358,8 +389,42 @@ class WorkerExecutionAdapterTest(unittest.TestCase):
         spec = self.spec(engine="podman")
         handle = adapter.start(spec, ["codex", "exec", "-"], stdin_prompt="perform the task")
         self.assertEqual((factory.argv or ())[0:2], ("podman", "run"))
+        rendered_log_options = {
+            factory.argv[index + 1]
+            for index, item in enumerate(factory.argv[:-1])
+            if item == "--log-opt"
+        }
+        self.assertEqual(rendered_log_options, {"max-size=2mb"})
         inspection = adapter.inspect(handle)
         self.assertEqual(inspection.container_id, "c" * 64)
+
+    def test_podman_normalized_log_size_is_accepted_only_at_exact_limit(self) -> None:
+        adapter, runner, process, factory = self.adapter(CapturedProcessResult(0), engine="podman")
+        handle = adapter.start(self.spec(engine="podman"), ["codex", "exec", "-"], stdin_prompt="task")
+
+        def normalized_log_size(payload: dict[str, object]) -> None:
+            host = payload["HostConfig"]
+            assert isinstance(host, dict)
+            log_config = host["LogConfig"]
+            assert isinstance(log_config, dict)
+            log_config["Config"] = None
+            log_config["Size"] = "2MB"
+
+        runner.payload_mutator = normalized_log_size
+        self.assertEqual(adapter.inspect(handle).container_id, "c" * 64)
+
+        def wrong_log_size(payload: dict[str, object]) -> None:
+            normalized_log_size(payload)
+            host = payload["HostConfig"]
+            assert isinstance(host, dict)
+            log_config = host["LogConfig"]
+            assert isinstance(log_config, dict)
+            log_config["Size"] = "3MB"
+
+        runner.payload_mutator = wrong_log_size
+        with self.assertRaises(WorkerExecutionError) as caught:
+            adapter.inspect(handle)
+        self.assertEqual(caught.exception.code, "container_security_contract_mismatch")
 
     def test_wait_sends_stdin_parses_jsonl_and_redacts_credential(self) -> None:
         stdout = (json.dumps({"type": "message", "text": f"prefix {SECRET} suffix"}) + "\n").encode()
@@ -533,6 +598,12 @@ class WorkerExecutionAdapterTest(unittest.TestCase):
                     "Type", "none"
                 ),
             ),
+            (
+                "container_security_contract_mismatch",
+                lambda payload: nested(
+                    nested(nested(payload, "HostConfig"), "LogConfig"), "Config"
+                ).pop("max-size"),
+            ),
             ("container_mount_mismatch", lambda payload: payload.__setitem__("Mounts", [])),
             (
                 "container_network_mismatch",
@@ -591,6 +662,50 @@ class WorkerExecutionAdapterTest(unittest.TestCase):
         with self.assertRaises(WorkerExecutionError) as caught:
             adapter.recover_wait(recovered)
         self.assertEqual(caught.exception.code, "worker_recovery_logs_unavailable")
+
+    def test_recovered_log_overflow_is_unknown_and_preserves_credential_until_cleanup(self) -> None:
+        adapter, runner, process, factory, original = self.start(
+            CapturedProcessResult(0),
+            max_stdout_bytes=1024,
+        )
+        recovered = adapter.attach(
+            self.spec(),
+            container_name=original.container_name,
+            container_id=original.container_id,
+            command=original.command,
+        )
+        runner.logs_stdout = "x" * 4096
+        with self.assertRaises(WorkerExecutionError) as caught:
+            adapter.recover_wait(recovered)
+        self.assertEqual(caught.exception.code, "worker_stdout_limit_exceeded")
+        self.assertIn("usage remains unknown", str(caught.exception))
+        self.assertTrue(self.credential.is_file())
+        cleanup = adapter.cleanup(recovered)
+        self.assertTrue(cleanup.credential.deleted)
+        self.assertFalse(self.credential.exists())
+
+    def test_real_bounded_runner_kills_oversized_stdout_and_stderr(self) -> None:
+        cases = ((1, 64 * 1024, 32 * 1024), (2, 64 * 1024, 32 * 1024))
+        for descriptor, stdout_limit, stderr_limit in cases:
+            with self.subTest(descriptor=descriptor):
+                survived = self.temp / f"oversized-{descriptor}-survived"
+                child = (
+                    "import os, pathlib, sys, time; "
+                    f"os.write({descriptor}, b'x' * (4 * 1024 * 1024)); "
+                    "time.sleep(1); pathlib.Path(sys.argv[1]).write_text('survived', encoding='utf-8')"
+                )
+                result = subprocess_bounded_command_runner(
+                    [sys.executable, "-c", child, str(survived)],
+                    timeout=5,
+                    max_stdout_bytes=stdout_limit,
+                    max_stderr_bytes=stderr_limit,
+                )
+                self.assertEqual(len(result.stdout), stdout_limit if descriptor == 1 else 0)
+                self.assertEqual(len(result.stderr), stderr_limit if descriptor == 2 else 0)
+                self.assertEqual(result.stdout_truncated, descriptor == 1)
+                self.assertEqual(result.stderr_truncated, descriptor == 2)
+                self.assertNotEqual(result.exit_code, 0)
+                self.assertFalse(survived.exists())
 
     def test_cleanup_confirmed_absent_requires_durable_identity_and_deletes_credential(self) -> None:
         adapter, runner, process, factory, original = self.start(CapturedProcessResult(0))

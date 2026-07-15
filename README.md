@@ -202,7 +202,7 @@ python scripts/costmarshal.py dashboard --project <project-dir>
 
 Worker dispatch defaults to `worker_isolation.mode=required`. Docker/Podman selection may fail over only between supported OCI engines; it never falls back to a host process. Preflight rejects missing daemons, remote contexts, non-Linux engines, unpinned images, unsafe mounts, failed canaries, unrestricted bridge networking, and unsupported network policy before an attempt or budget reservation is persisted.
 
-The required path now supervises the attested container through the bundled execution adapter: prompt over stdin, at most one selected credential file, a credential-free provider profile, bounded JSONL, strict `final.md` exchange validation, deterministic container labels, timeout/stop/cleanup, and a path-free credential deletion receipt. The reviewed image is built from [`container/worker`](container/worker/README.md); both the base image digest and Codex CLI version are mandatory build inputs, and dispatch still requires the resulting immutable image digest.
+The required path now supervises the attested container through the bundled execution adapter: an immutable inherited stdin snapshot, at most one selected credential file, a credential-free provider profile, bounded JSONL, strict `final.md` exchange validation, deterministic container labels, timeout/stop/cleanup, and a path-free credential deletion receipt. Docker/Podman logs use explicit bounded rotation; crash recovery streams those logs with hard stdout/stderr limits and preserves the budget reservation when usage cannot be recovered safely. The reviewed image is built from [`container/worker`](container/worker/README.md); both the base image digest and Codex CLI version are mandatory build inputs, and dispatch still requires the resulting immutable image digest.
 
 Production API access uses an externally provisioned `provider-proxy` topology:
 the worker attaches only to an internal, CostMarshal-labelled network, while a
@@ -273,6 +273,8 @@ python scripts/costmarshal.py init `
 
 The adapter runs only ArchMarshal bootstrap-status/doctor-style read checks, stores a binding fingerprint, and blocks dispatch/launch/recovery when a required binding drifts. Protected paths include `.agent`, `.agents`, `AGENTS.md`, `AGENTS.override.md`, `.git`, `.codex`, and `.codex-plugin`.
 
+Governance drift also blocks scheduler spawn, relay, and actor direct-entry paths before provider side effects. The sole emergency exception is an explicit `stop-actor --stop-runtime`: after SQLite cutover it drains only that durable STOP effect and never leases a pending SPAWN. If the stop command crashes after the OS/OCI stop but before applying its observation, repeat the same `--command-id` to recover it.
+
 CostMarshal never automatically adopts a workspace, applies an ArchMarshal plan, starts/ends a managed session, or edits ArchMarshal itself. Perform those lifecycle operations explicitly through ArchMarshal, preview first, then initialize or rebind CostMarshal.
 
 After upgrading CostMarshal's binding format, preview and explicitly apply a fresh
@@ -304,7 +306,7 @@ python scripts/costmarshal.py state-store --project <project-dir>
 python scripts/costmarshal.py state-store --project <project-dir> --repair-views
 ```
 
-After cutover, scheduler mutations use SQLite WAL transactions and stable `--command-id` values. A reused ID with a different payload is rejected. JSON/JSONL files are compatibility views rebuilt after a commit-time crash. `dispatch --start`, escalation starts, and `stop-actor --stop-runtime` commit a fenced effect intent first; the scheduler leases the effect, performs OS/OCI I/O outside the database transaction, persists its observation, and atomically marks the effect and command complete. Expired leased or observed effects are recoverable. Launch tokens plus the attempt lifetime lock prevent a duplicate runner from calling the provider when a start observation is uncertain.
+After cutover, scheduler mutations use SQLite WAL transactions and stable `--command-id` values. A reused ID with a different payload is rejected. JSON/JSONL files are compatibility views rebuilt after a commit-time crash, including cycles with no pending runtime effect. `dispatch --start`, escalation starts, and `stop-actor --stop-runtime` commit a fenced effect intent first; the scheduler leases the effect, performs OS/OCI I/O outside the database transaction, persists its observation, and atomically marks the effect and command complete. Expired leased or observed effects are recoverable. Launch tokens plus the attempt lifetime lock prevent a duplicate runner from calling the provider when a start observation is uncertain.
 
 ## Offline blind backtest
 
@@ -364,6 +366,7 @@ python tests/runtime_recovery_reliability_test.py
 python tests/pid_identity_test.py
 python tests/required_credential_preflight_test.py
 python tests/actor_fencing_test.py
+python tests/actor_governance_contract_test.py
 python tests/security_contract_test.py
 python tests/actor_security_contract_test.py
 python tests/reliability_contract_test.py

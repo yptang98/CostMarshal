@@ -22,6 +22,7 @@ from costmarshal_v2.actor_runner import (  # noqa: E402
     _required_worker_bundle,
     run_actor,
 )
+from costmarshal_v2.governance import GovernanceError  # noqa: E402
 from costmarshal_v2.paths import ProjectLayout  # noqa: E402
 from costmarshal_v2.state import load_actor, load_project, save_actor, save_project  # noqa: E402
 from costmarshal_v2.worker_isolation import (  # noqa: E402
@@ -378,11 +379,11 @@ class CleanupUnconfirmedAdapter(FakeOciAdapter):
         )
 
 
-class RecoveryLogsUnavailableAdapter(FakeOciAdapter):
+class RecoveryLogsOverflowAdapter(FakeOciAdapter):
     def recover_wait(self, handle):
         raise WorkerExecutionError(
-            "worker_recovery_logs_unavailable",
-            "recovered worker logs are unavailable; usage remains unknown",
+            "worker_stdout_limit_exceeded",
+            "recovered worker stdout exceeded its byte limit; usage remains unknown",
         )
 
 
@@ -652,6 +653,17 @@ raise SystemExit(run_actor(
         )
         recovered_actor = load_actor(layout, recovered_dispatch["actor_id"])
         recovered_actor["isolation"] = json.loads(json.dumps(actor["isolation"]))
+        save_actor(layout, recovered_actor)
+        with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
+            recovered_spec, recovered_command, _ = _required_worker_bundle(
+                layout,
+                project,
+                recovered_actor,
+                execution_workspace=workspace,
+                workspace_mode="read-only",
+            )
+        assert recovered_spec.credential_path is not None
+        recovered_actor = load_actor(layout, recovered_actor["id"])
         identity_spec = SimpleNamespace(
             project_id=project["project_id"],
             actor_id=recovered_actor["id"],
@@ -660,22 +672,45 @@ raise SystemExit(run_actor(
         recovered_actor.setdefault("runtime", {}).update(
             {
                 "container_name": _expected_oci_container_name(identity_spec),
-                "container_command": ["costmarshal-worker", "--jsonl", "--model", "LongCat-2.0"],
+                "container_command": recovered_command,
                 "oci_lifecycle_state": "started",
             }
         )
+        recovered_actor["runtime"]["credential_cleanup"]["status"] = "pending"
         save_actor(layout, recovered_actor)
         FakeOciAdapter.attached = False
-        with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False), patch(
-            "costmarshal_v2.actor_runner.OciWorkerExecutionAdapter",
-            FakeOciAdapter,
-        ):
-            recovered_returncode = run_actor(
-                layout,
-                recovered_actor["id"],
-                attempt_id=recovered_actor["attempt_id"],
-                launch_token=recovered_actor["launch_token"],
-            )
+        started_governed_project = load_project(layout)
+        started_original_governance = json.loads(
+            json.dumps(started_governed_project.get("governance"))
+        )
+        started_governed_project["governance"] = {
+            "mode": "required",
+            "ready": True,
+            "binding": {"fixture": "stale-after-durable-start"},
+            "wrapper_path": str(temp / "drifted-wrapper.py"),
+        }
+        save_project(layout, started_governed_project)
+        try:
+            with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False), patch(
+                "costmarshal_v2.actor_runner.OciWorkerExecutionAdapter",
+                FakeOciAdapter,
+            ), patch(
+                "costmarshal_v2.actor_runner.validate_governance_binding",
+                side_effect=GovernanceError(
+                    "governance_binding_drift",
+                    "fixture governance drift after durable provider start",
+                ),
+            ):
+                recovered_returncode = run_actor(
+                    layout,
+                    recovered_actor["id"],
+                    attempt_id=recovered_actor["attempt_id"],
+                    launch_token=recovered_actor["launch_token"],
+                )
+        finally:
+            restored_started_project = load_project(layout)
+            restored_started_project["governance"] = started_original_governance
+            save_project(layout, restored_started_project)
         assert recovered_returncode == 0
         assert FakeOciAdapter.attached is True
         recovered_finished = load_actor(layout, recovered_actor["id"])
@@ -761,16 +796,36 @@ raise SystemExit(actor_runner.run_actor(
             "CODEX_HOME": str(codex_home),
             "COSTMARSHAL_HARD_EXIT_DAEMON": str(hard_daemon),
         }
-        with patch.dict(os.environ, recovery_environment, clear=False), patch(
-            "costmarshal_v2.actor_runner.OciWorkerExecutionAdapter",
-            HardExitOciAdapter,
-        ):
-            hard_recovered = run_actor(
-                layout,
-                hard_actor["id"],
-                attempt_id=hard_actor["attempt_id"],
-                launch_token=hard_actor["launch_token"],
-            )
+        governed_project = load_project(layout)
+        original_governance = json.loads(json.dumps(governed_project.get("governance")))
+        governed_project["governance"] = {
+            "mode": "required",
+            "ready": True,
+            "binding": {"fixture": "stale-after-external-start"},
+            "wrapper_path": str(temp / "drifted-wrapper.py"),
+        }
+        save_project(layout, governed_project)
+        try:
+            with patch.dict(os.environ, recovery_environment, clear=False), patch(
+                "costmarshal_v2.actor_runner.OciWorkerExecutionAdapter",
+                HardExitOciAdapter,
+            ), patch(
+                "costmarshal_v2.actor_runner.validate_governance_binding",
+                side_effect=GovernanceError(
+                    "governance_binding_drift",
+                    "fixture governance drift after external provider start",
+                ),
+            ):
+                hard_recovered = run_actor(
+                    layout,
+                    hard_actor["id"],
+                    attempt_id=hard_actor["attempt_id"],
+                    launch_token=hard_actor["launch_token"],
+                )
+        finally:
+            restored_project = load_project(layout)
+            restored_project["governance"] = original_governance
+            save_project(layout, restored_project)
         assert hard_recovered == 0
         assert (hard_daemon / "provider-calls.txt").read_text(encoding="utf-8").strip() == "1"
         assert not (hard_daemon / "fresh-starts.txt").exists()
@@ -832,7 +887,7 @@ raise SystemExit(actor_runner.run_actor(
         assert cleanup_task["status"] == "needs_recovery"
         assert cleanup_task["attempts"][-1]["status"] == "needs_recovery"
 
-        # If durable engine logs cannot recover usage, never emit a final
+        # If bounded durable engine logs overflow, never emit a final
         # zero-token receipt that could release the reservation cheaply.
         cli(temp, "new-task", "--project", str(project_dir), "--title", "usage", "--purpose", "keep recovered usage unknown")
         usage_dispatch = cli(
@@ -861,7 +916,7 @@ raise SystemExit(actor_runner.run_actor(
         save_actor(layout, usage_actor)
         with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False), patch(
             "costmarshal_v2.actor_runner.OciWorkerExecutionAdapter",
-            RecoveryLogsUnavailableAdapter,
+            RecoveryLogsOverflowAdapter,
         ):
             usage_returncode = run_actor(
                 layout,

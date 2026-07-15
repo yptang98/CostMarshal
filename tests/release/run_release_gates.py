@@ -53,6 +53,7 @@ REQUIRED_LOCAL_TESTS = (
     "tests/worker_execution_adapter_test.py",
     "tests/container_worker_contract_test.py",
     "tests/oci_actor_runner_test.py",
+    "tests/actor_governance_contract_test.py",
     "tests/isolation_scheduler_gate_test.py",
     "tests/actor_fencing_test.py",
     "tests/actor_crash_recovery_test.py",
