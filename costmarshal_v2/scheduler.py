@@ -5,12 +5,22 @@ import functools
 import io
 import json
 import os
+import secrets
 import sys
+import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from .control_store import (
+    ControlStoreError,
+    control_store_status,
+    control_store_enabled,
+    control_transaction,
+    current_transaction,
+    reconcile_project_views,
+)
 from .mailbox import deliver_outbox_message, inbox_message_ids, send_message
 from .paths import ProjectLayout, actor_runtime_name, actor_target, default_root, make_project_id, relpath, resolve_project, slugify
 from .session_backend import (
@@ -40,6 +50,14 @@ from .routing import (
 )
 from .governance import GovernanceError, inspect_governance, validate_governance_binding
 from .locking import ProjectLockTimeout, project_write_lock, scheduler_instance_lock
+from .worker_isolation import (
+    IsolationError,
+    OciCliBackend,
+    ResourceLimits,
+    UnsafeNativeBackend,
+    WorkerExecutionSpec,
+    select_worker_isolation_backend,
+)
 from .state import (
     ACTOR_STATES,
     ACTIVE_TASK_STATES,
@@ -139,7 +157,7 @@ def default_actor_command(model: str | None) -> str:
 
 def default_actor_argv(layout: ProjectLayout, actor: dict[str, Any]) -> list[str]:
     script = Path(__file__).resolve().parents[1] / "scripts" / "costmarshal_actor.py"
-    return [
+    argv = [
         sys.executable,
         str(script),
         "--root",
@@ -149,6 +167,11 @@ def default_actor_argv(layout: ProjectLayout, actor: dict[str, Any]) -> list[str
         "--actor",
         str(actor["id"]),
     ]
+    if actor.get("attempt_id"):
+        argv.extend(["--attempt", str(actor["attempt_id"])])
+    if actor.get("launch_token"):
+        argv.extend(["--launch-token", str(actor["launch_token"])])
+    return argv
 
 
 def actor_launch_command(layout: ProjectLayout, session: dict[str, Any], actor: dict[str, Any]) -> str | list[str]:
@@ -156,6 +179,21 @@ def actor_launch_command(layout: ProjectLayout, session: dict[str, Any], actor: 
     if template:
         return format_actor_command(str(template), layout=layout, session=session, actor=actor)
     return default_actor_argv(layout, actor)
+
+
+def redact_launch_token(value: Any, actor: dict[str, Any]) -> Any:
+    """Keep the fencing capability out of logs, plans, and CLI responses."""
+
+    token = str(actor.get("launch_token") or "")
+    if not token:
+        return value
+    if isinstance(value, str):
+        return value.replace(token, "<launch-token-redacted>")
+    if isinstance(value, list):
+        return [redact_launch_token(item, actor) for item in value]
+    if isinstance(value, dict):
+        return {key: redact_launch_token(item, actor) for key, item in value.items()}
+    return value
 
 
 def route_provider(
@@ -528,6 +566,7 @@ def make_actor(
     profile: str | None = None,
     env_key: str | None = None,
     attempt_id: str | None = None,
+    launch_token: str | None = None,
     status: str = "configured",
 ) -> dict[str, Any]:
     mailbox = ensure_mailbox(layout, actor_id)
@@ -543,6 +582,7 @@ def make_actor(
         "profile": profile,
         "env_key": env_key,
         "attempt_id": attempt_id,
+        "launch_token": launch_token,
         "agent_name": agent_name,
         "task_id": task_id,
         "created_at": now_iso(),
@@ -573,6 +613,85 @@ def make_actor(
     }
     refresh_actor_prompt(layout, actor)
     return actor
+
+
+def preflight_worker_isolation(
+    layout: ProjectLayout,
+    project: dict[str, Any],
+    task: dict[str, Any],
+    actor: dict[str, Any],
+    *,
+    unsafe_native: bool,
+) -> dict[str, Any]:
+    """Attest the requested worker boundary before reserving budget or state."""
+
+    config = project.get("worker_isolation") or {}
+    project_opt_in = bool(config.get("allow_unsafe_native_workers"))
+    if unsafe_native and (project.get("governance") or {}).get("mode") == "required":
+        raise SystemExit("ArchMarshal required governance forbids unsafe-native workers")
+    mode = "unsafe-native" if unsafe_native else "required"
+    configured_image = config.get("image")
+    if not configured_image and mode == "unsafe-native":
+        configured_image = "costmarshal/unsafe-native@sha256:" + ("0" * 64)
+    limits_row = config.get("limits") or {}
+    limits = ResourceLimits(
+        memory_mb=int(limits_row.get("memory_mb") or 2048),
+        cpus=float(limits_row.get("cpus") or 2.0),
+        pids=int(limits_row.get("pids") or 256),
+        timeout_seconds=float(limits_row.get("timeout_seconds") or 30.0),
+    )
+    scratch_root = layout.root / "worker-preflight"
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="attempt-", dir=str(scratch_root)) as temporary_name:
+        temporary = Path(temporary_name)
+        profile = temporary / "profile.config.toml"
+        profile.write_text("# CostMarshal preflight profile placeholder\n", encoding="utf-8")
+        output = temporary / "out"
+        output.mkdir()
+        network_mode = "none" if mode == "unsafe-native" else str(config.get("network_mode") or "provider-proxy")
+        network_name = None if network_mode == "none" else config.get("network_name")
+        spec = WorkerExecutionSpec(
+            project_id=str(project.get("project_id") or "project"),
+            actor_id=str(actor["id"]),
+            attempt_id=str(actor.get("attempt_id") or actor["id"]),
+            image=str(configured_image or ""),
+            workspace=Path(str(project["workspace"])).resolve(),
+            workspace_mode="rw" if (task.get("allowed_paths") or []) else "ro",
+            profile_path=profile,
+            output_exchange=output,
+            isolation_mode=mode,
+            engine=str(config.get("engine") or "auto"),
+            network_mode=network_mode,
+            network_name=str(network_name) if network_name else None,
+            forbidden_mount_roots=(layout.project_dir.resolve(),) if mode == "required" else (),
+            limits=limits,
+        )
+        try:
+            selected = select_worker_isolation_backend(
+                spec,
+                docker=OciCliBackend("docker"),
+                podman=OciCliBackend("podman"),
+                unsafe_native=UnsafeNativeBackend(
+                    project_opt_in=project_opt_in,
+                    dispatch_opt_in=unsafe_native,
+                ),
+            )
+        except IsolationError as exc:
+            raise SystemExit(f"worker isolation preflight failed [{exc.code}]: {exc}") from exc
+    attestation = selected.attestation.to_dict()
+    if attestation.get("strong_isolation"):
+        # The isolated execution adapter is deliberately fail-closed until the
+        # attested snapshot/profile/report protocol is used by actor_runner.
+        raise SystemExit(
+            "OCI isolation attested, but the container worker execution adapter is not enabled in this build; "
+            "native fallback is forbidden"
+        )
+    return {
+        "mode": mode,
+        "project_opt_in": project_opt_in,
+        "dispatch_opt_in": bool(unsafe_native),
+        "attestation": attestation,
+    }
 
 
 def protocol_text() -> str:
@@ -698,6 +817,16 @@ def command_init(args: Any) -> None:
         "secrets_file": str(secrets_file) if secrets_file else None,
         "auto_escalate": bool(getattr(args, "auto_escalate", True)),
         "allow_unsafe_custom_worker_commands": bool(getattr(args, "allow_unsafe_custom_worker_commands", False)),
+        "worker_isolation": {
+            "mode": str(getattr(args, "worker_isolation", None) or "required"),
+            "engine": str(getattr(args, "container_engine", None) or "auto"),
+            "image": getattr(args, "worker_image", None),
+            "pull_policy": "never",
+            "network_mode": str(getattr(args, "worker_network", None) or "provider-proxy"),
+            "network_name": getattr(args, "worker_network_name", None),
+            "allow_unsafe_native_workers": bool(getattr(args, "allow_unsafe_native_workers", False)),
+            "limits": {"memory_mb": 2048, "cpus": 2.0, "pids": 256, "timeout_seconds": 30.0},
+        },
         "provider_catalog": provider_catalog,
         "routing_policy": {
             "version": 1,
@@ -804,7 +933,7 @@ def start_actor(layout: ProjectLayout, actor: dict[str, Any], *, dry_run: bool) 
             "backend": backend.kind,
             "backend_available": backend.available(),
             "prompt_file": str(prompt_path),
-            "planned_commands": [command_to_string(argv) for argv in plan],
+            "planned_commands": redact_launch_token([command_to_string(argv) for argv in plan], actor),
         }
     prompt_path = refresh_actor_prompt(layout, actor)
     save_actor(layout, actor)
@@ -816,9 +945,11 @@ def start_actor(layout: ProjectLayout, actor: dict[str, Any], *, dry_run: bool) 
         cwd=layout.project_dir,
         log_path=layout.transcripts_dir / f"{slugify(actor['id'], 'actor')}.log",
     )
+    actor = load_actor(layout, actor["id"])
+    runtime = actor_runtime(actor)
     actor["status"] = "running"
     runtime["started_at"] = now_iso()
-    runtime["last_launch_command"] = command_display(command)
+    runtime["last_launch_command"] = redact_launch_token(command_display(command), actor)
     runtime["target"] = launch.get("target")
     runtime["pid"] = launch.get("pid")
     runtime["log_path"] = relpath(Path(launch["log_path"]), layout.project_dir) if launch.get("log_path") else None
@@ -830,7 +961,7 @@ def start_actor(layout: ProjectLayout, actor: dict[str, Any], *, dry_run: bool) 
         "dry_run": False,
         "backend": backend.kind,
         "prompt_file": str(prompt_path),
-        "commands": launch.get("commands", []),
+        "commands": redact_launch_token(launch.get("commands", []), actor),
         "pid": runtime.get("pid"),
         "runtime_target": runtime.get("target"),
     }
@@ -1186,6 +1317,7 @@ def command_dispatch(args: Any) -> None:
         )
     session = load_session(layout)
     attempt_id = new_id("ATT")
+    launch_token = secrets.token_urlsafe(32)
     default_actor_id = (
         f"agent-{args.task.lower()}"
         if not task.get("attempts")
@@ -1220,10 +1352,23 @@ def command_dispatch(args: Any) -> None:
         profile=profile,
         env_key=provider_spec.get("env_key"),
         attempt_id=attempt_id,
+        launch_token=launch_token,
     )
+    unsafe_native = bool(getattr(args, "unsafe_native", False))
+    isolation = preflight_worker_isolation(
+        layout,
+        project,
+        task,
+        actor,
+        unsafe_native=unsafe_native,
+    )
+    actor["isolation"] = isolation
     if args.dry_run:
         plan = start_actor(layout, actor, dry_run=True) if args.start else {"planned_commands": []}
-        print_json({"status": "ok", "dry_run": True, "actor": actor, "route_decision": decision.to_dict(), "start_plan": plan})
+        actor_preview = dict(actor)
+        if actor_preview.get("launch_token"):
+            actor_preview["launch_token"] = "<redacted>"
+        print_json({"status": "ok", "dry_run": True, "actor": actor_preview, "route_decision": decision.to_dict(), "start_plan": plan})
         return
     save_actor(layout, actor)
     sync_actor_summary(layout, actor)
@@ -1241,6 +1386,7 @@ def command_dispatch(args: Any) -> None:
         {
             "attempt": len(task.get("attempts") or []) + 1,
             "attempt_id": attempt_id,
+            "launch_token": launch_token,
             "actor_id": actor_id,
             "provider": provider,
             "tier": tier,
@@ -1254,6 +1400,7 @@ def command_dispatch(args: Any) -> None:
             "dispatch_command_id": command_id,
             "reserved_cost_cny": decision.estimated_cost_cny,
             "actual_cost_cny": 0.0,
+            "isolation": isolation,
         }
     )
     assign_task_claim_actor(layout, args.task, actor_id)
@@ -1574,6 +1721,7 @@ def execute_scheduler_command(
             start=as_bool(command_args.get("start")),
             dry_run=False,
             force=as_bool(command_args.get("force")),
+            unsafe_native=as_bool(command_args.get("unsafe_native")),
             escalation_reason=command_args.get("escalation_reason"),
             command_id=command_id,
         )
@@ -1594,6 +1742,7 @@ def execute_scheduler_command(
             start=as_bool(command_args.get("start")),
             dry_run=False,
             force=False,
+            unsafe_native=as_bool(command_args.get("unsafe_native")),
             command_id=command_id,
         )
     if command == "collect_task":
@@ -1921,6 +2070,8 @@ def command_escalate(args: Any) -> None:
             dry_run=dry_run,
             force=True,
             escalation_reason=args.reason,
+            unsafe_native=bool(getattr(args, "unsafe_native", False))
+            or (previous.get("isolation") or {}).get("mode") == "unsafe-native",
             command_id=dispatch_command_id,
         )
 
@@ -2615,6 +2766,7 @@ def status_payload(layout: ProjectLayout) -> dict[str, Any]:
         "usage_summary": summarize_usage(usage),
         "relay_cursors": load_relay_cursors(layout),
         "active_locks": active_lock_rows(layout),
+        "control_store": control_store_status(layout),
     }
 
 
@@ -3144,6 +3296,9 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
         validate_non_negative_number(row.get("output_tokens"), f"{label} output_tokens", issues)
         validate_non_negative_number(row.get("total_tokens"), f"{label} total_tokens", issues)
         validate_non_negative_number(row.get("estimated_cost_cny"), f"{label} estimated_cost_cny", issues, allow_none=True)
+    store = control_store_status(layout)
+    if store.get("status") == "invalid":
+        issues.extend(f"control store: {issue}" for issue in store.get("issues") or [])
     return issues
 
 
@@ -3162,8 +3317,52 @@ def _locked_project_command(function: Any) -> Any:
         layout = resolve_project(args.root, args.project)
         try:
             with project_write_lock(layout):
-                return function(args)
-        except ProjectLockTimeout as exc:
+                if not control_store_enabled(layout):
+                    return function(args)
+                reconcile_project_views(layout)
+                if current_transaction() is not None:
+                    return function(args)
+                external_effect = (
+                    (function.__name__ in {"command_dispatch", "command_escalate"} and bool(getattr(args, "start", False)))
+                    or (function.__name__ == "command_send" and bool(getattr(args, "runtime_send", False)))
+                    or (function.__name__ == "command_stop_actor" and bool(getattr(args, "stop_runtime", False)))
+                    or (function.__name__ == "command_recover" and bool(getattr(args, "restart_missing", False)))
+                    or function.__name__ == "command_start_leader"
+                )
+                if external_effect:
+                    raise SystemExit(
+                        "this command has an OS runtime side effect and is blocked after SQLite cutover "
+                        "until it can be processed through the recoverable effect outbox"
+                    )
+                command_id = str(getattr(args, "command_id", None) or new_id("CMD"))
+                payload = {
+                    key: (str(value) if isinstance(value, Path) else value)
+                    for key, value in vars(args).items()
+                    if key != "func"
+                }
+                with control_transaction(
+                    layout,
+                    command_name=function.__name__,
+                    command_id=command_id,
+                    payload=payload,
+                ) as transaction:
+                    if transaction.replay:
+                        replay = transaction.replay_result or {}
+                        output = replay.get("stdout") if isinstance(replay, dict) else None
+                        if output:
+                            print(str(output), end="" if str(output).endswith("\n") else "\n")
+                        else:
+                            print_json({"status": "ok", "idempotent_replay": True, "command_id": command_id})
+                        return None
+                    buffer = io.StringIO()
+                    with contextlib.redirect_stdout(buffer):
+                        result = function(args)
+                    output = buffer.getvalue()
+                    transaction.set_result({"stdout": output})
+                if output:
+                    print(output, end="" if output.endswith("\n") else "\n")
+                return result
+        except (ProjectLockTimeout, ControlStoreError) as exc:
             raise SystemExit(str(exc)) from exc
 
     return wrapped

@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""Attempt launch tokens and lifetime locks prevent duplicate provider execution."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+CLI = ROOT / "scripts" / "costmarshal.py"
+ACTOR = ROOT / "scripts" / "costmarshal_actor.py"
+
+
+def cli(temp: Path, *args: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["COSTMARSHAL_V2_HOME"] = str(temp / "runtime")
+    result = subprocess.run(
+        [sys.executable, str(CLI), "--root", str(temp / "runtime"), *args],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        check=False,
+    )
+    if ok and result.returncode:
+        raise AssertionError(f"command failed: {args}\n{result.stdout}\n{result.stderr}")
+    if not ok and not result.returncode:
+        raise AssertionError(f"command unexpectedly succeeded: {args}\n{result.stdout}")
+    return result
+
+
+def cli_json(temp: Path, *args: str) -> dict:
+    return json.loads(cli(temp, *args).stdout)
+
+
+def main() -> int:
+    temp = Path(tempfile.mkdtemp(prefix="costmarshal-v2-actor-fence-"))
+    try:
+        workspace = temp / "workspace"
+        workspace.mkdir()
+        project = Path(
+            cli_json(
+                temp,
+                "init",
+                "--name",
+                "actor-fence",
+                "--objective",
+                "Prove one provider process per attempt",
+                "--workspace",
+                str(workspace),
+                "--backend",
+                "local",
+                "--governance",
+                "off",
+                "--allow-unsafe-native-workers",
+            )["project"]
+        )
+        cli_json(
+            temp,
+            "new-task",
+            "--project",
+            str(project),
+            "--title",
+            "fenced",
+            "--purpose",
+            "test duplicate launch fencing",
+            "--risk",
+            "low",
+        )
+
+        preview = cli_json(temp, "dispatch", "--project", str(project), "--task", "V2-0001", "--start", "--dry-run", "--unsafe-native")
+        assert preview["actor"]["launch_token"] == "<redacted>"
+        assert "token_urlsafe" not in json.dumps(preview)
+
+        dispatched = cli_json(temp, "dispatch", "--project", str(project), "--task", "V2-0001", "--unsafe-native")
+        actor_id = dispatched["actor_id"]
+        actor_file = project / "scheduler" / "actors" / f"{actor_id}.json"
+        actor = json.loads(actor_file.read_text(encoding="utf-8"))
+        attempt_id = actor["attempt_id"]
+        launch_token = actor["launch_token"]
+
+        counter = temp / "provider-invocations.txt"
+        ready = temp / "provider-ready"
+        fake = temp / "fake_codex.py"
+        fake.write_text(
+            "\n".join(
+                [
+                    "import json, pathlib, sys, time",
+                    f"counter = pathlib.Path({str(counter)!r})",
+                    f"ready = pathlib.Path({str(ready)!r})",
+                    "with counter.open('a', encoding='utf-8') as handle: handle.write('invoked\\n')",
+                    "ready.touch()",
+                    "output = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])",
+                    "time.sleep(2.0)",
+                    "output.write_text('# Completion Report\\n\\nStatus: done\\n\\n## Result\\nfenced\\n', encoding='utf-8')",
+                    "print(json.dumps({'usage': {'input_tokens': 3, 'output_tokens': 2}}))",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        command = [
+            sys.executable,
+            str(ACTOR),
+            "--root",
+            str(temp / "runtime"),
+            "--project",
+            str(project),
+            "--actor",
+            actor_id,
+            "--attempt",
+            attempt_id,
+            "--launch-token",
+            launch_token,
+        ]
+        env = os.environ.copy()
+        env["COSTMARSHAL_V2_HOME"] = str(temp / "runtime")
+        env["COSTMARSHAL_CODEX_COMMAND_JSON"] = json.dumps([sys.executable, str(fake)])
+
+        wrong = subprocess.run(command[:-1] + ["wrong-token"], text=True, capture_output=True, env=env, check=False)
+        assert wrong.returncode != 0
+        assert "launch token mismatch" in (wrong.stdout + wrong.stderr)
+        assert not counter.exists()
+
+        first = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        deadline = time.monotonic() + 10
+        while not ready.exists() and time.monotonic() < deadline:
+            if first.poll() is not None:
+                stdout, stderr = first.communicate()
+                raise AssertionError(f"first runner exited before provider start\n{stdout}\n{stderr}")
+            time.sleep(0.05)
+        assert ready.exists(), "provider did not start"
+
+        duplicate = subprocess.run(command, text=True, capture_output=True, env=env, check=False, timeout=5)
+        assert duplicate.returncode != 0
+        duplicate_error = duplicate.stdout + duplicate.stderr
+        assert (
+            "another runner owns this attempt" in duplicate_error
+            or "prior provider execution outcome is unknown" in duplicate_error
+        )
+        stdout, stderr = first.communicate(timeout=10)
+        assert first.returncode == 0, f"first runner failed\n{stdout}\n{stderr}"
+        assert counter.read_text(encoding="utf-8").splitlines() == ["invoked"]
+
+        actor = json.loads(actor_file.read_text(encoding="utf-8"))
+        registered = actor["runtime"]["registered_launch_token_sha256"]
+        assert registered == hashlib.sha256(launch_token.encode("utf-8")).hexdigest()
+        print("actor fencing ok")
+        return 0
+    finally:
+        shutil.rmtree(temp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

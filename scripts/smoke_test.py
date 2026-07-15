@@ -58,6 +58,7 @@ def main() -> int:
             "Verify official v2 CLI entrypoint",
             "--backend",
             "local",
+            "--allow-unsafe-native-workers",
         )
         project = Path(init["project"])
         assert_true(init["backend"] == "local", "official smoke should use portable local backend")
@@ -83,7 +84,7 @@ def main() -> int:
             "reports/result.md",
         )
         assert_true(task["task_id"] == "V2-0001", "new-task should use v2 task ids")
-        dispatch = run_json(temp, "dispatch", "--project", str(project), "--task", "V2-0001", "--model", "inherit")
+        dispatch = run_json(temp, "dispatch", "--project", str(project), "--task", "V2-0001", "--model", "inherit", "--unsafe-native")
         assert_true(dispatch["actor_id"] == "agent-v2-0001", "dispatch should create a v2 agent actor")
         usage = run_json(
             temp,
@@ -103,7 +104,7 @@ def main() -> int:
 
         report = project / "tasks" / "V2-0001" / "completion-report.md"
         report.write_text("# Completion Report: V2-0001\n\nStatus: done\n\n## Result\nOfficial smoke done.\n", encoding="utf-8")
-        run_json(temp, "collect", "--project", str(project), "--task", "V2-0001", "--state", "done")
+        run_json(temp, "collect", "--project", str(project), "--task", "V2-0001", "--state", "waiting_leader")
         result = run_json(
             temp,
             "record-result",

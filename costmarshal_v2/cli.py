@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 from . import __version__
-from .paths import default_root
+from .control_store import (
+    control_store_status,
+    migrate_legacy_store,
+    preview_legacy_migration,
+    reconcile_project_views,
+)
+from .locking import ProjectLockTimeout, project_write_lock, scheduler_instance_lock
+from .paths import default_root, resolve_project
 from .profiles import command_configure_profiles, command_configure_provider
 from .scheduler import (
     LEADER_WORK_TYPES,
@@ -32,6 +40,39 @@ from .scheduler import (
     command_status,
     command_validate,
 )
+
+
+def _add_command_id(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--command-id",
+        help="Stable idempotency key for safe retry after a crash; scheduler messages use their message id",
+    )
+
+
+def command_migrate_state(args: argparse.Namespace) -> None:
+    layout = resolve_project(args.root, args.project)
+    if not args.apply:
+        payload = preview_legacy_migration(layout)
+    else:
+        try:
+            with scheduler_instance_lock(layout, timeout_seconds=0.25):
+                with project_write_lock(layout):
+                    payload = migrate_legacy_store(layout)
+        except ProjectLockTimeout as exc:
+            raise SystemExit(f"state migration requires exclusive scheduler/project ownership: {exc}") from exc
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def command_state_store_status(args: argparse.Namespace) -> None:
+    layout = resolve_project(args.root, args.project)
+    if args.repair_views:
+        try:
+            with project_write_lock(layout):
+                reconcile_project_views(layout)
+        except ProjectLockTimeout as exc:
+            raise SystemExit(str(exc)) from exc
+    payload = control_store_status(layout)
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -79,6 +120,12 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--leader-profile")
     init.add_argument("--leader-command", help="Legacy custom manager command; default uses the structured codex exec runner")
     init.add_argument("--allow-unsafe-custom-worker-commands", action="store_true", help="Privileged compatibility escape hatch; bypasses worker sandbox and secret isolation")
+    init.add_argument("--worker-isolation", choices=["required"], default="required", help="Require attested Linux OCI isolation for task workers")
+    init.add_argument("--container-engine", choices=["auto", "docker", "podman"], default="auto")
+    init.add_argument("--worker-image", help="Digest-pinned worker image, name@sha256:<64 hex>")
+    init.add_argument("--worker-network", choices=["none", "bridge", "provider-proxy"], default="provider-proxy")
+    init.add_argument("--worker-network-name", default="costmarshal-provider-proxy")
+    init.add_argument("--allow-unsafe-native-workers", action="store_true", help="Project-level half of the explicit development-only native worker escape hatch")
     init.add_argument("--tmux-command", dest="backend_command", help=argparse.SUPPRESS)
     init.set_defaults(func=command_init)
 
@@ -121,6 +168,7 @@ def build_parser() -> argparse.ArgumentParser:
     new_task.add_argument("--allowed-path", action="append")
     new_task.add_argument("--claim-path", action="append", help="File or directory path this task claims for writing")
     new_task.add_argument("--allow-lock-conflict", action="store_true", help="Allow overlapping claimed paths after explicit leader review")
+    _add_command_id(new_task)
     new_task.set_defaults(func=command_new_task)
 
     route = sub.add_parser("route", help="Explain or simulate a safe cost-performance route without changing state")
@@ -161,6 +209,8 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch.add_argument("--start", action="store_true")
     dispatch.add_argument("--dry-run", action="store_true")
     dispatch.add_argument("--force", action="store_true")
+    dispatch.add_argument("--unsafe-native", action="store_true", help="Dispatch-level half of the development-only native worker escape hatch")
+    _add_command_id(dispatch)
     dispatch.set_defaults(func=command_dispatch)
 
     escalate = sub.add_parser("escalate", help="Route a failed or uncertain task to the next stronger provider tier")
@@ -177,6 +227,8 @@ def build_parser() -> argparse.ArgumentParser:
     escalate.add_argument("--start", action="store_true")
     escalate.add_argument("--dry-run", action="store_true")
     escalate.add_argument("--force", action="store_true")
+    escalate.add_argument("--unsafe-native", action="store_true", help="Explicitly continue an unsafe-native attempt during manual escalation")
+    _add_command_id(escalate)
     escalate.set_defaults(func=command_escalate)
 
     send = sub.add_parser("send", help="Relay a mailbox message")
@@ -188,6 +240,7 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--task")
     send.add_argument("--runtime-send", action="store_true", help="Also inject the text into the actor runtime when that backend supports it")
     send.add_argument("--tmux-send", dest="runtime_send", action="store_true", help=argparse.SUPPRESS)
+    _add_command_id(send)
     send.set_defaults(func=command_send)
 
     relay = sub.add_parser("relay", help="Deliver actor-authored outbox messages using a durable cursor")
@@ -212,6 +265,7 @@ def build_parser() -> argparse.ArgumentParser:
     heartbeat.add_argument("--actor", required=True)
     heartbeat.add_argument("--status", default="running")
     heartbeat.add_argument("--note")
+    _add_command_id(heartbeat)
     heartbeat.set_defaults(func=command_heartbeat)
 
     stop_actor = sub.add_parser("stop-actor", help="Mark an actor stopped and optionally stop its runtime process")
@@ -231,6 +285,7 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--state", default="waiting_leader")
     collect.add_argument("--report")
     collect.add_argument("--summary", help="Optional caller-provided compact summary; scheduler does not infer one")
+    _add_command_id(collect)
     collect.set_defaults(func=command_collect)
 
     result = sub.add_parser("record-result", help="Record leader acceptance/rejection for a worker attempt")
@@ -248,6 +303,7 @@ def build_parser() -> argparse.ArgumentParser:
     result.add_argument("--estimated-cost-cny", type=float)
     result.add_argument("--summary")
     result.add_argument("--note")
+    _add_command_id(result)
     result.set_defaults(func=command_record_result)
 
     leader_work = sub.add_parser("record-leader-work", help="Audit direct leader implementation-like work")
@@ -264,6 +320,7 @@ def build_parser() -> argparse.ArgumentParser:
     leader_work.add_argument("--output-tokens", type=int, default=0)
     leader_work.add_argument("--estimated-cost-cny", type=float)
     leader_work.add_argument("--note")
+    _add_command_id(leader_work)
     leader_work.set_defaults(func=command_record_leader_work)
 
     usage = sub.add_parser("record-usage", help="Record actor-reported token usage while work is in progress")
@@ -277,6 +334,7 @@ def build_parser() -> argparse.ArgumentParser:
     usage.add_argument("--estimated-cost-cny", type=float)
     usage.add_argument("--final", dest="final_usage", action="store_true", help="Mark this as terminal usage and settle the remaining reservation")
     usage.add_argument("--note")
+    _add_command_id(usage)
     usage.set_defaults(func=command_record_usage)
 
     recover = sub.add_parser("recover", help="Audit v2 session, mailbox, and backend recoverability")
@@ -300,6 +358,16 @@ def build_parser() -> argparse.ArgumentParser:
     validate = sub.add_parser("validate", help="Validate v2 project structure")
     validate.add_argument("--project", required=True)
     validate.set_defaults(func=command_validate)
+
+    migrate_state = sub.add_parser("migrate-state", help="Preview or explicitly enable the SQLite WAL control store")
+    migrate_state.add_argument("--project", required=True)
+    migrate_state.add_argument("--apply", action="store_true", help="Back up legacy views and atomically cut over to SQLite")
+    migrate_state.set_defaults(func=command_migrate_state)
+
+    store_status = sub.add_parser("state-store", help="Inspect SQLite integrity, schema, journal mode, and dirty views")
+    store_status.add_argument("--project", required=True)
+    store_status.add_argument("--repair-views", action="store_true", help="Rebuild committed dirty compatibility views")
+    store_status.set_defaults(func=command_state_store_status)
     return parser
 
 

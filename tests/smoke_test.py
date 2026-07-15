@@ -81,6 +81,7 @@ def main() -> int:
             "cmv2-smoke",
             "--backend",
             "local",
+            "--allow-unsafe-native-workers",
         )
         project = Path(init["project"])
         assert_true(init["backend"] == "local", "smoke project should force the portable local backend")
@@ -148,6 +149,7 @@ def main() -> int:
             "deepseek-v4-flash",
             "--command",
             "codex --model {model}",
+            "--unsafe-native",
         )
         assert_true(dispatch["actor_id"] == "agent-v2-0001", "dispatch should create a task-scoped agent")
         assert_true(Path(dispatch["prompt_file"]).is_file(), "dispatch should create a durable agent prompt")

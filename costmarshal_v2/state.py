@@ -9,6 +9,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .control_store import (
+    transactional_append_jsonl,
+    transactional_read_jsonl,
+    transactional_read_text,
+    transactional_write_text,
+)
 from .paths import ProjectLayout, relpath, slugify
 from .security import SecurityValidationError, validate_actor_id, validate_task_id
 
@@ -51,11 +57,21 @@ def redact(value: Any) -> Any:
 
 
 def atomic_write_text(path: Path, content: str) -> None:
+    if transactional_write_text(path, content):
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=str(path.parent)) as handle:
         handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
         temp_name = handle.name
     os.replace(temp_name, path)
+    if os.name != "nt":
+        descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def atomic_write_json(path: Path, data: Any) -> None:
@@ -63,6 +79,13 @@ def atomic_write_json(path: Path, data: Any) -> None:
 
 
 def read_json(path: Path, default: Any | None = None) -> Any:
+    transactional, content = transactional_read_text(path)
+    if transactional:
+        if content is None:
+            if default is not None:
+                return default
+            raise FileNotFoundError(path)
+        return json.loads(content)
     if not path.exists():
         if default is not None:
             return default
@@ -71,14 +94,20 @@ def read_json(path: Path, default: Any | None = None) -> Any:
 
 
 def append_jsonl(path: Path, row: dict[str, Any]) -> None:
+    safe_row = redact(row)
+    if transactional_append_jsonl(path, safe_row):
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(redact(row), ensure_ascii=False, sort_keys=True) + "\n")
+        handle.write(json.dumps(safe_row, ensure_ascii=False, sort_keys=True) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    transactional, rows = transactional_read_jsonl(path)
+    if transactional:
+        return rows
     if not path.exists():
         return []
     rows: list[dict[str, Any]] = []

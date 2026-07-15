@@ -18,10 +18,11 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
 5. Workers may return only `waiting_leader`, `failed`, or `escalate` through collect.
 6. Every worker command is fenced to its actor and attempt; stale commands must not mutate the current attempt.
 7. Budgeted dispatch requires reviewed pricing and non-zero token estimates.
-8. Workers never receive the CostMarshal runtime as a writable directory.
-9. Writable worker tasks use isolated git worktrees and a post-run path gate.
-10. Low/medium workers receive only their selected provider credential and a credential-free actor Codex home.
-11. ArchMarshal integration is read-only. Never auto-adopt, apply, start, end, or modify ArchMarshal.
+8. Production workers require an attested OCI boundary; required mode never falls back to native execution.
+9. Unsafe native workers require both project-level and dispatch-level explicit opt-in and must be treated as unisolated.
+10. Every attempt has a launch token and lifetime runtime lock; a duplicate or outcome-unknown runner must not call the provider.
+11. SQLite cutover is explicit and marker-driven. A present but invalid marker fails closed; JSON/JSONL are compatibility views after cutover.
+12. ArchMarshal integration is read-only. Never auto-adopt, apply, start, end, or modify ArchMarshal.
 
 ## Standard workflow
 
@@ -43,7 +44,7 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
 python scripts/costmarshal.py configure-provider --codex-home "$env:CODEX_HOME" --profile medium-api --provider-id medium-api --base-url "https://reviewed-endpoint/v1" --model "reviewed-model" --env-key MEDIUM_API_KEY
 
 # Initialize three-tier routing.
-python scripts/costmarshal.py init --name <name> --objective "<objective>" --workspace <workspace> --provider-catalog <catalog.json> --project-budget-cny <amount> --governance off
+python scripts/costmarshal.py init --name <name> --objective "<objective>" --workspace <workspace> --provider-catalog <catalog.json> --project-budget-cny <amount> --governance off --worker-image <name@sha256:digest>
 
 # Create a bounded task.
 python scripts/costmarshal.py new-task --project <project-dir> --title "<title>" --purpose "<purpose>" --task-type implementation --risk medium --difficulty normal --estimated-input-tokens 100000 --estimated-output-tokens 10000 --claim-path src/file.py --allowed-path src/file.py
@@ -65,6 +66,11 @@ python scripts/costmarshal.py budget --project <project-dir>
 python scripts/costmarshal.py governance-status --project <project-dir>
 python scripts/costmarshal.py validate --project <project-dir>
 python scripts/costmarshal.py recover --project <project-dir> --plan-restarts
+
+# Preview/apply the opt-in transactional authority only with actors stopped.
+python scripts/costmarshal.py migrate-state --project <project-dir>
+python scripts/costmarshal.py migrate-state --project <project-dir> --apply
+python scripts/costmarshal.py state-store --project <project-dir>
 ```
 
 ## Routing policy
@@ -82,10 +88,27 @@ Treat pricing as reviewed configuration. Use `null` for unknown values. A provid
 
 - `provider_id`, `tier`, `profile`, `model`, `env_key`
 - `enabled`, `priority`
-- `input_cny_per_1m`, `output_cny_per_1m`
+- canonical `pricing`: `currency`, `source`, `reviewed_at`, `effective_at`,
+  `expires_at`, `snapshot_id`, `snapshot_hash`, `input_per_1m`,
+  `cached_input_per_1m`, `output_per_1m`, and `fixed_request`
 - `capabilities`
 
+Canonical snapshots are hash-bound and must be current at routing time. Expired,
+future-effective, future-reviewed, mixed-currency, mixed canonical/legacy, or
+non-CNY pricing disables CNY optimization and yields no budget-eligible cost.
+The old flat `input_cny_per_1m`/`output_cny_per_1m` fields remain available only
+as explicitly labelled beta compatibility; they have no freshness guarantee and
+produce no immutable price snapshot.
+
 Task `--require-capability` values are hard constraints: providers lacking every required capability are removed before tier and cost selection.
+
+## Worker isolation policy
+
+- `required` is the default and may select only Docker/Podman Linux containers.
+- Missing engine/image/canary/network support fails before attempt persistence and budget reservation.
+- Images must be digest pinned and use pull-never, read-only rootfs, non-root UID, dropped capabilities, no-new-privileges, limits, and explicit mounts.
+- The current beta intentionally blocks even an attested required dispatch until the container execution adapter is enabled.
+- Development compatibility requires `init --allow-unsafe-native-workers` and `dispatch --unsafe-native`; the attestation records `strong_isolation=false`.
 
 ## Worker write policy
 
@@ -106,6 +129,8 @@ If adoption or repair is required, stop CostMarshal work and use the ArchMarshal
 
 Run every command listed in README's Verification section. At minimum, compile plus routing, model rotation, security, actor security, reliability, budget, concurrency, backend, ArchMarshal compatibility, and install smoke tests must pass.
 
-## Known beta boundary
+## Transaction and beta boundary
 
-The JSON/JSONL control plane is protected by an OS writer lock, a scheduler singleton lock, and idempotency fences, but multi-file dispatch/escalation is not fully crash-atomic. Do not describe v2.3-beta as transactionally exactly-once. After a hard crash, run `validate` and `recover`; a future non-beta release should move the control plane to a transactional store and strengthen the worker filesystem read boundary.
+An explicit `migrate-state --apply` cutover makes SQLite WAL authoritative for pure scheduler commands; compatibility views are materialized after commit and repaired on restart. Stable command IDs are payload-hashed. Do not enable cutover while actors are live.
+
+Do not describe v2.3-beta as end-to-end exactly-once or production-isolated yet. Spawn/stop still needs a leased transactional effect worker, and the OCI snapshot/profile/credential/report adapter is not enabled. Runtime-effect commands are blocked after SQLite cutover, while required isolation fails closed before dispatch. These are release gates, not silent fallbacks.

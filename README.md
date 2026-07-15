@@ -16,7 +16,8 @@ Current version: `v2.3.0-beta`
 - Escalates one tier at a time and fences stale actor attempts.
 - Uses durable actors, mailboxes, reports, claims, usage records, and recovery state.
 - Reserves task/project budget at dispatch and settles it from usage or leader results.
-- Isolates low/medium provider credentials and runs writable worker tasks in detached git worktrees.
+- Requires an attested OCI boundary for production workers and never silently falls back to a native process.
+- Provides an explicit SQLite WAL cutover for crash-atomic pure control-plane commands and recoverable compatibility views.
 - Supports ArchMarshal governance through explicit, read-only binding checks. It never runs ArchMarshal adopt/apply/lifecycle mutations automatically.
 
 ## Routing model
@@ -73,6 +74,8 @@ python "$env:CODEX_HOME\skills\costmarshal\scripts\install_smoke_test.py"
 
 CostMarshal uses only Python's standard library at runtime. `git` is required for writable worker worktrees. `tmux` is optional; Windows defaults to the local process backend.
 
+Production worker isolation additionally requires Docker or Podman running Linux containers and a digest-pinned CostMarshal worker image. Native workers are a development compatibility mode, not a security boundary.
+
 ## Provider setup
 
 The default catalog contains:
@@ -106,7 +109,41 @@ Provide credentials through the process environment or a secrets file outside th
 
 ## Reviewed provider catalog
 
-Create a JSON file and pass it to `init --provider-catalog`. Prices are CNY per one million tokens; use `null` until a human has reviewed the value.
+Create a JSON file and pass it to `init --provider-catalog`. Non-beta economic
+routing uses a hash-bound `pricing` snapshot on every enabled provider. The
+snapshot records `currency`, provenance `source`, `reviewed_at`, `effective_at`,
+`expires_at`, `snapshot_id`, `snapshot_hash`, ordinary/cached input rates,
+output rate, and a fixed request fee. Use
+`costmarshal_v2.routing.build_pricing_snapshot(...)` to canonicalize timestamps
+and generate the SHA-256 hash; never hand-edit a hash after review.
+
+Expired, future-reviewed, future-effective, mixed-currency, mixed
+canonical/legacy, or non-CNY snapshots cannot produce a CNY estimate. Routing
+falls back explicitly to the safe tier, and a budgeted dispatch fails closed
+because no eligible estimate exists.
+
+The flat price fields in the compatibility example below remain readable for
+existing v2.3-beta projects only. They have no provenance or freshness metadata,
+cannot price cached input or fixed request fees, and do not produce an immutable
+snapshot. New deployments should replace them with canonical nested `pricing`
+objects.
+
+```python
+from costmarshal_v2.routing import build_pricing_snapshot
+
+provider["pricing"] = build_pricing_snapshot(
+    currency="CNY",
+    source="https://vendor.example/reviewed-pricing",
+    reviewed_at="2026-07-16T00:00:00Z",
+    effective_at="2026-07-16T00:00:00Z",
+    expires_at="2026-08-16T00:00:00Z",
+    snapshot_id="vendor-2026-07",
+    input_per_1m=2.0,
+    cached_input_per_1m=0.5,
+    output_per_1m=8.0,
+    fixed_request=0.0,
+)
+```
 
 ```json
 {
@@ -163,7 +200,8 @@ python scripts/costmarshal.py init `
   --workspace C:\work\my-project `
   --provider-catalog C:\config\providers.json `
   --project-budget-cny 30 `
-  --governance off
+  --governance off `
+  --worker-image ghcr.io/example/costmarshal-worker@sha256:<reviewed-digest>
 ```
 
 Create, inspect, and dispatch a task:
@@ -186,7 +224,16 @@ python scripts/costmarshal.py run-scheduler --project <project-dir>
 python scripts/costmarshal.py dashboard --project <project-dir>
 ```
 
-Writable low/medium tasks require a clean git repository. They execute in a detached worktree under the CostMarshal runtime. The runner rejects diffs outside `allowed_paths`/`claimed_paths`; the leader reviews and integrates the isolated changes. A task with no write paths sees the source workspace read-only.
+Worker dispatch defaults to `worker_isolation.mode=required`. Docker/Podman selection may fail over only between supported OCI engines; it never falls back to a host process. Preflight rejects missing daemons, remote contexts, non-Linux engines, unpinned images, unsafe mounts, failed canaries, and unsupported network policy before an attempt or budget reservation is persisted.
+
+The current beta contains the OCI contract and fail-closed preflight, but the final container execution adapter/image distribution is still gated. For trusted development tests only, both project initialization and each dispatch must opt in:
+
+```powershell
+python scripts/costmarshal.py init ... --allow-unsafe-native-workers
+python scripts/costmarshal.py dispatch --project <project-dir> --task V2-0001 --unsafe-native --start
+```
+
+This records `strong_isolation=false`; it is forbidden when ArchMarshal governance is required. It does not protect host files from the model process.
 
 Custom worker command templates are rejected by default because they bypass the controlled runner. `init --allow-unsafe-custom-worker-commands` exists only as an explicit compatibility escape hatch for trusted test/backends; it forfeits sandbox and secret-isolation guarantees.
 
@@ -239,6 +286,19 @@ python scripts/costmarshal.py validate --project <project-dir>
 python scripts/costmarshal.py status --project <project-dir> --format md
 ```
 
+### Transactional control store
+
+Existing projects remain on their legacy JSON/JSONL authority until an explicit, offline cutover. Preview is read-only; apply requires exclusive scheduler/project locks, rejects live actors, creates a complete backup, validates a staged database, installs it atomically, and writes the backend marker last:
+
+```powershell
+python scripts/costmarshal.py migrate-state --project <project-dir>
+python scripts/costmarshal.py migrate-state --project <project-dir> --apply
+python scripts/costmarshal.py state-store --project <project-dir>
+python scripts/costmarshal.py state-store --project <project-dir> --repair-views
+```
+
+After cutover, pure scheduler mutations use SQLite WAL transactions and stable `--command-id` values. A reused ID with a different payload is rejected. JSON/JSONL files are compatibility views rebuilt after a commit-time crash. Commands that spawn or stop an OS runtime are currently blocked after cutover until the recoverable effect worker is complete; this prevents a false exactly-once claim.
+
 ## Verification
 
 ```powershell
@@ -249,6 +309,12 @@ python tests/local_backend_contract_test.py
 python tests/tmux_contract_test.py
 python tests/model_rotation_contract_test.py
 python tests/three_tier_routing_test.py
+python tests/pricing_metadata_test.py
+python tests/control_store_test.py
+python tests/transactional_scheduler_test.py
+python tests/worker_isolation_test.py
+python tests/isolation_scheduler_gate_test.py
+python tests/actor_fencing_test.py
 python tests/security_contract_test.py
 python tests/actor_security_contract_test.py
 python tests/reliability_contract_test.py
@@ -261,7 +327,7 @@ python scripts/install_smoke_test.py
 
 ## Current hardening boundary
 
-v2.3 has OS-backed single-writer locking, a scheduler singleton lock, attempt fencing, command replay guards, worktree isolation, secret minimization, and budget reservations. The remaining path to a non-beta release is a transactional state backend for crash-atomic multi-file dispatch/escalation plus a stronger OS/container read boundary for provider workers. Until then, use `validate` and `recover` after an unclean process or machine termination.
+v2.3-beta now has an opt-in SQLite WAL authority for pure commands, marker-last migration with backups, dirty-view recovery, command payload hashing, launch tokens, lifetime attempt locks, pricing freshness snapshots, and required-mode OCI preflight. It still remains beta because OS spawn/stop effects are not yet processed through the transactional effect outbox, and the attested OCI execution/image/report exchange path is not enabled. Required isolation therefore fails closed; only explicitly audited unsafe-native development dispatches can run today.
 
 ## License
 

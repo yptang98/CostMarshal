@@ -56,6 +56,7 @@ def main() -> int:
             "1.5",
             "--governance",
             "off",
+            "--allow-unsafe-native-workers",
         )
         project = Path(init["project"])
         for index in (1, 2):
@@ -75,8 +76,8 @@ def main() -> int:
                 "--estimated-input-tokens",
                 "1000000",
             )
-        first = data(temp, "dispatch", "--project", str(project), "--task", "V2-0001", "--provider", "longcat")
-        rejected = run(temp, "dispatch", "--project", str(project), "--task", "V2-0002", "--provider", "longcat", ok=False)
+        first = data(temp, "dispatch", "--project", str(project), "--task", "V2-0001", "--provider", "longcat", "--unsafe-native")
+        rejected = run(temp, "dispatch", "--project", str(project), "--task", "V2-0002", "--provider", "longcat", "--unsafe-native", ok=False)
         assert rejected.returncode != 0 and "Project budget exceeded" in (rejected.stdout + rejected.stderr)
 
         actor = first["actor_id"]
@@ -95,7 +96,7 @@ def main() -> int:
             "--input-tokens",
             "250000",
         )
-        rejected = run(temp, "dispatch", "--project", str(project), "--task", "V2-0002", "--provider", "longcat", ok=False)
+        rejected = run(temp, "dispatch", "--project", str(project), "--task", "V2-0002", "--provider", "longcat", "--unsafe-native", ok=False)
         assert rejected.returncode != 0
         task = json.loads((project / "tasks" / "V2-0001" / "task.json").read_text(encoding="utf-8"))
         attempt = task["attempts"][0]
@@ -116,7 +117,7 @@ def main() -> int:
             "--quality-score",
             "1",
         )
-        second = data(temp, "dispatch", "--project", str(project), "--task", "V2-0002", "--provider", "longcat")
+        second = data(temp, "dispatch", "--project", str(project), "--task", "V2-0002", "--provider", "longcat", "--unsafe-native")
         assert second["actor_id"] == "agent-v2-0002"
         print("budget contract ok")
         return 0

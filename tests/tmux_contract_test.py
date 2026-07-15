@@ -164,6 +164,7 @@ def main() -> int:
             "--backend-command",
             str(fake_tmux),
             "--allow-unsafe-custom-worker-commands",
+            "--allow-unsafe-native-workers",
         )
         project = Path(init["project"])
         assert_true(init["backend"] == "tmux", "tmux contract should explicitly select the tmux backend")
@@ -184,6 +185,7 @@ def main() -> int:
             "--command",
             "agent {prompt_file} {brief}",
             "--start",
+            "--unsafe-native",
         )
         assert_true(dispatch["started"], "dispatch --start should run through fake tmux")
         run_json(temp, "send", "--project", str(project), "--to", "agent-v2-0001", "--message", "hello agent", "--runtime-send")

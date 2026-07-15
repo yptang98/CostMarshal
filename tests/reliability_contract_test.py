@@ -49,10 +49,10 @@ def main() -> int:
     try:
         workspace = temp / "workspace"
         workspace.mkdir()
-        init = run_json(temp, "init", "--name", "reliability", "--objective", "replay fencing", "--workspace", str(workspace), "--backend", "local", "--governance", "off")
+        init = run_json(temp, "init", "--name", "reliability", "--objective", "replay fencing", "--workspace", str(workspace), "--backend", "local", "--governance", "off", "--allow-unsafe-native-workers")
         project = Path(init["project"])
         run_json(temp, "new-task", "--project", str(project), "--title", "bounded", "--purpose", "test fencing", "--task-type", "analysis", "--risk", "low")
-        dispatch = run_json(temp, "dispatch", "--project", str(project), "--task", "V2-0001")
+        dispatch = run_json(temp, "dispatch", "--project", str(project), "--task", "V2-0001", "--unsafe-native")
         actor = dispatch["actor_id"]
         actor_state = json.loads((project / "scheduler" / "actors" / f"{actor}.json").read_text(encoding="utf-8"))
         attempt = actor_state["attempt_id"]
@@ -124,12 +124,13 @@ def main() -> int:
                 str(temp / "missing-tmux.exe"),
                 "--governance",
                 "off",
+                "--allow-unsafe-native-workers",
             ).stdout
         )
         broken_project = Path(broken["project"])
         broken_json = lambda *args: json.loads(run(temp, *args).stdout)
         broken_json("new-task", "--project", str(broken_project), "--title", "launch", "--purpose", "fail safely")
-        launch = run(temp, "dispatch", "--project", str(broken_project), "--task", "V2-0001", "--start", ok=False)
+        launch = run(temp, "dispatch", "--project", str(broken_project), "--task", "V2-0001", "--start", "--unsafe-native", ok=False)
         assert launch.returncode != 0
         broken_task = json.loads((broken_project / "tasks" / "V2-0001" / "task.json").read_text(encoding="utf-8"))
         broken_actor = json.loads((broken_project / "scheduler" / "actors" / "agent-v2-0001.json").read_text(encoding="utf-8"))

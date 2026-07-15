@@ -92,6 +92,7 @@ print(json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 11, 'outpu
             str(workspace),
             "--backend",
             "local",
+            "--allow-unsafe-native-workers",
         )
         project = Path(init["project"])
         run_json(
@@ -109,7 +110,7 @@ print(json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 11, 'outpu
             "--provider",
             "auto",
         )
-        dispatched = run_json(temp, env, "dispatch", "--project", str(project), "--task", "V2-0001", "--start")
+        dispatched = run_json(temp, env, "dispatch", "--project", str(project), "--task", "V2-0001", "--start", "--unsafe-native")
         assert dispatched["actor_id"] == "agent-v2-0001"
 
         try:

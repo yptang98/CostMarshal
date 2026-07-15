@@ -10,6 +10,9 @@ tier (low, medium, or high).
 
 from copy import deepcopy
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+import hashlib
+import json
 import math
 import re
 from itertools import product
@@ -50,12 +53,47 @@ _PROVIDER_FIELDS = {
     "priority",
     "input_cny_per_1m",
     "output_cny_per_1m",
+    "pricing",
     "capabilities",
 }
+
+_PRICING_FIELDS = {
+    "currency",
+    "source",
+    "reviewed_at",
+    "effective_at",
+    "expires_at",
+    "snapshot_id",
+    "snapshot_hash",
+    "input_per_1m",
+    "cached_input_per_1m",
+    "output_per_1m",
+    "fixed_request",
+}
+_SNAPSHOT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+_SNAPSHOT_HASH = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 class RoutingValidationError(ValueError):
     """Raised when routing input is invalid or cannot satisfy safety floors."""
+
+
+@dataclass(frozen=True)
+class PricingSnapshot:
+    currency: str
+    source: str
+    reviewed_at: str
+    effective_at: str
+    expires_at: str
+    snapshot_id: str
+    snapshot_hash: str
+    input_per_1m: float
+    cached_input_per_1m: float | None
+    output_per_1m: float
+    fixed_request: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -90,6 +128,9 @@ class RouteDecision:
     expected_success_probability: float | None
     expected_cost_per_accepted_cny: float | None
     optimization_mode: str
+    pricing_status: str
+    pricing_currency: str | None
+    price_snapshot: PricingSnapshot | None
     reason: str
     explanation: str
 
@@ -97,6 +138,7 @@ class RouteDecision:
         payload = asdict(self)
         payload["candidate_provider_ids"] = list(self.candidate_provider_ids)
         payload["planned_provider_ids"] = list(self.planned_provider_ids)
+        payload["price_snapshot"] = self.price_snapshot.to_dict() if self.price_snapshot else None
         return payload
 
 
@@ -164,6 +206,142 @@ def _require_token_count(value: Any, label: str) -> int:
     return value
 
 
+def _parse_rfc3339(value: Any, label: str) -> tuple[datetime, str]:
+    if not isinstance(value, str) or not value.strip():
+        raise RoutingValidationError(f"{label} must be a non-empty RFC3339 timestamp")
+    raw = value.strip()
+    try:
+        parsed = datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith("Z") else raw)
+    except ValueError as exc:
+        raise RoutingValidationError(f"{label} must be a valid RFC3339 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise RoutingValidationError(f"{label} must include a timezone")
+    utc = parsed.astimezone(timezone.utc)
+    return utc, utc.isoformat().replace("+00:00", "Z")
+
+
+def _normalize_now(now: datetime | str | None) -> datetime:
+    if now is None:
+        return datetime.now(timezone.utc)
+    if isinstance(now, str):
+        return _parse_rfc3339(now, "now")[0]
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+        raise RoutingValidationError("now must be a timezone-aware datetime or RFC3339 timestamp")
+    return now.astimezone(timezone.utc)
+
+
+def _normalize_pricing_snapshot(
+    raw: Mapping[str, Any],
+    label: str,
+    *,
+    require_hash: bool,
+) -> dict[str, Any]:
+    if not isinstance(raw, Mapping):
+        raise RoutingValidationError(f"{label} must be an object")
+    unknown = set(raw) - _PRICING_FIELDS
+    if unknown:
+        raise RoutingValidationError(
+            f"{label} has unsupported charging dimensions or unknown fields: "
+            + ", ".join(sorted(str(item) for item in unknown))
+        )
+    currency = raw.get("currency")
+    if not isinstance(currency, str) or not re.fullmatch(r"[A-Z]{3}", currency):
+        raise RoutingValidationError(f"{label}.currency must be an ISO-style three-letter uppercase code")
+    source = raw.get("source")
+    if not isinstance(source, str) or not source.strip():
+        raise RoutingValidationError(f"{label}.source must be a non-empty reviewed provenance reference")
+    snapshot_id = raw.get("snapshot_id")
+    if not isinstance(snapshot_id, str) or not _SNAPSHOT_ID.fullmatch(snapshot_id):
+        raise RoutingValidationError(f"{label}.snapshot_id is invalid")
+    reviewed_dt, reviewed_at = _parse_rfc3339(raw.get("reviewed_at"), f"{label}.reviewed_at")
+    effective_dt, effective_at = _parse_rfc3339(raw.get("effective_at"), f"{label}.effective_at")
+    expires_dt, expires_at = _parse_rfc3339(raw.get("expires_at"), f"{label}.expires_at")
+    if effective_dt >= expires_dt:
+        raise RoutingValidationError(f"{label}.effective_at must be earlier than expires_at")
+    if reviewed_dt >= expires_dt:
+        raise RoutingValidationError(f"{label}.reviewed_at must be earlier than expires_at")
+    input_price = _require_plain_number(raw.get("input_per_1m"), f"{label}.input_per_1m")
+    output_price = _require_plain_number(raw.get("output_per_1m"), f"{label}.output_per_1m")
+    cached_price = _require_plain_number(
+        raw.get("cached_input_per_1m"),
+        f"{label}.cached_input_per_1m",
+        allow_none=True,
+    )
+    fixed_request = _require_plain_number(
+        raw.get("fixed_request", 0.0),
+        f"{label}.fixed_request",
+    )
+    assert input_price is not None and output_price is not None and fixed_request is not None
+    normalized = {
+        "currency": currency,
+        "source": source.strip(),
+        "reviewed_at": reviewed_at,
+        "effective_at": effective_at,
+        "expires_at": expires_at,
+        "snapshot_id": snapshot_id,
+        "input_per_1m": input_price,
+        "cached_input_per_1m": cached_price,
+        "output_per_1m": output_price,
+        "fixed_request": fixed_request,
+    }
+    computed_hash = "sha256:" + hashlib.sha256(
+        json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    supplied_hash = raw.get("snapshot_hash")
+    if require_hash:
+        if not isinstance(supplied_hash, str) or not _SNAPSHOT_HASH.fullmatch(supplied_hash):
+            raise RoutingValidationError(f"{label}.snapshot_hash must be sha256:<64 lowercase hex characters>")
+        if supplied_hash != computed_hash:
+            raise RoutingValidationError(f"{label}.snapshot_hash does not match the canonical snapshot")
+    normalized["snapshot_hash"] = computed_hash
+    return normalized
+
+
+def pricing_snapshot_hash(snapshot: Mapping[str, Any]) -> str:
+    """Return the canonical integrity hash for a pricing snapshot."""
+
+    return str(_normalize_pricing_snapshot(snapshot, "pricing", require_hash=False)["snapshot_hash"])
+
+
+def build_pricing_snapshot(**values: Any) -> dict[str, Any]:
+    """Build a canonical, hash-bound pricing snapshot for reviewed config."""
+
+    return _normalize_pricing_snapshot(values, "pricing", require_hash=False)
+
+
+def _snapshot_from_provider(provider: Mapping[str, Any]) -> PricingSnapshot | None:
+    raw = provider.get("pricing")
+    if not isinstance(raw, Mapping):
+        return None
+    normalized = _normalize_pricing_snapshot(raw, "provider.pricing", require_hash=True)
+    return PricingSnapshot(**normalized)
+
+
+def pricing_snapshot_status(
+    provider: Mapping[str, Any], *, now: datetime | str | None = None
+) -> str:
+    """Return the deterministic pricing freshness state for one provider."""
+
+    snapshot = _snapshot_from_provider(provider)
+    if snapshot is None:
+        legacy_input = provider.get("input_cny_per_1m")
+        legacy_output = provider.get("output_cny_per_1m")
+        return "beta-legacy" if legacy_input is not None and legacy_output is not None else "missing"
+    clock = _normalize_now(now)
+    reviewed = _parse_rfc3339(snapshot.reviewed_at, "pricing.reviewed_at")[0]
+    effective = _parse_rfc3339(snapshot.effective_at, "pricing.effective_at")[0]
+    expires = _parse_rfc3339(snapshot.expires_at, "pricing.expires_at")[0]
+    if reviewed > clock:
+        return "future-reviewed"
+    if effective > clock:
+        return "future-effective"
+    if expires <= clock:
+        return "expired"
+    if snapshot.currency != "CNY":
+        return "unsupported-currency"
+    return "current"
+
+
 def validate_provider_catalog(catalog: Mapping[str, Any]) -> dict[str, Any]:
     """Validate and normalize a catalog without mutating the caller's object.
 
@@ -228,16 +406,30 @@ def validate_provider_catalog(catalog: Mapping[str, Any]) -> dict[str, Any]:
         priority = raw.get("priority", 100)
         if isinstance(priority, bool) or not isinstance(priority, int) or priority < 0:
             raise RoutingValidationError(f"{label}.priority must be a non-negative integer")
-        input_price = _require_plain_number(
-            raw.get("input_cny_per_1m"),
-            f"{label}.input_cny_per_1m",
-            allow_none=True,
+        raw_pricing = raw.get("pricing")
+        has_legacy_price = raw.get("input_cny_per_1m") is not None or raw.get("output_cny_per_1m") is not None
+        if raw_pricing is not None and has_legacy_price:
+            raise RoutingValidationError(
+                f"{label} must not mix canonical pricing snapshots with beta legacy flat prices"
+            )
+        pricing = (
+            _normalize_pricing_snapshot(raw_pricing, f"{label}.pricing", require_hash=True)
+            if raw_pricing is not None
+            else None
         )
-        output_price = _require_plain_number(
-            raw.get("output_cny_per_1m"),
-            f"{label}.output_cny_per_1m",
-            allow_none=True,
-        )
+        input_price = None
+        output_price = None
+        if pricing is None:
+            input_price = _require_plain_number(
+                raw.get("input_cny_per_1m"),
+                f"{label}.input_cny_per_1m",
+                allow_none=True,
+            )
+            output_price = _require_plain_number(
+                raw.get("output_cny_per_1m"),
+                f"{label}.output_cny_per_1m",
+                allow_none=True,
+            )
         capabilities = raw.get("capabilities", [])
         if not isinstance(capabilities, list) or any(
             not isinstance(item, str) or not item.strip() for item in capabilities
@@ -245,8 +437,7 @@ def validate_provider_catalog(catalog: Mapping[str, Any]) -> dict[str, Any]:
             raise RoutingValidationError(f"{label}.capabilities must be a list of non-empty strings")
         if len(capabilities) != len(set(capabilities)):
             raise RoutingValidationError(f"{label}.capabilities must not contain duplicates")
-        normalized.append(
-            {
+        normalized_provider = {
                 "provider_id": provider_id,
                 "tier": tier,
                 "profile": profile,
@@ -258,7 +449,11 @@ def validate_provider_catalog(catalog: Mapping[str, Any]) -> dict[str, Any]:
                 "output_cny_per_1m": output_price,
                 "capabilities": list(capabilities),
             }
-        )
+        if pricing is not None:
+            normalized_provider.pop("input_cny_per_1m")
+            normalized_provider.pop("output_cny_per_1m")
+            normalized_provider["pricing"] = pricing
+        normalized.append(normalized_provider)
     return {"schema_version": CATALOG_SCHEMA_VERSION, "providers": normalized}
 
 
@@ -339,16 +534,40 @@ def provider_by_id(catalog: Mapping[str, Any], provider_id: str) -> dict[str, An
 
 
 def estimate_cost_cny(
-    provider: Mapping[str, Any], *, input_tokens: int, output_tokens: int
+    provider: Mapping[str, Any],
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    cached_input_tokens: int = 0,
 ) -> float | None:
-    """Estimate token cost from reviewed CNY-per-million prices.
+    """Estimate cost from canonical or beta legacy CNY prices.
 
-    Unknown input or output pricing yields ``None`` rather than a misleading
-    partial estimate.
+    Canonical snapshots support ordinary input, cached input, output, and a
+    fixed per-request fee. Unknown required dimensions yield ``None`` rather
+    than a misleading partial estimate.
     """
 
     input_count = _require_token_count(input_tokens, "input_tokens")
     output_count = _require_token_count(output_tokens, "output_tokens")
+    cached_count = _require_token_count(cached_input_tokens, "cached_input_tokens")
+    raw_snapshot = provider.get("pricing")
+    if raw_snapshot is not None:
+        snapshot = _normalize_pricing_snapshot(
+            raw_snapshot,
+            "provider.pricing",
+            require_hash=True,
+        )
+        if snapshot["currency"] != "CNY":
+            return None
+        cached_price = snapshot["cached_input_per_1m"]
+        if cached_count and cached_price is None:
+            return None
+        cost = (
+            input_count * float(snapshot["input_per_1m"])
+            + cached_count * float(cached_price or 0.0)
+            + output_count * float(snapshot["output_per_1m"])
+        ) / 1_000_000
+        return round(cost + float(snapshot["fixed_request"]), 9)
     input_price = _require_plain_number(
         provider.get("input_cny_per_1m"), "provider.input_cny_per_1m", allow_none=True
     )
@@ -357,7 +576,46 @@ def estimate_cost_cny(
     )
     if input_price is None or output_price is None:
         return None
+    if cached_count:
+        raise RoutingValidationError(
+            "beta legacy pricing does not support cached_input_tokens; use a canonical pricing snapshot"
+        )
     return round((input_count * input_price + output_count * output_price) / 1_000_000, 9)
+
+
+def _economic_pricing_gate(
+    providers: Sequence[Mapping[str, Any]],
+    *,
+    now: datetime | str | None,
+) -> tuple[bool, str, str | None]:
+    """Return whether providers share usable, current CNY pricing.
+
+    All-flat catalogs retain the explicitly labelled beta compatibility path.
+    Mixing legacy prices with canonical snapshots never enables optimization.
+    """
+
+    if not providers:
+        return False, "missing", None
+    snapshot_modes = [provider.get("pricing") is not None for provider in providers]
+    if not any(snapshot_modes):
+        statuses = [pricing_snapshot_status(provider, now=now) for provider in providers]
+        if all(status == "beta-legacy" for status in statuses):
+            return True, "beta-legacy", "CNY"
+        return False, "missing", None
+    if not all(snapshot_modes):
+        return False, "mixed-canonical-and-beta-legacy", None
+    snapshots = [_snapshot_from_provider(provider) for provider in providers]
+    assert all(snapshot is not None for snapshot in snapshots)
+    currencies = {snapshot.currency for snapshot in snapshots if snapshot is not None}
+    if len(currencies) != 1:
+        return False, "mixed-currency", None
+    currency = next(iter(currencies))
+    if currency != "CNY":
+        return False, f"unsupported-currency:{currency}", currency
+    statuses = [pricing_snapshot_status(provider, now=now) for provider in providers]
+    if not all(status == "current" for status in statuses):
+        return False, "+".join(sorted(set(statuses))), currency
+    return True, "current", currency
 
 
 def _row_provider_id(row: Mapping[str, Any]) -> str | None:
@@ -473,6 +731,7 @@ def _rank_candidates(
     difficulty: str,
     input_tokens: int,
     output_tokens: int,
+    allow_costs: bool = True,
 ) -> list[tuple[dict[str, Any], AcceptancePrior, float | None]]:
     rows: list[tuple[dict[str, Any], AcceptancePrior, float | None]] = []
     history_rows = list(history or [])
@@ -483,8 +742,10 @@ def _rank_candidates(
             task_type=task_type,
             difficulty=difficulty,
         )
-        cost = estimate_cost_cny(
-            provider, input_tokens=input_tokens, output_tokens=output_tokens
+        cost = (
+            estimate_cost_cny(provider, input_tokens=input_tokens, output_tokens=output_tokens)
+            if allow_costs
+            else None
         )
         rows.append((provider, prior, cost))
     rows.sort(
@@ -586,6 +847,7 @@ def decide_route(
     history: Iterable[Mapping[str, Any]] | None = None,
     input_tokens: int = 0,
     output_tokens: int = 0,
+    now: datetime | str | None = None,
 ) -> RouteDecision:
     """Choose and explain a provider without mutating scheduler state."""
 
@@ -656,6 +918,32 @@ def decide_route(
             base = requested_tier or floor
             reason = f"no enabled provider at tier {base}; selected next available stronger tier {selected_tier}"
 
+    pricing_scope = (
+        candidates
+        if requested_provider_id is not None or requested_tier is not None
+        else [provider for provider in enabled if TIER_RANK[provider["tier"]] >= TIER_RANK[floor]]
+    )
+    optimization_pricing_ready, optimization_pricing_status, optimization_pricing_currency = _economic_pricing_gate(
+        pricing_scope,
+        now=now,
+    )
+    candidate_pricing_ready, candidate_pricing_status, candidate_pricing_currency = _economic_pricing_gate(
+        candidates,
+        now=now,
+    )
+    uses_canonical_pricing = any(provider.get("pricing") is not None for provider in pricing_scope)
+    selection_pricing_ready = (
+        optimization_pricing_ready if uses_canonical_pricing else candidate_pricing_ready
+    )
+    pricing_status = optimization_pricing_status
+    pricing_currency = optimization_pricing_currency
+    if not uses_canonical_pricing and candidate_pricing_ready:
+        pricing_status = (
+            candidate_pricing_status
+            if optimization_pricing_ready
+            else f"{candidate_pricing_status}-partial"
+        )
+        pricing_currency = candidate_pricing_currency
     ranked = _rank_candidates(
         candidates,
         history=history,
@@ -663,6 +951,7 @@ def decide_route(
         difficulty=values["difficulty"],
         input_tokens=input_tokens,
         output_tokens=output_tokens,
+        allow_costs=selection_pricing_ready,
     )
     provider, prior, cost = ranked[0]
     candidate_ids = tuple(item[0]["provider_id"] for item in ranked)
@@ -675,14 +964,12 @@ def decide_route(
         requested_provider_id is None
         and requested_tier is None
         and input_tokens + output_tokens > 0
-        and all(
-            row.get("input_cny_per_1m") is not None and row.get("output_cny_per_1m") is not None
-            for row in enabled
-        )
+        and optimization_pricing_ready
     )
     if values.get("min_success_probability") is not None and not economics_ready:
         raise RoutingValidationError(
-            "minimum success probability requires auto routing, non-zero token estimates, and reviewed prices for all enabled providers"
+            "minimum success probability requires auto routing, non-zero token estimates, and current compatible pricing; "
+            f"pricing status is {optimization_pricing_status}"
         )
     if economics_ready:
         plans = _auto_chain_plans(
@@ -716,6 +1003,12 @@ def decide_route(
                 f"cost-performance optimization selected {provider['provider_id']} as the first "
                 f"step of chain {' -> '.join(planned_provider_ids)}"
             )
+    if not selection_pricing_ready:
+        cost = None
+        reason = f"{reason}; economic pricing gate degraded to safe-tier routing ({pricing_status})"
+    elif not optimization_pricing_ready and requested_provider_id is None and requested_tier is None:
+        reason = f"{reason}; cross-tier optimization unavailable ({optimization_pricing_status})"
+    selected_snapshot = _snapshot_from_provider(provider) if selection_pricing_ready else None
     cost_text = f"estimated cost CNY {cost}" if cost is not None else "cost unknown"
     objective_text = (
         f", expected chain cost CNY {expected_chain_cost}, expected success {expected_success}, "
@@ -745,6 +1038,9 @@ def decide_route(
         expected_success_probability=expected_success,
         expected_cost_per_accepted_cny=expected_cost_per_accepted,
         optimization_mode=optimization_mode,
+        pricing_status=pricing_status,
+        pricing_currency=pricing_currency,
+        price_snapshot=selected_snapshot,
         reason=reason,
         explanation=explanation,
     )
@@ -759,6 +1055,7 @@ def next_stronger_provider(
     difficulty: str = "normal",
     input_tokens: int = 0,
     output_tokens: int = 0,
+    now: datetime | str | None = None,
 ) -> dict[str, Any] | None:
     """Return the best provider at the next available stronger tier.
 
@@ -781,6 +1078,10 @@ def next_stronger_provider(
     for tier in TIERS[TIER_RANK[current["tier"]] + 1 :]:
         candidates = [provider for provider in enabled if provider["tier"] == tier]
         if candidates:
+            pricing_ready, pricing_status, pricing_currency = _economic_pricing_gate(
+                candidates,
+                now=now,
+            )
             ranked = _rank_candidates(
                 candidates,
                 history=history,
@@ -788,12 +1089,17 @@ def next_stronger_provider(
                 difficulty=difficulty,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
+                allow_costs=pricing_ready,
             )
             provider, prior, cost = ranked[0]
+            snapshot = _snapshot_from_provider(provider) if pricing_ready else None
             return {
                 **deepcopy(provider),
                 "estimated_cost_cny": cost,
                 "acceptance_prior": prior.to_dict(),
+                "pricing_status": pricing_status,
+                "pricing_currency": pricing_currency,
+                "price_snapshot": snapshot.to_dict() if snapshot else None,
                 "reason": f"next available stronger tier after {current['tier']} is {tier}",
             }
     return None

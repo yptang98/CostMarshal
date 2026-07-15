@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
+from .control_store import control_store_enabled, control_transaction
 from .mailbox import send_message
-from .locking import project_write_lock
+from .locking import ProjectLockTimeout, advisory_file_lock, project_write_lock
 from .paths import ProjectLayout, resolve_project, slugify
 from .security import (
     SecurityValidationError,
@@ -33,6 +37,7 @@ from .state import (
     load_task,
     now_iso,
     save_actor,
+    save_task,
     task_dir,
 )
 
@@ -424,7 +429,7 @@ def scheduler_command(
     args: dict[str, Any],
     *,
     body: str,
-) -> None:
+    ) -> None:
     with project_write_lock(layout):
         send_message(
             layout,
@@ -437,6 +442,32 @@ def scheduler_command(
         )
 
 
+def _control_mutation(
+    layout: ProjectLayout,
+    *,
+    command_name: str,
+    command_id: str,
+    payload: dict[str, Any],
+    mutate: Callable[[], None],
+) -> bool:
+    """Apply a runner-owned state transition through the enabled backend."""
+
+    with project_write_lock(layout):
+        if not control_store_enabled(layout):
+            mutate()
+            return True
+        with control_transaction(
+            layout,
+            command_name=command_name,
+            command_id=command_id,
+            payload=payload,
+        ) as transaction:
+            if transaction.replay:
+                return False
+            mutate()
+        return True
+
+
 def report_status(report: Path) -> str | None:
     if not report.is_file():
         return None
@@ -445,9 +476,63 @@ def report_status(report: Path) -> str | None:
     return match.group(1).lower() if match else None
 
 
-def run_actor(layout: ProjectLayout, actor_id: str) -> int:
+def _validate_worker_fence(
+    layout: ProjectLayout,
+    actor_id: str,
+    *,
+    attempt_id: str | None,
+    launch_token: str | None,
+) -> dict[str, Any]:
+    actor = load_actor(layout, actor_id)
+    if actor.get("role") != "agent":
+        return actor
+    isolation = actor.get("isolation") or {}
+    attestation = isolation.get("attestation") or {}
+    if (
+        isolation.get("mode") != "unsafe-native"
+        or not isolation.get("project_opt_in")
+        or not isolation.get("dispatch_opt_in")
+        or attestation.get("backend") != "unsafe-native"
+        or attestation.get("strong_isolation") is not False
+    ):
+        raise SystemExit("native worker runner rejected: explicit unsafe-native attestation is missing")
+    expected_attempt = str(actor.get("attempt_id") or "")
+    expected_token = str(actor.get("launch_token") or "")
+    if not attempt_id or not hmac.compare_digest(str(attempt_id), expected_attempt):
+        raise SystemExit("worker launch rejected: attempt fence mismatch")
+    if not launch_token or not expected_token or not hmac.compare_digest(str(launch_token), expected_token):
+        raise SystemExit("worker launch rejected: launch token mismatch")
+    if actor.get("status") in {"stopped", "failed", "idle", "waiting"}:
+        raise SystemExit(f"worker launch rejected: actor is {actor.get('status')}")
+    if (actor.get("runtime") or {}).get("provider_execution_state") == "started":
+        raise SystemExit("worker launch rejected: prior provider execution outcome is unknown")
+    task_id = actor.get("task_id")
+    if not task_id:
+        raise SystemExit("worker launch rejected: actor has no task binding")
+    task = load_task(layout, str(task_id))
+    attempts = task.get("attempts") or []
+    current = attempts[-1] if attempts else None
+    if not current or current.get("attempt_id") != expected_attempt or current.get("actor_id") != actor_id:
+        raise SystemExit("worker launch rejected: attempt is no longer current")
+    if current.get("status") not in {"preparing", "dispatched", "starting", "running", "needs_recovery"}:
+        raise SystemExit(f"worker launch rejected: attempt is {current.get('status')}")
+    return actor
+
+
+def _run_actor_once(
+    layout: ProjectLayout,
+    actor_id: str,
+    *,
+    attempt_id: str | None,
+    launch_token: str | None,
+) -> int:
     with project_write_lock(layout):
-        actor = load_actor(layout, actor_id)
+        actor = _validate_worker_fence(
+            layout,
+            actor_id,
+            attempt_id=attempt_id,
+            launch_token=launch_token,
+        )
         project = load_project(layout)
     prompt = (layout.project_dir / str(actor.get("prompt_path") or "")).resolve()
     expected_prompt = actor_prompt_file(layout, actor_id).resolve()
@@ -470,12 +555,32 @@ def run_actor(layout: ProjectLayout, actor_id: str) -> int:
     )
     env, secret_values = isolated_actor_env(project, actor, layout=layout)
     events: list[dict[str, Any]] = []
-    with project_write_lock(layout):
-        current_actor = load_actor(layout, actor_id)
+    def register_runner() -> None:
+        current_actor = _validate_worker_fence(
+            layout,
+            actor_id,
+            attempt_id=attempt_id,
+            launch_token=launch_token,
+        )
         current_actor["status"] = "running"
-        current_actor.setdefault("runtime", {})["execution_workspace"] = str(execution_workspace)
-        current_actor["runtime"]["sandbox"] = sandbox
+        runtime = current_actor.setdefault("runtime", {})
+        runtime["execution_workspace"] = str(execution_workspace)
+        runtime["sandbox"] = sandbox
+        runtime["runner_pid"] = os.getpid()
+        runtime["process_start_marker"] = f"{os.getpid()}:{time.time_ns()}"
+        runtime["registered_launch_token_sha256"] = hashlib.sha256(str(launch_token).encode("utf-8")).hexdigest()
+        runtime["provider_execution_state"] = "started"
         save_actor(layout, current_actor)
+        if current_actor.get("task_id") and current_actor.get("attempt_id"):
+            current_task = load_task(layout, str(current_actor["task_id"]))
+            current_attempt = (current_task.get("attempts") or [])[-1]
+            current_attempt["status"] = "running"
+            current_attempt["started_at"] = current_attempt.get("started_at") or now_iso()
+            current_attempt["runner_pid"] = os.getpid()
+            current_attempt["process_start_marker"] = runtime["process_start_marker"]
+            if current_task.get("status") == "dispatched":
+                current_task["status"] = "running"
+            save_task(layout, current_task)
         append_event(
             layout,
             "actor_exec_started",
@@ -487,6 +592,13 @@ def run_actor(layout: ProjectLayout, actor_id: str) -> int:
             execution_workspace=str(execution_workspace),
             sandbox=sandbox,
         )
+    _control_mutation(
+        layout,
+        command_name="runner_register",
+        command_id=f"RUNNER-REGISTER-{attempt_id or actor_id}",
+        payload={"actor_id": actor_id, "attempt_id": attempt_id, "launch_token_sha256": hashlib.sha256(str(launch_token).encode("utf-8")).hexdigest()},
+        mutate=register_runner,
+    )
     try:
         with prompt.open("r", encoding="utf-8") as prompt_handle:
             process = subprocess.Popen(
@@ -542,37 +654,51 @@ def run_actor(layout: ProjectLayout, actor_id: str) -> int:
         if safe_report_text != report_text:
             atomic_write_text(report, safe_report_text)
     task_id = actor.get("task_id")
+    final_report_status = report_status(report)
+    collected_state = (
+        "failed"
+        if returncode != 0
+        else final_report_status
+        if final_report_status in {"failed", "escalate"}
+        else "waiting_leader"
+    )
     if task_id:
         publish_task_report(layout, actor, report)
-        final_report_status = report_status(report)
-        if returncode != 0:
-            collected_state = "failed"
-        elif final_report_status in {"failed", "escalate"}:
-            collected_state = final_report_status
-        else:
-            collected_state = "waiting_leader"
-        atomic_write_json(
-            task_dir(layout, str(task_id)) / "status.json",
-            {
-                "schema_version": SCHEMA_VERSION,
-                "task_id": task_id,
-                "state": collected_state,
-                "updated_at": now_iso(),
-                "error": None if returncode == 0 else f"actor process exited {returncode}",
-                "actor_id": actor_id,
-                "provider": actor.get("provider"),
-                "profile": actor.get("profile"),
-                "model": actor.get("model"),
-                "attempt_id": actor.get("attempt_id"),
-                "execution_workspace": str(execution_workspace),
-                "changed_paths": list(changed_paths),
-            },
-        )
-        scheduler_command(
-            layout,
-            actor,
-            "record_usage",
-            {
+    report_bytes = report.read_bytes() if report.is_file() else b""
+    report_sha256 = hashlib.sha256(report_bytes).hexdigest() if report_bytes else None
+
+    def finalize_runner() -> None:
+        if task_id:
+            status_path = task_dir(layout, str(task_id)) / "status.json"
+            atomic_write_json(
+                status_path,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "task_id": task_id,
+                    "state": collected_state,
+                    "updated_at": now_iso(),
+                    "error": None if returncode == 0 else f"actor process exited {returncode}",
+                    "actor_id": actor_id,
+                    "provider": actor.get("provider"),
+                    "profile": actor.get("profile"),
+                    "model": actor.get("model"),
+                    "attempt_id": actor.get("attempt_id"),
+                    "execution_workspace": str(execution_workspace),
+                    "changed_paths": list(changed_paths),
+                    "report_sha256": report_sha256,
+                    "report_size": len(report_bytes),
+                },
+            )
+            current_task = load_task(layout, str(task_id))
+            for current_attempt in current_task.get("attempts") or []:
+                if current_attempt.get("attempt_id") == actor.get("attempt_id"):
+                    current_attempt["report_path"] = str(report.relative_to(layout.project_dir)).replace("\\", "/")
+                    current_attempt["report_sha256"] = report_sha256
+                    current_attempt["report_size"] = len(report_bytes)
+                    current_attempt["provider_exit_code"] = returncode
+                    break
+            save_task(layout, current_task)
+            usage_args = {
                 "actor": actor_id,
                 "task": task_id,
                 "attempt": actor.get("attempt_id"),
@@ -581,46 +707,54 @@ def run_actor(layout: ProjectLayout, actor_id: str) -> int:
                 "output_tokens": output_tokens,
                 "final_usage": True,
                 "note": f"provider={actor.get('provider')} profile={actor.get('profile') or '-'} exit={returncode}",
-            },
-            body="Record usage captured from codex exec JSONL.",
-        )
-        needs_escalation = returncode != 0 or final_report_status in {"failed", "escalate"}
-        actor_tier = actor.get("tier") or ("low" if actor.get("provider") == "longcat" else "high")
-        if actor_tier in {"low", "medium"} and needs_escalation and project.get("auto_escalate", True):
-            scheduler_command(
+            }
+            send_message(
                 layout,
-                actor,
-                "escalate_task",
-                {
+                sender=actor_id,
+                recipient="scheduler",
+                subject="scheduler.command",
+                body="Record usage captured from codex exec JSONL.",
+                task_id=str(task_id),
+                metadata={"command": "record_usage", "args": usage_args},
+            )
+            needs_escalation = returncode != 0 or final_report_status in {"failed", "escalate"}
+            actor_tier = actor.get("tier") or ("low" if actor.get("provider") == "longcat" else "high")
+            if actor_tier in {"low", "medium"} and needs_escalation and project.get("auto_escalate", True):
+                command = "escalate_task"
+                command_args = {
                     "task": task_id,
                     "actor": actor_id,
                     "attempt": actor.get("attempt_id"),
                     "reason": f"{actor.get('provider')} ({actor.get('tier')}) attempt requested escalation or exited {returncode}",
                     "start": True,
-                },
-                body="Escalate this bounded task to the next stronger provider tier.",
-            )
-        else:
-            scheduler_command(
-                layout,
-                actor,
-                "collect_task",
-                {
+                }
+                body = "Escalate this bounded task to the next stronger provider tier."
+            else:
+                command = "collect_task"
+                command_args = {
                     "task": task_id,
                     "actor": actor_id,
                     "attempt": actor.get("attempt_id"),
                     "state": collected_state,
                     "summary": f"{actor.get('provider')} worker exited {returncode}; report ready.",
-                },
-                body="Worker report is ready for manager review.",
+                }
+                body = "Worker report is ready for manager review."
+            send_message(
+                layout,
+                sender=actor_id,
+                recipient="scheduler",
+                subject="scheduler.command",
+                body=body,
+                task_id=str(task_id),
+                metadata={"command": command, "args": command_args},
             )
-
-    with project_write_lock(layout):
         current_actor = load_actor(layout, actor_id)
         current_actor["status"] = "stopped" if returncode == 0 else "failed"
         current_actor.setdefault("runtime", {})["exit_code"] = returncode
         current_actor["runtime"]["finished_at"] = now_iso()
         current_actor["runtime"]["changed_paths"] = list(changed_paths)
+        current_actor["runtime"]["provider_execution_state"] = "finished"
+        current_actor["runtime"]["report_sha256"] = report_sha256
         save_actor(layout, current_actor)
         append_event(
             layout,
@@ -635,7 +769,52 @@ def run_actor(layout: ProjectLayout, actor_id: str) -> int:
             output_tokens=output_tokens,
             changed_paths=list(changed_paths),
         )
+    _control_mutation(
+        layout,
+        command_name="runner_finalize",
+        command_id=f"RUNNER-FINALIZE-{attempt_id or actor_id}",
+        payload={
+            "actor_id": actor_id,
+            "attempt_id": attempt_id,
+            "exit_code": returncode,
+            "report_sha256": report_sha256,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        },
+        mutate=finalize_runner,
+    )
     return returncode
+
+
+def run_actor(
+    layout: ProjectLayout,
+    actor_id: str,
+    *,
+    attempt_id: str | None = None,
+    launch_token: str | None = None,
+) -> int:
+    """Run one actor, fencing task workers for their entire provider lifetime."""
+
+    with project_write_lock(layout):
+        actor = _validate_worker_fence(
+            layout,
+            actor_id,
+            attempt_id=attempt_id,
+            launch_token=launch_token,
+        )
+    if actor.get("role") != "agent":
+        return _run_actor_once(layout, actor_id, attempt_id=None, launch_token=None)
+    lock_path = layout.project_dir / "locks" / "attempts" / f"{slugify(str(attempt_id), 'attempt')}.runtime.lock"
+    try:
+        with advisory_file_lock(lock_path, timeout_seconds=0.25):
+            return _run_actor_once(
+                layout,
+                actor_id,
+                attempt_id=attempt_id,
+                launch_token=launch_token,
+            )
+    except ProjectLockTimeout as exc:
+        raise SystemExit("worker launch rejected: another runner owns this attempt") from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -643,13 +822,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--project", required=True)
     parser.add_argument("--actor", required=True)
+    parser.add_argument("--attempt")
+    parser.add_argument("--launch-token")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     layout = resolve_project(args.root, args.project)
-    return run_actor(layout, args.actor)
+    return run_actor(layout, args.actor, attempt_id=args.attempt, launch_token=args.launch_token)
 
 
 if __name__ == "__main__":

@@ -50,10 +50,10 @@ def main() -> int:
         subprocess.run(["git", "-C", str(workspace), "add", "."], check=True)
         subprocess.run(["git", "-C", str(workspace), "commit", "-qm", "baseline"], check=True)
 
-        init = json.loads(cli(temp, "init", "--name", "security", "--objective", "actor isolation", "--workspace", str(workspace), "--backend", "local", "--governance", "off").stdout)
+        init = json.loads(cli(temp, "init", "--name", "security", "--objective", "actor isolation", "--workspace", str(workspace), "--backend", "local", "--governance", "off", "--allow-unsafe-native-workers").stdout)
         project_dir = Path(init["project"])
         cli(temp, "new-task", "--project", str(project_dir), "--title", "edit", "--purpose", "bounded edit", "--task-type", "small-edit", "--risk", "low", "--allowed-path", "src/app.py", "--claim-path", "src/app.py")
-        dispatched = json.loads(cli(temp, "dispatch", "--project", str(project_dir), "--task", "V2-0001").stdout)
+        dispatched = json.loads(cli(temp, "dispatch", "--project", str(project_dir), "--task", "V2-0001", "--unsafe-native").stdout)
         layout = ProjectLayout(root=temp / "runtime", project_dir=project_dir)
         actor = load_actor(layout, dispatched["actor_id"])
         project = load_project(layout)

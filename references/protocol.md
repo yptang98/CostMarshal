@@ -20,7 +20,7 @@ Only `record-result --status done --accepted-by-leader` may create `done`. A wor
 
 ## Attempt fencing
 
-Every attempt has a unique `attempt_id`, actor ID, provider ID, and tier. Worker usage, collect, and escalation commands carry actor and attempt identity. A command from an older attempt is rejected after a stronger attempt exists.
+Every attempt has a unique `attempt_id`, actor ID, provider ID, tier, and launch token. The runner holds an attempt-specific lifetime lock, revalidates the current task/attempt/actor binding, and registers a process start marker before invoking a provider. A duplicate runner or an attempt whose prior execution outcome is unknown must not invoke the provider.
 
 Mailbox message IDs are idempotency keys. Replaying task creation, dispatch, escalation, collection, usage, or result commands must not duplicate their durable effect.
 
@@ -29,6 +29,27 @@ Mailbox message IDs are idempotency keys. Replaying task creation, dispatch, esc
 Safety establishes a minimum tier. Complete, reviewed price and token inputs enable cross-tier chain optimization. Incomplete economic inputs fall back to the minimum safe available tier.
 
 Escalation selects the next enabled stronger tier; a two-tier legacy catalog may skip a missing medium tier.
+
+### Pricing snapshot gate
+
+Non-beta pricing is a nested, immutable snapshot containing currency, source,
+review/effective/expiry timestamps, snapshot ID, canonical SHA-256 hash, normal
+input, cached input, output, and fixed-request rates. Routing evaluates
+freshness against an injected or UTC clock. A future-reviewed, future-effective,
+expired, mixed-currency, mixed canonical/legacy, hash-mismatched, or unsupported
+snapshot cannot emit a CNY estimate; unbudgeted routing degrades explicitly to
+the safe tier, while budget enforcement fails closed on the missing estimate.
+
+Flat `input_cny_per_1m` and `output_cny_per_1m` values are beta legacy
+compatibility only. They remain readable for existing v2.3 projects, but do not
+carry provenance, freshness, cached-input pricing, fixed fees, or an immutable
+snapshot.
+
+## Execution isolation
+
+Production worker dispatch uses `required` isolation and may select only an attested local Docker/Podman Linux engine with a digest-pinned image. Native execution is never a fallback. Unsafe native development execution requires two explicit opt-ins and records a weak attestation. Required governance forbids it.
+
+The beta OCI contract validates mounts, rootfs, UID, capabilities, no-new-privileges, engine locality, image digest, resources, and canary output before state or budget reservation. Required execution remains fail-closed until the container snapshot/profile/credential/report exchange adapter is enabled.
 
 ## Write isolation
 
@@ -51,6 +72,8 @@ A priced attempt reserves its estimated cost at dispatch. Project commitment is 
 
 ArchMarshal checks are explicit and read-only. Required binding drift blocks dispatch, launch, and recovery restart. CostMarshal never performs ArchMarshal lifecycle mutations.
 
-## Recovery boundary
+## Transaction and recovery boundary
 
-The v2.3-beta state backend is multiple atomic JSON files plus append-only JSONL ledgers behind an OS writer lock. It is concurrency-safe for covered writers but not fully crash-atomic across a multi-file dispatch or escalation. Run `validate` and `recover` after hard termination.
+Legacy projects use atomic JSON/JSONL until an explicit offline `migrate-state --apply`. Cutover creates a full backup and staged SQLite database, validates integrity and foreign keys, installs the database, then writes `state-backend.json` last. After the marker, SQLite WAL is authoritative for mutable JSON/JSONL control views; a missing or malformed enabled database fails closed.
+
+Pure commands commit their state, ledger, event, and mailbox view mutations together under a payload-hashed command ID. Dirty compatibility views are rebuilt after a post-commit crash. OS spawn/stop remains a separate effect boundary; those commands are blocked on SQLite-backed projects until the leased effect outbox and runner self-registration path are complete.
