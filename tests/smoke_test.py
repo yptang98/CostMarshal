@@ -241,7 +241,7 @@ def main() -> int:
             "--task",
             "V2-0001",
             "--state",
-            "done",
+            "waiting_leader",
             "--report",
             str(project / "tasks" / "V2-0001" / "missing-report.md"),
             expect_ok=False,
@@ -250,7 +250,7 @@ def main() -> int:
 
         report = project / "tasks" / "V2-0001" / "completion-report.md"
         report.write_text("# Completion Report: V2-0001\n\nStatus: done\n\n## Result\nSmoke done.\n", encoding="utf-8")
-        collect = run_json(temp, "collect", "--project", str(project), "--task", "V2-0001", "--state", "done")
+        collect = run_json(temp, "collect", "--project", str(project), "--task", "V2-0001", "--state", "waiting_leader")
         assert_true(collect["actor_id"] == "agent-v2-0001", "collect should infer the task actor")
         result = run_json(
             temp,
@@ -303,7 +303,7 @@ def main() -> int:
             "--project",
             str(project),
             "--task",
-            "V2-missing",
+            "V2-9999",
             "--scope",
             "Missing task",
             "--reason",

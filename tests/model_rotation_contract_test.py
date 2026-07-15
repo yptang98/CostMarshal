@@ -16,7 +16,7 @@ CLI = ROOT / "scripts" / "costmarshal.py"
 
 def run(temp: Path, env: dict[str, str], *args: str, expect_ok: bool = True) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
-        [sys.executable, str(CLI), "--root", str(temp), *args],
+        [sys.executable, str(CLI), "--root", str(temp / "runtime"), *args],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -51,7 +51,6 @@ def main() -> int:
         fake_codex.write_text(
             """from __future__ import annotations
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -61,9 +60,9 @@ profile = args[args.index('--profile') + 1] if '--profile' in args else 'codex-d
 model = args[args.index('--model') + 1] if '--model' in args else 'inherit'
 report = Path(args[args.index('--output-last-message') + 1])
 prompt = sys.stdin.read()
-with Path(os.environ['FAKE_CODEX_LOG']).open('a', encoding='utf-8') as handle:
+with Path(__file__).with_name('fake-codex.jsonl').open('a', encoding='utf-8') as handle:
     handle.write(json.dumps({'profile': profile, 'model': model, 'prompt_seen': 'Assigned Task' in prompt}) + '\\n')
-if profile == 'longcat':
+if profile in {'longcat', 'deepseek'}:
     report.write_text('# Completion Report\\n\\nStatus: escalate\\n\\n## Result\\nNeed stronger reasoning.\\n', encoding='utf-8')
 else:
     report.write_text('# Completion Report\\n\\nStatus: done\\n\\n## Result\\nCodex completed escalation.\\n', encoding='utf-8')
@@ -73,7 +72,6 @@ print(json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 11, 'outpu
         )
         env = dict(os.environ)
         env["COSTMARSHAL_CODEX_COMMAND_JSON"] = json.dumps([sys.executable, str(fake_codex)])
-        env["FAKE_CODEX_LOG"] = str(fake_log)
 
         profile_home = temp / "codex-home"
         configured = run_json(temp, env, "configure-profiles", "--codex-home", str(profile_home))
@@ -89,7 +87,7 @@ print(json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 11, 'outpu
             "--name",
             "rotation",
             "--objective",
-            "Prove LongCat to Codex rotation",
+            "Prove low to medium to high rotation",
             "--workspace",
             str(workspace),
             "--backend",
@@ -114,26 +112,34 @@ print(json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 11, 'outpu
         dispatched = run_json(temp, env, "dispatch", "--project", str(project), "--task", "V2-0001", "--start")
         assert dispatched["actor_id"] == "agent-v2-0001"
 
-        wait_until(lambda: fake_log.is_file() and len(fake_log.read_text(encoding="utf-8").splitlines()) >= 1)
+        try:
+            wait_until(lambda: fake_log.is_file() and len(fake_log.read_text(encoding="utf-8").splitlines()) >= 1)
+        except AssertionError as exc:
+            logs = list((project / "transcripts").glob("*.log"))
+            detail = "\n".join(path.read_text(encoding="utf-8", errors="replace") for path in logs)
+            raise AssertionError(f"timed out waiting for actor process\n{detail}") from exc
         run_json(temp, env, "run-scheduler", "--project", str(project), "--once")
         wait_until(lambda: fake_log.is_file() and len(fake_log.read_text(encoding="utf-8").splitlines()) >= 2)
         run_json(temp, env, "run-scheduler", "--project", str(project), "--once")
+        wait_until(lambda: fake_log.is_file() and len(fake_log.read_text(encoding="utf-8").splitlines()) >= 3)
+        run_json(temp, env, "run-scheduler", "--project", str(project), "--once")
 
         rows = [json.loads(line) for line in fake_log.read_text(encoding="utf-8").splitlines() if line.strip()]
-        assert [row["profile"] for row in rows[:2]] == ["longcat", "codex-default"], rows
-        assert all(row["prompt_seen"] for row in rows[:2]), rows
+        assert [row["profile"] for row in rows[:3]] == ["longcat", "deepseek", "codex-default"], rows
+        assert all(row["prompt_seen"] for row in rows[:3]), rows
         task = json.loads((project / "tasks" / "V2-0001" / "task.json").read_text(encoding="utf-8"))
-        assert [attempt["provider"] for attempt in task["attempts"]] == ["longcat", "codex"], task["attempts"]
+        assert [attempt["provider"] for attempt in task["attempts"]] == ["longcat", "deepseek", "codex"], task["attempts"]
+        assert [attempt["tier"] for attempt in task["attempts"]] == ["low", "medium", "high"], task["attempts"]
         assert task["status"] == "waiting_leader", task
         attempt_reports = sorted((project / "tasks" / "V2-0001" / "attempts").glob("*.md"))
-        assert len(attempt_reports) == 2, attempt_reports
+        assert len(attempt_reports) == 3, attempt_reports
         attempt_texts = [path.read_text(encoding="utf-8") for path in attempt_reports]
         assert any("Status: escalate" in text for text in attempt_texts), attempt_texts
         assert any("Status: done" in text for text in attempt_texts), attempt_texts
         assert "Codex completed escalation" in (project / "tasks" / "V2-0001" / "completion-report.md").read_text(encoding="utf-8")
         usage = [json.loads(line) for line in (project / "reports" / "usage.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
         assert {row["model"] for row in usage} >= {"LongCat-2.0", "inherit"}, usage
-        print(json.dumps({"status": "ok", "profiles": [row["profile"] for row in rows[:2]]}, indent=2))
+        print(json.dumps({"status": "ok", "profiles": [row["profile"] for row in rows[:3]]}, indent=2))
         return 0
     finally:
         shutil.rmtree(temp, ignore_errors=True)

@@ -163,6 +163,7 @@ def main() -> int:
             "tmux",
             "--backend-command",
             str(fake_tmux),
+            "--allow-unsafe-custom-worker-commands",
         )
         project = Path(init["project"])
         assert_true(init["backend"] == "tmux", "tmux contract should explicitly select the tmux backend")

@@ -1,306 +1,51 @@
-# Storage And Documentation Standard
+# CostMarshal v2.3 Storage
 
-## Global Root
-
-The CostMarshal root is selected in this order:
-
-1. `--root <dir>`
-2. `COSTMARSHAL_HOME`
-3. `MMC_HOME`
-4. `MULTI_MODEL_CONDUCTOR_HOME`
-5. `$CODEX_HOME/costmarshal`
-6. `~/.codex/costmarshal`
-
-Use `python scripts/costmarshal.py init-root` to create it.
+The runtime root defaults to `$COSTMARSHAL_V2_HOME`, then `$CODEX_HOME/costmarshal-v2`, then `~/.codex/costmarshal-v2`.
 
 ```text
-<root>/
-  config/
-    agents.json
-  memory/
-    agent-memory.json
-    events.jsonl
-  projects/
-    <timestamp>-<slug>/
-```
-
-`memory/agent-memory.json` is the global rolling model memory. It stores aggregate performance by agent and task type. `memory/events.jsonl` is append-only evidence.
-
-`memory/evolution-events.jsonl` records project-level evolution events. `memory/evolution-policy.json` stores the latest routing and retrieval policy generated from project evidence. `memory/knowledge-index.json` is the small hierarchical retrieval entrypoint for reusable lessons, grouped by task type. Full lesson files live under `memory/knowledge/<task-type>/<lesson>.md`; future tasks should attach at most one matching lesson unless the leader approves more context.
-
-## Project Directory
-
-Every new project must be created with `costmarshal.py new-project`. If a project already exists outside CostMarshal, create a normal CostMarshal control layer with `costmarshal.py adopt-project --path <existing-project>` instead of bypassing the project protocol.
-
-```text
-<project>/
+<runtime>/projects/<project-id>/
   project.json
-  adopted-project.json
-  imported-progress.md
-  reusable-candidates.md
-  master-snapshot.md
-  plan-approval.md
-  branch-tree.json
-  branch-tree.md
-  checks/
-    connectivity.json
-  locks/
-    claims.json
-  handoffs/
-    HF-0001.md
-  tasks/
-    CM-0001/
-      branch-card.json
-      branch-card.md
-      brief.md
-      status.json
-      completion-report.md
-      DONE | FAILED | ESCALATE
-      raw/
-        worker-output.md
-        worker-response.json
-        worker-error.md
-      artifacts/
-  memory/
-    handoffs.jsonl
-    leader-self-work.jsonl
-    leader-review-policy.jsonl
-    model-performance.jsonl
-    replay-feedback.jsonl
-    replay/
-      <task-type>/
-        <memory-name>/
-          memory.md
-          metadata.json
-          feedback.jsonl
+  session.json
+  protocol.md
+  scheduler/
+    scheduler.json
+    relay-cursors.json
+    locks.json
+    actors/
+    mailboxes/
+  tasks/<task-id>/
+    task.json
+    status.json
+    brief.md
+    completion-report.md
+    attempts/
   reports/
-    project-summary.md
-  runbooks/
-  artifacts/
-  raw/
-    adoption-scan.json
+    results.jsonl
+    usage.jsonl
+    leader-work.jsonl
+  actor-homes/
+  worktrees/
+  transcripts/
+  events.jsonl
 ```
 
-`adopted-project.json`, `imported-progress.md`, `reusable-candidates.md`, and `raw/adoption-scan.json` exist only for adopted projects. They summarize the source project read-only and do not approve the plan or create trusted replay memory.
+## Sources of truth
 
-Research projects also get:
+- `project.json`: provider catalog, routing/budget policy, workspace, and governance binding.
+- `task.json`: task and attempt state, route decisions, reservations, actual cost, and leader result.
+- actor JSON: runtime identity and process metadata.
+- `results.jsonl`: immutable leader judgments used by routing history.
+- `usage.jsonl`: immutable usage deltas.
+- `events.jsonl`: audit events and completed scheduler command IDs.
+- `locks.json`: active logical write claims.
+- `locks/project.lock`: OS advisory single-writer gate.
 
-```text
-research/
-  idea-tree/
-  evals/
-  runs/
-  literature/
-  reports/
-```
+`status.json` is a materialized task status view and must match `task.json` under `validate`.
 
-## Branch Tree
+## Compatibility
 
-`branch-tree.json` is the authoritative tree. `branch-tree.md` is a rendered human-readable view. Never hand-edit both manually; use `costmarshal.py new-task` and `costmarshal.py set-status`.
+Projects created before provider catalogs load a legacy LongCat/Codex low/high catalog. New projects always persist a validated low/medium/high catalog. Malformed explicit catalogs never fall back silently.
 
-Tree rules:
-- root node represents the project objective
-- every dispatched unit is a child task node
-- every task has one parent
-- a task can have child tasks when it is decomposed, retried, or escalated
-- task states are `planned`, `running`, `done`, `failed`, `escalate`, or `cancelled`
+## Crash behavior
 
-## Plan Approval
-
-Every new project starts with `project.json.plan_approval.status = not_drafted` and a `plan-approval.md` placeholder.
-
-Adopted projects follow the same rule. `adopt-project` imports existing progress into the project directory, but `new-task` remains blocked until the leader writes a plan with `draft-plan`, shows it to the user, and records approval with `approve-plan`.
-
-## Orchestration Mode
-
-Every project records an `orchestration` object in `project.json`:
-
-```json
-{
-  "requested_mode": "auto",
-  "effective_mode": "cost-saving",
-  "default_intent": "cost-saving",
-  "fallback_used": false,
-  "configured_cheap_agents": ["deepseek"]
-}
-```
-
-`auto` is the default. It resolves to `cost-saving` when at least one enabled medium/low agent has its required API key configured. It resolves to `same-agent` when no cheap worker is configured, so CostMarshal can still manage context, branch trees, structured reports, handoffs, waits, and project memory with the strong agent form.
-
-Before creating worker tasks, the leader must draft the initial plan and predictions:
-
-```bash
-python scripts/costmarshal.py draft-plan --project <project> --summary "..." --step "..." --task "..." --agent-plan "..." --predicted-cost-cny 3 --predicted-wall-time "30m" --acceptance "..." --verification "..." --risk "..."
-```
-
-The leader shows `plan-approval.md` to the user. After the user confirms, record approval:
-
-```bash
-python scripts/costmarshal.py approve-plan --project <project> --approved-by user
-```
-
-`new-task` rejects worker task creation until `project.json.plan_approval.status` is `approved`. Use `--allow-unapproved-plan` only for an explicit manual override after user confirmation happened outside the stored CostMarshal state.
-
-## Agent Memory
-
-Write to both current project memory and global memory after every meaningful worker outcome:
-- successful completion
-- bad answer
-- escalation
-- timeout or connection failure
-- strong reusable success worth promoting into a runbook
-
-Required event fields are generated by `costmarshal.py record-result`: agent, model when known, task type, difficulty, risk, status, quality score, acceptance, tests, rework count, input/output tokens, estimated cost, and note.
-
-Leader should use `costmarshal.py recommend` before dispatch. Early projects will return strict verification because the memory is sparse. Verification may relax after repeated accepted high-quality results for a specific agent and task type.
-
-## Leader Self-Work Memory
-
-Leader direct implementation-like work is stored separately from worker scorecards:
-
-```text
-memory/leader-self-work.jsonl
-```
-
-Use:
-
-```bash
-python scripts/costmarshal.py record-leader-work --project <project> --task CM-0001 --work-type integration --risk low --scope "Small final glue edit" --reason "Delegation would add coordination risk"
-```
-
-Each row records `event_type=leader_self_work`, project id, optional task id, work type, risk, bounded scope, reason, touched files, minutes, token estimates, and estimated CNY cost. These rows are appended to global `memory/events.jsonl` for audit, but they are not fed into worker scorecards. They do count toward project spend when an estimated cost is provided, and they appear in `status-project` and `finish-project`.
-
-## Leader Review Policy
-
-Every project has a leader review policy in `project.json`:
-
-```json
-{
-  "leader_review": {
-    "level": "auto",
-    "updated_at": "2026-07-08T00:00:00+08:00",
-    "reason": "Adapt leader participation from task risk, difficulty, and evidence."
-  }
-}
-```
-
-Changes are appended to:
-
-```text
-memory/leader-review-policy.jsonl
-```
-
-Use:
-
-```bash
-python scripts/costmarshal.py set-leader-review --project <project> --level auto --reason "Adapt verification depth to risk and evidence"
-```
-
-`new-check-task` uses this policy unless `--leader-review-level high|medium|low|auto` is provided. `auto` resolves to high for high-risk or S-difficulty checks, low for low-risk B/C checks, and medium otherwise.
-
-## Budget, Dependencies, Locks, And Handoffs
-
-New projects default to a CNY 20 project budget. Override only when needed:
-
-```bash
-python scripts/costmarshal.py new-project --name run --objective "..." --max-project-cost-cny 50
-```
-
-Use `--depends-on` for prerequisites. A task cannot enter `running` until every dependency is `done`.
-
-Use `--claim-path` for paths a task may write. Active overlapping claims are rejected unless the new task depends on the current claimant or the leader explicitly uses `--allow-lock-conflict`.
-
-Use `record-handoff` to create compressed task-to-task context in `handoffs/` and `memory/handoffs.jsonl`. Use `new-review-task` for bounded cross-agent review of another task's report and evidence. Use `status-project` to inspect tasks, active claims, budget, replay memory health, agent costs, model names, task summaries, leader self-work exceptions, and wait time.
-
-## Read-Only Worker Runner
-
-`costmarshal.py run-task` can execute one task with an OpenAI-compatible configured worker:
-
-```bash
-python scripts/costmarshal.py run-task --project <project> --task CM-0001 --dry-run
-python scripts/costmarshal.py run-task --project <project> --task CM-0001
-```
-
-The runner stores raw provider output under `tasks/<task>/raw/`, writes `completion-report.md`, updates `status.json`, and appends a usage event with token/cost data to `memory/model-performance.jsonl` and global `memory/events.jsonl`. Leader acceptance and quality must still be recorded separately with `record-result`.
-
-The runner is intentionally read-only. It does not execute shell commands and does not modify files outside the task directory. It skips `raw/` context by default unless `--allow-raw-context` is explicit.
-
-## Replay Memory
-
-When a strong agent proves a reusable workflow, the leader classifies the path by task type and promotes the source task into one complete replay memory file:
-
-```bash
-python scripts/costmarshal.py promote-memory --project <project> --source-task CM-0001 --name reusable-flow --memory-task-type mechanical --summary "Exact replayable procedure" --working-dir "." --required-input "config.yaml exists" --allowed-param "top_k" --allowed-command "python run_eval.py --config config.yaml" --expected-output "results.json" --success-marker "command exits 0"
-```
-
-This creates:
-
-```text
-memory/replay/<task-type>/<memory-name>/memory.md
-memory/replay/<task-type>/<memory-name>/metadata.json
-```
-
-Attach the replay memory to cheaper replay tasks:
-
-```bash
-python scripts/costmarshal.py new-task --project <project> --title "Replay proven flow" --purpose "Run with new explicit parameters" --agent longcat --difficulty B --risk low --task-type mechanical --replay-memory reusable-flow --depends-on CM-0001
-```
-
-Weak agents may use the replay memory file, but should not see the senior raw transcript by default.
-
-Complete replay memory requires: source task `done`, non-empty completion report, task classification, working directory, required inputs, allowed parameter changes, exact allowed commands, expected outputs, success markers, and failure protocol. `promote-memory` rejects incomplete memory unless `--draft` is set. Draft memory cannot be attached to weak-agent tasks.
-
-Replay memory quality is updated after weak-agent attempts:
-
-```bash
-python scripts/costmarshal.py record-memory-feedback --project <project> --task CM-0002 --outcome partial --sufficient no --memory-quality 2 --attribution memory_issue --needs-senior-refresh --issue "Missing required input path"
-```
-
-Feedback is appended to both project `memory/replay-feedback.jsonl` and the specific memory's `feedback.jsonl`. If feedback is attributed to `memory_issue` or requests senior refresh, metadata status becomes `needs_revision`, and future weak-agent tasks cannot attach that memory until a senior agent revises it with `promote-memory --force`.
-
-If feedback is attributed to `agent_capability`, do not downgrade the replay memory by default. The leader should adjust model routing because a complete memory file does not guarantee every weak agent can execute that task class.
-
-## Connectivity Check
-
-Run `costmarshal.py check-agents --project <project>` at project start. This checks that required environment variables are present and records results in `checks/connectivity.json`.
-
-Run `costmarshal.py check-agents --project <project> --live` only after provider base URL environment variables are configured, for example `DEEPSEEK_BASE_URL`, `MOONSHOT_BASE_URL`, and `LONGCAT_BASE_URL`.
-
-`check-agents` automatically loads local env files without printing secret values. Search locations include:
-- `COSTMARSHAL_SECRETS_FILE`
-- `$CODEX_HOME/.sandbox-secrets/costmarshal.env`
-- `~/.codex/.sandbox-secrets/costmarshal.env`
-- `<CostMarshal root>/config/secrets.env`
-- `<CostMarshal root>/secrets.env`
-
-Use `--secrets-file <path>` when a project should use a specific key file.
-
-Set `COSTMARSHAL_NO_AUTO_SECRETS=1` for tests or isolated runs that should not search ambient secret locations. Explicit `COSTMARSHAL_SECRETS_FILE` or `--secrets-file` paths still work.
-
-Do not store API keys in project files, reports, branch cards, or raw logs.
-
-## Embedded Waits
-
-Do not require a separate WakeWait installation. CostMarshal includes embedded wait commands:
-
-```bash
-python scripts/costmarshal.py sleep --duration 10m
-python scripts/costmarshal.py wait-task --project <project> --task CM-0001 --every 30s --timeout 1h
-python scripts/costmarshal.py wait-file --path <path> --every 30s --timeout 1h
-python scripts/costmarshal.py wait-contains --path <log> --text DONE --every 30s --timeout 1h
-python scripts/costmarshal.py wait-command --command "<check command>" --every 30s --timeout 1h
-```
-
-`wait-task` appends durable telemetry to `memory/wait-events.jsonl`, including task id, target states, timeout, result, final task state, and elapsed seconds. `status-project` and `finish-project` aggregate those rows so each task shows accumulated wait time.
-
-Compatibility scripts live inside the CostMarshal skill at `scripts/wakewait.ps1` and `scripts/wakewait.sh`.
-
-## Project Completion
-
-At the end of a project, run:
-
-```bash
-python scripts/costmarshal.py finish-project --project <project>
-```
-
-This creates `reports/project-summary.md` with per-agent performance, input/output token totals, estimated CNY cost, per-task model names, task summaries, leader self-work exceptions, and wait-time totals. It also runs project evolution by default, creating `reports/evolution-report.md`, appending evolution evidence, updating global routing policy, and promoting compact reusable lessons into the hierarchical knowledge index. The leader should then add final conclusions and promote exact repeated procedures into replay memory when command-level reproduction is required.
+Individual JSON replacements are atomic and JSONL rows are append-only, but a command that updates several files is not one database transaction. Idempotency keys and attempt fencing make replay safer; recovery and validation remain required after an unclean stop. A future non-beta state version should use a transactional store with unique command IDs and a transactional outbox.

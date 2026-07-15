@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .paths import ProjectLayout, relpath, slugify
+from .security import SecurityValidationError, validate_actor_id, validate_task_id
 
 
 SCHEMA_VERSION = 2
@@ -73,6 +74,8 @@ def append_jsonl(path: Path, row: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(redact(row), ensure_ascii=False, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -135,11 +138,19 @@ def ensure_runtime_dirs(layout: ProjectLayout) -> None:
 
 
 def actor_file(layout: ProjectLayout, actor_id: str) -> Path:
-    return layout.actors_dir / f"{slugify(actor_id, 'actor')}.json"
+    try:
+        safe_actor_id = validate_actor_id(actor_id)
+    except SecurityValidationError as exc:
+        raise SystemExit(str(exc)) from exc
+    return layout.actors_dir / f"{slugify(safe_actor_id, 'actor')}.json"
 
 
 def actor_prompt_file(layout: ProjectLayout, actor_id: str) -> Path:
-    return layout.actors_dir / f"{slugify(actor_id, 'actor')}.prompt.md"
+    try:
+        safe_actor_id = validate_actor_id(actor_id)
+    except SecurityValidationError as exc:
+        raise SystemExit(str(exc)) from exc
+    return layout.actors_dir / f"{slugify(safe_actor_id, 'actor')}.prompt.md"
 
 
 def actor_exists(layout: ProjectLayout, actor_id: str) -> bool:
@@ -147,7 +158,11 @@ def actor_exists(layout: ProjectLayout, actor_id: str) -> bool:
 
 
 def task_dir(layout: ProjectLayout, task_id: str) -> Path:
-    return layout.tasks_dir / task_id
+    try:
+        safe_task_id = validate_task_id(task_id)
+    except SecurityValidationError as exc:
+        raise SystemExit(str(exc)) from exc
+    return layout.tasks_dir / safe_task_id
 
 
 def task_json(layout: ProjectLayout, task_id: str) -> Path:

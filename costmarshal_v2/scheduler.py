@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import io
 import json
 import os
@@ -25,6 +26,20 @@ from .session_backend import (
     session_backend_kind,
     session_name as backend_session_name,
 )
+from .security import SecurityValidationError, normalize_claim_path as secure_normalize_claim_path, normalize_path_list
+from .routing import (
+    TIER_RANK,
+    RoutingValidationError,
+    decide_route,
+    default_provider_catalog,
+    estimate_cost_cny as estimate_provider_cost,
+    next_stronger_provider,
+    project_provider_catalog,
+    provider_by_id,
+    validate_provider_catalog,
+)
+from .governance import GovernanceError, inspect_governance, validate_governance_binding
+from .locking import ProjectLockTimeout, project_write_lock, scheduler_instance_lock
 from .state import (
     ACTOR_STATES,
     ACTIVE_TASK_STATES,
@@ -74,17 +89,7 @@ SCHEDULER_COMMANDS = {
     "escalate_task",
 }
 
-PROVIDERS = {"auto", "codex", "longcat"}
-LONGCAT_TASK_TYPES = {
-    "analysis",
-    "documentation",
-    "extraction",
-    "mechanical",
-    "small-edit",
-    "summarization",
-    "test",
-    "verification",
-}
+PROVIDERS = {"auto", "codex", "deepseek", "longcat"}
 
 
 def print_json(payload: dict[str, Any]) -> None:
@@ -153,20 +158,24 @@ def actor_launch_command(layout: ProjectLayout, session: dict[str, Any], actor: 
     return default_actor_argv(layout, actor)
 
 
-def route_provider(task: dict[str, Any], requested: str | None = None) -> str:
-    value = str(requested or task.get("provider") or task.get("agent_name") or "auto").lower()
-    if value not in PROVIDERS:
-        value = "auto"
-    if value != "auto":
-        return value
-    if str(task.get("risk") or "low") == "high":
-        return "codex"
-    if str(task.get("difficulty") or "normal") == "hard":
-        return "codex"
-    return "longcat" if str(task.get("task_type") or "analysis") in LONGCAT_TASK_TYPES else "codex"
+def route_provider(
+    task: dict[str, Any],
+    requested: str | None = None,
+    *,
+    project: dict[str, Any] | None = None,
+    history: list[dict[str, Any]] | None = None,
+) -> str:
+    """Compatibility wrapper around the fail-closed tier router."""
+
+    catalog = project_provider_catalog(project or {})
+    value = requested or task.get("provider_request") or task.get("provider") or "auto"
+    provider_id = None if value == "auto" else str(value).lower()
+    return decide_route(task, catalog, requested_provider_id=provider_id, history=history).provider_id
 
 
 def provider_defaults(provider: str, model: str | None, profile: str | None) -> tuple[str, str | None]:
+    if provider == "deepseek":
+        return (model if model and model != "inherit" else "inherit", profile or "deepseek")
     if provider == "longcat":
         return (model if model and model != "inherit" else "LongCat-2.0", profile or "longcat")
     return (model or "inherit", profile)
@@ -180,7 +189,9 @@ def actor_summary(actor: dict[str, Any]) -> dict[str, Any]:
         "status": actor.get("status"),
         "model": actor.get("model"),
         "provider": actor.get("provider"),
+        "tier": actor.get("tier"),
         "profile": actor.get("profile"),
+        "attempt_id": actor.get("attempt_id"),
         "task_id": actor.get("task_id"),
         "path": f"scheduler/actors/{slugify(actor['id'], 'actor')}.json",
         "prompt_path": actor.get("prompt_path"),
@@ -202,9 +213,10 @@ def require_task(layout: ProjectLayout, task_id: str) -> None:
 
 
 def normalize_claim_path(path: str) -> str:
-    normalized = path.replace("\\", "/").strip().strip("/")
-    normalized = "/".join(part for part in normalized.split("/") if part)
-    return normalized.lower() or "."
+    try:
+        return secure_normalize_claim_path(path).casefold()
+    except SecurityValidationError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def paths_conflict(left: str, right: str) -> bool:
@@ -213,6 +225,11 @@ def paths_conflict(left: str, right: str) -> bool:
     if left_norm == "." or right_norm == ".":
         return True
     return left_norm == right_norm or left_norm.startswith(right_norm + "/") or right_norm.startswith(left_norm + "/")
+
+
+def path_is_claimed(path: str, claims: list[str]) -> bool:
+    path_norm = normalize_claim_path(path)
+    return any(path_norm == normalize_claim_path(claim) or path_norm.startswith(normalize_claim_path(claim) + "/") for claim in claims)
 
 
 def load_locks(layout: ProjectLayout) -> dict[str, Any]:
@@ -296,8 +313,11 @@ def assign_task_claim_actor(layout: ProjectLayout, task_id: str, actor_id: str) 
     locks = load_locks(layout)
     changed = False
     for claim in locks.get("claims", []):
-        if claim.get("task_id") == task_id and claim.get("state") == "active":
+        if claim.get("task_id") == task_id:
             claim["actor_id"] = actor_id
+            claim["state"] = "active"
+            claim.pop("released_at", None)
+            claim.pop("final_task_state", None)
             claim["updated_at"] = now_iso()
             changed = True
     if changed:
@@ -504,7 +524,10 @@ def make_actor(
     task_id: str | None = None,
     agent_name: str | None = None,
     provider: str = "codex",
+    tier: str = "high",
     profile: str | None = None,
+    env_key: str | None = None,
+    attempt_id: str | None = None,
     status: str = "configured",
 ) -> dict[str, Any]:
     mailbox = ensure_mailbox(layout, actor_id)
@@ -516,7 +539,10 @@ def make_actor(
         "status": status,
         "model": model,
         "provider": provider,
+        "tier": tier,
         "profile": profile,
+        "env_key": env_key,
+        "attempt_id": attempt_id,
         "agent_name": agent_name,
         "task_id": task_id,
         "created_at": now_iso(),
@@ -559,7 +585,7 @@ def protocol_text() -> str:
             "## Roles",
             "- Scheduler: creates actors, writes mailbox messages, checks heartbeats, records events, and recovers sessions.",
             "- Leader: an on-demand Codex manager that plans, decomposes work, verifies reports, and owns final acceptance.",
-            "- Agent: executes one bounded task through an explicit Codex or LongCat profile and returns structured status/report files.",
+            "- Agent: executes one bounded task through an explicit low, medium, or high provider profile and returns a structured report.",
             "",
             "## Isolation",
             "- Actors communicate through `scheduler/mailboxes/<actor>/`.",
@@ -570,7 +596,7 @@ def protocol_text() -> str:
             "## Return Protocol",
             "- Agents return one structured final response; the actor runner writes `completion-report.md` and task status.",
             "- The actor runner records usage and asks the scheduler to collect or escalate the task.",
-            "- LongCat escalates to a fresh Codex attempt instead of expanding context or changing write scope on its own.",
+            "- A failed low/medium attempt escalates to a fresh actor at the next enabled stronger tier.",
             "",
             "## Actor-Authored Scheduler Commands",
             "Append JSONL to your outbox. Example:",
@@ -592,7 +618,6 @@ def command_init(args: Any) -> None:
     if project_dir.exists():
         raise SystemExit(f"Project already exists: {project_dir}")
     layout = ProjectLayout(root=root, project_dir=project_dir)
-    ensure_runtime_dirs(layout)
     source_project = Path(args.source_project).expanduser().resolve() if args.source_project else None
     if source_project and not source_project.is_dir():
         raise SystemExit(f"Source project not found: {source_project}")
@@ -600,10 +625,58 @@ def command_init(args: Any) -> None:
     workspace = Path(workspace_arg).expanduser().resolve() if workspace_arg else Path.cwd().resolve()
     if not workspace.is_dir():
         raise SystemExit(f"Workspace not found: {workspace}")
+    try:
+        workspace.relative_to(root)
+        raise SystemExit("Actor workspace must not be inside the CostMarshal runtime root")
+    except ValueError:
+        pass
+    try:
+        root.relative_to(workspace)
+        raise SystemExit("CostMarshal runtime root must not be inside the actor workspace")
+    except ValueError:
+        pass
+    if source_project is not None:
+        try:
+            workspace.relative_to(source_project)
+            raise SystemExit("Writable workspace must be disjoint from the read-only source project")
+        except ValueError:
+            pass
+        try:
+            source_project.relative_to(workspace)
+            raise SystemExit("Writable workspace must be disjoint from the read-only source project")
+        except ValueError:
+            pass
     secrets_arg = getattr(args, "secrets_file", None)
     secrets_file = Path(secrets_arg).expanduser().resolve() if secrets_arg else None
     if secrets_file and not secrets_file.is_file():
         raise SystemExit(f"Secrets file not found: {secrets_file}")
+    if secrets_file:
+        try:
+            secrets_file.relative_to(workspace)
+            raise SystemExit("Secrets file must be outside the actor workspace")
+        except ValueError:
+            pass
+    catalog_path = getattr(args, "provider_catalog", None)
+    try:
+        if catalog_path:
+            raw_catalog = json.loads(Path(catalog_path).expanduser().read_text(encoding="utf-8"))
+            provider_catalog = validate_provider_catalog(raw_catalog)
+        else:
+            provider_catalog = validate_provider_catalog(default_provider_catalog())
+    except (OSError, json.JSONDecodeError, RoutingValidationError) as exc:
+        raise SystemExit(f"Invalid provider catalog: {exc}") from exc
+    project_budget = require_non_negative_float(getattr(args, "project_budget_cny", None), "project-budget-cny")
+    governance_mode = str(getattr(args, "governance", None) or "auto")
+    governance_wrapper = getattr(args, "archmarshal_wrapper", None)
+    try:
+        governance_inspection = inspect_governance(
+            workspace,
+            mode=governance_mode,
+            wrapper_path=governance_wrapper,
+        )
+    except GovernanceError as exc:
+        raise SystemExit(f"ArchMarshal governance check failed [{exc.code}]: {exc}") from exc
+    ensure_runtime_dirs(layout)
     session_name = args.session_name or f"cmv2-{slugify(project_id)[:42]}"
     requested_backend = getattr(args, "backend", None) or "auto"
     backend_kind = select_backend_kind(requested_backend)
@@ -624,6 +697,25 @@ def command_init(args: Any) -> None:
         "workspace": str(workspace),
         "secrets_file": str(secrets_file) if secrets_file else None,
         "auto_escalate": bool(getattr(args, "auto_escalate", True)),
+        "allow_unsafe_custom_worker_commands": bool(getattr(args, "allow_unsafe_custom_worker_commands", False)),
+        "provider_catalog": provider_catalog,
+        "routing_policy": {
+            "version": 1,
+            "mode": "cost-performance",
+            "tier_order": ["low", "medium", "high"],
+            "project_budget_cny": project_budget,
+            "prices_require_review": True,
+        },
+        "governance": {
+            "provider": "archmarshal",
+            "mode": governance_mode,
+            "wrapper_path": str(Path(governance_wrapper).expanduser().resolve()) if governance_wrapper else None,
+            "status": governance_inspection.get("status"),
+            "ready": bool(governance_inspection.get("ready")),
+            "doctor_state": governance_inspection.get("doctor_state"),
+            "warnings": governance_inspection.get("warnings") or [],
+            "binding": governance_inspection.get("binding"),
+        },
         "manager_mode": "on-demand",
         "source_project": str(source_project) if source_project else None,
         "source_project_mode": "read-only-reference" if source_project else "none",
@@ -664,6 +756,7 @@ def command_init(args: Any) -> None:
         session_name=session_name,
         backend_kind=backend_kind,
         provider="codex",
+        tier="high",
         profile=getattr(args, "leader_profile", None),
     )
     save_actor(layout, leader)
@@ -674,14 +767,28 @@ def command_init(args: Any) -> None:
 
 
 def start_actor(layout: ProjectLayout, actor: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
+    project = load_project(layout)
+    governance = project.get("governance") or {"mode": "off"}
+    if governance.get("mode") == "required" or governance.get("ready"):
+        try:
+            validation = validate_governance_binding(
+                governance.get("binding"),
+                project.get("workspace"),
+                mode="required",
+                wrapper_path=governance.get("wrapper_path"),
+            )
+        except GovernanceError as exc:
+            raise SystemExit(f"ArchMarshal governance gate blocked actor launch [{exc.code}]: {exc}") from exc
+        if not validation.get("valid"):
+            raise SystemExit("ArchMarshal governance gate blocked actor launch: binding is not valid")
+    if actor.get("role") == "agent" and actor.get("command_template") and not project.get("allow_unsafe_custom_worker_commands"):
+        raise SystemExit("Custom worker commands are disabled because they bypass sandbox and secret isolation")
     session = load_session(layout)
     backend = backend_from_session(session)
     session_name = backend_session_name(session)
     if not session_name:
         raise SystemExit("v2 session is missing backend.session_name")
-    prompt_path = refresh_actor_prompt(layout, actor)
-    save_actor(layout, actor)
-    sync_actor_summary(layout, actor)
+    prompt_path = actor_prompt_file(layout, actor["id"])
     command = actor_launch_command(layout, session, actor)
     runtime = actor_runtime(actor)
     runtime["backend"] = backend.kind
@@ -699,6 +806,9 @@ def start_actor(layout: ProjectLayout, actor: dict[str, Any], *, dry_run: bool) 
             "prompt_file": str(prompt_path),
             "planned_commands": [command_to_string(argv) for argv in plan],
         }
+    prompt_path = refresh_actor_prompt(layout, actor)
+    save_actor(layout, actor)
+    sync_actor_summary(layout, actor)
     launch = backend.start_actor(
         session_name=session_name,
         actor_name=runtime_name,
@@ -757,7 +867,10 @@ def render_task_brief(task: dict[str, Any]) -> str:
             "## Routing",
             f"- Risk: {task.get('risk') or 'low'}",
             f"- Difficulty: {task.get('difficulty') or 'normal'}",
-            f"- Requested provider: {task.get('provider') or 'auto'}",
+            f"- Requested provider: {task.get('provider_request') or task.get('provider') or 'auto'}",
+            f"- Requested tier: {task.get('tier_request') or 'auto'}",
+            f"- Preview route: {(task.get('route_preview') or {}).get('provider_id') or 'not evaluated'}",
+            f"- Required capabilities: {', '.join(task.get('required_capabilities') or []) or 'none'}",
             "",
             "## Acceptance Criteria",
             "\n".join(f"- {item}" for item in task.get("acceptance", [])) or "- Leader acceptance is required.",
@@ -784,15 +897,55 @@ def render_task_brief(task: dict[str, Any]) -> str:
 
 def command_new_task(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
+    command_id = getattr(args, "command_id", None)
+    if command_id:
+        existing = next((row for row in task_rows(layout) if row.get("created_by_command_id") == command_id), None)
+        if existing:
+            print_json({"status": "ok", "idempotent_replay": True, "task_id": existing["id"]})
+            return
     if not str(args.title or "").strip():
         raise SystemExit("title is required")
     if not str(args.purpose or "").strip():
         raise SystemExit("purpose is required")
+    project = load_project(layout)
+    provider_request = str(getattr(args, "provider", None) or "auto").lower()
+    tier_request = str(getattr(args, "tier", None) or "auto").lower()
+    estimated_input_tokens = require_non_negative_int(getattr(args, "estimated_input_tokens", 0), "estimated-input-tokens")
+    estimated_output_tokens = require_non_negative_int(getattr(args, "estimated_output_tokens", 0), "estimated-output-tokens")
+    max_cost_cny = require_non_negative_float(getattr(args, "max_cost_cny", None), "max-cost-cny")
+    routing_stub = {
+        "risk": getattr(args, "risk", "low"),
+        "difficulty": getattr(args, "difficulty", "normal"),
+        "task_type": args.task_type,
+        "required_capabilities": getattr(args, "required_capabilities", None) or [],
+        "min_success_probability": getattr(args, "min_success_probability", None),
+    }
+    try:
+        route_preview = decide_route(
+            routing_stub,
+            project_provider_catalog(project),
+            requested_provider_id=None if provider_request == "auto" else provider_request,
+            requested_tier=None if tier_request == "auto" else tier_request,
+            history=result_rows(layout),
+            input_tokens=estimated_input_tokens,
+            output_tokens=estimated_output_tokens,
+        )
+    except RoutingValidationError as exc:
+        raise SystemExit(f"Task routing is invalid: {exc}") from exc
     task_id = args.id or next_task_id(layout)
     directory = task_dir(layout, task_id)
     if directory.exists():
         raise SystemExit(f"Task already exists: {task_id}")
-    claim_paths = args.claim_path or []
+    try:
+        claim_paths = list(normalize_path_list(args.claim_path or [], kind="claim"))
+        allowed_paths = list(normalize_path_list(args.allowed_path or [], kind="allowed"))
+    except SecurityValidationError as exc:
+        raise SystemExit(str(exc)) from exc
+    uncovered_allowed = [path for path in allowed_paths if not path_is_claimed(path, claim_paths)]
+    if uncovered_allowed:
+        raise SystemExit(
+            "Every allowed write path must be covered by a write claim: " + ", ".join(uncovered_allowed)
+        )
     conflicts = active_lock_conflicts(layout, task_id, claim_paths)
     if conflicts and not args.allow_lock_conflict:
         raise SystemExit(
@@ -808,21 +961,31 @@ def command_new_task(args: Any) -> None:
         "task_type": args.task_type,
         "risk": getattr(args, "risk", "low"),
         "difficulty": getattr(args, "difficulty", "normal"),
-        "provider": getattr(args, "provider", "auto"),
+        "provider": "auto",
+        "tier": "auto",
+        "provider_request": provider_request,
+        "tier_request": tier_request,
         "profile": getattr(args, "profile", None),
         "status": "planned",
         "agent_id": None,
         "agent_name": args.agent,
         "model": args.model,
+        "estimated_input_tokens": estimated_input_tokens,
+        "estimated_output_tokens": estimated_output_tokens,
+        "max_cost_cny": max_cost_cny,
+        "required_capabilities": getattr(args, "required_capabilities", None) or [],
+        "min_success_probability": getattr(args, "min_success_probability", None),
+        "route_preview": route_preview.to_dict(),
         "created_at": now_iso(),
         "updated_at": now_iso(),
         "acceptance": args.acceptance or [],
         "allowed_context": args.allowed_context or [],
-        "allowed_paths": args.allowed_path or [],
+        "allowed_paths": allowed_paths,
         "claimed_paths": [normalize_claim_path(path) for path in claim_paths],
         "lock_conflict_override": bool(args.allow_lock_conflict),
         "report_path": relpath(directory / "completion-report.md", layout.project_dir),
         "attempts": [],
+        "created_by_command_id": command_id,
     }
     atomic_write_json(directory / "task.json", task)
     atomic_write_json(
@@ -846,24 +1009,201 @@ def command_new_task(args: Any) -> None:
     print_json({"status": "ok", "task_id": task_id, "task": str(directory)})
 
 
+def command_route(args: Any) -> None:
+    """Explain a three-tier route without mutating project state."""
+
+    layout = resolve_project(args.root, args.project)
+    project = load_project(layout)
+    catalog = project_provider_catalog(project)
+    task = {
+        "risk": args.risk,
+        "difficulty": args.difficulty,
+        "task_type": args.task_type,
+        "required_capabilities": getattr(args, "required_capabilities", None) or [],
+        "min_success_probability": getattr(args, "min_success_probability", None),
+    }
+    try:
+        decision = decide_route(
+            task,
+            catalog,
+            requested_provider_id=None if args.provider == "auto" else args.provider,
+            requested_tier=None if args.tier == "auto" else args.tier,
+            history=result_rows(layout),
+            input_tokens=require_non_negative_int(args.estimated_input_tokens, "estimated-input-tokens"),
+            output_tokens=require_non_negative_int(args.estimated_output_tokens, "estimated-output-tokens"),
+        )
+    except RoutingValidationError as exc:
+        raise SystemExit(f"Unable to explain route: {exc}") from exc
+    print_json(
+        {
+            "status": "ok",
+            "project": str(layout.project_dir),
+            "task": task,
+            "decision": decision.to_dict(),
+            "catalog": catalog,
+        }
+    )
+
+
+def command_providers(args: Any) -> None:
+    layout = resolve_project(args.root, args.project)
+    catalog = project_provider_catalog(load_project(layout))
+    print_json({"status": "ok", "project": str(layout.project_dir), "catalog": catalog})
+
+
+def command_budget_status(args: Any) -> None:
+    layout = resolve_project(args.root, args.project)
+    project = load_project(layout)
+    limit = (project.get("routing_policy") or {}).get("project_budget_cny")
+    commitment = project_budget_commitment(layout)
+    attempts = [
+        {
+            "task_id": task["id"],
+            "attempt_id": attempt.get("attempt_id"),
+            "provider": attempt.get("provider"),
+            "status": attempt.get("status"),
+            "reserved_cost_cny": attempt.get("reserved_cost_cny"),
+            "actual_cost_cny": attempt.get("actual_cost_cny"),
+            "commitment_cny": attempt_budget_commitment(attempt),
+            "cost_settled": bool(attempt.get("cost_settled")),
+        }
+        for task in task_rows(layout)
+        for attempt in task.get("attempts") or []
+    ]
+    print_json(
+        {
+            "status": "ok",
+            "project": str(layout.project_dir),
+            "limit_cny": limit,
+            "commitment_cny": commitment,
+            "remaining_cny": None if limit is None else round(float(limit) - commitment, 9),
+            "attempts": attempts,
+        }
+    )
+
+
+def command_governance_status(args: Any) -> None:
+    layout = resolve_project(args.root, args.project)
+    project = load_project(layout)
+    governance = project.get("governance") or {"mode": "off", "ready": False}
+    validation: dict[str, Any] | None = None
+    error: str | None = None
+    if governance.get("ready") or governance.get("mode") == "required":
+        try:
+            validation = validate_governance_binding(
+                governance.get("binding"),
+                project.get("workspace"),
+                mode="required",
+                wrapper_path=governance.get("wrapper_path"),
+            )
+        except GovernanceError as exc:
+            error = f"{exc.code}: {exc}"
+    print_json(
+        {
+            "status": "ok" if error is None else "blocked",
+            "project": str(layout.project_dir),
+            "governance": governance,
+            "validation": validation,
+            "error": error,
+        }
+    )
+    if error:
+        raise SystemExit(1)
+
+
 def command_dispatch(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
     require_task(layout, args.task)
     task = load_task(layout, args.task)
+    command_id = getattr(args, "command_id", None)
+    if command_id:
+        existing_attempt = next((row for row in task.get("attempts") or [] if row.get("dispatch_command_id") == command_id), None)
+        if existing_attempt:
+            print_json({"status": "ok", "idempotent_replay": True, "task_id": args.task, "attempt": existing_attempt})
+            return
     force = bool(getattr(args, "force", False))
     if task.get("status") in {"done", "failed", "cancelled"} and not force:
         raise SystemExit(f"Task is already terminal: {args.task}")
+    conflicts = active_lock_conflicts(layout, args.task, task.get("claimed_paths") or [])
+    if conflicts:
+        raise SystemExit(
+            "Path claim conflict while dispatching:\n"
+            + "\n".join(
+                f"- {claim.get('path')} claimed by {claim.get('task_id')} ({claim.get('actor_id') or claim.get('agent')})"
+                for claim in conflicts
+            )
+        )
+    project = load_project(layout)
+    governance = project.get("governance") or {"mode": "off"}
+    governance_mode = str(governance.get("mode") or "off")
+    if governance_mode == "required" or governance.get("ready"):
+        try:
+            validation = validate_governance_binding(
+                governance.get("binding"),
+                project.get("workspace"),
+                mode="required",
+                wrapper_path=governance.get("wrapper_path"),
+            )
+        except GovernanceError as exc:
+            raise SystemExit(f"ArchMarshal governance gate blocked dispatch [{exc.code}]: {exc}") from exc
+        if not validation.get("valid"):
+            raise SystemExit("ArchMarshal governance gate blocked dispatch: binding is not valid")
+    try:
+        catalog = project_provider_catalog(project)
+        raw_provider = getattr(args, "provider", None)
+        if raw_provider is None:
+            raw_provider = task.get("provider_request") or "auto"
+        raw_tier = getattr(args, "tier", None)
+        if raw_tier is None:
+            raw_tier = task.get("tier_request") or "auto"
+        decision = decide_route(
+            task,
+            catalog,
+            requested_provider_id=None if raw_provider == "auto" else str(raw_provider).lower(),
+            requested_tier=None if raw_tier == "auto" else str(raw_tier).lower(),
+            history=result_rows(layout),
+            input_tokens=int(task.get("estimated_input_tokens") or 0),
+            output_tokens=int(task.get("estimated_output_tokens") or 0),
+        )
+    except (RoutingValidationError, ValueError) as exc:
+        raise SystemExit(f"Unable to route task: {exc}") from exc
+    max_cost = task.get("max_cost_cny")
+    project_budget = (project.get("routing_policy") or {}).get("project_budget_cny")
+    if max_cost is not None or project_budget is not None:
+        if not int(task.get("estimated_input_tokens") or 0) and not int(task.get("estimated_output_tokens") or 0):
+            raise SystemExit("Budgeted dispatch requires non-zero estimated input or output tokens")
+        if decision.estimated_cost_cny is None:
+            raise SystemExit(f"Budgeted dispatch requires reviewed prices for provider {decision.provider_id}")
+    task_spend = sum(attempt_budget_commitment(row) for row in task.get("attempts") or [])
+    if max_cost is not None and decision.estimated_cost_cny is not None and task_spend + decision.estimated_cost_cny > float(max_cost):
+        raise SystemExit(
+            f"Task budget exceeded: spent={round(task_spend, 6)} planned={decision.estimated_cost_cny} max={max_cost}"
+        )
+    known_spend = project_budget_commitment(layout)
+    if project_budget is not None and decision.estimated_cost_cny is not None and known_spend + decision.estimated_cost_cny > float(project_budget):
+        raise SystemExit(
+            f"Project budget exceeded: spent={round(known_spend, 6)} planned={decision.estimated_cost_cny} max={project_budget}"
+        )
     session = load_session(layout)
-    actor_id = args.actor_id or f"agent-{args.task.lower()}"
+    attempt_id = new_id("ATT")
+    default_actor_id = (
+        f"agent-{args.task.lower()}"
+        if not task.get("attempts")
+        else f"agent-{args.task.lower()}-{decision.provider_id}-{len(task.get('attempts') or []) + 1}"
+    )
+    actor_id = args.actor_id or default_actor_id
     if (layout.actors_dir / f"{slugify(actor_id, 'actor')}.json").exists() and not force:
         raise SystemExit(f"Actor already exists: {actor_id}")
-    provider = route_provider(task, getattr(args, "provider", None))
-    inherited_profile = task.get("profile") if task.get("provider") in {None, "auto", provider} else None
-    model, profile = provider_defaults(
-        provider,
-        getattr(args, "model", None) or task.get("model") or "inherit",
-        getattr(args, "profile", None) or inherited_profile,
-    )
+    provider = decision.provider_id
+    tier = decision.tier
+    provider_spec = provider_by_id(catalog, provider)
+    requested_model = getattr(args, "model", None)
+    requested_profile = getattr(args, "profile", None)
+    if not task.get("attempts"):
+        requested_model = requested_model or task.get("model")
+        requested_profile = requested_profile or task.get("profile")
+    model = requested_model if requested_model and requested_model != "inherit" else (decision.model or "inherit")
+    profile = requested_profile or decision.profile
     command_template = getattr(args, "command", None)
     actor = make_actor(
         layout,
@@ -876,11 +1216,14 @@ def command_dispatch(args: Any) -> None:
         task_id=args.task,
         agent_name=args.agent or task.get("agent_name"),
         provider=provider,
+        tier=tier,
         profile=profile,
+        env_key=provider_spec.get("env_key"),
+        attempt_id=attempt_id,
     )
     if args.dry_run:
         plan = start_actor(layout, actor, dry_run=True) if args.start else {"planned_commands": []}
-        print_json({"status": "ok", "dry_run": True, "actor": actor, "start_plan": plan})
+        print_json({"status": "ok", "dry_run": True, "actor": actor, "route_decision": decision.to_dict(), "start_plan": plan})
         return
     save_actor(layout, actor)
     sync_actor_summary(layout, actor)
@@ -891,16 +1234,26 @@ def command_dispatch(args: Any) -> None:
     task["agent_name"] = args.agent or task.get("agent_name")
     task["model"] = model
     task["provider"] = provider
+    task["tier"] = tier
     task["profile"] = profile
+    task["route_decision"] = decision.to_dict()
     task.setdefault("attempts", []).append(
         {
             "attempt": len(task.get("attempts") or []) + 1,
+            "attempt_id": attempt_id,
             "actor_id": actor_id,
             "provider": provider,
+            "tier": tier,
             "profile": profile,
             "model": model,
+            "status": "running" if args.start else "dispatched",
             "started_at": now_iso() if args.start else None,
+            "finished_at": None,
+            "route_decision": decision.to_dict(),
             "escalation_reason": getattr(args, "escalation_reason", None),
+            "dispatch_command_id": command_id,
+            "reserved_cost_cny": decision.estimated_cost_cny,
+            "actual_cost_cny": 0.0,
         }
     )
     assign_task_claim_actor(layout, args.task, actor_id)
@@ -917,7 +1270,23 @@ def command_dispatch(args: Any) -> None:
     send_message(layout, sender=SCHEDULER_ID, recipient=LEADER_ID, subject=f"Task dispatched: {args.task}", body=f"{args.task} is assigned to {actor_id}.", task_id=args.task)
     start_payload: dict[str, Any] | None = None
     if args.start:
-        start_payload = start_actor(layout, actor, dry_run=False)
+        try:
+            start_payload = start_actor(layout, actor, dry_run=False)
+        except BaseException as exc:
+            actor_state = load_actor(layout, actor_id)
+            actor_state["status"] = "needs_recovery"
+            actor_state.setdefault("runtime", {})["launch_error"] = f"{type(exc).__name__}: {exc}"
+            save_actor(layout, actor_state)
+            sync_actor_summary(layout, actor_state)
+            failed_task = load_task(layout, args.task)
+            for attempt in failed_task.get("attempts") or []:
+                if attempt.get("attempt_id") == attempt_id:
+                    attempt["status"] = "needs_recovery"
+                    attempt["launch_error"] = f"{type(exc).__name__}: {exc}"
+                    break
+            save_task(layout, failed_task)
+            append_event(layout, "actor_launch_failed", actor_id=actor_id, task_id=args.task, attempt_id=attempt_id, error=f"{type(exc).__name__}: {exc}")
+            raise
         task = load_task(layout, args.task)
         set_task_state(layout, task, "running")
     append_event(
@@ -926,6 +1295,7 @@ def command_dispatch(args: Any) -> None:
         task_id=args.task,
         actor_id=actor_id,
         provider=provider,
+        tier=tier,
         profile=profile,
         model=model,
         started=bool(args.start),
@@ -1119,12 +1489,31 @@ def require_scheduler_command_authority(layout: ProjectLayout, *, sender: str, c
             task_id = str(command_args.get("task") or message.get("task_id") or actor.get("task_id") or "")
             if actor.get("role") == "agent" and task_id and actor.get("task_id") != task_id:
                 raise SystemExit(f"agent {sender} cannot collect task {task_id}")
+            state = str(command_args.get("state") or "waiting_leader")
+            if state not in {"waiting_leader", "failed", "escalate"}:
+                raise SystemExit("worker collect may only request waiting_leader, failed, or escalate")
+            task = load_task(layout, task_id)
+            attempts = task.get("attempts") or []
+            current = attempts[-1] if attempts else {}
+            attempt_id = command_args.get("attempt")
+            if not attempt_id or attempt_id != current.get("attempt_id") or sender != current.get("actor_id"):
+                raise SystemExit(f"stale worker collect rejected for task {task_id}")
         if command == "escalate_task":
             task_id = str(command_args.get("task") or message.get("task_id") or actor.get("task_id") or "")
             if actor.get("role") != "agent" or actor.get("task_id") != task_id:
                 raise SystemExit(f"agent {sender} cannot escalate task {task_id}")
-            if actor.get("provider") != "longcat":
-                raise SystemExit("only a LongCat worker may auto-escalate to Codex")
+            task = load_task(layout, task_id)
+            attempts = task.get("attempts") or []
+            current = attempts[-1] if attempts else {}
+            attempt_id = command_args.get("attempt")
+            if not attempt_id or attempt_id != current.get("attempt_id") or sender != current.get("actor_id"):
+                raise SystemExit(f"stale worker escalation rejected for task {task_id}")
+            try:
+                catalog = project_provider_catalog(load_project(layout))
+                if next_stronger_provider(catalog, str(actor.get("provider") or "")) is None:
+                    raise SystemExit("worker is already at the strongest enabled provider tier")
+            except RoutingValidationError as exc:
+                raise SystemExit(f"worker escalation is not allowed: {exc}") from exc
 
 
 def execute_scheduler_command(
@@ -1141,6 +1530,7 @@ def execute_scheduler_command(
     require_scheduler_command_authority(layout, sender=sender, command=command, command_args=command_args, message=message)
     if dry_run:
         return {"dry_run": True, "command": command, "args": command_args}
+    command_id = message.get("id")
     if command == "create_task":
         return run_cli_helper(
             layout,
@@ -1154,12 +1544,19 @@ def execute_scheduler_command(
             risk=str(command_args.get("risk") or "low"),
             difficulty=str(command_args.get("difficulty") or "normal"),
             provider=str(command_args.get("provider") or "auto"),
+            tier=str(command_args.get("tier") or "auto"),
             profile=command_args.get("profile"),
+            estimated_input_tokens=int(command_args.get("estimated_input_tokens") or 0),
+            estimated_output_tokens=int(command_args.get("estimated_output_tokens") or 0),
+            max_cost_cny=command_args.get("max_cost_cny"),
+            required_capabilities=as_list(command_args.get("required_capabilities")),
+            min_success_probability=command_args.get("min_success_probability"),
             acceptance=as_list(command_args.get("acceptance")),
             allowed_context=as_list(command_args.get("allowed_context")),
             allowed_path=as_list(command_args.get("allowed_path")),
             claim_path=as_list(command_args.get("claim_path")),
             allow_lock_conflict=as_bool(command_args.get("allow_lock_conflict")),
+            command_id=command_id,
         )
     if command == "dispatch_task":
         task_id = str(command_args.get("task") or message.get("task_id") or "")
@@ -1171,12 +1568,14 @@ def execute_scheduler_command(
             agent=command_args.get("agent"),
             model=command_args.get("model"),
             provider=command_args.get("provider"),
+            tier=command_args.get("tier"),
             profile=command_args.get("profile"),
             command=command_args.get("actor_command") or command_args.get("command_template"),
             start=as_bool(command_args.get("start")),
             dry_run=False,
             force=as_bool(command_args.get("force")),
             escalation_reason=command_args.get("escalation_reason"),
+            command_id=command_id,
         )
     if command == "escalate_task":
         task_id = str(command_args.get("task") or message.get("task_id") or "")
@@ -1184,13 +1583,18 @@ def execute_scheduler_command(
             layout,
             command_escalate,
             task=task_id,
-            reason=str(command_args.get("reason") or "LongCat requested escalation"),
+            reason=str(command_args.get("reason") or "Worker requested a stronger provider tier"),
             actor_id=command_args.get("actor_id"),
+            from_actor=command_args.get("actor") or sender,
+            attempt=command_args.get("attempt"),
             profile=command_args.get("profile"),
             model=command_args.get("model"),
+            provider=command_args.get("provider"),
+            to_tier=command_args.get("to_tier"),
             start=as_bool(command_args.get("start")),
             dry_run=False,
             force=False,
+            command_id=command_id,
         )
     if command == "collect_task":
         actor = command_args.get("actor") or (sender if sender != LEADER_ID else None)
@@ -1200,9 +1604,11 @@ def execute_scheduler_command(
             command_collect,
             task=task_id,
             actor=actor,
+            attempt=command_args.get("attempt"),
             state=str(command_args.get("state") or "waiting_leader"),
             report=command_args.get("report"),
             summary=command_args.get("summary"),
+            command_id=command_id,
         )
     if command == "record_result":
         task_id = str(command_args.get("task") or message.get("task_id") or "")
@@ -1215,12 +1621,14 @@ def execute_scheduler_command(
             accepted_by_leader=as_bool(command_args.get("accepted_by_leader") or command_args.get("accepted")),
             agent=command_args.get("agent"),
             actor=command_args.get("actor"),
+            attempt=command_args.get("attempt"),
             model=command_args.get("model"),
             input_tokens=int(command_args.get("input_tokens") or 0),
             output_tokens=int(command_args.get("output_tokens") or 0),
             estimated_cost_cny=command_args.get("estimated_cost_cny"),
             summary=command_args.get("summary"),
             note=command_args.get("note"),
+            command_id=command_id,
         )
     if command == "record_usage":
         return run_cli_helper(
@@ -1228,11 +1636,14 @@ def execute_scheduler_command(
             command_record_usage,
             actor=str(command_args.get("actor") or sender),
             task=command_args.get("task") or message.get("task_id"),
+            attempt=command_args.get("attempt"),
             model=command_args.get("model"),
             input_tokens=int(command_args.get("input_tokens") or 0),
             output_tokens=int(command_args.get("output_tokens") or 0),
             estimated_cost_cny=command_args.get("estimated_cost_cny"),
+            final_usage=as_bool(command_args.get("final_usage") or command_args.get("final")),
             note=command_args.get("note"),
+            command_id=command_id,
         )
     if command == "heartbeat":
         return run_cli_helper(
@@ -1241,6 +1652,7 @@ def execute_scheduler_command(
             actor=str(command_args.get("actor") or sender),
             status=str(command_args.get("status") or "running"),
             note=command_args.get("note"),
+            command_id=command_id,
         )
     if command == "stop_actor":
         return run_cli_helper(
@@ -1251,6 +1663,7 @@ def execute_scheduler_command(
             stop_runtime=as_bool(command_args.get("stop_runtime")),
             kill_window=as_bool(command_args.get("stop_runtime")),
             dry_run=False,
+            command_id=command_id,
         )
     raise SystemExit(f"Unsupported scheduler command: {command}")
 
@@ -1285,8 +1698,16 @@ def process_scheduler_inbox(layout: ProjectLayout, *, limit: int | None = None, 
     processed: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
+    completed_ids = {
+        row.get("message_id")
+        for row in read_jsonl(layout.events_jsonl)
+        if row.get("event_type") == "scheduler_command_executed" and row.get("message_id")
+    }
     for offset, message in enumerate(pending, start=start_line + 1):
         try:
+            if message.get("id") in completed_ids:
+                skipped.append({"line": offset, "id": message.get("id"), "reason": "idempotent_replay"})
+                continue
             parsed = parse_scheduler_command(message)
             if not parsed:
                 skipped.append({"line": offset, "id": message.get("id"), "reason": "not_a_scheduler_command"})
@@ -1366,7 +1787,7 @@ def scheduler_cycle(layout: ProjectLayout, *, relay_limit: int | None = None, co
     }
 
 
-def command_run_scheduler(args: Any) -> None:
+def _command_run_scheduler_with_instance_lock(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
     ensure_runtime_dirs(layout)
     ensure_mailbox(layout, SCHEDULER_ID)
@@ -1417,33 +1838,116 @@ def command_run_scheduler(args: Any) -> None:
     )
 
 
+def command_run_scheduler(args: Any) -> None:
+    layout = resolve_project(args.root, args.project)
+    try:
+        with scheduler_instance_lock(layout):
+            _command_run_scheduler_with_instance_lock(args)
+    except ProjectLockTimeout as exc:
+        raise SystemExit(f"another scheduler instance is already active: {exc}") from exc
+
+
 def command_escalate(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
     require_task(layout, args.task)
     task = load_task(layout, args.task)
+    command_id = getattr(args, "command_id", None)
+    if command_id:
+        existing = next((row for row in task.get("attempts") or [] if row.get("escalation_command_id") == command_id), None)
+        if existing:
+            print_json({"status": "ok", "idempotent_replay": True, "task_id": args.task, "attempt_id": existing.get("attempt_id")})
+            return
     attempts = task.get("attempts") or []
-    if attempts and attempts[-1].get("provider") == "codex" and not getattr(args, "force", False):
-        raise SystemExit(f"Task is already assigned to Codex: {args.task}")
-    next_attempt = len(attempts) + 1
-    actor_id = getattr(args, "actor_id", None) or f"agent-{args.task.lower()}-codex-{next_attempt}"
-    append_event(layout, "task_escalation_requested", task_id=args.task, actor_id=actor_id, reason=args.reason)
-    command_dispatch(
-        SimpleNamespace(
+    if not attempts:
+        raise SystemExit(f"Task has no provider attempt to escalate: {args.task}")
+    previous = attempts[-1]
+    expected_attempt = getattr(args, "attempt", None)
+    expected_actor = getattr(args, "from_actor", None)
+    if expected_attempt and previous.get("attempt_id") != expected_attempt:
+        raise SystemExit(f"Stale escalation attempt rejected: {expected_attempt}")
+    if expected_actor and previous.get("actor_id") != expected_actor:
+        raise SystemExit(f"Stale escalation actor rejected: {expected_actor}")
+    project = load_project(layout)
+    try:
+        catalog = project_provider_catalog(project)
+        current_provider = str(attempts[-1].get("provider") or task.get("provider") or "")
+        current_spec = provider_by_id(catalog, current_provider)
+        explicit_provider = getattr(args, "provider", None)
+        explicit_tier = getattr(args, "to_tier", None)
+        if explicit_provider:
+            target = provider_by_id(catalog, str(explicit_provider))
+        elif explicit_tier:
+            decision = decide_route(
+                task,
+                catalog,
+                requested_tier=str(explicit_tier),
+                history=result_rows(layout),
+                input_tokens=int(task.get("estimated_input_tokens") or 0),
+                output_tokens=int(task.get("estimated_output_tokens") or 0),
+            )
+            target = provider_by_id(catalog, decision.provider_id)
+        else:
+            target = next_stronger_provider(
+                catalog,
+                current_provider,
+                history=result_rows(layout),
+                task_type=str(task.get("task_type") or "analysis"),
+                difficulty=str(task.get("difficulty") or "normal"),
+                input_tokens=int(task.get("estimated_input_tokens") or 0),
+                output_tokens=int(task.get("estimated_output_tokens") or 0),
+            )
+        if target is None:
+            raise SystemExit(f"Task is already at the strongest enabled provider tier: {args.task}")
+        if TIER_RANK[str(target["tier"])] <= TIER_RANK[str(current_spec["tier"])] and not getattr(args, "force", False):
+            raise SystemExit(
+                f"Escalation target {target['provider_id']} ({target['tier']}) is not stronger than {current_provider} ({current_spec['tier']})"
+            )
+    except RoutingValidationError as exc:
+        raise SystemExit(f"Unable to escalate task: {exc}") from exc
+    actor_id = getattr(args, "actor_id", None)
+    def escalation_dispatch_args(*, dry_run: bool, dispatch_command_id: str | None) -> SimpleNamespace:
+        return SimpleNamespace(
             root=args.root,
             project=args.project,
             task=args.task,
             actor_id=actor_id,
-            agent="codex",
-            provider="codex",
+            agent=target["provider_id"],
+            provider=target["provider_id"],
+            tier=target["tier"],
             profile=getattr(args, "profile", None),
-            model=getattr(args, "model", None) or "inherit",
+            model=getattr(args, "model", None),
             command=None,
             start=bool(getattr(args, "start", False)),
-            dry_run=bool(getattr(args, "dry_run", False)),
+            dry_run=dry_run,
             force=True,
             escalation_reason=args.reason,
+            command_id=dispatch_command_id,
         )
+
+    if bool(getattr(args, "dry_run", False)):
+        command_dispatch(escalation_dispatch_args(dry_run=True, dispatch_command_id=None))
+        return
+    # Validate routing, governance, budget, claims, and launch planning before
+    # ending the current attempt. A real spawn failure remains a recoverable
+    # new attempt rather than leaving the task with no active successor.
+    with contextlib.redirect_stdout(io.StringIO()):
+        command_dispatch(escalation_dispatch_args(dry_run=True, dispatch_command_id=None))
+    attempts[-1]["status"] = "escalated"
+    attempts[-1]["finished_at"] = now_iso()
+    attempts[-1]["escalation_reason"] = args.reason
+    attempts[-1]["escalation_command_id"] = command_id
+    save_task(layout, task)
+    append_event(
+        layout,
+        "task_escalation_requested",
+        task_id=args.task,
+        actor_id=actor_id,
+        from_provider=current_provider,
+        to_provider=target["provider_id"],
+        to_tier=target["tier"],
+        reason=args.reason,
     )
+    command_dispatch(escalation_dispatch_args(dry_run=False, dispatch_command_id=command_id))
 
 
 def command_heartbeat(args: Any) -> None:
@@ -1512,11 +2016,18 @@ def command_stop_actor(args: Any) -> None:
 
 def command_collect(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
-    if args.state and args.state not in TASK_STATES:
-        raise SystemExit(f"Invalid task state: {args.state}")
+    if args.state and args.state not in {"waiting_leader", "failed", "escalate"}:
+        raise SystemExit("collect state must be waiting_leader, failed, or escalate; done requires leader record-result acceptance")
     require_task(layout, args.task)
     task = load_task(layout, args.task)
+    command_id = getattr(args, "command_id", None)
+    if command_id and task.get("last_collect_command_id") == command_id:
+        print_json({"status": "ok", "idempotent_replay": True, "task_id": args.task})
+        return
     actor_id = args.actor or task.get("agent_id")
+    attempt_id = getattr(args, "attempt", None)
+    if not attempt_id and actor_id and actor_exists(layout, actor_id):
+        attempt_id = load_actor(layout, actor_id).get("attempt_id")
     report_path = Path(args.report).expanduser().resolve() if args.report else task_dir(layout, args.task) / "completion-report.md"
     if args.state in {"done", "failed", "escalate", "waiting_leader"} and not report_path.is_file():
         raise SystemExit(f"Report file not found: {report_path}")
@@ -1524,6 +2035,17 @@ def command_collect(args: Any) -> None:
     task["collected_at"] = now_iso()
     if args.summary:
         task["summary"] = compact_text(args.summary)
+    task["last_collect_command_id"] = command_id
+    if attempt_id:
+        matched = False
+        for attempt in task.get("attempts") or []:
+            if attempt.get("attempt_id") == attempt_id:
+                attempt["status"] = args.state
+                attempt["finished_at"] = attempt.get("finished_at") or now_iso()
+                matched = True
+                break
+        if not matched:
+            raise SystemExit(f"Attempt not found for task {args.task}: {attempt_id}")
     set_task_state(layout, task, args.state)
     if actor_id:
         require_actor(layout, actor_id)
@@ -1548,32 +2070,65 @@ def command_collect(args: Any) -> None:
 def command_record_result(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
     require_task(layout, args.task)
+    command_id = getattr(args, "command_id", None)
+    if command_id:
+        existing = next((row for row in result_rows(layout) if row.get("command_id") == command_id), None)
+        if existing:
+            print_json({"status": "ok", "idempotent_replay": True, "result": existing})
+            return
     if args.status not in RESULT_TASK_STATES:
         raise SystemExit(f"record-result status must be one of: {', '.join(sorted(RESULT_TASK_STATES))}")
     if args.accepted_by_leader and args.status != "done":
         raise SystemExit("--accepted-by-leader requires --status done")
+    if args.status == "done" and not args.accepted_by_leader:
+        raise SystemExit("--status done requires --accepted-by-leader")
     if int(args.quality_score) not in {1, 2, 3, 4, 5}:
         raise SystemExit("quality-score must be 1-5")
-    input_tokens = require_non_negative_int(args.input_tokens, "input-tokens")
-    output_tokens = require_non_negative_int(args.output_tokens, "output-tokens")
-    estimated_cost_cny = require_non_negative_float(args.estimated_cost_cny, "estimated-cost-cny")
     task = load_task(layout, args.task)
     project = load_project(layout)
-    actor_id = args.actor or task.get("agent_id")
+    attempts = task.get("attempts") or []
+    requested_attempt = getattr(args, "attempt", None)
+    attempt = next((row for row in attempts if row.get("attempt_id") == requested_attempt), None) if requested_attempt else (attempts[-1] if attempts else None)
+    if requested_attempt and attempt is None:
+        raise SystemExit(f"Attempt not found for task {args.task}: {requested_attempt}")
+    input_tokens = require_non_negative_int(args.input_tokens, "input-tokens")
+    output_tokens = require_non_negative_int(args.output_tokens, "output-tokens")
+    if attempt:
+        input_tokens = input_tokens or int(attempt.get("input_tokens") or 0)
+        output_tokens = output_tokens or int(attempt.get("output_tokens") or 0)
+    estimated_cost_cny = require_non_negative_float(args.estimated_cost_cny, "estimated-cost-cny")
+    provider_id = (attempt or {}).get("provider") or task.get("provider")
+    pricing_source = "caller" if estimated_cost_cny is not None else "not_provided"
+    if estimated_cost_cny is None and attempt and attempt.get("estimated_cost_cny") is not None:
+        estimated_cost_cny = float(attempt["estimated_cost_cny"])
+        pricing_source = str(attempt.get("cost_source") or "attempt_usage")
+    elif estimated_cost_cny is None and provider_id:
+        try:
+            spec = provider_by_id(project_provider_catalog(project), str(provider_id))
+            estimated_cost_cny = estimate_provider_cost(spec, input_tokens=input_tokens, output_tokens=output_tokens)
+            if estimated_cost_cny is not None:
+                pricing_source = "provider_catalog"
+        except RoutingValidationError as exc:
+            raise SystemExit(f"Unable to price result: {exc}") from exc
+    actor_id = args.actor or (attempt or {}).get("actor_id") or task.get("agent_id")
     agent_name = args.agent or task.get("agent_name") or actor_id or "unknown"
-    model = args.model or task.get("model") or "inherit"
+    model = args.model or (attempt or {}).get("model") or task.get("model") or "inherit"
     row = {
         "id": new_id("RES"),
+        "command_id": command_id,
         "event_type": "result",
         "timestamp": now_iso(),
         "project_id": project.get("project_id"),
         "task_id": args.task,
+        "attempt_id": (attempt or {}).get("attempt_id"),
         "actor_id": actor_id,
         "agent": agent_name,
-        "provider": task.get("provider"),
-        "profile": task.get("profile"),
+        "provider": provider_id,
+        "tier": (attempt or {}).get("tier") or task.get("tier"),
+        "profile": (attempt or {}).get("profile") or task.get("profile"),
         "model": model,
         "task_type": task.get("task_type") or "unknown",
+        "difficulty": task.get("difficulty") or "normal",
         "status": args.status,
         "completed": args.status == "done",
         "needs_escalation": args.status == "escalate",
@@ -1583,12 +2138,23 @@ def command_record_result(args: Any) -> None:
         "output_tokens": output_tokens,
         "total_tokens": total_tokens(input_tokens, output_tokens),
         "estimated_cost_cny": estimated_cost_cny,
-        "cost_source": cost_source(estimated_cost_cny),
+        "cost_source": pricing_source,
         "summary": compact_text(args.summary) if args.summary else "",
         "note": args.note or "",
         "report_path": task.get("report_path"),
     }
     append_jsonl(layout.results_jsonl, row)
+    if attempt is not None:
+        attempt["status"] = args.status
+        attempt["finished_at"] = attempt.get("finished_at") or row["timestamp"]
+        attempt["leader_result_id"] = row["id"]
+        attempt["accepted_by_leader"] = row["accepted_by_leader"]
+        attempt["quality_score"] = row["quality_score"]
+        if estimated_cost_cny is not None:
+            attempt["actual_cost_cny"] = max(float(attempt.get("actual_cost_cny") or 0.0), estimated_cost_cny)
+        attempt["cost_settled"] = True
+        attempt["estimated_cost_cny"] = estimated_cost_cny
+        attempt["cost_source"] = pricing_source
     task["leader_result"] = {
         "result_id": row["id"],
         "recorded_at": row["timestamp"],
@@ -1657,16 +2223,33 @@ def command_record_leader_work(args: Any) -> None:
 def command_record_usage(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
     require_actor(layout, args.actor)
+    command_id = getattr(args, "command_id", None)
+    if command_id:
+        existing = next((row for row in usage_rows(layout) if row.get("command_id") == command_id), None)
+        if existing:
+            print_json({"status": "ok", "idempotent_replay": True, "usage": existing})
+            return
     actor = load_actor(layout, args.actor)
     task_id = args.task or actor.get("task_id")
     if task_id:
         require_task(layout, task_id)
     input_tokens = require_non_negative_int(args.input_tokens, "input-tokens")
     output_tokens = require_non_negative_int(args.output_tokens, "output-tokens")
-    estimated_cost_cny = require_non_negative_float(args.estimated_cost_cny, "estimated-cost-cny")
+    estimated_cost_cny = require_non_negative_float(getattr(args, "estimated_cost_cny", None), "estimated-cost-cny")
     project = load_project(layout)
+    pricing_source = "caller" if estimated_cost_cny is not None else "not_provided"
+    if estimated_cost_cny is None and actor.get("provider"):
+        try:
+            spec = provider_by_id(project_provider_catalog(project), str(actor.get("provider")))
+            estimated_cost_cny = estimate_provider_cost(spec, input_tokens=input_tokens, output_tokens=output_tokens)
+            if estimated_cost_cny is not None:
+                pricing_source = "provider_catalog"
+        except RoutingValidationError as exc:
+            raise SystemExit(f"Unable to price usage: {exc}") from exc
+    attempt_id = getattr(args, "attempt", None) or actor.get("attempt_id")
     row = {
         "id": new_id("USG"),
+        "command_id": command_id,
         "event_type": "usage",
         "timestamp": now_iso(),
         "project_id": project.get("project_id"),
@@ -1674,17 +2257,35 @@ def command_record_usage(args: Any) -> None:
         "role": actor.get("role"),
         "agent": actor.get("agent_name") or ("leader" if actor.get("role") == "leader" else args.actor),
         "task_id": task_id,
+        "attempt_id": attempt_id,
         "provider": actor.get("provider"),
+        "tier": actor.get("tier"),
         "profile": actor.get("profile"),
         "model": args.model or actor.get("model") or "inherit",
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens(input_tokens, output_tokens),
         "estimated_cost_cny": estimated_cost_cny,
-        "cost_source": cost_source(estimated_cost_cny),
+        "cost_source": pricing_source,
+        "final_usage": bool(getattr(args, "final_usage", False)),
         "note": args.note or "",
     }
     append_jsonl(layout.usage_jsonl, row)
+    if task_id and attempt_id:
+        task = load_task(layout, task_id)
+        for attempt in task.get("attempts") or []:
+            if attempt.get("attempt_id") == attempt_id:
+                attempt["input_tokens"] = int(attempt.get("input_tokens") or 0) + input_tokens
+                attempt["output_tokens"] = int(attempt.get("output_tokens") or 0) + output_tokens
+                attempt["total_tokens"] = int(attempt.get("total_tokens") or 0) + row["total_tokens"]
+                if estimated_cost_cny is not None:
+                    attempt["actual_cost_cny"] = round(float(attempt.get("actual_cost_cny") or 0.0) + estimated_cost_cny, 9)
+                    attempt["estimated_cost_cny"] = attempt["actual_cost_cny"]
+                if bool(getattr(args, "final_usage", False)):
+                    attempt["cost_settled"] = True
+                attempt["cost_source"] = pricing_source
+                break
+        save_task(layout, task)
     actor_usage = actor.setdefault("usage", {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "estimated_cost_cny": 0.0, "unknown_cost_count": 0})
     actor_usage["input_tokens"] = int(actor_usage.get("input_tokens") or 0) + input_tokens
     actor_usage["output_tokens"] = int(actor_usage.get("output_tokens") or 0) + output_tokens
@@ -1731,6 +2332,25 @@ def leader_work_rows(layout: ProjectLayout) -> list[dict[str, Any]]:
 
 def usage_rows(layout: ProjectLayout) -> list[dict[str, Any]]:
     return read_jsonl(layout.usage_jsonl)
+
+
+def attempt_budget_commitment(attempt: dict[str, Any]) -> float:
+    actual = float(attempt.get("actual_cost_cny") or 0.0)
+    reserved = float(attempt.get("reserved_cost_cny") or 0.0)
+    if attempt.get("status") in {"preparing", "dispatched", "running", "starting", "needs_recovery"} or not attempt.get("cost_settled"):
+        return actual + max(0.0, reserved - actual)
+    return actual
+
+
+def project_budget_commitment(layout: ProjectLayout) -> float:
+    return round(
+        sum(
+            attempt_budget_commitment(attempt)
+            for task in task_rows(layout)
+            for attempt in task.get("attempts") or []
+        ),
+        9,
+    )
 
 
 def empty_token_bucket() -> dict[str, Any]:
@@ -2280,8 +2900,8 @@ def command_recover(args: Any) -> None:
                 target=runtime.get("target"),
                 pid=runtime.get("pid"),
             )
-            if actor.get("status") == "running" and not is_alive:
-                issues.append(f"running actor missing runtime: {actor['id']}")
+            if actor.get("status") in {"running", "starting", "needs_recovery"} and not is_alive:
+                issues.append(f"recoverable actor missing runtime: {actor['id']} ({actor.get('status')})")
                 actor_data = load_actor(layout, actor["id"])
                 actor_data["status"] = "needs_recovery"
                 save_actor(layout, actor_data)
@@ -2296,6 +2916,18 @@ def command_recover(args: Any) -> None:
                     sync_actor_summary(layout, actor_data)
                     start_payload = start_actor(layout, actor_data, dry_run=False)
                     restarted.extend(start_payload.get("commands", []))
+                    if actor_data.get("task_id") and actor_data.get("attempt_id"):
+                        recovered_task = load_task(layout, actor_data["task_id"])
+                        for attempt in recovered_task.get("attempts") or []:
+                            if attempt.get("attempt_id") == actor_data.get("attempt_id"):
+                                attempt["status"] = "running"
+                                attempt["started_at"] = attempt.get("started_at") or now_iso()
+                                attempt.pop("launch_error", None)
+                                break
+                        if recovered_task.get("status") == "dispatched":
+                            set_task_state(layout, recovered_task, "running")
+                        else:
+                            save_task(layout, recovered_task)
     status = "ok" if not issues else "degraded"
     session = load_session(layout)
     session["recovery"] = {"last_recovered_at": now_iso(), "last_status": status, "issues": issues}
@@ -2352,6 +2984,17 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
     project = load_project(layout)
     if project.get("schema_version") != SCHEMA_VERSION:
         issues.append("project schema_version is not 2")
+    try:
+        catalog = project_provider_catalog(project)
+    except RoutingValidationError as exc:
+        catalog = None
+        issues.append(f"invalid provider catalog: {exc}")
+    governance = project.get("governance")
+    if governance is not None:
+        if not isinstance(governance, dict) or governance.get("mode") not in {"off", "auto", "required"}:
+            issues.append("invalid governance configuration")
+        elif governance.get("ready") and not isinstance(governance.get("binding"), dict):
+            issues.append("ready governance configuration is missing its binding")
     source_project = project.get("source_project")
     if source_project and not Path(source_project).exists():
         issues.append(f"source project no longer exists: {source_project}")
@@ -2402,6 +3045,35 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
     for task in task_rows(layout):
         if task.get("agent_id") and task["agent_id"] not in actor_ids:
             issues.append(f"{task['id']} references missing actor {task['agent_id']}")
+        if task.get("status") == "done":
+            leader_result = task.get("leader_result") or {}
+            if leader_result.get("status") != "done" or leader_result.get("accepted_by_leader") is not True:
+                issues.append(f"{task['id']} is done without an accepted leader result")
+        try:
+            normalized_claims = list(normalize_path_list(task.get("claimed_paths") or [], kind="claim"))
+            normalized_allowed = list(normalize_path_list(task.get("allowed_paths") or [], kind="allowed"))
+            if normalized_claims != (task.get("claimed_paths") or []):
+                issues.append(f"{task['id']} claimed_paths are not canonical")
+            if normalized_allowed != (task.get("allowed_paths") or []):
+                issues.append(f"{task['id']} allowed_paths are not canonical")
+        except SecurityValidationError as exc:
+            issues.append(f"{task['id']} has unsafe paths: {exc}")
+        attempt_ids: set[str] = set()
+        for attempt in task.get("attempts") or []:
+            attempt_id = attempt.get("attempt_id")
+            if not attempt_id:
+                # Legacy attempts predate first-class attempt ids.
+                continue
+            if attempt_id in attempt_ids:
+                issues.append(f"{task['id']} has duplicate attempt_id {attempt_id}")
+            attempt_ids.add(attempt_id)
+            if catalog is not None:
+                try:
+                    spec = provider_by_id(catalog, str(attempt.get("provider") or ""))
+                    if attempt.get("tier") != spec.get("tier"):
+                        issues.append(f"{task['id']} attempt {attempt_id} tier/provider mismatch")
+                except RoutingValidationError as exc:
+                    issues.append(f"{task['id']} attempt {attempt_id} has invalid provider: {exc}")
         task_path = task_dir(layout, task["id"])
         for rel in ["task.json", "brief.md", "status.json", "completion-report.md"]:
             if not (task_path / rel).exists():
@@ -2482,6 +3154,53 @@ def command_validate(args: Any) -> None:
     print_json({"status": status, "issues": issues})
     if issues:
         raise SystemExit(1)
+
+
+def _locked_project_command(function: Any) -> Any:
+    @functools.wraps(function)
+    def wrapped(args: Any) -> Any:
+        layout = resolve_project(args.root, args.project)
+        try:
+            with project_write_lock(layout):
+                return function(args)
+        except ProjectLockTimeout as exc:
+            raise SystemExit(str(exc)) from exc
+
+    return wrapped
+
+
+def _locked_layout_operation(function: Any) -> Any:
+    @functools.wraps(function)
+    def wrapped(layout: ProjectLayout, *args: Any, **kwargs: Any) -> Any:
+        try:
+            with project_write_lock(layout):
+                return function(layout, *args, **kwargs)
+        except ProjectLockTimeout as exc:
+            raise SystemExit(str(exc)) from exc
+
+    return wrapped
+
+
+# One OS-backed writer gate protects every read-modify-write control-plane
+# command. Nested calls such as escalate -> dispatch are reentrant in-process.
+for _command_name in (
+    "command_start_leader",
+    "command_new_task",
+    "command_dispatch",
+    "command_escalate",
+    "command_send",
+    "command_relay",
+    "command_heartbeat",
+    "command_stop_actor",
+    "command_collect",
+    "command_record_result",
+    "command_record_leader_work",
+    "command_record_usage",
+    "command_recover",
+):
+    globals()[_command_name] = _locked_project_command(globals()[_command_name])
+
+scheduler_cycle = _locked_layout_operation(scheduler_cycle)
 
 
 def root_from_args(args: Any) -> Path:

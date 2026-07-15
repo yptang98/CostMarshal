@@ -1,121 +1,111 @@
 ---
 name: costmarshal
-description: "CostMarshal v2: scheduler-first, cost-aware multi-agent orchestration for Codex CLI with durable actor mailboxes, pluggable runtime backends, leader acceptance records, write locks, recovery, and audit trails."
+description: "CostMarshal v2.3: scheduler-first, cost-aware low/medium/high provider orchestration for Codex CLI with conservative route optimization, durable attempts, budget reservations, isolated worker worktrees, recovery, leader acceptance, and optional ArchMarshal governance checks."
 ---
 
-# CostMarshal v2
+# CostMarshal v2.3
 
-CostMarshal v2 is the official implementation line. Use `scripts/costmarshal.py`
-for durable state and orchestration. The legacy v1 engine remains in
-`scripts/mc.py` only for historical reference; do not use it for new runs.
+Use this skill for long or decomposable work where multiple API price/capability tiers should cooperate under explicit safety, cost, and recovery controls.
 
-## Core Contract
+Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do not use legacy `scripts/mc.py` flows.
 
-Keep the leader as the project controller, not the bulk implementer.
+## Invariants
 
-The on-demand Codex manager must:
-- define goals and acceptance criteria
-- split work into bounded tasks
-- route tasks to agent actors by risk, difficulty, budget, and evidence
-- read structured reports and mailbox messages before raw transcripts
-- decide whether to accept, retry, or escalate
-- record final evaluation with `record-result`
-- record direct implementation-like leader work with `record-leader-work`
+1. The scheduler relays commands and supervises processes; it does not make technical decisions.
+2. Provider identity and tier are separate. Tiers are exactly `low`, `medium`, and `high`.
+3. Risk/difficulty/task-type safety floors cannot be bypassed by a cheaper provider request.
+4. A task is done only after an explicit leader result with `accepted_by_leader=true`.
+5. Workers may return only `waiting_leader`, `failed`, or `escalate` through collect.
+6. Every worker command is fenced to its actor and attempt; stale commands must not mutate the current attempt.
+7. Budgeted dispatch requires reviewed pricing and non-zero token estimates.
+8. Workers never receive the CostMarshal runtime as a writable directory.
+9. Writable worker tasks use isolated git worktrees and a post-run path gate.
+10. Low/medium workers receive only their selected provider credential and a credential-free actor Codex home.
+11. ArchMarshal integration is read-only. Never auto-adopt, apply, start, end, or modify ArchMarshal.
 
-The scheduler must stay small. It relays messages, launches/stops actors through
-a runtime backend, executes validated actor-authored scheduler commands, writes
-durable state, checks recovery, enforces write claims, records usage, and
-reports status. It must not plan, implement, review, or summarize raw actor
-context.
+## Standard workflow
 
-## Runtime Model
+1. Confirm the writable workspace, provider catalog, budget, and governance mode.
+2. Configure required Codex profiles with `configure-provider`; never store API keys in profile files.
+3. Initialize the project.
+4. Create bounded tasks with explicit risk, difficulty, estimates, acceptance criteria, allowed context, and write scope.
+5. Run `route` to inspect safety floor, chain, cost, and acceptance prior when economics matter.
+6. Dispatch only after the route explanation and claims are acceptable.
+7. Keep `run-scheduler` active while actors execute.
+8. Review the completion report, isolated worktree diff, tests, and evidence.
+9. Record the leader result. Escalate one tier when evidence is insufficient.
+10. Run `validate`, and use `recover` after an unclean stop.
 
-v2 models a project as durable actors:
-
-- `scheduler`: relay, mailbox writer, process supervisor, recovery auditor
-- `leader`: on-demand Codex project controller invoked at planning/review/integration gates
-- `agent-*`: task-scoped Codex or LongCat workers that receive a bounded prompt and return one final report
-
-Actor execution is provided by a pluggable backend:
-
-| Backend | Use |
-| --- | --- |
-| `auto` | Default; Windows uses `local`, macOS/Linux use `tmux` when available and otherwise `local` |
-| `local` | Detached local process with pid/log tracking; best for Windows and CI |
-| `tmux` | One actor per tmux window; best for Unix servers with tmux |
-
-## Official CLI
-
-```bash
-python scripts/costmarshal.py configure-profiles
-python scripts/costmarshal.py init --name demo --objective "Try cost-aware rotation" --workspace . --backend auto
-python scripts/costmarshal.py run-scheduler --project <project-id> --interval 2
-python scripts/costmarshal.py dashboard --project <project-id> --watch
-python scripts/costmarshal.py new-task --project <project-id> --title "Inspect baseline" --purpose "Return a bounded report" --risk low --provider auto --claim-path reports/baseline.md
-python scripts/costmarshal.py dispatch --project <project-id> --task V2-0001 --start
-python scripts/costmarshal.py escalate --project <project-id> --task V2-0001 --reason "Needs stronger judgment" --start
-python scripts/costmarshal.py run-manager --project <project-id>
-python scripts/costmarshal.py send --project <project-id> --to leader --message "Task V2-0001 is dispatched."
-python scripts/costmarshal.py relay --project <project-id> --actor leader
-python scripts/costmarshal.py record-usage --project <project-id> --actor agent-v2-0001 --input-tokens 100 --output-tokens 40
-python scripts/costmarshal.py collect --project <project-id> --task V2-0001 --state waiting_leader
-python scripts/costmarshal.py record-result --project <project-id> --task V2-0001 --status done --quality-score 4 --accepted-by-leader
-python scripts/costmarshal.py record-leader-work --project <project-id> --task V2-0001 --work-type verification --risk low --scope "Sampled evidence" --reason "Leader acceptance requires review"
-python scripts/costmarshal.py stop-actor --project <project-id> --actor agent-v2-0001 --reason "task complete"
-python scripts/costmarshal.py status --project <project-id>
-python scripts/costmarshal.py recover --project <project-id> --plan-restarts
-python scripts/costmarshal.py validate --project <project-id>
-```
-
-Use `--root <dir>` or `COSTMARSHAL_V2_HOME` to choose the runtime root. Default
-storage is `$CODEX_HOME/costmarshal-v2` when `CODEX_HOME` is set, otherwise
-`~/.codex/costmarshal-v2`.
-
-## Dispatch Discipline
-
-1. Create the user-level LongCat profile once with `configure-profiles`; provide `LONGCAT_API_KEY` through the environment or a local secrets file.
-2. Create or select a v2 project with `init --workspace <dir>`.
-3. Create bounded tasks with `new-task`; include `--claim-path` for write scopes.
-4. Dispatch at most a small number of active agents at once. Auto routing uses LongCat for bounded low-risk work and Codex for high-risk/hard work.
-5. Give agents only the durable prompt file, task brief, allowed context, and mailbox messages.
-6. Keep `run-scheduler` active so LongCat failures or `Status: escalate` reports launch a fresh Codex attempt.
-7. Use `dashboard --watch` to monitor scheduler, leader, agents, process liveness, mailbox counts, logs, and agent token totals.
-8. Use `collect` to move task reports into leader review when manually operating without the scheduler loop.
-9. Use `record-result` after every worker attempt; worker usage is not leader acceptance.
-10. Use `record-leader-work` whenever the leader directly writes or fixes implementation-like work.
-11. Use `status`, `dashboard`, and `validate` as the normal audit surface.
-12. Invoke `run-manager` only for planning, review, integration, rescue, or final acceptance gates.
-13. Use `recover --plan-restarts` or `recover --restart-missing` after disconnects.
-
-## Isolation Rules
-
-- Treat raw transcripts as audit evidence, not default leader memory.
-- Keep worker write scopes disjoint with `--claim-path`; validate active lock conflicts.
-- Never put API keys or secrets in prompts, reports, logs, or skill files.
-- Use mailbox relay rather than having the scheduler inspect actor reasoning.
-- The default actor runner persists reports, usage, and scheduler commands; models do not edit runtime state themselves.
-- Custom/legacy actors may still append scheduler commands to outbox messages addressed to `scheduler`.
-  Supported commands are `create_task`, `dispatch_task`, `escalate_task`, `collect_task`,
-  `record_result`, `record_usage`, `heartbeat`, and `stop_actor`.
-- If a worker needs broader context, new write scope, secrets, or architectural judgment, escalate.
-
-## Required Verification
-
-For changes to CostMarshal itself, run:
-
-```bash
-python tests/unit_test.py
-python tests/smoke_test.py
-python tests/local_backend_contract_test.py
-python tests/tmux_contract_test.py
-python tests/model_rotation_contract_test.py
-python scripts/install_smoke_test.py
-```
-
-Compile check:
+## Commands
 
 ```powershell
-$files = @('scripts/costmarshal.py') + (Get-ChildItem -Path 'costmarshal_v2','tests','scripts' -Filter '*.py' | ForEach-Object { $_.FullName })
-python -m py_compile @files
+# Configure an OpenAI-compatible provider profile.
+python scripts/costmarshal.py configure-provider --codex-home "$env:CODEX_HOME" --profile medium-api --provider-id medium-api --base-url "https://reviewed-endpoint/v1" --model "reviewed-model" --env-key MEDIUM_API_KEY
+
+# Initialize three-tier routing.
+python scripts/costmarshal.py init --name <name> --objective "<objective>" --workspace <workspace> --provider-catalog <catalog.json> --project-budget-cny <amount> --governance off
+
+# Create a bounded task.
+python scripts/costmarshal.py new-task --project <project-dir> --title "<title>" --purpose "<purpose>" --task-type implementation --risk medium --difficulty normal --estimated-input-tokens 100000 --estimated-output-tokens 10000 --claim-path src/file.py --allowed-path src/file.py
+
+# Explain without mutation.
+python scripts/costmarshal.py route --project <project-dir> --task-type implementation --risk medium --difficulty normal --estimated-input-tokens 100000 --estimated-output-tokens 10000
+
+# Dispatch and supervise.
+python scripts/costmarshal.py dispatch --project <project-dir> --task V2-0001 --start
+python scripts/costmarshal.py run-scheduler --project <project-dir>
+
+# Accept only after leader review.
+python scripts/costmarshal.py record-result --project <project-dir> --task V2-0001 --attempt <attempt-id> --status done --quality-score 5 --accepted-by-leader
+
+# Inspect and recover.
+python scripts/costmarshal.py dashboard --project <project-dir>
+python scripts/costmarshal.py providers --project <project-dir>
+python scripts/costmarshal.py budget --project <project-dir>
+python scripts/costmarshal.py governance-status --project <project-dir>
+python scripts/costmarshal.py validate --project <project-dir>
+python scripts/costmarshal.py recover --project <project-dir> --plan-restarts
 ```
 
+## Routing policy
+
+- High risk or hard difficulty: high floor.
+- Medium risk or implementation/review/code-review: medium floor.
+- Low-risk bounded analysis, docs, extraction, mechanical work, small edits, summaries, tests, or verification: low floor.
+- Unknown or judgment-heavy types: medium floor.
+
+With complete reviewed prices and token estimates, compare all valid provider combinations in escalation chains using expected cost per leader-accepted result. Enforce `--min-success-probability` when supplied. Without complete inputs, choose the minimum safe available tier. Explain the fallback; do not manufacture a price.
+
+## Provider catalog
+
+Treat pricing as reviewed configuration. Use `null` for unknown values. A provider entry contains:
+
+- `provider_id`, `tier`, `profile`, `model`, `env_key`
+- `enabled`, `priority`
+- `input_cny_per_1m`, `output_cny_per_1m`
+- `capabilities`
+
+Task `--require-capability` values are hard constraints: providers lacking every required capability are removed before tier and cost selection.
+
+## Worker write policy
+
+- No write paths: source workspace is read-only.
+- Write paths: source workspace must be a clean git repository root; execution occurs in a detached runtime worktree.
+- After exit, changed/untracked paths must all be within the declared write scope.
+- The leader reviews and integrates isolated changes.
+- Never permit claims for `.agent`, `.agents`, `AGENTS.md`, `AGENTS.override.md`, `.git`, `.codex`, or `.codex-plugin`.
+- Custom worker command templates are disabled by default because they bypass the controlled runner. The explicit `--allow-unsafe-custom-worker-commands` compatibility escape hatch forfeits sandbox and secret-isolation guarantees and must not be enabled for untrusted work.
+
+## ArchMarshal governance
+
+Use `--governance required --archmarshal-wrapper <exact invoke_archmarshal.py>` only after the workspace is explicitly managed by ArchMarshal. CostMarshal stores a binding fingerprint and validates it before dispatch and actor launch. A drift blocks execution.
+
+If adoption or repair is required, stop CostMarshal work and use the ArchMarshal skill/workflow explicitly with preview-first safety. Do not infer permission to apply an ArchMarshal plan.
+
+## Verification before handoff
+
+Run every command listed in README's Verification section. At minimum, compile plus routing, model rotation, security, actor security, reliability, budget, concurrency, backend, ArchMarshal compatibility, and install smoke tests must pass.
+
+## Known beta boundary
+
+The JSON/JSONL control plane is protected by an OS writer lock, a scheduler singleton lock, and idempotency fences, but multi-file dispatch/escalation is not fully crash-atomic. Do not describe v2.3-beta as transactionally exactly-once. After a hard crash, run `validate` and `recover`; a future non-beta release should move the control plane to a transactional store and strengthen the worker filesystem read boundary.

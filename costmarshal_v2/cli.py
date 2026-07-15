@@ -5,7 +5,7 @@ from pathlib import Path
 
 from . import __version__
 from .paths import default_root
-from .profiles import command_configure_profiles
+from .profiles import command_configure_profiles, command_configure_provider
 from .scheduler import (
     LEADER_WORK_TYPES,
     RISKS,
@@ -16,11 +16,15 @@ from .scheduler import (
     command_init,
     command_new_task,
     command_dashboard,
+    command_budget_status,
+    command_governance_status,
+    command_providers,
     command_record_leader_work,
     command_record_result,
     command_record_usage,
     command_recover,
     command_relay,
+    command_route,
     command_run_scheduler,
     command_send,
     command_start_leader,
@@ -33,7 +37,7 @@ from .scheduler import (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="CostMarshal v2 scheduler")
     parser.add_argument("--root", type=Path, default=default_root(), help="CostMarshal v2 runtime root")
-    parser.add_argument("--version", action="version", version=f"CostMarshal v2 {__version__}")
+    parser.add_argument("--version", action="version", version=f"CostMarshal {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     configure_profiles = sub.add_parser("configure-profiles", help="Create the user-level LongCat Codex profile without storing an API key")
@@ -43,19 +47,38 @@ def build_parser() -> argparse.ArgumentParser:
     configure_profiles.add_argument("--dry-run", action="store_true")
     configure_profiles.set_defaults(func=command_configure_profiles)
 
+    configure_provider = sub.add_parser("configure-provider", help="Create a user-level Codex profile for a custom API without storing its key")
+    configure_provider.add_argument("--codex-home")
+    configure_provider.add_argument("--profile", required=True)
+    configure_provider.add_argument("--provider-id", required=True)
+    configure_provider.add_argument("--display-name")
+    configure_provider.add_argument("--base-url", required=True)
+    configure_provider.add_argument("--model", required=True)
+    configure_provider.add_argument("--env-key", required=True)
+    configure_provider.add_argument("--wire-api")
+    configure_provider.add_argument("--reasoning-effort", choices=["minimal", "low", "medium", "high", "xhigh"])
+    configure_provider.add_argument("--force", action="store_true")
+    configure_provider.add_argument("--dry-run", action="store_true")
+    configure_provider.set_defaults(func=command_configure_provider)
+
     init = sub.add_parser("init", help="Create a v2 project without touching legacy state")
     init.add_argument("--name", default="")
     init.add_argument("--objective", required=True)
     init.add_argument("--source-project", help="Optional existing project to reference read-only")
     init.add_argument("--workspace", help="Writable workspace used by Codex and LongCat actors; defaults to the current directory")
     init.add_argument("--secrets-file", help="Optional local env file loaded only into actor subprocesses")
-    init.add_argument("--no-auto-escalate", dest="auto_escalate", action="store_false", default=True, help="Do not automatically route failed LongCat attempts to Codex")
+    init.add_argument("--provider-catalog", type=Path, help="Reviewed JSON provider catalog; defaults to LongCat/DeepSeek/Codex low/medium/high tiers")
+    init.add_argument("--project-budget-cny", type=float, help="Optional hard project budget; requires reviewed prices for routed providers")
+    init.add_argument("--governance", choices=["off", "auto", "required"], default="auto", help="ArchMarshal governance gate; checks are read-only and require an explicit wrapper")
+    init.add_argument("--archmarshal-wrapper", type=Path, help="Exact reviewed invoke_archmarshal.py path used for read-only governance checks")
+    init.add_argument("--no-auto-escalate", dest="auto_escalate", action="store_false", default=True, help="Do not automatically route failed attempts to the next stronger tier")
     init.add_argument("--session-name", help="Backend session name; defaults to cmv2-<project>")
     init.add_argument("--backend", choices=["auto", "tmux", "local"], default="auto", help="Actor runtime backend; auto chooses a platform-appropriate backend")
     init.add_argument("--backend-command", help="Backend executable, for example a tmux binary when --backend tmux")
     init.add_argument("--leader-model", default="inherit")
     init.add_argument("--leader-profile")
     init.add_argument("--leader-command", help="Legacy custom manager command; default uses the structured codex exec runner")
+    init.add_argument("--allow-unsafe-custom-worker-commands", action="store_true", help="Privileged compatibility escape hatch; bypasses worker sandbox and secret isolation")
     init.add_argument("--tmux-command", dest="backend_command", help=argparse.SUPPRESS)
     init.set_defaults(func=command_init)
 
@@ -83,10 +106,16 @@ def build_parser() -> argparse.ArgumentParser:
     new_task.add_argument("--task-type", default="analysis")
     new_task.add_argument("--risk", choices=["low", "medium", "high"], default="low")
     new_task.add_argument("--difficulty", choices=["simple", "normal", "hard"], default="normal")
-    new_task.add_argument("--provider", choices=["auto", "codex", "longcat"], default="auto")
+    new_task.add_argument("--provider", default="auto", help="Provider id from the project catalog, or auto")
+    new_task.add_argument("--tier", choices=["auto", "low", "medium", "high"], default="auto")
     new_task.add_argument("--profile")
     new_task.add_argument("--agent", default="auto")
     new_task.add_argument("--model", default="inherit")
+    new_task.add_argument("--estimated-input-tokens", type=int, default=0)
+    new_task.add_argument("--estimated-output-tokens", type=int, default=0)
+    new_task.add_argument("--max-cost-cny", type=float)
+    new_task.add_argument("--require-capability", action="append", dest="required_capabilities")
+    new_task.add_argument("--min-success-probability", type=float)
     new_task.add_argument("--acceptance", action="append")
     new_task.add_argument("--allowed-context", action="append")
     new_task.add_argument("--allowed-path", action="append")
@@ -94,13 +123,39 @@ def build_parser() -> argparse.ArgumentParser:
     new_task.add_argument("--allow-lock-conflict", action="store_true", help="Allow overlapping claimed paths after explicit leader review")
     new_task.set_defaults(func=command_new_task)
 
+    route = sub.add_parser("route", help="Explain or simulate a safe cost-performance route without changing state")
+    route.add_argument("--project", required=True)
+    route.add_argument("--task-type", default="analysis")
+    route.add_argument("--risk", choices=["low", "medium", "high"], default="low")
+    route.add_argument("--difficulty", choices=["simple", "normal", "hard"], default="normal")
+    route.add_argument("--provider", default="auto")
+    route.add_argument("--tier", choices=["auto", "low", "medium", "high"], default="auto")
+    route.add_argument("--estimated-input-tokens", type=int, default=0)
+    route.add_argument("--estimated-output-tokens", type=int, default=0)
+    route.add_argument("--require-capability", action="append", dest="required_capabilities")
+    route.add_argument("--min-success-probability", type=float)
+    route.set_defaults(func=command_route)
+
+    providers = sub.add_parser("providers", help="List and validate the project provider catalog")
+    providers.add_argument("--project", required=True)
+    providers.set_defaults(func=command_providers)
+
+    budget = sub.add_parser("budget", help="Show project budget commitment and per-attempt reservations")
+    budget.add_argument("--project", required=True)
+    budget.set_defaults(func=command_budget_status)
+
+    governance_status = sub.add_parser("governance-status", help="Validate the stored ArchMarshal governance binding without mutation")
+    governance_status.add_argument("--project", required=True)
+    governance_status.set_defaults(func=command_governance_status)
+
     dispatch = sub.add_parser("dispatch", help="Assign a task to an agent actor and optionally start it")
     dispatch.add_argument("--project", required=True)
     dispatch.add_argument("--task", required=True)
     dispatch.add_argument("--actor-id")
     dispatch.add_argument("--agent")
     dispatch.add_argument("--model")
-    dispatch.add_argument("--provider", choices=["auto", "codex", "longcat"])
+    dispatch.add_argument("--provider", help="Provider id from the project catalog, or auto")
+    dispatch.add_argument("--tier", choices=["auto", "low", "medium", "high"])
     dispatch.add_argument("--profile")
     dispatch.add_argument("--command")
     dispatch.add_argument("--start", action="store_true")
@@ -108,13 +163,17 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch.add_argument("--force", action="store_true")
     dispatch.set_defaults(func=command_dispatch)
 
-    escalate = sub.add_parser("escalate", help="Route a failed or uncertain task from LongCat to Codex")
+    escalate = sub.add_parser("escalate", help="Route a failed or uncertain task to the next stronger provider tier")
     escalate.add_argument("--project", required=True)
     escalate.add_argument("--task", required=True)
     escalate.add_argument("--reason", required=True)
     escalate.add_argument("--actor-id")
+    escalate.add_argument("--from-actor", help=argparse.SUPPRESS)
+    escalate.add_argument("--attempt", help=argparse.SUPPRESS)
     escalate.add_argument("--profile")
     escalate.add_argument("--model")
+    escalate.add_argument("--provider", help="Explicit stronger provider id")
+    escalate.add_argument("--to-tier", choices=["medium", "high"], help="Explicit stronger target tier")
     escalate.add_argument("--start", action="store_true")
     escalate.add_argument("--dry-run", action="store_true")
     escalate.add_argument("--force", action="store_true")
@@ -168,6 +227,7 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--project", required=True)
     collect.add_argument("--task", required=True)
     collect.add_argument("--actor")
+    collect.add_argument("--attempt")
     collect.add_argument("--state", default="waiting_leader")
     collect.add_argument("--report")
     collect.add_argument("--summary", help="Optional caller-provided compact summary; scheduler does not infer one")
@@ -181,6 +241,7 @@ def build_parser() -> argparse.ArgumentParser:
     result.add_argument("--accepted-by-leader", action="store_true")
     result.add_argument("--agent")
     result.add_argument("--actor")
+    result.add_argument("--attempt")
     result.add_argument("--model")
     result.add_argument("--input-tokens", type=int, default=0)
     result.add_argument("--output-tokens", type=int, default=0)
@@ -209,10 +270,12 @@ def build_parser() -> argparse.ArgumentParser:
     usage.add_argument("--project", required=True)
     usage.add_argument("--actor", required=True)
     usage.add_argument("--task")
+    usage.add_argument("--attempt")
     usage.add_argument("--model")
     usage.add_argument("--input-tokens", type=int, default=0)
     usage.add_argument("--output-tokens", type=int, default=0)
     usage.add_argument("--estimated-cost-cny", type=float)
+    usage.add_argument("--final", dest="final_usage", action="store_true", help="Mark this as terminal usage and settle the remaining reservation")
     usage.add_argument("--note")
     usage.set_defaults(func=command_record_usage)
 
