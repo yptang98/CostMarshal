@@ -305,9 +305,12 @@ HEAD and the complete Git state before and after, and stages the exact candidate
 tree without committing it. A retry with the same command ID is idempotent.
 Leader acceptance rechecks both the content-addressed patch bytes and the clean
 frozen source state, so a deleted/stale preview cannot be accepted. Explicit
-Preview and explicit `--apply` remain available while JSON files are
-authoritative; after SQLite cutover both fail closed until detached Git preview
-and staging are represented by the recoverable external-effect outbox.
+preview and `--apply` also work after SQLite cutover through owner-leased
+`git_preview` / `git_apply` effects. Their SQLite transactions freeze only the
+hash-bound intent; detached Git I/O runs after commit, canonical observations
+are projected idempotently into the task receipt/event, and only then is the
+original command completed. A busy daemon may leave the exact effect honestly
+queued for its next scheduler cycle.
 
 If the leader rejects an attempt but wants the reviewed chain to continue, record the
 decision and then explicitly queue the next provider step in the admitted monotonic chain, which may skip a tier. `record-result` does not
@@ -402,9 +405,12 @@ container that it cannot durably stop.
 ## Offline blind backtest
 
 `scripts/backtest_shadow_matrix.py` evaluates an already collected real-provider
-low/medium/high blind shadow matrix. It never reads credentials or calls a
-provider. Without at least 200 attested real tasks it writes an honest blocked
-`artifacts/backtest-report.json` and exits `2`. Dataset schema, checkpoint resume,
+low/medium/high blind shadow matrix. Dataset schema v2 keys final outcomes by
+the frozen provider ID, so multiple providers in the same tier are evaluated
+without collapsing their cost or acceptance evidence. Every blind result and
+provider-call hash must match the signed unblinding map. The harness never reads
+credentials or calls a provider. Without at least 200 attested real tasks it
+writes an honest blocked `artifacts/backtest-report.json` and exits `2`. Dataset schema, checkpoint resume,
 paired bootstrap confidence intervals, and budget rules are documented in
 [`references/backtest.md`](references/backtest.md).
 

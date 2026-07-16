@@ -42,8 +42,10 @@ from .change_apply import (
     ChangeApplyError,
     PreparedChangePreview,
     apply_prepared_change_preview,
+    canonical_change_apply_observation,
     prepare_change_preview,
     prepared_change_preview_from_dict,
+    prepared_change_preview_intent_from_dict,
     require_prepared_change_source_ready,
 )
 from .mailbox import deliver_outbox_message, inbox_message_ids, send_message
@@ -183,6 +185,9 @@ PROVIDERS = {"auto", "codex", "deepseek", "longcat"}
 SCHEDULER_FAULT_ENV = "COSTMARSHAL_SCHEDULER_FAULT"
 SPAWN_EFFECT_TYPE = "spawn_actor"
 STOP_EFFECT_TYPE = "stop_actor"
+GIT_PREVIEW_EFFECT_TYPE = "git_preview"
+GIT_APPLY_EFFECT_TYPE = "git_apply"
+GIT_EFFECT_TYPES = (GIT_PREVIEW_EFFECT_TYPE, GIT_APPLY_EFFECT_TYPE)
 SPAWN_EFFECT_LEASE_SECONDS = 2.0
 SPAWN_EFFECT_MAX_ATTEMPTS = 5
 SPAWN_RUNTIME_FENCE_KEYS = (
@@ -2159,6 +2164,491 @@ def _execute_stop_effect(
     }
 
 
+class _PermanentGitEffectError(ValueError):
+    """A frozen Git effect can never be valid for its authoritative state."""
+
+
+def _retryable_git_error(exc: ChangeApplyError) -> bool:
+    detail = str(exc).casefold()
+    return any(
+        marker in detail
+        for marker in (
+            "timed out waiting for the repository apply lease",
+            "git operation failed",
+            "resource temporarily unavailable",
+            "unable to create",
+            "index.lock",
+        )
+    )
+
+
+def _require_git_effect_envelope(
+    effect: dict[str, Any],
+    *,
+    effect_type: str,
+) -> dict[str, Any]:
+    payload = effect.get("payload")
+    if effect.get("effect_type") != effect_type or not isinstance(payload, dict):
+        raise _PermanentGitEffectError("Git effect envelope is invalid")
+    command_id = payload.get("command_id")
+    attempt_id = payload.get("attempt_id")
+    if (
+        not isinstance(command_id, str)
+        or not command_id
+        or not isinstance(attempt_id, str)
+        or not attempt_id
+        or effect.get("command_id") != command_id
+        or effect.get("aggregate_id") != attempt_id
+        or effect.get("effect_id") != _git_effect_id(effect_type, command_id)
+        or int(effect.get("generation") or 0) != 1
+    ):
+        raise _PermanentGitEffectError("Git effect identity fence is invalid")
+    return payload
+
+
+def _validate_git_preview_effect_state(
+    layout: ProjectLayout,
+    effect: dict[str, Any],
+    *,
+    external: bool,
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    tuple[str, ...],
+    dict[str, Any],
+    Path,
+    Path,
+]:
+    payload = _require_git_effect_envelope(effect, effect_type=GIT_PREVIEW_EFFECT_TYPE)
+    project = load_project(layout)
+    if str(project.get("project_id") or "") != payload.get("project_id"):
+        raise _PermanentGitEffectError("Git preview project identity changed")
+    task_id = payload.get("task_id")
+    if not isinstance(task_id, str) or not task_exists(layout, task_id):
+        raise _PermanentGitEffectError("Git preview task no longer exists")
+    task = load_task(layout, task_id)
+    attempt = _current_change_attempt(task, str(payload["attempt_id"]))
+    expected = _git_preview_intent(
+        layout,
+        project,
+        task,
+        attempt,
+        command_id=str(payload["command_id"]),
+    )
+    if expected != payload:
+        raise _PermanentGitEffectError("Git preview frozen intent differs from authoritative state")
+    if external:
+        contract, output, write_scope, manifest, artifact_root, preview_root = (
+            _semantic_change_inputs(layout, project, task, attempt)
+        )
+        external_bindings = {
+            "workspace": str(Path(str(project.get("workspace") or "")).expanduser().resolve()),
+            "base_sha": str(contract["base_sha"]),
+            "write_scope": list(write_scope),
+            "collaboration_contract_sha256": str(contract.get("contract_sha256") or ""),
+            "attempt_output_sha256": str(output.get("attempt_output_sha256") or ""),
+            "change_manifest_sha256": str(output["outgoing_changes"]["manifest_sha256"]),
+            "change_manifest": manifest,
+            "change_artifact_root": str(artifact_root),
+            "preview_root": str(preview_root),
+        }
+        for key, value in external_bindings.items():
+            if payload.get(key) != value:
+                raise _PermanentGitEffectError(
+                    f"Git preview external binding changed: {key}"
+                )
+    else:
+        contract, output, write_scope, manifest, artifact_root, preview_root = (
+            _frozen_change_state_inputs(layout, project, task, attempt)
+        )
+    return (
+        payload,
+        project,
+        task,
+        attempt,
+        contract,
+        output,
+        write_scope,
+        manifest,
+        artifact_root,
+        preview_root,
+    )
+
+
+def _validate_git_apply_effect_state(
+    layout: ProjectLayout,
+    effect: dict[str, Any],
+    *,
+    external: bool,
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    PreparedChangePreview,
+    dict[str, Any],
+    dict[str, Any],
+    tuple[str, ...],
+    dict[str, Any],
+    Path,
+    dict[str, Any],
+]:
+    payload = _require_git_effect_envelope(effect, effect_type=GIT_APPLY_EFFECT_TYPE)
+    project = load_project(layout)
+    if str(project.get("project_id") or "") != payload.get("project_id"):
+        raise _PermanentGitEffectError("Git apply project identity changed")
+    task_id = payload.get("task_id")
+    if not isinstance(task_id, str) or not task_exists(layout, task_id):
+        raise _PermanentGitEffectError("Git apply task no longer exists")
+    task = load_task(layout, task_id)
+    attempt = _current_change_attempt(task, str(payload["attempt_id"]))
+    expected, _ = _git_apply_intent(
+        layout,
+        project,
+        task,
+        attempt,
+        command_id=str(payload["command_id"]),
+        verify_external_preview=external,
+    )
+    if expected != payload:
+        raise _PermanentGitEffectError("Git apply frozen intent differs from authoritative state")
+    (
+        preview,
+        contract,
+        output,
+        write_scope,
+        manifest,
+        artifact_root,
+        _preview_root,
+        _trusted_result,
+        apply_contract,
+    ) = _accepted_change_apply_inputs(
+        layout,
+        project,
+        task,
+        attempt,
+        verify_external_preview=external,
+    )
+    return (
+        payload,
+        project,
+        task,
+        attempt,
+        preview,
+        contract,
+        output,
+        write_scope,
+        manifest,
+        artifact_root,
+        apply_contract,
+    )
+
+
+def _project_git_preview_observation(
+    layout: ProjectLayout,
+    *,
+    effect: dict[str, Any],
+    observation: dict[str, Any],
+) -> dict[str, Any]:
+    effect_id = str(effect["effect_id"])
+    with control_transaction(
+        layout,
+        command_name="effect_git_preview_projection",
+        command_id=f"PROJECT-{effect_id}",
+        payload={"effect_id": effect_id, "observation_sha256": _canonical_json_sha256(observation)},
+    ) as transaction:
+        if not transaction.replay:
+            payload, _project, task, attempt, *_rest = _validate_git_preview_effect_state(
+                layout,
+                effect,
+                external=False,
+            )
+            preview_receipt = observation.get("preview")
+            if not isinstance(preview_receipt, dict):
+                raise _PermanentGitEffectError("Git preview observation is missing its receipt")
+            existing = attempt.get("change_preview_receipt")
+            if existing is not None and (
+                existing != preview_receipt
+                or attempt.get("change_preview_command_id") != payload.get("command_id")
+            ):
+                raise _PermanentGitEffectError(
+                    "authoritative attempt contains a conflicting preview receipt"
+                )
+            if existing is None:
+                attempt["change_preview_receipt"] = preview_receipt
+                attempt["change_preview_command_id"] = payload["command_id"]
+                attempt["change_preview_attempt_output_sha256"] = payload[
+                    "attempt_output_sha256"
+                ]
+                attempt["change_preview_created_at"] = now_iso()
+                save_task(layout, task)
+                append_event(
+                    layout,
+                    "change_preview_created",
+                    task_id=task.get("id"),
+                    attempt_id=attempt.get("attempt_id"),
+                    effect_id=effect_id,
+                    patch_sha256=preview_receipt.get("patch_sha256"),
+                    candidate_tree_sha=preview_receipt.get("candidate_tree_sha"),
+                )
+    projected = load_task(layout, str((effect.get("payload") or {})["task_id"]))
+    attempt = _current_change_attempt(
+        projected,
+        str((effect.get("payload") or {})["attempt_id"]),
+    )
+    receipt = attempt.get("change_preview_receipt")
+    if not isinstance(receipt, dict) or receipt != observation.get("preview"):
+        raise _PermanentGitEffectError("Git preview projection did not converge")
+    return receipt
+
+
+def _project_git_apply_observation(
+    layout: ProjectLayout,
+    *,
+    effect: dict[str, Any],
+    observation: dict[str, Any],
+) -> dict[str, Any]:
+    effect_id = str(effect["effect_id"])
+    with control_transaction(
+        layout,
+        command_name="effect_git_apply_projection",
+        command_id=f"PROJECT-{effect_id}",
+        payload={"effect_id": effect_id, "observation_sha256": _canonical_json_sha256(observation)},
+    ) as transaction:
+        if not transaction.replay:
+            (
+                payload,
+                _project,
+                task,
+                attempt,
+                _preview,
+                _contract,
+                _output,
+                _write_scope,
+                _manifest,
+                _artifact_root,
+                apply_contract,
+            ) = _validate_git_apply_effect_state(layout, effect, external=False)
+            existing = attempt.get("change_apply_receipt")
+            receipt = {
+                "schema_version": 2,
+                "kind": "costmarshal-change-apply-receipt",
+                "command_id": payload["command_id"],
+                "applied_at": (
+                    existing.get("applied_at")
+                    if isinstance(existing, dict) and isinstance(existing.get("applied_at"), str)
+                    else now_iso()
+                ),
+                "preview_sha256": payload["preview_sha256"],
+                "patch_sha256": observation.get("patch_sha256"),
+                "candidate_tree_sha": observation.get("candidate_tree_sha"),
+                "outcome": observation,
+                "effect_id": effect_id,
+            }
+            if existing is not None and existing != receipt:
+                raise _PermanentGitEffectError(
+                    "authoritative attempt contains a conflicting apply receipt"
+                )
+            if existing is None:
+                attempt["change_apply_contract"] = apply_contract
+                attempt["change_apply_receipt"] = receipt
+                save_task(layout, task)
+                append_event(
+                    layout,
+                    "change_apply_recorded",
+                    task_id=task.get("id"),
+                    attempt_id=attempt.get("attempt_id"),
+                    effect_id=effect_id,
+                    preview_sha256=payload["preview_sha256"],
+                    apply_status=observation.get("status"),
+                )
+    projected = load_task(layout, str((effect.get("payload") or {})["task_id"]))
+    attempt = _current_change_attempt(
+        projected,
+        str((effect.get("payload") or {})["attempt_id"]),
+    )
+    receipt = attempt.get("change_apply_receipt")
+    if not isinstance(receipt, dict) or receipt.get("outcome") != observation:
+        raise _PermanentGitEffectError("Git apply projection did not converge")
+    return receipt
+
+
+def _execute_git_effect(
+    layout: ProjectLayout,
+    *,
+    effect: dict[str, Any],
+    owner: str,
+) -> dict[str, Any]:
+    effect_type = str(effect.get("effect_type") or "")
+    effect_id = str(effect["effect_id"])
+    observation = effect.get("observation")
+    if effect.get("status") != "observed" or not isinstance(observation, dict):
+        try:
+            if effect_type == GIT_PREVIEW_EFFECT_TYPE:
+                (
+                    payload,
+                    project,
+                    _task,
+                    _attempt,
+                    contract,
+                    _output,
+                    write_scope,
+                    manifest,
+                    artifact_root,
+                    preview_root,
+                ) = _validate_git_preview_effect_state(layout, effect, external=True)
+                preview = prepare_change_preview(
+                    project.get("workspace"),
+                    base_sha=str(contract["base_sha"]),
+                    write_scope=write_scope,
+                    change_manifest=manifest,
+                    change_artifact_root=artifact_root,
+                    preview_root=preview_root,
+                )
+                observation = {
+                    "schema": "costmarshal-git-preview-observation-v1",
+                    "task_id": payload["task_id"],
+                    "attempt_id": payload["attempt_id"],
+                    "preview": preview.to_dict(),
+                    "source_workspace_modified": False,
+                }
+            elif effect_type == GIT_APPLY_EFFECT_TYPE:
+                (
+                    payload,
+                    project,
+                    _task,
+                    _attempt,
+                    preview,
+                    contract,
+                    output,
+                    write_scope,
+                    manifest,
+                    artifact_root,
+                    _apply_contract,
+                ) = _validate_git_apply_effect_state(layout, effect, external=True)
+                outcome = apply_prepared_change_preview(
+                    preview,
+                    expected_repository=project.get("workspace"),
+                    expected_base_sha=str(contract["base_sha"]),
+                    expected_write_scope=write_scope,
+                    expected_change_manifest_sha256=str(
+                        output["outgoing_changes"]["manifest_sha256"]
+                    ),
+                    change_manifest=manifest,
+                    change_artifact_root=artifact_root,
+                    scratch_root=(
+                        layout.root
+                        / "apply-verify"
+                        / hashlib.sha256(
+                            (
+                                str(payload.get("project_id") or "project")
+                                + ":"
+                                + str(payload.get("attempt_id") or "attempt")
+                            ).encode("utf-8")
+                        ).hexdigest()[:16]
+                    ),
+                )
+                observation = canonical_change_apply_observation(outcome)
+            else:
+                raise _PermanentGitEffectError("unsupported Git effect type")
+        except ChangeApplyError as exc:
+            if _retryable_git_error(exc):
+                raise RuntimeError(str(exc)) from exc
+            raise _PermanentGitEffectError(str(exc)) from exc
+        except HandoffContractError as exc:
+            raise _PermanentGitEffectError(str(exc)) from exc
+        _scheduler_fault(f"{effect_type}.after_external_before_observe")
+        observe_effect(
+            layout,
+            effect_id=effect_id,
+            owner=owner,
+            observation=observation,
+        )
+        _scheduler_fault(f"{effect_type}.after_observe_before_projection")
+    if effect_type == GIT_PREVIEW_EFFECT_TYPE:
+        receipt = _project_git_preview_observation(
+            layout,
+            effect=effect,
+            observation=observation,
+        )
+        response = {
+            "status": "ok",
+            "source_workspace_modified": False,
+            "preview": receipt,
+        }
+    elif effect_type == GIT_APPLY_EFFECT_TYPE:
+        receipt = _project_git_apply_observation(
+            layout,
+            effect=effect,
+            observation=observation,
+        )
+        response = {"status": "ok", "apply": receipt}
+    else:
+        raise _PermanentGitEffectError("unsupported Git effect type")
+    _scheduler_fault(f"{effect_type}.after_projection_before_apply")
+    result = {"status": "completed", "response": response, "observation": observation}
+    applied = apply_effect(
+        layout,
+        effect_id=effect_id,
+        owner=owner,
+        result=result,
+        command_result={"stdout": json.dumps(response, ensure_ascii=False, indent=2) + "\n"},
+    )
+    return {
+        "effect_id": effect_id,
+        "effect_type": effect_type,
+        "task_id": (effect.get("payload") or {}).get("task_id"),
+        "attempt_id": (effect.get("payload") or {}).get("attempt_id"),
+        "status": applied.get("status"),
+    }
+
+
+def _record_git_effect_terminal_failure(
+    layout: ProjectLayout,
+    *,
+    effect: dict[str, Any],
+    owner: str,
+    error: str,
+) -> None:
+    effect_id = str(effect["effect_id"])
+    payload = effect.get("payload") or {}
+    with control_transaction(
+        layout,
+        command_name="effect_git_terminal_failure",
+        command_id=f"FAIL-{effect_id}",
+        payload={"effect_id": effect_id, "error": error},
+    ) as transaction:
+        if not transaction.replay:
+            task_id = payload.get("task_id")
+            attempt_id = payload.get("attempt_id")
+            if isinstance(task_id, str) and task_exists(layout, task_id):
+                task = load_task(layout, task_id)
+                try:
+                    attempt = _current_change_attempt(task, str(attempt_id or ""))
+                except ChangeApplyError:
+                    attempt = None
+                if isinstance(attempt, dict):
+                    field = (
+                        "change_preview_error"
+                        if effect.get("effect_type") == GIT_PREVIEW_EFFECT_TYPE
+                        else "change_apply_error"
+                    )
+                    attempt[field] = {"effect_id": effect_id, "error": error}
+                    save_task(layout, task)
+                append_event(
+                    layout,
+                    "git_effect_failed_permanently",
+                    effect_id=effect_id,
+                    effect_type=effect.get("effect_type"),
+                    task_id=task_id,
+                    attempt_id=attempt_id,
+                    error=error,
+                )
+            transaction.finalize_dead_effect(effect_id=effect_id, owner=owner, error=error)
+
+
 def _process_runtime_effects_under_instance_lock(
     layout: ProjectLayout,
     *,
@@ -2184,7 +2674,9 @@ def _process_runtime_effects_under_instance_lock(
             layout,
             owner=owner,
             ttl_seconds=SPAWN_EFFECT_LEASE_SECONDS,
-            effect_types=(STOP_EFFECT_TYPE,) if _emergency_stop_only else (SPAWN_EFFECT_TYPE, STOP_EFFECT_TYPE),
+            effect_types=(STOP_EFFECT_TYPE,)
+            if _emergency_stop_only
+            else (SPAWN_EFFECT_TYPE, STOP_EFFECT_TYPE, *GIT_EFFECT_TYPES),
             effect_ids=_effect_ids,
         )
         if effect is None:
@@ -2202,6 +2694,8 @@ def _process_runtime_effects_under_instance_lock(
                 reconcile_project_views(layout)
                 if effect.get("effect_type") == STOP_EFFECT_TYPE:
                     processed.append(_execute_stop_effect(layout, effect=effect, owner=owner))
+                elif effect.get("effect_type") in GIT_EFFECT_TYPES:
+                    processed.append(_execute_git_effect(layout, effect=effect, owner=owner))
                 else:
                     actor = _validate_spawn_effect(layout, effect)
                     if effect.get("status") == "observed":
@@ -2251,18 +2745,13 @@ def _process_runtime_effects_under_instance_lock(
                     )
         except ValueError as exc:
             error = f"{type(exc).__name__}: {exc}"
-            _record_terminal_effect_failure(
-                layout,
-                effect=effect,
-                error=error,
-                owner=owner,
-            )
-            failed.append({"effect_id": effect_id, "retryable": False, "error": error})
-        except (Exception, SystemExit) as exc:  # external runtime failures are durable and retryable
-            error = f"{type(exc).__name__}: {exc}"
-            retryable = int(effect.get("attempts") or 0) < SPAWN_EFFECT_MAX_ATTEMPTS
-            if retryable:
-                fail_effect(layout, effect_id=effect_id, owner=owner, error=error, retryable=True)
+            if effect.get("effect_type") in GIT_EFFECT_TYPES:
+                _record_git_effect_terminal_failure(
+                    layout,
+                    effect=effect,
+                    error=error,
+                    owner=owner,
+                )
             else:
                 _record_terminal_effect_failure(
                     layout,
@@ -2270,6 +2759,27 @@ def _process_runtime_effects_under_instance_lock(
                     error=error,
                     owner=owner,
                 )
+            failed.append({"effect_id": effect_id, "retryable": False, "error": error})
+        except (Exception, SystemExit) as exc:  # external runtime failures are durable and retryable
+            error = f"{type(exc).__name__}: {exc}"
+            retryable = int(effect.get("attempts") or 0) < SPAWN_EFFECT_MAX_ATTEMPTS
+            if retryable:
+                fail_effect(layout, effect_id=effect_id, owner=owner, error=error, retryable=True)
+            else:
+                if effect.get("effect_type") in GIT_EFFECT_TYPES:
+                    _record_git_effect_terminal_failure(
+                        layout,
+                        effect=effect,
+                        error=error,
+                        owner=owner,
+                    )
+                else:
+                    _record_terminal_effect_failure(
+                        layout,
+                        effect=effect,
+                        error=error,
+                        owner=owner,
+                    )
             failed.append({"effect_id": effect_id, "retryable": retryable, "error": error})
     return {
         "status": "ok" if not failed else "degraded",
@@ -5423,6 +5933,287 @@ def _load_bound_change_preview(
     )
 
 
+def _canonical_json_sha256(value: Any) -> str:
+    try:
+        payload = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ChangeApplyError("Git effect intent is not canonical JSON") from exc
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def _git_effect_id(effect_type: str, command_id: str) -> str:
+    if effect_type not in GIT_EFFECT_TYPES:
+        raise ValueError(f"unsupported Git effect type: {effect_type}")
+    label = "PREVIEW" if effect_type == GIT_PREVIEW_EFFECT_TYPE else "APPLY"
+    digest = hashlib.sha256(command_id.encode("utf-8")).hexdigest()[:32]
+    return f"EFF-GIT-{label}-{digest}"
+
+
+def _current_change_attempt(task: dict[str, Any], attempt_id: str) -> dict[str, Any]:
+    attempts = task.get("attempts") or []
+    attempt = next(
+        (row for row in attempts if row.get("attempt_id") == attempt_id),
+        None,
+    )
+    if not isinstance(attempt, dict):
+        raise ChangeApplyError("Git effect attempt no longer exists")
+    if attempts and attempt is not attempts[-1]:
+        raise ChangeApplyError("Git effect refuses a stale non-current attempt")
+    return attempt
+
+
+def _frozen_change_state_inputs(
+    layout: ProjectLayout,
+    project: dict[str, Any],
+    task: dict[str, Any],
+    attempt: dict[str, Any],
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    tuple[str, ...],
+    dict[str, Any],
+    Path,
+    Path,
+]:
+    """Extract a Git-effect intent from authoritative documents without FS I/O.
+
+    This intentionally does less than ``_semantic_change_inputs``.  The leased
+    executor repeats the complete sealed-output, artifact, patch and Git checks
+    immediately before the external effect.  The command transaction only
+    freezes the exact state it admitted.
+    """
+
+    if _required_attempt_output_boundary(task, attempt) != "sealed-required":
+        raise ChangeApplyError("change review requires a sealed required-isolation attempt")
+    contract = validate_semantic_collaboration_contract(task.get("handoff_contract"))
+    output = attempt.get("attempt_output")
+    if not isinstance(output, dict):
+        raise ChangeApplyError("sealed attempt output is missing")
+    change_policy = contract.get("change_policy") or {}
+    try:
+        write_scope = tuple(
+            sorted(normalize_path_list(change_policy.get("write_scope") or [], kind="allowed"))
+        )
+    except SecurityValidationError as exc:
+        raise ChangeApplyError(str(exc)) from exc
+    if not write_scope:
+        raise ChangeApplyError("attempt is read-only and has no workspace changes to review")
+    receipt = attempt.get("change_artifact")
+    outgoing = output.get("outgoing_changes") or {}
+    manifest = receipt.get("manifest") if isinstance(receipt, dict) else None
+    if (
+        not isinstance(receipt, dict)
+        or not isinstance(manifest, dict)
+        or receipt.get("manifest_sha256") != outgoing.get("manifest_sha256")
+        or receipt.get("change_count") != outgoing.get("change_count")
+        or receipt.get("total_upsert_bytes") != outgoing.get("total_upsert_bytes")
+        or receipt.get("base_sha") != contract.get("base_sha")
+        or receipt.get("write_scope") != list(write_scope)
+        or receipt.get("collaboration_contract_sha256") != contract.get("contract_sha256")
+        or manifest.get("manifest_sha256") != outgoing.get("manifest_sha256")
+    ):
+        raise ChangeApplyError("cumulative change artifact differs from the sealed attempt output")
+    artifact_root = Path(str(receipt.get("artifact_root") or "")).expanduser()
+    expected_artifact_root = layout.root / "task-change-artifacts"
+    if (
+        not artifact_root.is_absolute()
+        or ".." in artifact_root.parts
+        or not expected_artifact_root.is_absolute()
+    ):
+        raise ChangeApplyError("frozen change artifact path is not canonical absolute")
+    try:
+        artifact_root.relative_to(expected_artifact_root)
+    except ValueError as exc:
+        raise ChangeApplyError("change artifact escapes the CostMarshal runtime root") from exc
+    workspace = Path(str(project.get("workspace") or "")).expanduser()
+    if not workspace.is_absolute() or ".." in workspace.parts:
+        raise ChangeApplyError("frozen workspace path is not canonical absolute")
+    preview_root = (
+        layout.root
+        / "change-previews"
+        / slugify(str(project.get("project_id") or "project"), "project")
+        / slugify(str(task.get("id") or "task"), "task")
+        / slugify(str(attempt.get("attempt_id") or "attempt"), "attempt")
+    )
+    return contract, output, write_scope, manifest, artifact_root, preview_root
+
+
+def _git_preview_intent(
+    layout: ProjectLayout,
+    project: dict[str, Any],
+    task: dict[str, Any],
+    attempt: dict[str, Any],
+    *,
+    command_id: str,
+) -> dict[str, Any]:
+    if attempt.get("status") not in {"waiting_leader", "failed", "escalate"}:
+        raise ChangeApplyError("preview-changes requires a collected finished attempt")
+    if attempt.get("leader_result_id") is not None:
+        raise ChangeApplyError("preview-changes must occur before the leader result is recorded")
+    contract, output, write_scope, manifest, artifact_root, preview_root = (
+        _frozen_change_state_inputs(layout, project, task, attempt)
+    )
+    return {
+        "schema": "costmarshal-git-preview-effect-v1",
+        "command_id": command_id,
+        "project_id": str(project.get("project_id") or ""),
+        "task_id": str(task.get("id") or ""),
+        "attempt_id": str(attempt.get("attempt_id") or ""),
+        "workspace": str(Path(str(project.get("workspace") or "")).expanduser()),
+        "base_sha": str(contract["base_sha"]),
+        "write_scope": list(write_scope),
+        "collaboration_contract_sha256": str(contract.get("contract_sha256") or ""),
+        "attempt_output_sha256": str(output.get("attempt_output_sha256") or ""),
+        "change_manifest_sha256": str(output["outgoing_changes"]["manifest_sha256"]),
+        "change_manifest": manifest,
+        "change_artifact_root": str(artifact_root),
+        "preview_root": str(preview_root),
+    }
+
+
+def _accepted_change_apply_inputs(
+    layout: ProjectLayout,
+    project: dict[str, Any],
+    task: dict[str, Any],
+    attempt: dict[str, Any],
+    *,
+    verify_external_preview: bool,
+) -> tuple[
+    PreparedChangePreview,
+    dict[str, Any],
+    dict[str, Any],
+    tuple[str, ...],
+    dict[str, Any],
+    Path,
+    Path,
+    dict[str, Any],
+    dict[str, Any],
+]:
+    if (
+        attempt.get("recorded_result_status") != "done"
+        or attempt.get("accepted_by_leader") is not True
+        or not isinstance(attempt.get("leader_result_id"), str)
+    ):
+        raise ChangeApplyError("apply-changes requires an explicitly accepted done result")
+    if verify_external_preview:
+        contract, output, write_scope, manifest, artifact_root, preview_root = (
+            _semantic_change_inputs(layout, project, task, attempt)
+        )
+    else:
+        contract, output, write_scope, manifest, artifact_root, preview_root = (
+            _frozen_change_state_inputs(layout, project, task, attempt)
+        )
+    stored = attempt.get("change_preview_receipt")
+    if not isinstance(stored, dict):
+        raise ChangeApplyError("leader acceptance requires a durable change preview")
+    preview_loader = (
+        prepared_change_preview_from_dict
+        if verify_external_preview
+        else prepared_change_preview_intent_from_dict
+    )
+    preview = preview_loader(
+        stored,
+        expected_repository=project.get("workspace"),
+        expected_base_sha=str(contract["base_sha"]),
+        expected_write_scope=write_scope,
+        expected_change_manifest_sha256=str(output["outgoing_changes"]["manifest_sha256"]),
+        expected_preview_root=preview_root,
+    )
+    if preview.changed_paths != tuple(str(entry["path"]) for entry in manifest["changes"]):
+        raise ChangeApplyError("stored preview path set differs from the cumulative manifest")
+    trusted_result = next(
+        (
+            row
+            for row in trusted_result_rows(layout)
+            if row.get("id") == attempt.get("leader_result_id")
+            and row.get("attempt_id") == attempt.get("attempt_id")
+        ),
+        None,
+    )
+    if not isinstance(trusted_result, dict):
+        raise ChangeApplyError("apply-changes requires intact trusted leader result evidence")
+    try:
+        apply_contract = build_apply_preview_contract(
+            collaboration_contract=contract,
+            accepted_attempt_input=attempt.get("attempt_input"),
+            accepted_attempt_output=output,
+            accepted_leader_result=trusted_result,
+            expected_source_head_sha=preview.expected_head_sha,
+            patch_sha256=preview.patch_sha256,
+            patch_size_bytes=preview.patch_size_bytes,
+            candidate_tree_sha=preview.candidate_tree_sha,
+        )
+    except HandoffContractError as exc:
+        raise ChangeApplyError(f"Unable to bind accepted apply preview: {exc}") from exc
+    return (
+        preview,
+        contract,
+        output,
+        write_scope,
+        manifest,
+        artifact_root,
+        preview_root,
+        trusted_result,
+        apply_contract,
+    )
+
+
+def _git_apply_intent(
+    layout: ProjectLayout,
+    project: dict[str, Any],
+    task: dict[str, Any],
+    attempt: dict[str, Any],
+    *,
+    command_id: str,
+    verify_external_preview: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    (
+        preview,
+        contract,
+        output,
+        write_scope,
+        manifest,
+        artifact_root,
+        preview_root,
+        trusted_result,
+        apply_contract,
+    ) = _accepted_change_apply_inputs(
+        layout,
+        project,
+        task,
+        attempt,
+        verify_external_preview=verify_external_preview,
+    )
+    intent = {
+        "schema": "costmarshal-git-apply-effect-v1",
+        "command_id": command_id,
+        "project_id": str(project.get("project_id") or ""),
+        "task_id": str(task.get("id") or ""),
+        "attempt_id": str(attempt.get("attempt_id") or ""),
+        "workspace": str(Path(str(project.get("workspace") or "")).expanduser()),
+        "base_sha": str(contract["base_sha"]),
+        "write_scope": list(write_scope),
+        "collaboration_contract_sha256": str(contract.get("contract_sha256") or ""),
+        "attempt_output_sha256": str(output.get("attempt_output_sha256") or ""),
+        "change_manifest_sha256": str(output["outgoing_changes"]["manifest_sha256"]),
+        "change_manifest": manifest,
+        "change_artifact_root": str(artifact_root),
+        "preview_root": str(preview_root),
+        "preview_receipt": preview.to_dict(),
+        "preview_sha256": str(apply_contract.get("preview_sha256") or ""),
+        "apply_contract": apply_contract,
+        "leader_result_id": str(attempt.get("leader_result_id") or ""),
+        "trusted_leader_result_sha256": _canonical_json_sha256(trusted_result),
+    }
+    return intent, apply_contract
+
+
 def command_collect(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
     if args.state and args.state not in {"waiting_leader", "failed", "escalate"}:
@@ -5635,6 +6426,46 @@ def command_preview_changes(args: Any) -> None:
         raise SystemExit("preview-changes requires a collected finished attempt")
     if attempt.get("leader_result_id") is not None:
         raise SystemExit("preview-changes must occur before the leader result is recorded")
+    existing_preview = attempt.get("change_preview_receipt")
+    existing_preview_command = attempt.get("change_preview_command_id")
+    if existing_preview is not None and not isinstance(existing_preview, dict):
+        raise SystemExit("stored change preview receipt is invalid")
+    if isinstance(existing_preview, dict) and existing_preview_command != command_id:
+        raise SystemExit(
+            "change preview is already bound to a different command-id"
+        )
+    if existing_preview is None and existing_preview_command is not None:
+        raise SystemExit("change preview command binding exists without its receipt")
+    transaction = current_transaction()
+    if transaction is not None and control_store_enabled(layout):
+        try:
+            intent = _git_preview_intent(
+                layout,
+                project,
+                task,
+                attempt,
+                command_id=command_id,
+            )
+        except (ChangeApplyError, HandoffContractError) as exc:
+            raise SystemExit(f"Unable to freeze sealed change preview: {exc}") from exc
+        effect_id = _git_effect_id(GIT_PREVIEW_EFFECT_TYPE, command_id)
+        transaction.queue_effect(
+            effect_id=effect_id,
+            effect_type=GIT_PREVIEW_EFFECT_TYPE,
+            aggregate_id=str(attempt.get("attempt_id") or ""),
+            generation=1,
+            payload=intent,
+        )
+        print_json(
+            {
+                "status": "queued",
+                "effect_id": effect_id,
+                "effect_type": GIT_PREVIEW_EFFECT_TYPE,
+                "task_id": task.get("id"),
+                "attempt_id": attempt.get("attempt_id"),
+            }
+        )
+        return
     try:
         (
             contract,
@@ -5724,6 +6555,58 @@ def command_apply_changes(args: Any) -> None:
         or not isinstance(attempt.get("leader_result_id"), str)
     ):
         raise SystemExit("apply-changes requires an explicitly accepted done result")
+    transaction = current_transaction()
+    if (
+        transaction is not None
+        and control_store_enabled(layout)
+        and bool(getattr(args, "apply", False))
+    ):
+        command_id = getattr(args, "command_id", None)
+        if not isinstance(command_id, str) or not command_id.strip():
+            raise SystemExit("apply-changes --apply requires --command-id")
+        command_id = command_id.strip()
+        try:
+            intent, apply_contract = _git_apply_intent(
+                layout,
+                project,
+                task,
+                attempt,
+                command_id=command_id,
+                verify_external_preview=False,
+            )
+        except (ChangeApplyError, HandoffContractError) as exc:
+            raise SystemExit(f"Unable to freeze accepted change apply: {exc}") from exc
+        if getattr(args, "preview_sha", None) != apply_contract.get("preview_sha256"):
+            raise SystemExit(
+                "apply-changes --preview-sha does not match the current accepted contract"
+            )
+        existing = attempt.get("change_apply_receipt")
+        if isinstance(existing, dict):
+            if existing.get("command_id") != command_id:
+                raise SystemExit(
+                    "accepted changes were already applied under a different command-id"
+                )
+            if existing.get("preview_sha256") != apply_contract.get("preview_sha256"):
+                raise SystemExit("apply-changes command-id is bound to a different preview")
+        effect_id = _git_effect_id(GIT_APPLY_EFFECT_TYPE, command_id)
+        transaction.queue_effect(
+            effect_id=effect_id,
+            effect_type=GIT_APPLY_EFFECT_TYPE,
+            aggregate_id=str(attempt.get("attempt_id") or ""),
+            generation=1,
+            payload=intent,
+        )
+        print_json(
+            {
+                "status": "queued",
+                "effect_id": effect_id,
+                "effect_type": GIT_APPLY_EFFECT_TYPE,
+                "task_id": task.get("id"),
+                "attempt_id": attempt.get("attempt_id"),
+                "preview_sha256": apply_contract.get("preview_sha256"),
+            }
+        )
+        return
     try:
         (
             preview,
@@ -9537,10 +10420,50 @@ def _command_requires_governance_preflight(function: Any, args: Any) -> bool:
     )
 
 
+def _drain_exact_git_effect(layout: ProjectLayout, *, effect_id: str) -> dict[str, Any]:
+    """Best-effort synchronous CLI drain; a busy daemon yields an honest queue."""
+
+    try:
+        process_runtime_effects(
+            layout,
+            limit=1,
+            dry_run=False,
+            _effect_ids=(effect_id,),
+            _instance_timeout_seconds=0.1,
+        )
+    except ProjectLockTimeout:
+        pass
+    current = effect_status(layout, effect_id)
+    if current.get("status") == "applied":
+        result = current.get("result") or {}
+        response = result.get("response") if isinstance(result, dict) else None
+        if isinstance(response, dict):
+            return response
+        raise ControlStoreError(f"applied Git effect has no canonical response: {effect_id}")
+    if current.get("status") == "dead":
+        raise SystemExit(
+            f"Git effect {effect_id} failed permanently: "
+            f"{current.get('last_error') or 'unknown error'}"
+        )
+    payload = current.get("payload") or {}
+    return {
+        "status": "queued",
+        "effect_id": effect_id,
+        "effect_type": current.get("effect_type"),
+        "effect_status": current.get("status"),
+        "task_id": payload.get("task_id"),
+        "attempt_id": payload.get("attempt_id"),
+        "retryable_error": current.get("last_error"),
+    }
+
+
 def _locked_project_command(function: Any) -> Any:
     @functools.wraps(function)
     def wrapped(args: Any) -> Any:
         layout = resolve_project(args.root, args.project)
+        raw_command_id = getattr(args, "command_id", None)
+        if isinstance(raw_command_id, str) and raw_command_id != raw_command_id.strip():
+            raise SystemExit("command-id must not contain leading or trailing whitespace")
         governance_preflight = _command_requires_governance_preflight(function, args)
         stop_runtime_requested = bool(
             function.__name__ == "command_stop_actor"
@@ -9552,6 +10475,16 @@ def _locked_project_command(function: Any) -> Any:
         # change between command commit and effect drain.  The post-commit path
         # leases exactly this command's STOP effect and no SPAWN work.
         emergency_stop = bool(stop_runtime_requested and control_store_enabled(layout))
+        deferred_git = bool(
+            control_store_enabled(layout)
+            and (
+                function.__name__ == "command_preview_changes"
+                or (
+                    function.__name__ == "command_apply_changes"
+                    and bool(getattr(args, "apply", False))
+                )
+            )
+        )
         output = ""
         result: Any = None
         command_id: str | None = None
@@ -9561,12 +10494,16 @@ def _locked_project_command(function: Any) -> Any:
                     layout,
                     operation=function.__name__.removeprefix("command_").replace("_", "-"),
                 )
+            # A scheduler mailbox cycle already owns the authoritative SQLite
+            # write transaction.  Do not acquire the legacy project file lock
+            # from inside that transaction: a concurrent CLI writer acquires
+            # the same locks in project-lock -> SQLite order, so doing the
+            # reverse here creates a cross-process deadlock.  Nested commands
+            # mutate through the active transaction and are materialized only
+            # after its outer commit.
+            if current_transaction() is not None:
+                return function(args)
             with project_write_lock(layout):
-                # Nested scheduler commands already share the outer SQLite
-                # transaction.  Opening a second reconciliation connection
-                # while BEGIN IMMEDIATE is held self-deadlocks the process.
-                if current_transaction() is not None:
-                    return function(args)
                 if governance_preflight:
                     _validate_governance_preflight(
                         layout,
@@ -9576,14 +10513,16 @@ def _locked_project_command(function: Any) -> Any:
                     return function(args)
                 reconcile_project_views(layout)
                 audit_project_views(layout, repair=True)
+                # The read-only apply contract performs Git verification but no
+                # control mutation.  Keep it outside the SQLite transaction;
+                # explicit --apply below is represented by a durable effect.
+                if function.__name__ == "command_apply_changes" and not bool(
+                    getattr(args, "apply", False)
+                ):
+                    return function(args)
                 external_effect = (
                     (function.__name__ == "command_send" and bool(getattr(args, "runtime_send", False)))
                     or function.__name__ == "command_start_leader"
-                    or function.__name__ == "command_preview_changes"
-                    or (
-                        function.__name__ == "command_apply_changes"
-                        and bool(getattr(args, "apply", False))
-                    )
                 )
                 if external_effect:
                     raise SystemExit(
@@ -9618,7 +10557,11 @@ def _locked_project_command(function: Any) -> Any:
                             with contextlib.redirect_stdout(buffer):
                                 print_json({"status": "ok", "idempotent_replay": True, "command_id": command_id})
                             output = buffer.getvalue()
-                        if not emergency_stop:
+                        if transaction.replay_status == "completed":
+                            if output:
+                                print(output, end="" if output.endswith("\n") else "\n")
+                            return None
+                        if not emergency_stop and not deferred_git:
                             if output:
                                 print(output, end="" if output.endswith("\n") else "\n")
                             return None
@@ -9628,11 +10571,23 @@ def _locked_project_command(function: Any) -> Any:
                             result = function(args)
                         output = buffer.getvalue()
                         transaction.set_result({"stdout": output})
-                if not emergency_stop:
+                if not emergency_stop and not deferred_git:
                     if output:
                         print(output, end="" if output.endswith("\n") else "\n")
                     return result
             assert command_id is not None
+            if deferred_git:
+                effect_type = (
+                    GIT_PREVIEW_EFFECT_TYPE
+                    if function.__name__ == "command_preview_changes"
+                    else GIT_APPLY_EFFECT_TYPE
+                )
+                response = _drain_exact_git_effect(
+                    layout,
+                    effect_id=_git_effect_id(effect_type, command_id),
+                )
+                print_json(response)
+                return result
             effect_id = f"EFF-STOP-{command_id}"
             applied = _drain_emergency_stop_effect(layout, effect_id=effect_id)
             try:

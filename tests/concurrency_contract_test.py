@@ -9,7 +9,9 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -17,9 +19,13 @@ ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "scripts" / "costmarshal.py"
 sys.path.insert(0, str(ROOT))
 
+from costmarshal_v2.control_store import (  # noqa: E402
+    control_document_transaction,
+    control_transaction,
+)
 from costmarshal_v2.locking import project_write_lock  # noqa: E402
 from costmarshal_v2.paths import resolve_project  # noqa: E402
-from costmarshal_v2.scheduler import scheduler_cycle  # noqa: E402
+from costmarshal_v2.scheduler import _locked_project_command, scheduler_cycle  # noqa: E402
 
 
 def run_json(runtime: Path, *args: str) -> dict[str, object]:
@@ -135,6 +141,66 @@ def main() -> int:
             thread.join(timeout=10)
         assert not thread.is_alive()
         assert cycle_error == [], cycle_error
+
+        # Reproduce the historical DB -> project.lock / project.lock -> DB
+        # inversion with deterministic barriers.  The scheduler-side nested
+        # command must use its active SQLite transaction without touching the
+        # legacy project lock, allowing the CLI writer to finish after commit.
+        db_held = threading.Event()
+        cli_lock_held = threading.Event()
+        nested_executed = threading.Event()
+        lock_order_errors: list[BaseException] = []
+
+        def nested_command(args: object) -> None:
+            del args
+            nested_executed.set()
+
+        locked_nested_command = _locked_project_command(nested_command)
+        nested_args = SimpleNamespace(root=layout.root, project=str(layout.project_dir))
+
+        @contextmanager
+        def short_project_lock(target: object):
+            with project_write_lock(target, timeout_seconds=0.25):
+                yield
+
+        def scheduler_writer() -> None:
+            try:
+                with control_transaction(
+                    layout,
+                    command_name="lock_order_scheduler",
+                    command_id="CMD-LOCK-ORDER-SCHEDULER",
+                    payload={},
+                ) as transaction:
+                    db_held.set()
+                    if not cli_lock_held.wait(timeout=5):
+                        raise AssertionError("CLI writer did not acquire project.lock")
+                    locked_nested_command(nested_args)
+                    transaction.set_result({"status": "ok"})
+            except BaseException as exc:  # noqa: BLE001 - thread assertion handoff
+                lock_order_errors.append(exc)
+
+        def cli_writer() -> None:
+            try:
+                if not db_held.wait(timeout=5):
+                    raise AssertionError("scheduler writer did not acquire SQLite")
+                with project_write_lock(layout):
+                    cli_lock_held.set()
+                    with control_document_transaction(layout):
+                        pass
+            except BaseException as exc:  # noqa: BLE001 - thread assertion handoff
+                lock_order_errors.append(exc)
+
+        with patch("costmarshal_v2.scheduler.project_write_lock", short_project_lock):
+            scheduler_thread = threading.Thread(target=scheduler_writer, daemon=True)
+            cli_thread = threading.Thread(target=cli_writer, daemon=True)
+            scheduler_thread.start()
+            cli_thread.start()
+            scheduler_thread.join(timeout=10)
+            cli_thread.join(timeout=10)
+        assert not scheduler_thread.is_alive(), "scheduler writer deadlocked"
+        assert not cli_thread.is_alive(), "CLI writer deadlocked"
+        assert lock_order_errors == [], lock_order_errors
+        assert nested_executed.is_set(), "nested scheduler command did not execute"
     print("concurrency contract ok")
     return 0
 

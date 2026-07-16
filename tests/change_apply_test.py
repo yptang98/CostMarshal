@@ -19,8 +19,10 @@ if str(ROOT) not in sys.path:
 from costmarshal_v2.change_apply import (  # noqa: E402
     ChangeApplyError,
     apply_prepared_change_preview,
+    canonical_change_apply_observation,
     prepare_change_preview,
     prepared_change_preview_from_dict,
+    prepared_change_preview_intent_from_dict,
     require_prepared_change_source_ready,
 )
 from costmarshal_v2.context_projection import (  # noqa: E402
@@ -97,6 +99,57 @@ class ChangeApplyTests(unittest.TestCase):
             change_artifact_root=persisted.artifact_root,
             scratch_root=self.temporary / "apply-verification",
         )
+
+    def test_frozen_preview_intent_parser_performs_no_external_io(self) -> None:
+        prepared, persisted = self.change_artifact()
+        preview_root = self.temporary / "previews"
+        preview = prepare_change_preview(
+            self.repository,
+            base_sha=self.base_sha,
+            write_scope=["src"],
+            change_manifest=prepared.manifest,
+            change_artifact_root=persisted.artifact_root,
+            preview_root=preview_root,
+        )
+        with mock.patch(
+            "costmarshal_v2.change_apply._run_git",
+            side_effect=AssertionError("intent parser must not invoke Git"),
+        ), mock.patch.object(
+            Path,
+            "is_symlink",
+            side_effect=AssertionError("intent parser must not inspect symlinks"),
+        ), mock.patch.object(
+            Path,
+            "resolve",
+            side_effect=AssertionError("intent parser must not resolve external paths"),
+        ), mock.patch.object(
+            Path,
+            "read_bytes",
+            side_effect=AssertionError("intent parser must not read the patch"),
+        ):
+            frozen = prepared_change_preview_intent_from_dict(
+                preview.to_dict(),
+                expected_repository=self.repository,
+                expected_base_sha=self.base_sha,
+                expected_write_scope=["src"],
+                expected_change_manifest_sha256=prepared.manifest_sha256,
+                expected_preview_root=preview_root,
+            )
+        self.assertEqual(frozen.to_dict(), preview.to_dict())
+
+    def test_apply_observation_normalizes_first_run_and_replay(self) -> None:
+        common = {
+            "head_sha": self.base_sha,
+            "candidate_tree_sha": self.base_sha,
+            "patch_sha256": "sha256:" + "1" * 64,
+            "staged": True,
+        }
+        first = canonical_change_apply_observation({"status": "applied", **common})
+        replay = canonical_change_apply_observation(
+            {"status": "already_applied", **common}
+        )
+        self.assertEqual(first, replay)
+        self.assertEqual(first["status"], "reviewed_patch_staged")
 
     def test_preview_isolated_and_apply_is_head_cas_idempotent(self) -> None:
         prepared, persisted = self.change_artifact()

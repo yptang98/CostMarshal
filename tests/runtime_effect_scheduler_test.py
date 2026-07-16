@@ -969,39 +969,41 @@ def main() -> int:
             # Its lifetime lock must not block the short runtime-effect mutex.
             with scheduler_daemon_lock(slow_layout, timeout_seconds=5):
                 daemon_acquired.set()
-                daemon_release.wait(10)
+                daemon_release.wait()
 
         daemon_thread = threading.Thread(target=hold_daemon_lock, name="existing-daemon")
         daemon_thread.start()
-        assert daemon_acquired.wait(5)
-        daemon_stop = run_json(
-            temp,
-            "stop-actor",
-            "--project",
-            str(slow_project),
-            "--actor",
-            "leader",
-            "--stop-runtime",
-            "--reason",
-            "existing daemon owns drainer",
-            "--command-id",
-            "CMD-DAEMON-LONG-INTERVAL-STOP",
-        )
-        assert daemon_stop["runtime"]["status"] == "applied"
-        assert daemon_stop["runtime"]["drain_deferred"] is False
-        assert daemon_stop["runtime"]["effect_status"] == "applied"
-        assert effect_status(slow_layout, daemon_stop["runtime"]["effect_id"])["status"] == "applied"
-        assert daemon_thread.is_alive(), "the sleeping daemon must still own its lifetime lock"
-        with sqlite3.connect(slow_project / "scheduler" / "state.db") as connection:
-            assert connection.execute(
-                "SELECT status, attempts FROM effects WHERE effect_id=?",
-                (daemon_stop["runtime"]["effect_id"],),
-            ).fetchone() == ("applied", 1)
-            assert connection.execute(
-                "SELECT status FROM commands WHERE command_id='CMD-DAEMON-LONG-INTERVAL-STOP'"
-            ).fetchone()[0] == "completed"
-        daemon_release.set()
-        daemon_thread.join(5)
+        try:
+            assert daemon_acquired.wait(5)
+            daemon_stop = run_json(
+                temp,
+                "stop-actor",
+                "--project",
+                str(slow_project),
+                "--actor",
+                "leader",
+                "--stop-runtime",
+                "--reason",
+                "existing daemon owns drainer",
+                "--command-id",
+                "CMD-DAEMON-LONG-INTERVAL-STOP",
+            )
+            assert daemon_stop["runtime"]["status"] == "applied"
+            assert daemon_stop["runtime"]["drain_deferred"] is False
+            assert daemon_stop["runtime"]["effect_status"] == "applied"
+            assert effect_status(slow_layout, daemon_stop["runtime"]["effect_id"])["status"] == "applied"
+            assert daemon_thread.is_alive(), "the sleeping daemon must still own its lifetime lock"
+            with sqlite3.connect(slow_project / "scheduler" / "state.db") as connection:
+                assert connection.execute(
+                    "SELECT status, attempts FROM effects WHERE effect_id=?",
+                    (daemon_stop["runtime"]["effect_id"],),
+                ).fetchone() == ("applied", 1)
+                assert connection.execute(
+                    "SELECT status FROM commands WHERE command_id='CMD-DAEMON-LONG-INTERVAL-STOP'"
+                ).fetchone()[0] == "completed"
+        finally:
+            daemon_release.set()
+            daemon_thread.join(5)
         assert not daemon_thread.is_alive()
         daemon_cycle = scheduler_module.process_runtime_effects(
             slow_layout,
@@ -1332,7 +1334,11 @@ def main() -> int:
             env_extra={"COSTMARSHAL_SCHEDULER_FAULT": "effect.after_stop_observe_before_apply"},
             ok=False,
         )
-        assert emergency_stop_crash.returncode == 96
+        assert emergency_stop_crash.returncode == 96, (
+            emergency_stop_crash.returncode,
+            emergency_stop_crash.stdout[-2000:],
+            emergency_stop_crash.stderr[-2000:],
+        )
         wait_for_process_exit(running_pid)
         with sqlite3.connect(emergency_project / "scheduler" / "state.db") as connection:
             assert connection.execute(

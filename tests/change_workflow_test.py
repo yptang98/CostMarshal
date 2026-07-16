@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -21,10 +24,13 @@ from costmarshal_v2.context_projection import (  # noqa: E402
     persist_change_artifact,
 )
 from costmarshal_v2.paths import ProjectLayout  # noqa: E402
+from costmarshal_v2.control_store import control_transaction, effect_status  # noqa: E402
+from costmarshal_v2 import scheduler as scheduler_module  # noqa: E402
 from costmarshal_v2.scheduler import (  # noqa: E402
     command_apply_changes,
     command_preview_changes,
     command_record_result,
+    process_runtime_effects,
 )
 from costmarshal_v2.state import load_project, load_task, save_task  # noqa: E402
 
@@ -171,6 +177,19 @@ class ChangeWorkflowTest(unittest.TestCase):
             self.assertTrue(Path(receipt["patch_path"]).is_file())
             self.assertEqual(git(self.workspace, "status", "--porcelain"), "")
             command_preview_changes(self.args())
+            with mock.patch(
+                "costmarshal_v2.scheduler.prepare_change_preview",
+                side_effect=AssertionError("conflicting command must fail before Git"),
+            ), self.assertRaisesRegex(SystemExit, "different command-id"):
+                command_preview_changes(
+                    self.args(command_id="CMD-change-preview-conflicting")
+                )
+            self.assertEqual(
+                load_task(self.layout, "V2-0001")["attempts"][0][
+                    "change_preview_receipt"
+                ],
+                receipt,
+            )
 
             attempt = replay_task["attempts"][0]
             attempt.update(
@@ -229,7 +248,7 @@ class ChangeWorkflowTest(unittest.TestCase):
                 )
                 self.assertEqual(git(self.workspace, "show", ":src/app.py"), "reviewed")
 
-    def test_sqlite_cutover_blocks_unrecoverable_git_apply_effect(self) -> None:
+    def test_sqlite_cutover_recovers_preview_and_apply_through_effect_outbox(self) -> None:
         migrated = subprocess.run(
             [
                 sys.executable,
@@ -248,17 +267,308 @@ class ChangeWorkflowTest(unittest.TestCase):
         )
         if migrated.returncode:
             raise AssertionError(migrated.stderr)
-        with self.assertRaisesRegex(SystemExit, "recoverable effect outbox"):
+        with self.assertRaisesRegex(SystemExit, "leading or trailing whitespace"):
             command_preview_changes(
-                self.args(command_id="CMD-change-preview-sqlite-blocked")
+                self.args(command_id=" CMD-change-preview-whitespace ")
             )
-        with self.assertRaisesRegex(SystemExit, "recoverable effect outbox"):
+        connection = sqlite3.connect(self.layout.scheduler_dir / "state.db")
+        try:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM effects").fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+        trusted = {
+            "id": "RES-change-workflow-sqlite-001",
+            "attempt_id": self.attempt_id,
+        }
+        apply_contract = {"preview_sha256": "sha256:" + "4" * 64}
+        with mock.patch(
+            "costmarshal_v2.scheduler._frozen_change_state_inputs",
+            side_effect=lambda *_args: self.semantic_inputs(),
+        ), mock.patch(
+            "costmarshal_v2.scheduler._semantic_change_inputs",
+            side_effect=lambda *_args: self.semantic_inputs(),
+        ), mock.patch(
+            "costmarshal_v2.scheduler.trusted_result_rows",
+            return_value=[trusted],
+        ), mock.patch(
+            "costmarshal_v2.scheduler.build_apply_preview_contract",
+            return_value=apply_contract,
+        ):
+            command_preview_changes(
+                self.args(command_id="CMD-change-preview-sqlite-outbox")
+            )
+            preview_effect_id = scheduler_module._git_effect_id(
+                scheduler_module.GIT_PREVIEW_EFFECT_TYPE,
+                "CMD-change-preview-sqlite-outbox",
+            )
+            self.assertEqual(
+                effect_status(self.layout, preview_effect_id)["status"],
+                "applied",
+            )
+            previewed = load_task(self.layout, "V2-0001")
+            self.assertIn(
+                "change_preview_receipt",
+                previewed["attempts"][0],
+            )
+            self.assertEqual(git(self.workspace, "status", "--porcelain"), "")
+            with mock.patch(
+                "costmarshal_v2.scheduler.prepare_change_preview",
+                side_effect=AssertionError("conflicting command must fail before Git"),
+            ), self.assertRaisesRegex(SystemExit, "different command-id"):
+                command_preview_changes(
+                    self.args(command_id="CMD-change-preview-sqlite-conflicting")
+                )
+
+            with control_transaction(
+                self.layout,
+                command_name="fixture_accept_change",
+                command_id="CMD-fixture-accept-change",
+                payload={"task_id": "V2-0001", "attempt_id": self.attempt_id},
+            ) as transaction:
+                if not transaction.replay:
+                    accepted = load_task(self.layout, "V2-0001")
+                    accepted["attempts"][0].update(
+                        {
+                            "recorded_result_status": "done",
+                            "accepted_by_leader": True,
+                            "leader_result_id": trusted["id"],
+                            "attempt_input": {"fixture": True},
+                        }
+                    )
+                    save_task(self.layout, accepted)
+
             command_apply_changes(
                 self.args(
-                    command_id="CMD-change-apply-sqlite-blocked",
+                    command_id="CMD-change-apply-sqlite-outbox",
                     apply=True,
-                    preview_sha="sha256:" + "4" * 64,
+                    preview_sha=apply_contract["preview_sha256"],
                 )
+            )
+            apply_effect_id = scheduler_module._git_effect_id(
+                scheduler_module.GIT_APPLY_EFFECT_TYPE,
+                "CMD-change-apply-sqlite-outbox",
+            )
+            self.assertEqual(
+                effect_status(self.layout, apply_effect_id)["status"],
+                "applied",
+            )
+            applied = load_task(self.layout, "V2-0001")["attempts"][0][
+                "change_apply_receipt"
+            ]
+            self.assertEqual(
+                applied["outcome"]["status"],
+                "reviewed_patch_staged",
+            )
+            self.assertEqual(git(self.workspace, "show", ":src/app.py"), "reviewed")
+
+    def test_sqlite_apply_crashes_before_observe_and_after_projection_converge(self) -> None:
+        migrated = subprocess.run(
+            [
+                sys.executable,
+                str(CLI),
+                "--root",
+                str(self.layout.root),
+                "migrate-state",
+                "--project",
+                str(self.layout.project_dir),
+                "--apply",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if migrated.returncode:
+            raise AssertionError(migrated.stderr)
+        trusted = {
+            "id": "RES-change-workflow-crash-001",
+            "attempt_id": self.attempt_id,
+        }
+        apply_contract = {"preview_sha256": "sha256:" + "7" * 64}
+
+        def expire(effect_id: str) -> None:
+            connection = sqlite3.connect(self.layout.scheduler_dir / "state.db")
+            try:
+                connection.execute(
+                    "UPDATE effects SET lease_expires_at=? WHERE effect_id=?",
+                    ("2000-01-01T00:00:00.000000+00:00", effect_id),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+        def crash_at(expected: str):
+            def injected(name: str) -> None:
+                if name == expected:
+                    raise KeyboardInterrupt(expected)
+
+            return injected
+
+        with mock.patch(
+            "costmarshal_v2.scheduler._frozen_change_state_inputs",
+            side_effect=lambda *_args: self.semantic_inputs(),
+        ), mock.patch(
+            "costmarshal_v2.scheduler._semantic_change_inputs",
+            side_effect=lambda *_args: self.semantic_inputs(),
+        ), mock.patch(
+            "costmarshal_v2.scheduler.trusted_result_rows",
+            return_value=[trusted],
+        ), mock.patch(
+            "costmarshal_v2.scheduler.build_apply_preview_contract",
+            return_value=apply_contract,
+        ):
+            preview_args = self.args(command_id="CMD-change-preview-crash-outbox")
+            with control_transaction(
+                self.layout,
+                command_name="command_preview_changes",
+                command_id=preview_args.command_id,
+                payload={"fixture": "preview-crash-boundary"},
+            ):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    command_preview_changes(preview_args)
+            preview_effect_id = scheduler_module._git_effect_id(
+                scheduler_module.GIT_PREVIEW_EFFECT_TYPE,
+                preview_args.command_id,
+            )
+            with mock.patch(
+                "costmarshal_v2.scheduler._scheduler_fault",
+                side_effect=crash_at("git_preview.after_external_before_observe"),
+            ), self.assertRaises(KeyboardInterrupt):
+                process_runtime_effects(
+                    self.layout,
+                    limit=1,
+                    _effect_ids=(preview_effect_id,),
+                    _governance_prevalidated=True,
+                )
+            preview_first = effect_status(self.layout, preview_effect_id)
+            self.assertEqual(preview_first["status"], "leased")
+            self.assertIsNone(preview_first["observation"])
+            published_patches = list(self.preview_root.glob("patches/sha256/*"))
+            self.assertEqual(len(published_patches), 1)
+            published_bytes = published_patches[0].read_bytes()
+            expire(preview_effect_id)
+            process_runtime_effects(
+                self.layout,
+                limit=1,
+                _effect_ids=(preview_effect_id,),
+                _governance_prevalidated=True,
+            )
+            preview_final = effect_status(self.layout, preview_effect_id)
+            self.assertEqual(preview_final["status"], "applied")
+            self.assertEqual(preview_final["attempts"], 2)
+            self.assertEqual(published_patches[0].read_bytes(), published_bytes)
+            with control_transaction(
+                self.layout,
+                command_name="fixture_accept_change_crash",
+                command_id="CMD-fixture-accept-change-crash",
+                payload={"task_id": "V2-0001", "attempt_id": self.attempt_id},
+            ) as transaction:
+                if not transaction.replay:
+                    accepted = load_task(self.layout, "V2-0001")
+                    accepted["attempts"][0].update(
+                        {
+                            "recorded_result_status": "done",
+                            "accepted_by_leader": True,
+                            "leader_result_id": trusted["id"],
+                            "attempt_input": {"fixture": True},
+                        }
+                    )
+                    save_task(self.layout, accepted)
+
+            apply_args = self.args(
+                command_id="CMD-change-apply-crash-outbox",
+                apply=True,
+                preview_sha=apply_contract["preview_sha256"],
+            )
+            with control_transaction(
+                self.layout,
+                command_name="command_apply_changes",
+                command_id=apply_args.command_id,
+                payload={"fixture": "crash-boundaries"},
+            ):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    command_apply_changes(apply_args)
+            effect_id = scheduler_module._git_effect_id(
+                scheduler_module.GIT_APPLY_EFFECT_TYPE,
+                apply_args.command_id,
+            )
+
+            with mock.patch(
+                "costmarshal_v2.scheduler._scheduler_fault",
+                side_effect=crash_at("git_apply.after_external_before_observe"),
+            ), self.assertRaises(KeyboardInterrupt):
+                process_runtime_effects(
+                    self.layout,
+                    limit=1,
+                    _effect_ids=(effect_id,),
+                    _governance_prevalidated=True,
+                )
+            first = effect_status(self.layout, effect_id)
+            self.assertEqual(first["status"], "leased")
+            self.assertIsNone(first["observation"])
+            self.assertEqual(git(self.workspace, "show", ":src/app.py"), "reviewed")
+            self.assertNotIn(
+                "change_apply_receipt",
+                load_task(self.layout, "V2-0001")["attempts"][0],
+            )
+
+            expire(effect_id)
+            with mock.patch(
+                "costmarshal_v2.scheduler._scheduler_fault",
+                side_effect=crash_at("git_apply.after_observe_before_projection"),
+            ), self.assertRaises(KeyboardInterrupt):
+                process_runtime_effects(
+                    self.layout,
+                    limit=1,
+                    _effect_ids=(effect_id,),
+                    _governance_prevalidated=True,
+                )
+            second = effect_status(self.layout, effect_id)
+            self.assertEqual(second["status"], "observed")
+            self.assertEqual(
+                second["observation"]["status"],
+                "reviewed_patch_staged",
+            )
+            self.assertNotIn(
+                "change_apply_receipt",
+                load_task(self.layout, "V2-0001")["attempts"][0],
+            )
+
+            expire(effect_id)
+            with mock.patch(
+                "costmarshal_v2.scheduler._scheduler_fault",
+                side_effect=crash_at("git_apply.after_projection_before_apply"),
+            ), self.assertRaises(KeyboardInterrupt):
+                process_runtime_effects(
+                    self.layout,
+                    limit=1,
+                    _effect_ids=(effect_id,),
+                    _governance_prevalidated=True,
+                )
+            third = effect_status(self.layout, effect_id)
+            self.assertEqual(third["status"], "observed")
+            projected_receipt = load_task(self.layout, "V2-0001")["attempts"][0][
+                "change_apply_receipt"
+            ]
+
+            expire(effect_id)
+            process_runtime_effects(
+                self.layout,
+                limit=1,
+                _effect_ids=(effect_id,),
+                _governance_prevalidated=True,
+            )
+            final = effect_status(self.layout, effect_id)
+            self.assertEqual(final["status"], "applied")
+            self.assertEqual(final["attempts"], 4)
+            self.assertEqual(
+                load_task(self.layout, "V2-0001")["attempts"][0][
+                    "change_apply_receipt"
+                ],
+                projected_receipt,
             )
 
     def test_record_result_rechecks_preview_source_freshness_before_acceptance(self) -> None:
@@ -321,4 +631,31 @@ class ChangeWorkflowTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    program = unittest.main(verbosity=2, exit=False)
+    if program.result.wasSuccessful() and len(sys.argv) == 1:
+        print(
+            "COSTMARSHAL_RUNTIME_EVIDENCE="
+            + json.dumps(
+                {
+                    "schema_version": 1,
+                    "test": "tests/change_workflow_test.py",
+                    "crash_points": [
+                        "git_preview.after_external_before_observe",
+                        "git_apply.after_external_before_observe",
+                        "git_apply.after_observe_before_projection",
+                        "git_apply.after_projection_before_apply",
+                    ],
+                    "recovery_scenarios": [
+                        "git_preview_content_addressed_publication_replay",
+                        "git_apply_external_replay_canonicalized",
+                        "git_apply_observed_projection_replay",
+                        "git_apply_projected_command_completion_replay",
+                    ],
+                    "provider_calls": 0,
+                    "expected_provider_calls": 0,
+                    "orphan_effects": 0,
+                },
+                sort_keys=True,
+            )
+        )
+    raise SystemExit(0 if program.result.wasSuccessful() else 1)

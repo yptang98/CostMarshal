@@ -37,7 +37,7 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
 7. Keep `run-scheduler` active while actors execute.
 8. Review the completion report, tests, and evidence. For a sealed write output, run `preview-changes` before acceptance; it must not modify the source workspace.
 9. Record the leader result. When sealed evidence is insufficient, reject it with a bounded `--handoff`, then explicitly continue to the next provider step in the admitted monotonic chain; that step may skip a tier.
-10. After accepting reviewed changes, run `apply-changes` once to obtain the hash-bound contract, then repeat with `--apply --preview-sha ... --command-id ...`. The command stages but never commits the exact candidate tree. Change preview and explicit apply are currently limited to file-authority projects and fail closed after SQLite cutover until Git effects use the recoverable outbox.
+10. After accepting reviewed changes, run `apply-changes` once to obtain the hash-bound contract, then repeat with `--apply --preview-sha ... --command-id ...`. The command stages but never commits the exact candidate tree. After SQLite cutover, preview and explicit apply use owner-leased recoverable Git effects; a command may honestly report `queued` when another drainer owns the effect fence.
 11. Run `validate`, and use `recover` after an unclean stop.
 
 ## Commands
@@ -175,6 +175,6 @@ Run every command in README's Required local verification section. At minimum, c
 
 ## Transaction and beta boundary
 
-An explicit `migrate-state --apply` cutover makes SQLite WAL authoritative for scheduler control state; compatibility views are materialized after commit under a cross-process materializer lock and repaired on restart. Stable command IDs are payload-hashed, while spawn/stop I/O is represented by owner-leased effects outside the transaction; slow effects renew their lease and a crashed owner becomes recoverable after expiry. `preview-changes` and explicit `apply-changes --apply` are blocked after cutover rather than running Git effects inside a database transaction. Do not enable cutover while actors are live.
+An explicit `migrate-state --apply` cutover makes SQLite WAL authoritative for scheduler control state; compatibility views are materialized after commit under a cross-process materializer lock and repaired on restart. Stable command IDs are payload-hashed, while spawn/stop and Git preview/apply I/O are represented by owner-leased effects outside the transaction; slow effects renew their lease and a crashed owner becomes recoverable after expiry. Git-effect payloads freeze the task/attempt/base SHA/write scope/manifest/review contract, execution revalidates authoritative state, and task receipts/events are projected idempotently before the original effect command completes. Do not enable cutover while actors are live.
 
 Do not describe v2.4-beta as economically optimal or universally production-ready yet. Spawn/stop use a leased transactional effect worker and required dispatch uses the OCI snapshot/profile/credential/report adapter, but external effects are fenced/recoverable rather than magically exactly-once. A non-beta release still requires the machine-readable real-provider shadow matrix and live malicious OCI evidence for the reviewed digest. These are explicit release gates, not silent fallbacks.

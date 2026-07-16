@@ -68,7 +68,7 @@ class PreparedChangePreview:
         return body
 
 
-def prepared_change_preview_from_dict(
+def _prepared_change_preview_from_dict(
     value: Mapping[str, Any],
     *,
     expected_repository: Path | str,
@@ -76,8 +76,9 @@ def prepared_change_preview_from_dict(
     expected_write_scope: Iterable[object],
     expected_change_manifest_sha256: str,
     expected_preview_root: Path | str,
+    verify_external_state: bool,
 ) -> PreparedChangePreview:
-    """Load a durable preview only when every authoritative binding matches."""
+    """Parse a durable preview, optionally touching Git/patch external state."""
 
     if not isinstance(value, Mapping):
         raise ChangeApplyError("stored change preview is not an object")
@@ -110,7 +111,11 @@ def prepared_change_preview_from_dict(
     ).hexdigest()
     if claimed_hash != observed_hash:
         raise ChangeApplyError("stored change preview receipt hash is invalid")
-    repository, _ = _repository_and_head(expected_repository)
+    repository = Path(expected_repository).expanduser()
+    if verify_external_state:
+        repository, _ = _repository_and_head(repository)
+    elif not repository.is_absolute() or ".." in repository.parts:
+        raise ChangeApplyError("frozen preview repository path is not canonical absolute")
     try:
         scopes = tuple(sorted(normalize_path_list(expected_write_scope, kind="allowed")))
     except SecurityValidationError as exc:
@@ -137,11 +142,20 @@ def prepared_change_preview_from_dict(
         or not _GIT_OID_RE.fullmatch(candidate_tree)
     ):
         raise ChangeApplyError("stored change preview contains an invalid patch/tree receipt")
-    preview_root = Path(expected_preview_root).expanduser().resolve()
+    preview_root = Path(expected_preview_root).expanduser()
+    if verify_external_state:
+        preview_root = preview_root.resolve()
+    elif not preview_root.is_absolute() or ".." in preview_root.parts:
+        raise ChangeApplyError("frozen preview root path is not canonical absolute")
     raw_patch_path = Path(str(receipt.get("patch_path") or "")).expanduser()
-    if raw_patch_path.is_symlink():
-        raise ChangeApplyError("stored preview patch must not be a symlink")
-    patch_path = raw_patch_path.resolve()
+    if verify_external_state:
+        if raw_patch_path.is_symlink():
+            raise ChangeApplyError("stored preview patch must not be a symlink")
+        patch_path = raw_patch_path.resolve()
+    else:
+        if not raw_patch_path.is_absolute() or ".." in raw_patch_path.parts:
+            raise ChangeApplyError("frozen preview patch path is not canonical absolute")
+        patch_path = raw_patch_path
     try:
         patch_path.relative_to(preview_root)
     except ValueError as exc:
@@ -174,8 +188,58 @@ def prepared_change_preview_from_dict(
         candidate_tree_sha=candidate_tree,
         changed_paths=tuple(changed_paths),
     )
-    _read_verified_patch(preview)
+    if verify_external_state:
+        _read_verified_patch(preview)
     return preview
+
+
+def prepared_change_preview_from_dict(
+    value: Mapping[str, Any],
+    *,
+    expected_repository: Path | str,
+    expected_base_sha: str,
+    expected_write_scope: Iterable[object],
+    expected_change_manifest_sha256: str,
+    expected_preview_root: Path | str,
+) -> PreparedChangePreview:
+    """Load a durable preview only when every authoritative binding matches."""
+
+    return _prepared_change_preview_from_dict(
+        value,
+        expected_repository=expected_repository,
+        expected_base_sha=expected_base_sha,
+        expected_write_scope=expected_write_scope,
+        expected_change_manifest_sha256=expected_change_manifest_sha256,
+        expected_preview_root=expected_preview_root,
+        verify_external_state=True,
+    )
+
+
+def prepared_change_preview_intent_from_dict(
+    value: Mapping[str, Any],
+    *,
+    expected_repository: Path | str,
+    expected_base_sha: str,
+    expected_write_scope: Iterable[object],
+    expected_change_manifest_sha256: str,
+    expected_preview_root: Path | str,
+) -> PreparedChangePreview:
+    """Validate frozen preview bindings without Git or patch-file I/O.
+
+    This narrow parser is for an authoritative SQLite command transaction.
+    Effect execution must call :func:`prepared_change_preview_from_dict` again
+    before touching the repository.
+    """
+
+    return _prepared_change_preview_from_dict(
+        value,
+        expected_repository=expected_repository,
+        expected_base_sha=expected_base_sha,
+        expected_write_scope=expected_write_scope,
+        expected_change_manifest_sha256=expected_change_manifest_sha256,
+        expected_preview_root=expected_preview_root,
+        verify_external_state=False,
+    )
 
 
 def _run_git(
@@ -908,10 +972,52 @@ def apply_prepared_change_preview(
         raise ChangeApplyError("timed out waiting for the repository apply lease") from exc
 
 
+def canonical_change_apply_observation(outcome: Mapping[str, Any]) -> dict[str, Any]:
+    """Collapse first-run and replay apply results into one durable observation.
+
+    A crash after ``git apply --index`` but before effect observation causes the
+    retry to report ``already_applied``.  Those two transient executor labels
+    must not change the immutable observation stored by the outbox.
+    """
+
+    if not isinstance(outcome, Mapping):
+        raise ChangeApplyError("change apply outcome is not an object")
+    status = outcome.get("status")
+    staged = outcome.get("staged")
+    if status in {"applied", "already_applied"} and staged is True:
+        canonical_status = "reviewed_patch_staged"
+    elif status == "nothing_to_apply" and staged is False:
+        canonical_status = "reviewed_tree_already_current"
+    else:
+        raise ChangeApplyError("change apply outcome has an invalid status/staged pair")
+    head_sha = outcome.get("head_sha")
+    candidate_tree_sha = outcome.get("candidate_tree_sha")
+    patch_sha256 = outcome.get("patch_sha256")
+    if (
+        not isinstance(head_sha, str)
+        or not _GIT_OID_RE.fullmatch(head_sha)
+        or not isinstance(candidate_tree_sha, str)
+        or not _GIT_OID_RE.fullmatch(candidate_tree_sha)
+        or not isinstance(patch_sha256, str)
+        or not _SHA256_RE.fullmatch(patch_sha256)
+    ):
+        raise ChangeApplyError("change apply outcome has invalid Git/hash evidence")
+    return {
+        "schema": "costmarshal-git-apply-observation-v1",
+        "status": canonical_status,
+        "head_sha": head_sha,
+        "candidate_tree_sha": candidate_tree_sha,
+        "patch_sha256": patch_sha256,
+        "staged": bool(staged),
+    }
+
+
 __all__ = [
     "ChangeApplyError",
     "PreparedChangePreview",
     "apply_prepared_change_preview",
+    "canonical_change_apply_observation",
     "prepared_change_preview_from_dict",
+    "prepared_change_preview_intent_from_dict",
     "prepare_change_preview",
 ]
