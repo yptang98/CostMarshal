@@ -22,6 +22,7 @@ from .profiles import command_configure_profiles, command_configure_provider
 from .scheduler import (
     LEADER_WORK_TYPES,
     RISKS,
+    command_apply_changes,
     command_collect,
     command_dispatch,
     command_escalate,
@@ -33,6 +34,7 @@ from .scheduler import (
     command_governance_status,
     command_governance_rebind,
     command_providers,
+    command_preview_changes,
     command_record_leader_work,
     command_record_result,
     command_record_usage,
@@ -133,7 +135,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help=argparse.SUPPRESS,
     )
-    init.add_argument("--no-auto-escalate", dest="auto_escalate", action="store_false", default=True, help="Do not automatically continue failed attempts to the next admitted provider step")
+    init.add_argument(
+        "--no-auto-escalate",
+        dest="auto_escalate",
+        action="store_false",
+        default=False,
+        help=(
+            "Deprecated compatibility flag; workers always wait for an explicit "
+            "leader-rejected result and escalation command"
+        ),
+    )
     init.add_argument("--session-name", help="Backend session name; defaults to cmv2-<project>")
     init.add_argument("--backend", choices=["auto", "tmux", "local"], default="auto", help="Actor runtime backend; auto chooses a platform-appropriate backend")
     init.add_argument("--backend-command", help="Backend executable, for example a tmux binary when --backend tmux")
@@ -348,6 +359,35 @@ def build_parser() -> argparse.ArgumentParser:
     _add_command_id(collect)
     collect.set_defaults(func=command_collect)
 
+    preview_changes = sub.add_parser(
+        "preview-changes",
+        help="Build a source-isolated Git patch/tree preview for a sealed worker output",
+    )
+    preview_changes.add_argument("--project", required=True)
+    preview_changes.add_argument("--task", required=True)
+    preview_changes.add_argument("--attempt")
+    _add_command_id(preview_changes)
+    preview_changes.set_defaults(func=command_preview_changes)
+
+    apply_changes = sub.add_parser(
+        "apply-changes",
+        help="Preview or explicitly stage a leader-accepted sealed change set",
+    )
+    apply_changes.add_argument("--project", required=True)
+    apply_changes.add_argument("--task", required=True)
+    apply_changes.add_argument("--attempt")
+    apply_changes.add_argument(
+        "--apply",
+        action="store_true",
+        help="Stage the exact reviewed patch after HEAD/clean-worktree compare-and-swap",
+    )
+    apply_changes.add_argument(
+        "--preview-sha",
+        help="Exact preview_sha256 printed by the preceding read-only invocation",
+    )
+    _add_command_id(apply_changes)
+    apply_changes.set_defaults(func=command_apply_changes)
+
     result = sub.add_parser("record-result", help="Record leader acceptance/rejection for a worker attempt")
     result.add_argument("--project", required=True)
     result.add_argument("--task", required=True)
@@ -373,6 +413,10 @@ def build_parser() -> argparse.ArgumentParser:
     result.add_argument("--output-tokens", type=int, default=0)
     result.add_argument("--estimated-cost-cny", help="Unverified caller-reported cost, up to 9 decimal places")
     result.add_argument("--summary")
+    result.add_argument(
+        "--handoff",
+        help="Bound successor handoff for a rejected sealed required attempt",
+    )
     result.add_argument("--note")
     _add_command_id(result)
     result.set_defaults(func=command_record_result)

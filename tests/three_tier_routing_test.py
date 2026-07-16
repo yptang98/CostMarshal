@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT))
 from costmarshal_v2.routing import (  # noqa: E402
     RoutingValidationError,
     auto_tier_floor,
+    conditional_leader_acceptance_prior,
     decide_route,
     default_provider_catalog,
     estimate_cost_cny,
@@ -61,6 +62,7 @@ def paired_chain_history(
                 "route_plan_step_index": 0,
                 "route_predecessors": [],
                 "accepted_by_leader": low_accepted,
+                "status": "done" if low_accepted else "escalate",
             }
         )
         if low_accepted:
@@ -91,6 +93,7 @@ def paired_chain_history(
                     }
                 ],
                 "accepted_by_leader": medium_accepted,
+                "status": "done" if medium_accepted else "escalate",
             }
         )
         if medium_accepted:
@@ -129,6 +132,7 @@ def paired_chain_history(
                     },
                 ],
                 "accepted_by_leader": high_accepted,
+                "status": "done" if high_accepted else "failed",
             }
         )
     return rows
@@ -463,6 +467,100 @@ class ThreeTierRoutingTest(unittest.TestCase):
         self.assertLess(cold.conservative_probability, 0.5)
         self.assertGreater(proven.conservative_probability, 0.9)
 
+    def test_conditional_prior_cache_is_scoped_to_provider_id(self) -> None:
+        catalog = default_provider_catalog()
+        low = deepcopy(catalog["providers"][0])
+        medium_a = deepcopy(catalog["providers"][1])
+        low.update({"input_cny_per_1m": 0.1, "output_cny_per_1m": 0.1})
+        medium_a.update(
+            {
+                "provider_id": "medium-a",
+                "profile": "shared-medium",
+                "model": "shared-model",
+                "input_cny_per_1m": 1.0,
+                "output_cny_per_1m": 1.0,
+            }
+        )
+        medium_b = deepcopy(medium_a)
+        medium_b.update(
+            {
+                "provider_id": "medium-b",
+                "input_cny_per_1m": 0.2,
+                "output_cny_per_1m": 0.2,
+            }
+        )
+        catalog["providers"] = [low, medium_a, medium_b]
+
+        history: list[dict] = []
+        for provider_id, accepts in (("medium-a", True), ("medium-b", False)):
+            for index in range(20):
+                task_id = f"TASK-{provider_id}-{index}"
+                envelope_id = f"ENV-{provider_id}-{index}"
+                fingerprint = "sha256:" + f"{len(history):064x}"[-64:]
+                low_result_id = f"RES-low-{provider_id}-{index}"
+                low_attempt_id = f"ATT-low-{provider_id}-{index}"
+                history.append(
+                    {
+                        "id": low_result_id,
+                        "attempt_id": low_attempt_id,
+                        "provider_id": low["provider_id"],
+                        "model": low["model"],
+                        "profile": low["profile"],
+                        "profile_sha256": None,
+                        "task_type": "analysis",
+                        "difficulty": "normal",
+                        "task_id": task_id,
+                        "route_envelope_id": envelope_id,
+                        "route_plan_fingerprint": fingerprint,
+                        "route_plan_step_index": 0,
+                        "route_predecessors": [],
+                        "accepted_by_leader": False,
+                        "status": "escalate",
+                    }
+                )
+                history.append(
+                    {
+                        "id": f"RES-{provider_id}-{index}",
+                        "attempt_id": f"ATT-{provider_id}-{index}",
+                        "provider_id": provider_id,
+                        "model": "shared-model",
+                        "profile": "shared-medium",
+                        "profile_sha256": None,
+                        "task_type": "analysis",
+                        "difficulty": "normal",
+                        "task_id": task_id,
+                        "route_envelope_id": envelope_id,
+                        "route_plan_fingerprint": fingerprint,
+                        "route_plan_step_index": 1,
+                        "route_predecessors": [
+                            {
+                                "provider_id": low["provider_id"],
+                                "model": low["model"],
+                                "profile": low["profile"],
+                                "profile_sha256": None,
+                                "attempt_id": low_attempt_id,
+                                "result_id": low_result_id,
+                            }
+                        ],
+                        "accepted_by_leader": accepts,
+                        "status": "done" if accepts else "failed",
+                    }
+                )
+
+        decision = decide_route(
+            {
+                "risk": "low",
+                "task_type": "analysis",
+                "difficulty": "normal",
+                "min_success_probability": 0.1,
+            },
+            catalog,
+            history=history,
+            input_tokens=1_000_000,
+            output_tokens=0,
+        )
+        self.assertEqual(decision.planned_provider_ids, ("longcat", "medium-a"))
+
     def test_acceptance_prior_deduplicates_attempts_and_rejects_conflicts(self) -> None:
         duplicate = {
             "provider_id": "deepseek",
@@ -596,6 +694,54 @@ class ThreeTierRoutingTest(unittest.TestCase):
                 history=history,
                 input_tokens=1_000_000,
             )
+
+    def test_conditional_success_never_trains_a_standalone_start_prior(self) -> None:
+        conditional = {
+            "id": "RES-conditional-high",
+            "command_id": "CMD-conditional-high",
+            "attempt_id": "ATT-conditional-high",
+            "provider_id": "codex",
+            "accepted_by_leader": True,
+            "route_plan_step_index": 2,
+            "route_predecessors": [
+                {"provider_id": "longcat"},
+                {"provider_id": "deepseek"},
+            ],
+        }
+        prior = leader_acceptance_prior([conditional], "codex")
+        self.assertEqual((prior.observations, prior.accepted), (0, 0))
+
+        unconditional = {
+            **conditional,
+            "id": "RES-unconditional-high",
+            "command_id": "CMD-unconditional-high",
+            "attempt_id": "ATT-unconditional-high",
+            "route_plan_step_index": 0,
+            "route_predecessors": [],
+        }
+        prior = leader_acceptance_prior([conditional, unconditional], "codex")
+        self.assertEqual((prior.observations, prior.accepted), (1, 1))
+
+    def test_conditional_prior_rejects_an_impossible_recursive_prefix(self) -> None:
+        history = paired_chain_history(
+            total=1,
+            low_accepts=0,
+            medium_accepts=0,
+            high_accepts=1,
+        )
+        medium = next(row for row in history if row["provider_id"] == "deepseek")
+        medium["route_predecessors"] = []
+        prior = conditional_leader_acceptance_prior(
+            history,
+            "codex",
+            predecessor_execution_identities=(
+                ("longcat", "LongCat-2.0", "longcat", None),
+                ("deepseek", "inherit", "deepseek", None),
+            ),
+            task_type="analysis",
+            difficulty="normal",
+        )
+        self.assertEqual((prior.observations, prior.accepted), (0, 0))
 
     def test_optimizer_enumerates_early_stop_and_skip_tier_chains(self) -> None:
         catalog = default_provider_catalog()

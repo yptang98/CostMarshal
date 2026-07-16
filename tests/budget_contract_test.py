@@ -51,7 +51,7 @@ def main() -> int:
                 input_per_1m=1.0,
                 cached_input_per_1m=1.0,
                 output_per_1m=1.0,
-                fixed_request=0.0,
+                fixed_attempt=0.0,
             )
         catalog_path = temp / "catalog.json"
         catalog_path.write_text(json.dumps(catalog), encoding="utf-8")

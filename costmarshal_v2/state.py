@@ -74,6 +74,24 @@ def atomic_write_text(path: Path, content: str) -> None:
             os.close(descriptor)
 
 
+def atomic_write_bytes(path: Path, content: bytes) -> None:
+    """Atomically persist exact bytes without platform newline translation."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("wb", delete=False, dir=str(path.parent)) as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+        temp_name = handle.name
+    os.replace(temp_name, path)
+    if os.name != "nt":
+        descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
 def atomic_write_json(path: Path, data: Any) -> None:
     atomic_write_text(path, json.dumps(redact(data), ensure_ascii=False, indent=2) + "\n")
 

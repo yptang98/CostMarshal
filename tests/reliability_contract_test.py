@@ -138,8 +138,21 @@ def main() -> int:
         append(inbox, command("MSG-escalate-1", actor, "V2-0001", "escalate_task", escalation_args))
         append(inbox, command("MSG-escalate-stale", actor, "V2-0001", "escalate_task", escalation_args))
         cycle = run_json(temp, "run-scheduler", "--project", str(project), "--once")
-        assert cycle["processed_commands"] == 1
-        assert cycle["failed_commands"] == 1
+        assert cycle["processed_commands"] == 0
+        assert cycle["failed_commands"] == 2
+        task = json.loads((project / "tasks" / "V2-0001" / "task.json").read_text(encoding="utf-8"))
+        assert [row["tier"] for row in task["attempts"]] == ["low"]
+        run_json(
+            temp,
+            "escalate",
+            "--project",
+            str(project),
+            "--task",
+            "V2-0001",
+            "--reason",
+            "leader authorizes stronger capability",
+            "--unsafe-native",
+        )
         task = json.loads((project / "tasks" / "V2-0001" / "task.json").read_text(encoding="utf-8"))
         assert [row["tier"] for row in task["attempts"]] == ["low", "medium"]
 

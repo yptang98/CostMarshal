@@ -172,7 +172,9 @@ def main() -> int:
             "--provider",
             "longcat",
         )
-        assert route_before["decision"]["acceptance_prior"]["observations"] == 1
+        # Unsafe-native outcomes remain auditable and replayable, but cannot
+        # train the production prior used by required-isolation routing.
+        assert route_before["decision"]["acceptance_prior"]["observations"] == 0
 
         # Simulate the legacy append-before-task-save crash.  Exact replay must
         # recover the already appended row instead of charging a second result.

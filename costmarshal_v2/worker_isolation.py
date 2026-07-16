@@ -2134,8 +2134,13 @@ class OciWorkerExecutionAdapter:
                     details={"line": line_number},
                 )
             try:
-                event = json.loads(line)
-            except json.JSONDecodeError as exc:
+                event = json.loads(
+                    line,
+                    parse_constant=lambda value: (_ for _ in ()).throw(
+                        ValueError(f"non-finite JSON constant: {value}")
+                    ),
+                )
+            except (json.JSONDecodeError, ValueError) as exc:
                 raise WorkerExecutionError(
                     "worker_stdout_json_invalid",
                     "managed worker stdout contained invalid JSONL",

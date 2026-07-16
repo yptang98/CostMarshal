@@ -176,7 +176,7 @@ class HandoffContractTest(unittest.TestCase):
     ) -> dict[str, object]:
         return {
             "id": f"RES-rejected-{sequence}",
-            "evidence_schema_version": "costmarshal-result-evidence-v2",
+            "evidence_schema_version": "costmarshal-result-evidence-v3",
             "task_id": output["task_id"],
             "attempt_id": output["attempt_id"],
             "status": "escalate",
@@ -457,7 +457,7 @@ class HandoffContractTest(unittest.TestCase):
             )
         accepted = {
             "id": "RES-accepted-1",
-            "evidence_schema_version": "costmarshal-result-evidence-v2",
+            "evidence_schema_version": "costmarshal-result-evidence-v3",
             "task_id": "V2-0001",
             "attempt_id": "ATT-low-001",
             "status": "done",

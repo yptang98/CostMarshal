@@ -10,6 +10,7 @@ RUNTIME_EVIDENCE_TESTS = (
     "tests/actor_crash_recovery_test.py",
     "tests/runtime_recovery_reliability_test.py",
     "tests/oci_actor_runner_test.py",
+    "tests/provider_completion_recovery_test.py",
 )
 REQUIRED_RUNTIME_CRASH_POINTS = (
     "effect.after_lease_commit_before_spawn",
@@ -23,6 +24,8 @@ REQUIRED_RUNTIME_CRASH_POINTS = (
     "after_credential_before_oci_prepare",
     "after_oci_prepare_before_start",
     "after_external_create_before_durable_identity",
+    "after_provider_completion_before_cleanup",
+    "after_provider_cleanup_before_seal",
     "effect.after_dead_status_before_projection",
 )
 REQUIRED_RUNTIME_RECOVERY_SCENARIOS = (
@@ -40,4 +43,9 @@ REQUIRED_RUNTIME_RECOVERY_SCENARIOS = (
     "deterministic_name_attach_after_hard_exit",
     "cleanup_unconfirmed_preserves_credential",
     "recovered_usage_unknown_preserves_budget_reservation",
+    "provider_completion_precleanup_hard_exit_finalize_only",
+    "provider_completion_sqlite_cleanup_replay",
+    "provider_completion_cas_tamper_fail_closed",
+    "provider_completion_secret_redaction",
+    "provider_completion_reparse_rejected",
 )

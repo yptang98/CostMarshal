@@ -47,7 +47,7 @@ _GIT_OID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _ATTEMPT_ID_RE = re.compile(r"ATT-[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _RESULT_ID_RE = re.compile(r"RES-[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _ENVELOPE_ID_RE = re.compile(r"ENV-[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
-_RESULT_EVIDENCE_SCHEMA = "costmarshal-result-evidence-v2"
+_RESULT_EVIDENCE_SCHEMA = "costmarshal-result-evidence-v3"
 _PROMPT_MAGIC = b"COSTMARSHAL-BOUND-PROMPT-V1\n"
 _TASK_PROMPT_DELIMITER = b"\nCOSTMARSHAL-TASK-PROMPT-V1\n"
 _ROUTE_STEP_KEYS = {
@@ -1038,15 +1038,66 @@ def build_attempt_output_contract(
         raise HandoffContractError("outgoing changes exceed the task change-count limit")
     if outgoing_bytes > change_policy["max_total_upsert_bytes"]:
         raise HandoffContractError("outgoing changes exceed the task byte limit")
+    return seal_attempt_output(
+        task_id=attempt["task_id"],
+        attempt_id=attempt["attempt_id"],
+        route_step_index=attempt["route_step_index"],
+        collaboration_contract_sha256=contract["contract_sha256"],
+        attempt_input_sha256=attempt["attempt_input_sha256"],
+        prompt_binding_sha256=binding["binding_sha256"],
+        execution_receipt_sha256=execution_receipt_sha256,
+        report_sha256=report_sha256,
+        report_size_bytes=report_size_bytes,
+        outgoing_change_manifest_sha256=outgoing_change_manifest_sha256,
+        outgoing_change_count=outgoing_count,
+        outgoing_total_upsert_bytes=outgoing_bytes,
+    )
+
+
+def seal_attempt_output(
+    *,
+    task_id: str,
+    attempt_id: str,
+    route_step_index: int,
+    collaboration_contract_sha256: str,
+    attempt_input_sha256: str,
+    prompt_binding_sha256: str,
+    execution_receipt_sha256: str,
+    report_sha256: str,
+    report_size_bytes: int,
+    outgoing_change_manifest_sha256: str,
+    outgoing_change_count: int,
+    outgoing_total_upsert_bytes: int,
+) -> dict[str, Any]:
+    """Seal already-normalized scheduler receipts into one immutable output."""
+
+    try:
+        exact_task_id = validate_task_id(task_id)
+    except SecurityValidationError as exc:
+        raise HandoffContractError(str(exc)) from exc
+    exact_attempt_id = _require_identifier(attempt_id, "attempt id", _ATTEMPT_ID_RE)
+    step_index = _require_non_negative_int(route_step_index, "route step index")
+    outgoing_count = _require_non_negative_int(
+        outgoing_change_count, "outgoing change count"
+    )
+    outgoing_bytes = _require_non_negative_int(
+        outgoing_total_upsert_bytes, "outgoing total upsert bytes"
+    )
     body = {
         "schema_version": 1,
         "kind": ATTEMPT_OUTPUT_KIND,
-        "task_id": attempt["task_id"],
-        "attempt_id": attempt["attempt_id"],
-        "route_step_index": attempt["route_step_index"],
-        "collaboration_contract_sha256": contract["contract_sha256"],
-        "attempt_input_sha256": attempt["attempt_input_sha256"],
-        "prompt_binding_sha256": binding["binding_sha256"],
+        "task_id": exact_task_id,
+        "attempt_id": exact_attempt_id,
+        "route_step_index": step_index,
+        "collaboration_contract_sha256": _require_sha256(
+            collaboration_contract_sha256, "collaboration contract hash"
+        ),
+        "attempt_input_sha256": _require_sha256(
+            attempt_input_sha256, "attempt input hash"
+        ),
+        "prompt_binding_sha256": _require_sha256(
+            prompt_binding_sha256, "prompt binding hash"
+        ),
         "execution_receipt_sha256": _require_sha256(
             execution_receipt_sha256, "execution_receipt_sha256"
         ),
@@ -1063,7 +1114,7 @@ def build_attempt_output_contract(
             "total_upsert_bytes": outgoing_bytes,
         },
     }
-    return _with_self_hash(body, "attempt_output_sha256")
+    return validate_attempt_output(_with_self_hash(body, "attempt_output_sha256"))
 
 
 def validate_attempt_output(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -1141,7 +1192,7 @@ def build_handoff_capsule(
         raise HandoffContractError("attempt output belongs to a different attempt input")
     result = _canonical_mapping(leader_result, "leader_result")
     if result.get("evidence_schema_version") != _RESULT_EVIDENCE_SCHEMA:
-        raise HandoffContractError("leader rejection is not trusted result evidence v2")
+        raise HandoffContractError("leader rejection is not trusted result evidence v3")
     rejected_status = result.get("status")
     if rejected_status not in {"failed", "escalate"}:
         raise HandoffContractError("handoff requires an explicit leader-rejected failed/escalate result")
@@ -1361,7 +1412,7 @@ def build_apply_preview_contract(
         raise HandoffContractError("accepted output belongs to a different attempt input")
     result = _canonical_mapping(accepted_leader_result, "accepted_leader_result")
     if result.get("evidence_schema_version") != _RESULT_EVIDENCE_SCHEMA:
-        raise HandoffContractError("accepted result is not trusted result evidence v2")
+        raise HandoffContractError("accepted result is not trusted result evidence v3")
     if (
         result.get("attempt_id") != attempt["attempt_id"]
         or result.get("task_id") != contract["task_id"]
@@ -1537,6 +1588,7 @@ __all__ = [
     "build_collaboration_contract",
     "build_handoff_capsule",
     "build_prompt_binding",
+    "seal_attempt_output",
     "validate_apply_preview_contract",
     "validate_attempt_input",
     "validate_attempt_phase_transition",

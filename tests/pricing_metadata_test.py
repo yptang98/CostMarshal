@@ -6,6 +6,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 import hashlib
 import json
 import os
@@ -54,7 +55,7 @@ def canonical_catalog(
     for provider in catalog["providers"]:
         provider.pop("input_cny_per_1m", None)
         provider.pop("output_cny_per_1m", None)
-        input_price, cached_price, output_price, fixed_request = prices[provider["provider_id"]]
+        input_price, cached_price, output_price, fixed_attempt = prices[provider["provider_id"]]
         provider["pricing"] = build_pricing_snapshot(
             currency="CNY",
             source=f"https://pricing.example/{provider['provider_id']}",
@@ -65,12 +66,55 @@ def canonical_catalog(
             input_per_1m=input_price,
             cached_input_per_1m=cached_price,
             output_per_1m=output_price,
-            fixed_request=fixed_request,
+            fixed_attempt=fixed_attempt,
         )
     return catalog
 
 
 class PricingMetadataTest(unittest.TestCase):
+    def test_zero_legacy_fixed_request_is_compatible_but_nonzero_fails_closed(self) -> None:
+        legacy_zero = build_pricing_snapshot(
+            currency="CNY",
+            source="https://pricing.example/legacy-zero-request-fee",
+            reviewed_at="2026-07-15T00:00:00Z",
+            effective_at="2026-07-15T00:00:00Z",
+            expires_at="2026-08-15T00:00:00Z",
+            snapshot_id="legacy-zero-request-fee",
+            input_per_1m="1",
+            cached_input_per_1m="0",
+            output_per_1m="2",
+            fixed_request="0",
+        )
+        self.assertIn("fixed_request", legacy_zero)
+        self.assertNotIn("fixed_attempt", legacy_zero)
+        provider = canonical_catalog()["providers"][0]
+        provider["pricing"] = legacy_zero
+        normalized = validate_provider_catalog(
+            {"schema_version": 1, "providers": [provider]}
+        )["providers"][0]
+        self.assertEqual(
+            estimate_cost_nano_cny(
+                normalized,
+                input_tokens=1_000_000,
+                cached_input_tokens=0,
+                output_tokens=0,
+            ),
+            1_000_000_000,
+        )
+        with self.assertRaisesRegex(RoutingValidationError, "request-count metering"):
+            build_pricing_snapshot(
+                currency="CNY",
+                source="https://pricing.example/unsupported-request-fee",
+                reviewed_at="2026-07-15T00:00:00Z",
+                effective_at="2026-07-15T00:00:00Z",
+                expires_at="2026-08-15T00:00:00Z",
+                snapshot_id="unsupported-request-fee",
+                input_per_1m="1",
+                cached_input_per_1m="0",
+                output_per_1m="2",
+                fixed_request="0.01",
+            )
+
     def test_canonical_cost_uses_exact_conservative_nano_cny_math(self) -> None:
         provider = canonical_catalog()["providers"][0]
         provider["pricing"] = build_pricing_snapshot(
@@ -83,7 +127,7 @@ class PricingMetadataTest(unittest.TestCase):
             input_per_1m=428.086698109,
             cached_input_per_1m=428.086698109,
             output_per_1m=428.086698109,
-            fixed_request=0,
+            fixed_attempt=0,
         )
         self.assertEqual(
             estimate_cost_nano_cny(
@@ -107,7 +151,7 @@ class PricingMetadataTest(unittest.TestCase):
             input_per_1m="999999999.123456789",
             cached_input_per_1m="0",
             output_per_1m="0",
-            fixed_request="0",
+            fixed_attempt="0",
         )
         self.assertEqual(provider["pricing"]["input_per_1m"], "999999999.123456789")
         self.assertEqual(
@@ -131,14 +175,14 @@ class PricingMetadataTest(unittest.TestCase):
             input_per_1m="1000000000000000063.999999999",
             cached_input_per_1m="0",
             output_per_1m="0",
-            fixed_request="0",
+            fixed_attempt="0",
         )
         legacy_payload = {
             **{key: value for key, value in snapshot.items() if key != "snapshot_hash"},
             "input_per_1m": float(snapshot["input_per_1m"]),
             "cached_input_per_1m": float(snapshot["cached_input_per_1m"]),
             "output_per_1m": float(snapshot["output_per_1m"]),
-            "fixed_request": float(snapshot["fixed_request"]),
+            "fixed_attempt": float(snapshot["fixed_attempt"]),
         }
         snapshot["snapshot_hash"] = "sha256:" + hashlib.sha256(
             json.dumps(
@@ -169,7 +213,7 @@ class PricingMetadataTest(unittest.TestCase):
             input_per_1m="1000000000000000000",
             cached_input_per_1m="0",
             output_per_1m="0",
-            fixed_request="0",
+            fixed_attempt="0",
         )
         expensive = deepcopy(cheap)
         expensive.update({"provider_id": "a-expensive", "profile": "a-expensive"})
@@ -183,7 +227,7 @@ class PricingMetadataTest(unittest.TestCase):
             input_per_1m="1000000000000000063.999999999",
             cached_input_per_1m="0",
             output_per_1m="0",
-            fixed_request="0",
+            fixed_attempt="0",
         )
         decision = decide_route(
             {"risk": "low", "task_type": "analysis"},
@@ -212,7 +256,7 @@ class PricingMetadataTest(unittest.TestCase):
             input_per_1m="999999999.123456789",
             cached_input_per_1m="0",
             output_per_1m="0",
-            fixed_request="0",
+            fixed_attempt="0",
         )
         encoded = json.dumps(catalog, ensure_ascii=False)
         encoded = encoded.replace('"999999999.123456789"', "999999999.123456789", 1)
@@ -441,7 +485,7 @@ class PricingMetadataTest(unittest.TestCase):
                 input_per_1m=input_price,
                 cached_input_per_1m=cached_price,
                 output_per_1m=0.0,
-                fixed_request=0.0,
+                fixed_attempt=0.0,
             )
 
         ordinary = decide_route(
@@ -743,12 +787,23 @@ class PricingMetadataTest(unittest.TestCase):
                         input_per_1m=500.0,
                         cached_input_per_1m=750.0,
                         output_per_1m=900.0,
-                        fixed_request=1.0,
+                        fixed_attempt=1.0,
                     )
             project_path.write_text(
                 json.dumps(project_payload, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
+            first_usage = run(
+                "record-usage",
+                "--project",
+                project,
+                "--actor",
+                dispatched["actor_id"],
+                "--input-tokens",
+                "400",
+                "--cached-input-tokens",
+                "200",
+            )["event"]
             usage = run(
                 "record-usage",
                 "--project",
@@ -756,15 +811,37 @@ class PricingMetadataTest(unittest.TestCase):
                 "--actor",
                 dispatched["actor_id"],
                 "--input-tokens",
-                "1000",
+                "600",
                 "--cached-input-tokens",
-                "500",
+                "300",
                 "--final",
             )["event"]
-            self.assertEqual(usage["cached_input_tokens"], 500)
-            self.assertEqual(usage["total_tokens"], 1500)
-            self.assertEqual(usage["estimated_cost_cny"], "0.011125")
+            self.assertEqual(first_usage["estimated_cost_cny"], "0.01045")
+            self.assertEqual(usage["cached_input_tokens"], 300)
+            self.assertEqual(usage["total_tokens"], 900)
+            self.assertEqual(usage["estimated_cost_cny"], "0.000675")
             self.assertTrue(usage["cost_source"].startswith("attempt_price_snapshot:sha256:"))
+            usage_rows = [
+                json.loads(line)
+                for line in (Path(project) / "reports" / "usage.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(
+                sum(Decimal(str(row["estimated_cost_cny"])) for row in usage_rows),
+                Decimal("0.011125"),
+            )
+            actor_state = next(
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in (Path(project) / "scheduler" / "actors").glob("*.json")
+                if json.loads(path.read_text(encoding="utf-8")).get("id")
+                == dispatched["actor_id"]
+            )
+            self.assertEqual(
+                Decimal(str(actor_state["usage"]["estimated_cost_cny"])),
+                Decimal("0.011125"),
+            )
             run(
                 "collect",
                 "--project",

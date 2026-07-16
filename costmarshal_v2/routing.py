@@ -72,6 +72,7 @@ _PRICING_FIELDS = {
     "input_per_1m",
     "cached_input_per_1m",
     "output_per_1m",
+    "fixed_attempt",
     "fixed_request",
 }
 _SNAPSHOT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
@@ -98,10 +99,15 @@ class PricingSnapshot:
     input_per_1m: str | float
     cached_input_per_1m: str | float | None
     output_per_1m: str | float
-    fixed_request: str | float
+    fixed_attempt: str | float | None = None
+    fixed_request: str | float | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {
+            key: value
+            for key, value in asdict(self).items()
+            if value is not None
+        }
 
 
 @dataclass(frozen=True)
@@ -114,6 +120,8 @@ class AcceptancePrior:
     prior_beta: float
     posterior_mean: float
     conservative_probability: float
+    evidence_result_ids: tuple[str, ...]
+    evidence_sha256: str
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -304,9 +312,21 @@ def _normalize_pricing_snapshot(
             _money_decimal(raw_cached_price, f"{label}.cached_input_per_1m")
         )
     )
-    fixed_request = _decimal_money_text(
-        _money_decimal(raw.get("fixed_request", 0), f"{label}.fixed_request")
+    if "fixed_attempt" in raw and "fixed_request" in raw:
+        raise RoutingValidationError(
+            f"{label} cannot mix fixed_attempt with legacy fixed_request"
+        )
+    legacy_fixed_request = "fixed_request" in raw
+    fixed_field = "fixed_request" if legacy_fixed_request else "fixed_attempt"
+    fixed_attempt = _decimal_money_text(
+        _money_decimal(raw.get(fixed_field, 0), f"{label}.{fixed_field}")
     )
+    if legacy_fixed_request and Decimal(fixed_attempt) != 0:
+        raise RoutingValidationError(
+            f"{label}.fixed_request is a per-wire-request dimension and is unsupported "
+            "without request-count metering; use fixed_attempt only for a fee charged "
+            "once per CostMarshal attempt"
+        )
     normalized = {
         "currency": currency,
         "source": source.strip(),
@@ -317,7 +337,7 @@ def _normalize_pricing_snapshot(
         "input_per_1m": input_price,
         "cached_input_per_1m": cached_price,
         "output_per_1m": output_price,
-        "fixed_request": fixed_request,
+        fixed_field: fixed_attempt,
     }
     computed_hash = "sha256:" + hashlib.sha256(
         json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -327,14 +347,14 @@ def _normalize_pricing_snapshot(
         "input_per_1m": float(input_price),
         "cached_input_per_1m": None if cached_price is None else float(cached_price),
         "output_per_1m": float(output_price),
-        "fixed_request": float(fixed_request),
+        fixed_field: float(fixed_attempt),
     }
     legacy_hash = "sha256:" + hashlib.sha256(
         json.dumps(legacy_normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     ).hexdigest()
     legacy_float_exact = all(
         Decimal(value) == Decimal(str(float(value)))
-        for value in (input_price, output_price, fixed_request)
+        for value in (input_price, output_price, fixed_attempt)
     ) and (
         cached_price is None
         or Decimal(cached_price) == Decimal(str(float(cached_price)))
@@ -751,7 +771,9 @@ def estimate_cost_nano_cny(
     """Return the conservative exact integer nano-CNY provider estimate.
 
     Canonical snapshots support ordinary input, cached input, output, and a
-    fixed per-request fee. Unknown required dimensions yield ``None`` rather
+    fixed per-CostMarshal-attempt fee. Per-wire-request charges are intentionally
+    unsupported because one provider attempt may issue multiple API requests.
+    Unknown required dimensions yield ``None`` rather
     than a misleading partial estimate. Fractional nano-CNY usage rounds up so
     a route reservation can never understate the reviewed quote.
     """
@@ -777,8 +799,12 @@ def estimate_cost_nano_cny(
             + output_count * int(_money_decimal(snapshot["output_per_1m"], "pricing.output_per_1m") * _NANO_CNY)
         )
         variable_units = (variable_numerator + 1_000_000 - 1) // 1_000_000
+        fixed_field = (
+            "fixed_attempt" if "fixed_attempt" in snapshot else "fixed_request"
+        )
         fixed_units = int(
-            _money_decimal(snapshot["fixed_request"], "pricing.fixed_request") * _NANO_CNY
+            _money_decimal(snapshot[fixed_field], f"pricing.{fixed_field}")
+            * _NANO_CNY
         )
         return fixed_units + variable_units
     raw_input_price = provider.get("input_cny_per_1m")
@@ -955,6 +981,7 @@ def _leader_rows(
     *,
     execution_identity: ExecutionIdentity | None = None,
     _history_is_deduplicated: bool = False,
+    require_unconditional: bool = True,
 ) -> list[Mapping[str, Any]]:
     rows: list[Mapping[str, Any]] = []
     source = list(history) if _history_is_deduplicated else _deduplicated_leader_history(history)
@@ -967,6 +994,13 @@ def _leader_rows(
             continue
         if execution_identity is not None:
             if _row_execution_identity(row) != execution_identity:
+                continue
+        if require_unconditional:
+            predecessors = row.get("route_predecessors")
+            step_index = row.get("route_plan_step_index")
+            if predecessors is not None and predecessors != () and predecessors != []:
+                continue
+            if step_index not in {None, 0}:
                 continue
         rows.append(row)
     return rows
@@ -984,6 +1018,40 @@ def _wilson_lower(successes: float, trials: float, z: float = 1.96) -> float:
     return max(0.0, (center - margin) / denominator)
 
 
+def acceptance_evidence_provenance(
+    rows: Iterable[Mapping[str, Any]],
+) -> tuple[tuple[str, ...], str]:
+    """Bind the exact trusted result rows used by an acceptance prior."""
+
+    canonical_rows: list[tuple[str, bytes, dict[str, Any]]] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise RoutingValidationError("acceptance evidence row must be an object")
+        material = dict(row)
+        try:
+            encoded = json.dumps(
+                material,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise RoutingValidationError(
+                "acceptance evidence row is not canonical JSON"
+            ) from exc
+        result_id = material.get("id")
+        canonical_rows.append(
+            (result_id if isinstance(result_id, str) else "", encoded, material)
+        )
+    canonical_rows.sort(key=lambda item: (item[0], item[1]))
+    result_ids = tuple(item[0] for item in canonical_rows if item[0])
+    if len(result_ids) != len(set(result_ids)):
+        raise RoutingValidationError("acceptance evidence contains duplicate result ids")
+    payload = b"[" + b",".join(item[1] for item in canonical_rows) + b"]"
+    return result_ids, "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
 def leader_acceptance_prior(
     history: Iterable[Mapping[str, Any]] | None,
     provider_id: str,
@@ -996,6 +1064,7 @@ def leader_acceptance_prior(
     _history_is_deduplicated: bool = False,
     require_exact_scope: bool = False,
     minimum_observations: int = 0,
+    _require_unconditional: bool = True,
 ) -> AcceptancePrior:
     """Build a conservative Beta-style prior from leader acceptance records.
 
@@ -1030,6 +1099,7 @@ def leader_acceptance_prior(
         provider_id,
         execution_identity=execution_identity,
         _history_is_deduplicated=_history_is_deduplicated,
+        require_unconditional=_require_unconditional,
     )
     scope = "provider+execution" if execution_identity is not None else "provider"
     selected = provider_rows
@@ -1083,6 +1153,7 @@ def leader_acceptance_prior(
 
     accepted = sum(1 for row in selected if row["accepted_by_leader"] is True)
     observations = len(selected)
+    evidence_result_ids, evidence_sha256 = acceptance_evidence_provenance(selected)
     posterior_alpha = alpha + accepted
     posterior_beta = beta + observations - accepted
     trials = posterior_alpha + posterior_beta
@@ -1101,6 +1172,8 @@ def leader_acceptance_prior(
             if observations >= minimum_observations
             else 0.0
         ),
+        evidence_result_ids=evidence_result_ids,
+        evidence_sha256=evidence_sha256,
     )
 
 
@@ -1202,6 +1275,7 @@ def conditional_leader_acceptance_prior(
         _history_is_deduplicated=True,
         require_exact_scope=require_exact_scope,
         minimum_observations=minimum_observations,
+        _require_unconditional=False,
     )
     return AcceptancePrior(
         provider_id=prior.provider_id,
@@ -1214,6 +1288,8 @@ def conditional_leader_acceptance_prior(
         conservative_probability=(
             prior.conservative_probability if prior.observations > 0 else 0.0
         ),
+        evidence_result_ids=prior.evidence_result_ids,
+        evidence_sha256=prior.evidence_sha256,
     )
 
 
@@ -1319,6 +1395,11 @@ def _conditional_evidence_index(
                 valid = False
                 break
             predecessor_row = result_index.get(predecessor_result_id)
+            predecessor_prefix = (
+                predecessor_row.get("route_predecessors")
+                if predecessor_row is not None
+                else None
+            )
             if (
                 predecessor_row is None
                 or predecessor_row.get("attempt_id") != predecessor_attempt_id
@@ -1329,6 +1410,9 @@ def _conditional_evidence_index(
                 or _row_provider_id(predecessor_row) != predecessor_provider
                 or _row_execution_identity(predecessor_row) != identity
                 or predecessor_row.get("accepted_by_leader") is not False
+                or predecessor_row.get("status") != "escalate"
+                or not isinstance(predecessor_prefix, list)
+                or predecessor_prefix != raw_prefix[:predecessor_index]
             ):
                 valid = False
                 break
@@ -1439,7 +1523,7 @@ def _auto_chain_plans(
     )
     conditional_evidence_index = _conditional_evidence_index(history_rows)
     conditional_prior_cache: dict[
-        tuple[ExecutionIdentity, tuple[PredecessorExecutionIdentity, ...]],
+        tuple[str, ExecutionIdentity, tuple[PredecessorExecutionIdentity, ...]],
         AcceptancePrior,
     ] = {}
     plans: list[dict[str, Any]] = []
@@ -1499,6 +1583,7 @@ def _auto_chain_plans(
                 item_prior = marginal_prior
                 if index:
                     cache_key = (
+                        str(item_provider["provider_id"]),
                         item_identity,
                         tuple(predecessor_identities),
                     )

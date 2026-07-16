@@ -9,8 +9,10 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from dataclasses import replace
@@ -21,6 +23,7 @@ from urllib.parse import urlsplit
 from .context_projection import (
     ContextProjectionError,
     apply_cumulative_change_artifact,
+    build_cumulative_change_manifest,
     capture_projection_changes,
     materialize_context_projection,
     persist_change_artifact,
@@ -31,6 +34,16 @@ from .governance import (
     GovernanceError,
     enforce_governance_contract,
     load_stable_governance_project,
+)
+from .handoff_contract import (
+    HandoffContractError,
+    HandoffLimits,
+    build_attempt_input_contract,
+    build_attempt_output_contract,
+    build_bound_prompt_bytes,
+    build_collaboration_contract as build_semantic_collaboration_contract,
+    build_prompt_binding as build_semantic_prompt_binding,
+    validate_collaboration_contract as validate_semantic_collaboration_contract,
 )
 from .mailbox import send_message
 from .locking import ProjectLockTimeout, advisory_file_lock, project_write_lock
@@ -53,6 +66,8 @@ from .security import (
 from .routing import RoutingValidationError, project_provider_catalog
 from .session_backend import pid_start_marker
 from .worker_isolation import (
+    CredentialCleanupReceipt,
+    ExecutionCleanupReceipt,
     IsolationError,
     OciCliBackend,
     OciWorkerExecutionAdapter,
@@ -66,6 +81,7 @@ from .worker_isolation import (
 from .state import (
     SCHEMA_VERSION,
     append_event,
+    atomic_write_bytes,
     atomic_write_json,
     atomic_write_text,
     actor_prompt_file,
@@ -80,6 +96,7 @@ from .state import (
 
 
 ACTOR_FAULT_ENV = "COSTMARSHAL_ACTOR_FAULT"
+PROVIDER_COMPLETION_PENDING = "finished_pending_finalize"
 NATIVE_LAUNCH_BARRIER_STAGE_ENV = "COSTMARSHAL_NATIVE_LAUNCH_BARRIER_STAGE"
 NATIVE_LAUNCH_BARRIER_READY_ENV = "COSTMARSHAL_NATIVE_LAUNCH_BARRIER_READY"
 NATIVE_LAUNCH_BARRIER_RELEASE_ENV = "COSTMARSHAL_NATIVE_LAUNCH_BARRIER_RELEASE"
@@ -596,6 +613,634 @@ def _incoming_change_artifact(
     return receipt
 
 
+def _canonical_sha256(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def _persist_immutable_payload(root: Path, digest: str, payload: bytes) -> Path:
+    if digest != "sha256:" + hashlib.sha256(payload).hexdigest():
+        raise SystemExit("immutable payload does not match its content address")
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / digest.removeprefix("sha256:")
+    if path.exists():
+        if path.is_symlink() or not path.is_file() or path.read_bytes() != payload:
+            raise SystemExit("content-addressed payload already exists with different bytes")
+        return path
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".incoming-", dir=str(root))
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            if path.is_symlink() or not path.is_file() or path.read_bytes() != payload:
+                raise SystemExit("content-addressed payload publication raced with different bytes")
+        except OSError as exc:
+            # Windows can reject a hard-link target at the legacy MAX_PATH
+            # boundary even though the already-open temporary file is valid.
+            # rename is atomic and non-overwriting on Windows, retaining the
+            # same publish-if-absent semantics under the attempt lock.
+            if os.name != "nt" or getattr(exc, "winerror", None) not in {3, 206}:
+                raise
+            try:
+                os.rename(temporary, path)
+            except FileExistsError:
+                if path.is_symlink() or not path.is_file() or path.read_bytes() != payload:
+                    raise SystemExit(
+                        "content-addressed payload publication raced with different bytes"
+                    )
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+    return path
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _redact_provider_events(
+    events: Iterable[dict[str, Any]],
+    secret_values: Iterable[str],
+) -> list[dict[str, Any]]:
+    secrets_to_remove = tuple(value for value in secret_values if value)
+
+    def redact_value(value: Any) -> Any:
+        if isinstance(value, str):
+            safe_value = redact_secret_values(value, secrets_to_remove)
+            if any(secret in safe_value for secret in secrets_to_remove):
+                raise SystemExit("provider event redaction failed closed")
+            return safe_value
+        if isinstance(value, list):
+            return [redact_value(item) for item in value]
+        if isinstance(value, dict):
+            safe_dict: dict[str, Any] = {}
+            for key, item in value.items():
+                safe_key = redact_value(key) if isinstance(key, str) else key
+                if not isinstance(safe_key, str) or safe_key in safe_dict:
+                    raise SystemExit("provider event redaction produced an invalid or duplicate key")
+                safe_dict[safe_key] = redact_value(item)
+            return safe_dict
+        return value
+
+    redacted: list[dict[str, Any]] = []
+    for event in events:
+        parsed = redact_value(event)
+        if not isinstance(parsed, dict):
+            raise SystemExit("provider event redaction changed its object contract")
+        redacted.append(parsed)
+    return redacted
+
+
+def _provider_completion_root(
+    layout: ProjectLayout,
+    project: dict[str, Any],
+    actor: dict[str, Any],
+) -> Path:
+    return Path(os.path.abspath(
+        layout.root
+        / "provider-completions"
+        / slugify(str(project.get("project_id") or "project"), "project")
+        / slugify(str(actor.get("attempt_id") or actor.get("id") or "attempt"), "attempt")
+    ))
+
+
+def _is_link_or_reparse(path: Path, info: os.stat_result) -> bool:
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+
+
+def _ensure_completion_directory(
+    authority_root: Path,
+    directory: Path,
+    *,
+    create: bool = True,
+) -> None:
+    authority = Path(os.path.abspath(authority_root))
+    candidate = Path(os.path.abspath(directory))
+    try:
+        relative = candidate.relative_to(authority)
+    except ValueError as exc:
+        raise SystemExit("durable provider completion path escaped its authority root") from exc
+    current = authority
+    for part in relative.parts:
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            if not create:
+                raise SystemExit("durable provider completion directory is missing")
+            try:
+                current.mkdir()
+            except FileExistsError:
+                pass
+            info = current.lstat()
+        except OSError as exc:
+            raise SystemExit("durable provider completion directory is unreadable") from exc
+        if not stat.S_ISDIR(info.st_mode) or _is_link_or_reparse(current, info):
+            raise SystemExit("durable provider completion directory contains a link or reparse point")
+
+
+def _read_completion_cas(
+    path_value: Any,
+    *,
+    expected_path: Path,
+    digest: str,
+    max_bytes: int,
+    label: str,
+    authority_root: Path,
+) -> bytes:
+    if not isinstance(path_value, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise SystemExit(f"durable provider completion {label} receipt is invalid")
+    try:
+        path = Path(os.path.abspath(path_value))
+        expected = Path(os.path.abspath(expected_path))
+        if os.path.normcase(os.fspath(path)) != os.path.normcase(os.fspath(expected)):
+            raise ValueError("content-addressed path mismatch")
+        _ensure_completion_directory(authority_root, expected.parent, create=False)
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode) or _is_link_or_reparse(path, before):
+            raise ValueError("content-addressed payload is not a regular file")
+        if before.st_size < 1 or before.st_size > max_bytes:
+            raise ValueError("content-addressed payload size is invalid")
+        payload = path.read_bytes()
+        after = path.stat()
+        if (
+            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or len(payload) != after.st_size
+        ):
+            raise ValueError("content-addressed payload changed during read")
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"durable provider completion {label} CAS is unavailable: {exc}") from exc
+    if "sha256:" + hashlib.sha256(payload).hexdigest() != digest:
+        raise SystemExit(f"durable provider completion {label} CAS hash mismatch")
+    return payload
+
+
+def _completion_attempt(task: dict[str, Any], actor: dict[str, Any]) -> dict[str, Any]:
+    matches = [
+        row
+        for row in task.get("attempts") or []
+        if row.get("attempt_id") == actor.get("attempt_id")
+        and row.get("actor_id") == actor.get("id")
+    ]
+    if len(matches) != 1 or (task.get("attempts") or [])[-1] is not matches[0]:
+        raise SystemExit("durable provider completion is not bound to the current attempt")
+    return matches[0]
+
+
+def _load_provider_completion(
+    layout: ProjectLayout,
+    project: dict[str, Any],
+    actor: dict[str, Any],
+    *,
+    semantic_contract: dict[str, Any] | None,
+    attempt_input: dict[str, Any] | None,
+    prompt_binding: dict[str, Any] | None,
+    projection_receipt: dict[str, Any] | None,
+) -> tuple[dict[str, Any], bytes, list[dict[str, Any]]] | None:
+    task = load_task(layout, str(actor.get("task_id") or ""))
+    attempt = _completion_attempt(task, actor)
+    runtime = actor.get("runtime") or {}
+    candidates = [
+        value
+        for value in (attempt.get("provider_completion"), runtime.get("provider_completion"))
+        if value is not None
+    ]
+    marked = (
+        runtime.get("provider_execution_state") == PROVIDER_COMPLETION_PENDING
+        or attempt.get("provider_execution_state") == PROVIDER_COMPLETION_PENDING
+    )
+    if not candidates:
+        if marked:
+            raise SystemExit("durable provider completion marker has no receipt")
+        return None
+    if any(not isinstance(value, dict) for value in candidates) or any(
+        value != candidates[0] for value in candidates[1:]
+    ):
+        raise SystemExit("durable provider completion actor/task receipts conflict")
+    receipt = dict(candidates[0])
+    receipt_sha256 = receipt.pop("receipt_sha256", None)
+    receipt_path = receipt.pop("path", None)
+    if not isinstance(receipt_sha256, str):
+        raise SystemExit("durable provider completion receipt hash is missing")
+    root = _provider_completion_root(layout, project, actor)
+    receipt_payload = _read_completion_cas(
+        receipt_path,
+        expected_path=root / "c" / receipt_sha256.removeprefix("sha256:"),
+        digest=receipt_sha256,
+        max_bytes=128 * 1024,
+        label="receipt",
+        authority_root=layout.root,
+    )
+    if receipt_payload != _canonical_json_bytes(receipt):
+        raise SystemExit("durable provider completion receipt bytes are non-canonical")
+    expected_bindings = {
+        "schema_version": 1,
+        "kind": "costmarshal-provider-completion",
+        "task_id": actor.get("task_id"),
+        "attempt_id": actor.get("attempt_id"),
+        "actor_id": actor.get("id"),
+        "launch_token_sha256": hashlib.sha256(
+            str(actor.get("launch_token") or "").encode("utf-8")
+        ).hexdigest(),
+        "provider": actor.get("provider"),
+        "tier": actor.get("tier"),
+        "model": actor.get("model"),
+        "profile": actor.get("profile"),
+        "profile_sha256": (actor.get("profile_binding") or {}).get("sha256"),
+        "collaboration_contract_sha256": (semantic_contract or {}).get("contract_sha256"),
+        "attempt_input_sha256": (attempt_input or {}).get("attempt_input_sha256"),
+        "semantic_prompt_sha256": (prompt_binding or {}).get("prompt_sha256"),
+        "context_projection_manifest_sha256": (projection_receipt or {}).get("manifest_sha256"),
+        "isolation_backend": runtime.get("isolation_backend"),
+        "container_name": runtime.get("container_name"),
+        "container_id": runtime.get("container_id"),
+        "container_command_sha256": _canonical_sha256(runtime.get("container_command") or []),
+        "isolation_attestation_sha256": _canonical_sha256(runtime.get("isolation_attestation")),
+    }
+    if any(receipt.get(key) != value for key, value in expected_bindings.items()):
+        raise SystemExit("durable provider completion identity binding mismatch")
+    report_row = receipt.get("report")
+    events_row = receipt.get("events")
+    if not isinstance(report_row, dict) or not isinstance(events_row, dict):
+        raise SystemExit("durable provider completion report/events receipts are missing")
+    report_digest = str(report_row.get("sha256") or "")
+    events_digest = str(events_row.get("sha256") or "")
+    report_bytes = _read_completion_cas(
+        report_row.get("path"),
+        expected_path=root / "r" / report_digest.removeprefix("sha256:"),
+        digest=report_digest,
+        max_bytes=1024 * 1024,
+        label="report",
+        authority_root=layout.root,
+    )
+    events_bytes = _read_completion_cas(
+        events_row.get("path"),
+        expected_path=root / "e" / events_digest.removeprefix("sha256:"),
+        digest=events_digest,
+        max_bytes=2 * 1024 * 1024,
+        label="events",
+        authority_root=layout.root,
+    )
+    if report_row.get("size_bytes") != len(report_bytes) or events_row.get("size_bytes") != len(events_bytes):
+        raise SystemExit("durable provider completion payload size mismatch")
+    try:
+        report_bytes.decode("utf-8", errors="strict")
+        event_document = json.loads(events_bytes.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SystemExit("durable provider completion payload encoding is invalid") from exc
+    events = event_document.get("events") if isinstance(event_document, dict) else None
+    if (
+        event_document.get("schema") != "costmarshal-provider-events-v1"
+        or not isinstance(events, list)
+        or len(events) > 4096
+        or any(not isinstance(event, dict) for event in events)
+        or _canonical_json_bytes(event_document) != events_bytes
+        or events_row.get("count") != len(events)
+    ):
+        raise SystemExit("durable provider completion events CAS is invalid")
+    if type(receipt.get("exit_code")) is not int:
+        raise SystemExit("durable provider completion exit code is invalid")
+    return ({**receipt, "receipt_sha256": receipt_sha256, "path": receipt_path}, report_bytes, events)
+
+
+def _persist_provider_completion(
+    layout: ProjectLayout,
+    project: dict[str, Any],
+    actor: dict[str, Any],
+    *,
+    wait_receipt: Any,
+    validated_output: Any,
+    safe_report_bytes: bytes,
+    events: list[dict[str, Any]],
+    semantic_contract: dict[str, Any] | None,
+    attempt_input: dict[str, Any] | None,
+    prompt_binding: dict[str, Any] | None,
+    projection_receipt: dict[str, Any] | None,
+    attempt_id: str | None,
+    launch_token: str | None,
+) -> dict[str, Any]:
+    event_document = {"schema": "costmarshal-provider-events-v1", "events": events}
+    events_bytes = _canonical_json_bytes(event_document)
+    root = _provider_completion_root(layout, project, actor)
+    report_digest = "sha256:" + hashlib.sha256(safe_report_bytes).hexdigest()
+    events_digest = "sha256:" + hashlib.sha256(events_bytes).hexdigest()
+    # Single-letter leaf directories keep Windows paths below legacy MAX_PATH
+    # even when the project and attempt identities are long.
+    _ensure_completion_directory(layout.root, root / "r")
+    _ensure_completion_directory(layout.root, root / "e")
+    _ensure_completion_directory(layout.root, root / "c")
+    report_path = _persist_immutable_payload(root / "r", report_digest, safe_report_bytes)
+    events_path = _persist_immutable_payload(root / "e", events_digest, events_bytes)
+    durable_actor = load_actor(layout, str(actor["id"]))
+    runtime = durable_actor.get("runtime") or {}
+    command = runtime.get("container_command") or []
+    body = {
+        "schema_version": 1,
+        "kind": "costmarshal-provider-completion",
+        "task_id": actor.get("task_id"),
+        "attempt_id": actor.get("attempt_id"),
+        "actor_id": actor.get("id"),
+        "launch_token_sha256": hashlib.sha256(str(launch_token or "").encode("utf-8")).hexdigest(),
+        "provider": actor.get("provider"),
+        "tier": actor.get("tier"),
+        "model": actor.get("model"),
+        "profile": actor.get("profile"),
+        "profile_sha256": (actor.get("profile_binding") or {}).get("sha256"),
+        "collaboration_contract_sha256": (semantic_contract or {}).get("contract_sha256"),
+        "attempt_input_sha256": (attempt_input or {}).get("attempt_input_sha256"),
+        "semantic_prompt_sha256": (prompt_binding or {}).get("prompt_sha256"),
+        "context_projection_manifest_sha256": (projection_receipt or {}).get("manifest_sha256"),
+        "isolation_backend": runtime.get("isolation_backend"),
+        "container_name": runtime.get("container_name"),
+        "container_id": runtime.get("container_id"),
+        "container_command_sha256": _canonical_sha256(command),
+        "isolation_attestation_sha256": _canonical_sha256(runtime.get("isolation_attestation")),
+        "exit_code": int(wait_receipt.exit_code),
+        "stdout_bytes": int(getattr(wait_receipt, "stdout_bytes", 0)),
+        "stderr_bytes": int(getattr(wait_receipt, "stderr_bytes", 0)),
+        "stderr_truncated": bool(getattr(wait_receipt, "stderr_truncated", False)),
+        "worker_output_sha256": "sha256:" + str(validated_output.sha256).removeprefix("sha256:"),
+        "report": {"path": str(report_path), "sha256": report_digest, "size_bytes": len(safe_report_bytes)},
+        "events": {"path": str(events_path), "sha256": events_digest, "size_bytes": len(events_bytes), "count": len(events)},
+    }
+    receipt_bytes = _canonical_json_bytes(body)
+    receipt_digest = "sha256:" + hashlib.sha256(receipt_bytes).hexdigest()
+    receipt_path = _persist_immutable_payload(root / "c", receipt_digest, receipt_bytes)
+    completion = {**body, "receipt_sha256": receipt_digest, "path": str(receipt_path)}
+
+    def persist_completion() -> None:
+        current_actor = _validate_worker_fence(
+            layout,
+            str(actor["id"]),
+            attempt_id=attempt_id,
+            launch_token=launch_token,
+            allow_provider_started=True,
+        )
+        current_task = load_task(layout, str(current_actor.get("task_id")))
+        current_attempt = _completion_attempt(current_task, current_actor)
+        prior = current_attempt.get("provider_completion")
+        if prior is not None and prior != completion:
+            raise SystemExit("durable provider completion changed for the same attempt")
+        current_attempt["provider_completion"] = completion
+        current_attempt["provider_execution_state"] = PROVIDER_COMPLETION_PENDING
+        save_task(layout, current_task)
+        current_runtime = current_actor.setdefault("runtime", {})
+        prior = current_runtime.get("provider_completion")
+        if prior is not None and prior != completion:
+            raise SystemExit("actor provider completion changed for the same attempt")
+        current_runtime["provider_completion"] = completion
+        current_runtime["provider_execution_state"] = PROVIDER_COMPLETION_PENDING
+        current_runtime["oci_lifecycle_state"] = "finished"
+        save_actor(layout, current_actor)
+        append_event(
+            layout,
+            "actor_provider_completion_observed",
+            actor_id=actor.get("id"),
+            task_id=actor.get("task_id"),
+            attempt_id=actor.get("attempt_id"),
+            provider_completion_sha256=receipt_digest,
+        )
+
+    _control_mutation(
+        layout,
+        command_name="runner_observe_provider_completion",
+        command_id=f"RUNNER-PROVIDER-COMPLETION-{attempt_id or actor.get('id')}",
+        payload={
+            "actor_id": actor.get("id"),
+            "attempt_id": attempt_id,
+            "provider_completion_sha256": receipt_digest,
+        },
+        mutate=persist_completion,
+    )
+    return completion
+
+
+def _semantic_handoff_limits(
+    task: dict[str, Any],
+    *,
+    bootstrap_prompt_size: int,
+) -> HandoffLimits:
+    input_tokens = int(task.get("estimated_input_tokens") or 0)
+    output_tokens = int(task.get("estimated_output_tokens") or 0)
+    framing_reserve = 256
+    maximum_from_input = (
+        input_tokens - bootstrap_prompt_size - framing_reserve - 1024
+    ) // 2
+    maximum_from_output = (output_tokens - 1) // 2
+    maximum_handoff = min(4096, maximum_from_input, maximum_from_output)
+    if maximum_handoff <= 0:
+        raise HandoffContractError(
+            "estimated token budgets cannot reserve a bounded successor handoff"
+        )
+    return HandoffLimits(
+        max_handoff_bytes=maximum_handoff,
+        continuation_input_reserve_tokens=(2 * maximum_handoff) + framing_reserve,
+        handoff_output_reserve_tokens=maximum_handoff,
+        prompt_framing_reserve_tokens=framing_reserve,
+        max_route_steps=3,
+    )
+
+
+def _prepare_semantic_attempt(
+    layout: ProjectLayout,
+    project: dict[str, Any],
+    actor: dict[str, Any],
+    task: dict[str, Any],
+    *,
+    bootstrap_prompt_bytes: bytes,
+    projection_receipt: dict[str, Any],
+    incoming_change_artifact: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], bytes] | None:
+    """Build the single scheduler-first low/medium/high handoff protocol."""
+
+    envelope = task.get("route_budget_envelope")
+    planned_steps = envelope.get("planned_steps") if isinstance(envelope, dict) else None
+    if not isinstance(planned_steps, list) or not planned_steps:
+        return None
+    if len(planned_steps) > 1 and (
+        int(task.get("estimated_input_tokens") or 0) <= 0
+        or int(task.get("estimated_output_tokens") or 0) <= 0
+    ):
+        raise SystemExit(
+            "required multi-tier collaboration needs positive input/output token estimates"
+        )
+    try:
+        limits = _semantic_handoff_limits(
+            task,
+            bootstrap_prompt_size=len(bootstrap_prompt_bytes),
+        )
+    except HandoffContractError as exc:
+        if len(planned_steps) > 1:
+            raise SystemExit(f"required multi-tier handoff budget failed closed: {exc}") from exc
+        return None
+
+    write_scope = sorted(str(path) for path in (actor.get("collaboration_contract") or {}).get("write_scope") or [])
+    base_sha = str((actor.get("collaboration_contract") or {}).get("base_sha") or "")
+    if write_scope:
+        initial_changes = build_cumulative_change_manifest(
+            base_sha=base_sha,
+            write_scope=write_scope,
+            operations=[],
+        )
+        initial_persisted = persist_change_artifact(
+            (
+                layout.root
+                / "task-change-artifacts"
+                / slugify(str(project.get("project_id") or "project"), "project")
+                / slugify(str(actor.get("task_id") or "task"), "task")
+            ).resolve(),
+            initial_changes,
+        )
+        initial_manifest_sha256 = initial_persisted.manifest_sha256
+    else:
+        initial_manifest_sha256 = _canonical_sha256(
+            {
+                "schema_version": 1,
+                "kind": "costmarshal-no-writes",
+                "base_sha": base_sha,
+                "write_scope": [],
+            }
+        )
+
+    task_spec = {
+        "title": task.get("title"),
+        "purpose": task.get("purpose"),
+        "task_type": task.get("task_type"),
+        "risk": task.get("risk"),
+        "difficulty": task.get("difficulty"),
+        "acceptance": task.get("acceptance") or [],
+        "required_capabilities": task.get("required_capabilities") or [],
+    }
+    try:
+        semantic_contract = build_semantic_collaboration_contract(
+            task_id=str(task["id"]),
+            task_spec=task_spec,
+            base_sha=base_sha,
+            context_allowlist=sorted(str(path) for path in projection_receipt.get("allowlist") or []),
+            context_manifest_sha256=str(projection_receipt["manifest_sha256"]),
+            context_file_count=int(projection_receipt.get("file_count") or 0),
+            context_total_size_bytes=int(projection_receipt.get("total_size_bytes") or 0),
+            write_scope=write_scope,
+            initial_change_manifest_sha256=initial_manifest_sha256,
+            max_changes=4096,
+            max_total_upsert_bytes=128 * 1024 * 1024,
+            estimated_input_tokens=int(task.get("estimated_input_tokens") or 0),
+            estimated_cached_input_tokens=int(task.get("estimated_cached_input_tokens") or 0),
+            estimated_output_tokens=int(task.get("estimated_output_tokens") or 0),
+            handoff_limits=limits,
+            route_envelope_id=str(envelope.get("envelope_id") or ""),
+            route_plan_fingerprint_sha256=str(envelope.get("plan_fingerprint") or ""),
+            planned_steps=planned_steps,
+        )
+        existing_contract = task.get("handoff_contract")
+        if existing_contract is not None:
+            validate_semantic_collaboration_contract(existing_contract)
+            if existing_contract != semantic_contract:
+                raise HandoffContractError(
+                    "stored handoff contract differs from the immutable route/context/token inputs"
+                )
+        attempts = task.get("attempts") or []
+        current_index = next(
+            index
+            for index, row in enumerate(attempts)
+            if row.get("attempt_id") == actor.get("attempt_id")
+        )
+        current_attempt = attempts[current_index]
+        route_step_index = current_attempt.get("route_plan_step_index")
+        if type(route_step_index) is not int:
+            raise HandoffContractError("attempt has no immutable route step index")
+        predecessor_capsule = None
+        predecessor_result = None
+        if route_step_index == 0:
+            incoming_manifest_sha256 = initial_manifest_sha256
+            incoming_change_count = 0
+            incoming_total_bytes = 0
+        else:
+            predecessor_attempt = attempts[current_index - 1] if current_index > 0 else None
+            if not isinstance(predecessor_attempt, dict):
+                raise HandoffContractError("continuation has no immediate predecessor attempt")
+            predecessor_capsule = predecessor_attempt.get("handoff_capsule")
+            predecessor_result = predecessor_attempt.get("handoff_result_evidence")
+            if not isinstance(predecessor_capsule, dict) or not isinstance(predecessor_result, dict):
+                raise HandoffContractError(
+                    "continuation requires a sealed predecessor capsule and trusted result evidence"
+                )
+            if write_scope:
+                if incoming_change_artifact is None:
+                    raise HandoffContractError("continuation cumulative change artifact is missing")
+                incoming_manifest_sha256 = str(incoming_change_artifact["manifest_sha256"])
+                incoming_change_count = int(incoming_change_artifact.get("change_count") or 0)
+                incoming_total_bytes = int(incoming_change_artifact.get("total_upsert_bytes") or 0)
+            else:
+                if incoming_change_artifact is not None:
+                    raise HandoffContractError(
+                        "read-only continuation has an unexpected cumulative change artifact"
+                    )
+                predecessor_changes = predecessor_capsule.get("outgoing_changes")
+                if not isinstance(predecessor_changes, dict):
+                    raise HandoffContractError(
+                        "read-only continuation predecessor has no cumulative change receipt"
+                    )
+                incoming_manifest_sha256 = str(
+                    predecessor_changes.get("manifest_sha256") or ""
+                )
+                incoming_change_count = int(
+                    predecessor_changes.get("change_count") or 0
+                )
+                incoming_total_bytes = int(
+                    predecessor_changes.get("total_upsert_bytes") or 0
+                )
+                if incoming_change_count != 0 or incoming_total_bytes != 0:
+                    raise HandoffContractError(
+                        "read-only continuation predecessor claims workspace changes"
+                    )
+        attempt_input = build_attempt_input_contract(
+            collaboration_contract=semantic_contract,
+            attempt_id=str(actor["attempt_id"]),
+            actor_id=str(actor["id"]),
+            route_step_index=route_step_index,
+            incoming_change_manifest_sha256=incoming_manifest_sha256,
+            incoming_change_count=incoming_change_count,
+            incoming_total_upsert_bytes=incoming_total_bytes,
+            predecessor_handoff=predecessor_capsule,
+            trusted_predecessor_result=predecessor_result,
+        )
+        bound_prompt_bytes = build_bound_prompt_bytes(
+            attempt_input=attempt_input,
+            task_prompt_bytes=bootstrap_prompt_bytes,
+            predecessor_handoff=predecessor_capsule,
+        )
+        semantic_prompt_binding = build_semantic_prompt_binding(
+            collaboration_contract=semantic_contract,
+            attempt_input=attempt_input,
+            prompt_bytes=bound_prompt_bytes,
+            predecessor_handoff=predecessor_capsule,
+        )
+    except (HandoffContractError, StopIteration) as exc:
+        raise SystemExit(f"required semantic handoff failed closed: {exc}") from exc
+    return semantic_contract, attempt_input, semantic_prompt_binding, bound_prompt_bytes
+
+
 def actor_execution_workspace(
     layout: ProjectLayout,
     project: dict[str, Any],
@@ -648,7 +1293,8 @@ def actor_execution_workspace(
         ).resolve()
         runtime_receipt = (actor.get("runtime") or {}).get("context_projection")
         provider_may_have_started = bool(
-            (actor.get("runtime") or {}).get("provider_execution_state") == "started"
+            (actor.get("runtime") or {}).get("provider_execution_state")
+            in {"started", PROVIDER_COMPLETION_PENDING}
             or (actor.get("runtime") or {}).get("oci_lifecycle_state")
             in {"started", "finished", "uncertain_start", "uncertain_cleanup"}
         )
@@ -862,9 +1508,9 @@ def report_path(layout: ProjectLayout, actor: dict[str, Any]) -> Path:
 def publish_task_report(layout: ProjectLayout, actor: dict[str, Any], attempt_report: Path) -> None:
     task_id = actor.get("task_id")
     if task_id and attempt_report.is_file():
-        atomic_write_text(
+        atomic_write_bytes(
             task_dir(layout, str(task_id)) / "completion-report.md",
-            attempt_report.read_text(encoding="utf-8", errors="replace"),
+            attempt_report.read_bytes(),
         )
 
 
@@ -1046,6 +1692,38 @@ def report_status(report: Path) -> str | None:
     return match.group(1).lower() if match else None
 
 
+def _completion_scheduler_command(
+    *,
+    task_id: str,
+    actor_id: str,
+    attempt_id: str | None,
+    provider: str | None,
+    returncode: int,
+    collected_state: str,
+    needs_escalation: bool,
+    plan_allows_next: bool,
+) -> tuple[str, dict[str, Any], str]:
+    """Workers publish evidence only; continuation always remains leader-owned."""
+
+    command_args = {
+        "task": task_id,
+        "actor": actor_id,
+        "attempt": attempt_id,
+        "state": "waiting_leader",
+        "summary": f"{provider} worker exited {returncode}; report ready.",
+    }
+    if needs_escalation and plan_allows_next:
+        body = (
+            "Worker report is ready for leader review; the next admitted tier remains "
+            "blocked until an explicit rejected result and escalation command."
+        )
+    elif needs_escalation:
+        body = "The admitted route plan is exhausted; the worker report is ready for manager review."
+    else:
+        body = "Worker report is ready for manager review."
+    return "collect_task", command_args, body
+
+
 def _required_worker_bundle(
     layout: ProjectLayout,
     project: dict[str, Any],
@@ -1054,6 +1732,7 @@ def _required_worker_bundle(
     execution_workspace: Path,
     workspace_mode: str,
     allow_credential_creation: bool = True,
+    finalize_only: bool = False,
 ) -> tuple[WorkerExecutionSpec, list[str], tuple[str, ...]]:
     """Build the durable, attempt-scoped host side of the OCI exchange contract."""
 
@@ -1091,11 +1770,12 @@ def _required_worker_bundle(
         runtime.get("container_name")
         and runtime.get("container_command")
         and (
-            runtime.get("oci_lifecycle_state") in {"prepared", "started", "finished"}
+            runtime.get("oci_lifecycle_state") in {"prepared", "started", "finished", "cleaned"}
             or runtime.get("container_id")
+            or runtime.get("provider_execution_state") == PROVIDER_COMPLETION_PENDING
         )
     )
-    if any(output_exchange.iterdir()) and not recovering_existing_container:
+    if any(output_exchange.iterdir()) and not (recovering_existing_container or finalize_only):
         raise SystemExit("required worker output exchange is not empty for this attempt")
 
     profile = actor.get("profile")
@@ -1204,7 +1884,7 @@ def _required_worker_bundle(
     try:
         validate_execution_spec(
             preflight_spec,
-            require_empty_output=not recovering_existing_container,
+            require_empty_output=not (recovering_existing_container or finalize_only),
         )
     except IsolationError as exc:
         raise SystemExit(f"required worker execution spec is invalid [{exc.code}]: {exc}") from exc
@@ -1212,10 +1892,19 @@ def _required_worker_bundle(
     # No provider secret is materialized until every credential-free execution
     # invariant has passed.  From this point onward cleanup is part of the
     # persisted OCI lifecycle contract.
-    isolated_env, secret_values = isolated_actor_env(project, actor, layout=layout)
+    isolated_env, secret_values = (
+        ({}, ())
+        if finalize_only
+        else isolated_actor_env(project, actor, layout=layout)
+    )
     env_key = provider_env_key(actor)
     credential_path: Path | None = None
-    if env_key and isolated_env.get(env_key):
+    durable_credential = runtime.get("credential_cleanup") or {}
+    if finalize_only and durable_credential.get("path"):
+        candidate = Path(str(durable_credential["path"]))
+        if candidate.is_file():
+            credential_path = candidate
+    elif env_key and isolated_env.get(env_key):
         credential_path = credential_root / "provider.secret"
         if credential_path.exists():
             if credential_path.is_symlink() or not credential_path.is_file():
@@ -1288,7 +1977,7 @@ def _required_worker_bundle(
             _actor_fault("after_credential_before_oci_prepare")
         with contextlib.suppress(OSError):
             credential_path.chmod(0o404 if hasattr(os, "getuid") and os.getuid() == 0 else 0o600)
-    elif env_key:
+    elif env_key and not finalize_only:
         raise SystemExit(f"required worker credential is unavailable for {env_key}")
 
     spec = replace(
@@ -1301,7 +1990,7 @@ def _required_worker_bundle(
     try:
         validate_execution_spec(
             spec,
-            require_empty_output=not recovering_existing_container,
+            require_empty_output=not (recovering_existing_container or finalize_only),
         )
     except IsolationError as exc:
         with contextlib.suppress(IsolationError):
@@ -1412,6 +2101,11 @@ def _provider_execution_needs_recovery(actor: dict[str, Any]) -> bool:
     runtime = actor.get("runtime") or {}
     if (actor.get("isolation") or {}).get("mode") != "required":
         return False
+    if (
+        runtime.get("provider_execution_state") == PROVIDER_COMPLETION_PENDING
+        or runtime.get("provider_completion") is not None
+    ):
+        return True
     if runtime.get("container_id"):
         return True
     lifecycle = runtime.get("oci_lifecycle_state")
@@ -1517,6 +2211,12 @@ def _run_actor_once(
     execution_workspace, sandbox, write_scopes, base_sha = actor_execution_workspace(layout, project, actor)
     required_isolation = (actor.get("isolation") or {}).get("mode") == "required"
     projection_receipt: dict[str, Any] | None = None
+    semantic_contract: dict[str, Any] | None = None
+    attempt_input_contract: dict[str, Any] | None = None
+    semantic_prompt_binding: dict[str, Any] | None = None
+    semantic_prompt_receipt: dict[str, Any] | None = None
+    provider_completion_recovery: tuple[dict[str, Any], bytes, list[dict[str, Any]]] | None = None
+    provider_completion_observed = False
     if required_isolation:
         collaboration_contract = actor.get("collaboration_contract")
         assert isinstance(collaboration_contract, dict)
@@ -1589,6 +2289,127 @@ def _run_actor_once(
             },
             mutate=persist_projection_receipt,
         )
+        prepared_semantic_attempt = _prepare_semantic_attempt(
+            layout,
+            project,
+            actor,
+            load_task(layout, str(actor.get("task_id"))),
+            bootstrap_prompt_bytes=prompt_text.encode("utf-8"),
+            projection_receipt=projection_receipt,
+            incoming_change_artifact=incoming_change_artifact,
+        )
+        if prepared_semantic_attempt is not None:
+            (
+                semantic_contract,
+                attempt_input_contract,
+                semantic_prompt_binding,
+                bound_prompt_bytes,
+            ) = prepared_semantic_attempt
+            semantic_prompt_path = _persist_immutable_payload(
+                (
+                    layout.root
+                    / "semantic-prompts"
+                    / slugify(str(project.get("project_id") or "project"), "project")
+                    / slugify(str(actor.get("attempt_id") or actor_id), "attempt")
+                ).resolve(),
+                str(semantic_prompt_binding["prompt_sha256"]),
+                bound_prompt_bytes,
+            )
+            semantic_prompt_receipt = {
+                "schema": "costmarshal-semantic-prompt-receipt-v1",
+                "path": str(semantic_prompt_path),
+                "sha256": semantic_prompt_binding["prompt_sha256"],
+                "size_bytes": len(bound_prompt_bytes),
+                "binding_sha256": semantic_prompt_binding["binding_sha256"],
+                "attempt_input_sha256": attempt_input_contract[
+                    "attempt_input_sha256"
+                ],
+                "collaboration_contract_sha256": semantic_contract[
+                    "contract_sha256"
+                ],
+            }
+
+            def persist_semantic_prompt() -> None:
+                current_actor = _validate_worker_fence(
+                    layout,
+                    actor_id,
+                    attempt_id=attempt_id,
+                    launch_token=launch_token,
+                )
+                current_task = load_task(layout, str(current_actor.get("task_id")))
+                existing_contract = current_task.get("handoff_contract")
+                if existing_contract is not None and existing_contract != semantic_contract:
+                    raise SystemExit("semantic handoff contract changed before provider launch")
+                current_task["handoff_contract"] = semantic_contract
+                matched = False
+                for current_attempt in current_task.get("attempts") or []:
+                    if current_attempt.get("attempt_id") == current_actor.get("attempt_id"):
+                        for field, value in (
+                            ("attempt_input", attempt_input_contract),
+                            ("semantic_prompt_binding", semantic_prompt_binding),
+                            ("semantic_prompt", semantic_prompt_receipt),
+                        ):
+                            prior = current_attempt.get(field)
+                            if prior is not None and prior != value:
+                                raise SystemExit(f"{field} changed before provider launch")
+                            current_attempt[field] = value
+                        current_attempt["collaboration_phase"] = "prompt_bound"
+                        matched = True
+                        break
+                if not matched:
+                    raise SystemExit("semantic prompt has no authoritative attempt")
+                save_task(layout, current_task)
+                runtime = current_actor.setdefault("runtime", {})
+                runtime["handoff_contract_sha256"] = semantic_contract[
+                    "contract_sha256"
+                ]
+                runtime["attempt_input_sha256"] = attempt_input_contract[
+                    "attempt_input_sha256"
+                ]
+                runtime["semantic_prompt"] = semantic_prompt_receipt
+                current_actor["handoff_contract"] = semantic_contract
+                current_actor["attempt_input"] = attempt_input_contract
+                current_actor["semantic_prompt_binding"] = semantic_prompt_binding
+                save_actor(layout, current_actor)
+                append_event(
+                    layout,
+                    "actor_semantic_prompt_bound",
+                    actor_id=actor_id,
+                    task_id=current_actor.get("task_id"),
+                    attempt_id=current_actor.get("attempt_id"),
+                    contract_sha256=semantic_contract["contract_sha256"],
+                    attempt_input_sha256=attempt_input_contract[
+                        "attempt_input_sha256"
+                    ],
+                    prompt_sha256=semantic_prompt_binding["prompt_sha256"],
+                )
+
+            _control_mutation(
+                layout,
+                command_name="runner_bind_semantic_prompt",
+                command_id=f"RUNNER-SEMANTIC-PROMPT-{attempt_id or actor_id}",
+                payload={
+                    "actor_id": actor_id,
+                    "attempt_id": attempt_id,
+                    "contract_sha256": semantic_contract["contract_sha256"],
+                    "attempt_input_sha256": attempt_input_contract[
+                        "attempt_input_sha256"
+                    ],
+                    "prompt_sha256": semantic_prompt_binding["prompt_sha256"],
+                },
+                mutate=persist_semantic_prompt,
+            )
+            prompt_text = bound_prompt_bytes.decode("utf-8", errors="strict")
+        provider_completion_recovery = _load_provider_completion(
+            layout,
+            project,
+            load_actor(layout, actor_id),
+            semantic_contract=semantic_contract,
+            attempt_input=attempt_input_contract,
+            prompt_binding=semantic_prompt_binding,
+            projection_receipt=projection_receipt,
+        )
+        provider_completion_observed = provider_completion_recovery is not None
     recovery_generation_value = (actor.get("runtime") or {}).get("recovery_generation")
     native_recovery_generation = (
         recovery_generation_value
@@ -1607,6 +2428,7 @@ def _run_actor_once(
             execution_workspace=execution_workspace,
             workspace_mode=sandbox,
             allow_credential_creation=not governance_recovery_only,
+            finalize_only=provider_completion_recovery is not None,
         )
     else:
         argv = build_codex_argv(
@@ -1647,9 +2469,10 @@ def _run_actor_once(
         runtime["registered_profile_sha256"] = str(
             (current_actor.get("profile_binding") or {}).get("sha256") or ""
         ).removeprefix("sha256:")
-        runtime["provider_execution_state"] = (
-            "started" if required_isolation else "launch_pending_authorization"
-        )
+        if runtime.get("provider_execution_state") != PROVIDER_COMPLETION_PENDING:
+            runtime["provider_execution_state"] = (
+                "started" if required_isolation else "launch_pending_authorization"
+            )
         runtime.update(runtime_registration)
         save_actor(layout, current_actor)
         if current_actor.get("task_id") and current_actor.get("attempt_id"):
@@ -1804,6 +2627,9 @@ def _run_actor_once(
         pending_report_text: str | None = None
         cleanup_unconfirmed = False
         cleanup_error_code: str | None = None
+        provider_outcome_in_memory = False
+        provider_completion_durable = provider_completion_recovery is not None
+        completion_cleanup_receipt = None
 
         def prepare_oci_runtime() -> None:
             current_actor = _validate_worker_fence(
@@ -1825,24 +2651,25 @@ def _run_actor_once(
             }
             save_actor(layout, current_actor)
 
-        _control_mutation(
-            layout,
-            command_name="runner_prepare_oci",
-            command_id=(
-                f"RUNNER-PREPARE-OCI-{attempt_id or actor_id}-"
-                f"{int(existing_runtime.get('credential_generation') or 0)}"
-            ),
-            payload={
-                **registration_payload,
-                "container_name": expected_container_name,
-                "credential_cleanup_required": required_spec.credential_path is not None,
-                "credential_generation": int(
-                    existing_runtime.get("credential_generation") or 0
+        if provider_completion_recovery is None:
+            _control_mutation(
+                layout,
+                command_name="runner_prepare_oci",
+                command_id=(
+                    f"RUNNER-PREPARE-OCI-{attempt_id or actor_id}-"
+                    f"{int(existing_runtime.get('credential_generation') or 0)}"
                 ),
-            },
-            mutate=prepare_oci_runtime,
-        )
-        _actor_fault("after_oci_prepare_before_start")
+                payload={
+                    **registration_payload,
+                    "container_name": expected_container_name,
+                    "credential_cleanup_required": required_spec.credential_path is not None,
+                    "credential_generation": int(
+                        existing_runtime.get("credential_generation") or 0
+                    ),
+                },
+                mutate=prepare_oci_runtime,
+            )
+            _actor_fault("after_oci_prepare_before_start")
         try:
             governance_recovery_only = (
                 _validate_actor_governance_before_side_effect(
@@ -1851,7 +2678,67 @@ def _run_actor_once(
                 )
                 or governance_recovery_only
             )
-            if recovering_existing:
+            if provider_completion_recovery is not None:
+                completion, completion_report_bytes, completion_events = provider_completion_recovery
+                events.extend(completion_events)
+                returncode = int(completion["exit_code"])
+                usage_known = True
+                pending_report_text = completion_report_bytes.decode("utf-8", errors="strict")
+                if existing_lifecycle == "cleaned":
+                    cleanup_row = existing_runtime.get("credential_cleanup") or {}
+                    cleanup_required = bool(cleanup_row.get("required"))
+                    cleanup_deleted = cleanup_row.get("status") == "deleted"
+                    if (
+                        existing_runtime.get("container_removed") is not True
+                        or (cleanup_required and not cleanup_deleted)
+                    ):
+                        raise SystemExit(
+                            "finalize-only recovery rejected: durable OCI cleanup receipt is incomplete"
+                        )
+                    completion_cleanup_receipt = ExecutionCleanupReceipt(
+                        existing_container_name,
+                        True,
+                        CredentialCleanupReceipt(
+                            cleanup_row.get("identifier"),
+                            cleanup_required,
+                            cleanup_deleted if cleanup_required else False,
+                            int(cleanup_row.get("bytes_removed") or 0),
+                        ),
+                        tuple(existing_runtime.get("cleanup_identity_drift") or ()),
+                    )
+                else:
+                    if (
+                        not prepared_identity
+                        or not re.fullmatch(r"[0-9a-f]{64}", str(existing_runtime.get("container_id") or ""))
+                    ):
+                        raise SystemExit(
+                            "finalize-only recovery rejected: durable OCI cleanup identity is incomplete"
+                        )
+                    try:
+                        handle = adapter.attach(
+                            required_spec,
+                            container_name=existing_container_name,
+                            container_id=str(existing_runtime["container_id"]),
+                            command=tuple(str(item) for item in existing_container_command),
+                        )
+                    except IsolationError:
+                        completion_cleanup_receipt = adapter.cleanup_confirmed_absent(
+                            required_spec,
+                            container_name=existing_container_name,
+                            container_id=str(existing_runtime["container_id"]),
+                            command=tuple(str(item) for item in existing_container_command),
+                        )
+                    else:
+                        inspection = adapter.inspect(handle)
+                        if (
+                            inspection.status not in {"exited", "dead", "stopped"}
+                            or inspection.exit_code is None
+                            or int(inspection.exit_code) != returncode
+                        ):
+                            raise SystemExit(
+                                "finalize-only recovery rejected: OCI terminal receipt mismatch"
+                            )
+            elif recovering_existing:
                 handle = adapter.attach(
                     required_spec,
                     container_name=existing_container_name,
@@ -1895,66 +2782,83 @@ def _run_actor_once(
                     required_command,
                     stdin_prompt=prompt_text,
                 )
-            recovered_execution = bool(getattr(handle, "recovered", False))
-            if handle.container_name != expected_container_name:
-                raise SystemExit("OCI worker returned an unexpected deterministic container identity")
-            runtime_registration.update(
-                {
-                    "isolation_backend": required_spec.engine,
-                    "container_name": handle.container_name,
-                    "container_id": handle.container_id,
-                    "container_command": list(handle.command),
-                    "container_network_id": handle.network_id,
-                    "isolation_attestation": handle.attestation.to_dict(),
-                    "output_exchange": str(required_spec.output_exchange),
-                    "oci_lifecycle_state": "started",
-                }
-            )
+            if provider_completion_recovery is None:
+                recovered_execution = bool(getattr(handle, "recovered", False))
+                if handle.container_name != expected_container_name:
+                    raise SystemExit("OCI worker returned an unexpected deterministic container identity")
+                runtime_registration.update(
+                    {
+                        "isolation_backend": required_spec.engine,
+                        "container_name": handle.container_name,
+                        "container_id": handle.container_id,
+                        "container_command": list(handle.command),
+                        "container_network_id": handle.network_id,
+                        "isolation_attestation": handle.attestation.to_dict(),
+                        "output_exchange": str(required_spec.output_exchange),
+                        "oci_lifecycle_state": "started",
+                    }
+                )
 
-            def persist_oci_identity() -> None:
-                current_actor = _validate_worker_fence(
+                def persist_oci_identity() -> None:
+                    current_actor = _validate_worker_fence(
+                        layout,
+                        actor_id,
+                        attempt_id=attempt_id,
+                        launch_token=launch_token,
+                    )
+                    runtime = current_actor.setdefault("runtime", {})
+                    runtime.update(runtime_registration)
+                    save_actor(layout, current_actor)
+
+                _control_mutation(
                     layout,
-                    actor_id,
+                    command_name="runner_register_oci_identity",
+                    command_id=f"RUNNER-OCI-IDENTITY-{attempt_id or actor_id}",
+                    payload={
+                        **registration_payload,
+                        "container_name": handle.container_name,
+                        "container_id": handle.container_id,
+                        "container_command": list(handle.command),
+                        "network_id": handle.network_id,
+                    },
+                    mutate=persist_oci_identity,
+                )
+                _actor_fault("after_oci_start_before_register")
+                _control_mutation(
+                    layout,
+                    command_name="runner_register",
+                    command_id=f"RUNNER-REGISTER-{attempt_id or actor_id}",
+                    payload=registration_payload,
+                    mutate=register_runner,
+                )
+                if recovering_existing or recovered_execution:
+                    receipt = adapter.recover_wait(handle)
+                else:
+                    receipt = adapter.wait(handle)
+                provider_outcome_in_memory = True
+                events.extend(dict(event) for event in receipt.stdout_events)
+                returncode = receipt.exit_code
+                usage_known = True
+                validated = validate_output_exchange(required_spec.output_exchange)
+                pending_report_text = redact_secret_values(validated.text, secret_values)
+                _persist_provider_completion(
+                    layout,
+                    project,
+                    actor,
+                    wait_receipt=receipt,
+                    validated_output=validated,
+                    safe_report_bytes=pending_report_text.encode("utf-8"),
+                    events=_redact_provider_events(events, secret_values),
+                    semantic_contract=semantic_contract,
+                    attempt_input=attempt_input_contract,
+                    prompt_binding=semantic_prompt_binding,
+                    projection_receipt=projection_receipt,
                     attempt_id=attempt_id,
                     launch_token=launch_token,
                 )
-                runtime = current_actor.setdefault("runtime", {})
-                runtime.update(runtime_registration)
-                save_actor(layout, current_actor)
-
-            _control_mutation(
-                layout,
-                command_name="runner_register_oci_identity",
-                command_id=f"RUNNER-OCI-IDENTITY-{attempt_id or actor_id}",
-                payload={
-                    **registration_payload,
-                    "container_name": handle.container_name,
-                    "container_id": handle.container_id,
-                    "container_command": list(handle.command),
-                    "network_id": handle.network_id,
-                },
-                mutate=persist_oci_identity,
-            )
-            _actor_fault("after_oci_start_before_register")
-            _control_mutation(
-                layout,
-                command_name="runner_register",
-                command_id=f"RUNNER-REGISTER-{attempt_id or actor_id}",
-                payload=registration_payload,
-                mutate=register_runner,
-            )
-            if recovering_existing or recovered_execution:
-                receipt = adapter.recover_wait(handle)
-                events.extend(dict(event) for event in receipt.stdout_events)
-                returncode = receipt.exit_code
-                usage_known = True
-            else:
-                receipt = adapter.wait(handle)
-                events.extend(dict(event) for event in receipt.stdout_events)
-                returncode = receipt.exit_code
-                usage_known = True
-            validated = validate_output_exchange(required_spec.output_exchange)
-            pending_report_text = redact_secret_values(validated.text, secret_values)
+                provider_completion_durable = True
+                provider_completion_observed = True
+                _actor_fault("after_provider_completion_before_cleanup")
         except IsolationError as exc:
             if governance_recovery_only and handle is None:
                 failure = WorkerExecutionError(
@@ -2010,7 +2914,17 @@ def _run_actor_once(
             cleanup_credential = None
             cleanup_identity_drift: tuple[str, ...] = ()
             try:
-                if handle is not None:
+                if provider_outcome_in_memory and not provider_completion_durable:
+                    raise WorkerExecutionError(
+                        "provider_completion_not_durable",
+                        "provider completion was observed but not durably recorded; cleanup is deferred",
+                        details={"container_cleanup_unconfirmed": True},
+                    )
+                if completion_cleanup_receipt is not None:
+                    cleanup_container_removed = completion_cleanup_receipt.container_removed
+                    cleanup_credential = completion_cleanup_receipt.credential
+                    cleanup_identity_drift = completion_cleanup_receipt.identity_drift
+                elif handle is not None:
                     cleanup_receipt = adapter.cleanup(handle)
                     cleanup_container_removed = cleanup_receipt.container_removed
                     cleanup_credential = cleanup_receipt.credential
@@ -2028,7 +2942,10 @@ def _run_actor_once(
             except IsolationError as exc:
                 failure = failure or exc
                 returncode = 125
-                cleanup_unconfirmed = bool(exc.details.get("container_cleanup_unconfirmed"))
+                cleanup_unconfirmed = bool(
+                    exc.details.get("container_cleanup_unconfirmed")
+                    or provider_completion_durable
+                )
                 cleanup_error_code = exc.code
                 existing = pending_report_text or "# Completion Report\n"
                 pending_report_text = (
@@ -2074,7 +2991,11 @@ def _run_actor_once(
                         command_id=f"RUNNER-OCI-CLEANUP-{attempt_id or actor_id}",
                         payload={
                             **registration_payload,
-                            "container_id": handle.container_id if handle is not None else None,
+                            "container_id": (
+                                handle.container_id
+                                if handle is not None
+                                else existing_runtime.get("container_id")
+                            ),
                             "container_removed": cleanup_container_removed,
                             "credential_identifier": cleanup_credential.credential_id,
                         },
@@ -2252,6 +3173,9 @@ def _run_actor_once(
             returncode = 127
             atomic_write_text(report, f"# Completion Report\n\nStatus: failed\n\n## Result\n{type(exc).__name__}: {exc}\n")
 
+    if required_isolation and provider_completion_observed:
+        _actor_fault("after_provider_cleanup_before_seal")
+
     changed_paths: tuple[str, ...] = ()
     change_artifact_receipt: dict[str, Any] | None = None
     if write_scopes:
@@ -2331,18 +3255,179 @@ def _run_actor_once(
             atomic_write_text(report, safe_report_text)
     task_id = actor.get("task_id")
     final_report_status = report_status(report)
-    collected_state = (
+    worker_outcome = (
         "failed"
         if returncode != 0
         else final_report_status
         if final_report_status in {"failed", "escalate"}
         else "waiting_leader"
     )
-    if task_id:
-        _actor_fault("after_attempt_report_before_publish")
-        publish_task_report(layout, actor, report)
+    # A worker reports evidence, never a task decision.  Keeping collection in
+    # waiting_leader preserves the admitted budget envelope and path claims
+    # until the leader explicitly records done/failed/escalate.
+    collected_state = "waiting_leader"
     report_bytes = report.read_bytes() if report.is_file() else b""
     report_sha256 = hashlib.sha256(report_bytes).hexdigest() if report_bytes else None
+    attempt_output_contract: dict[str, Any] | None = None
+    execution_receipt: dict[str, Any] | None = None
+    if semantic_contract is not None:
+        if (
+            attempt_input_contract is None
+            or semantic_prompt_binding is None
+            or semantic_prompt_receipt is None
+            or report_sha256 is None
+            or not report_bytes
+        ):
+            raise SystemExit("semantic attempt output cannot be sealed without prompt and report receipts")
+        outgoing_manifest_sha256 = semantic_contract["change_policy"][
+            "initial_manifest_sha256"
+        ]
+        outgoing_change_count = 0
+        outgoing_total_bytes = 0
+        if incoming_change_artifact is not None:
+            outgoing_manifest_sha256 = incoming_change_artifact["manifest_sha256"]
+            outgoing_change_count = int(incoming_change_artifact.get("change_count") or 0)
+            outgoing_total_bytes = int(
+                incoming_change_artifact.get("total_upsert_bytes") or 0
+            )
+        if change_artifact_receipt is not None:
+            outgoing_manifest_sha256 = change_artifact_receipt["manifest_sha256"]
+            outgoing_change_count = int(change_artifact_receipt.get("change_count") or 0)
+            outgoing_total_bytes = int(
+                change_artifact_receipt.get("total_upsert_bytes") or 0
+            )
+        durable_actor = load_actor(layout, actor_id)
+        durable_runtime = durable_actor.get("runtime") or {}
+        execution_receipt_body = {
+            "schema_version": 1,
+            "kind": "costmarshal-execution-receipt",
+            "task_id": task_id,
+            "attempt_id": actor.get("attempt_id"),
+            "actor_id": actor_id,
+            "provider": actor.get("provider"),
+            "tier": actor.get("tier"),
+            "model": actor.get("model"),
+            "profile": actor.get("profile"),
+            "profile_sha256": (actor.get("profile_binding") or {}).get("sha256"),
+            "context_projection_manifest_sha256": (projection_receipt or {}).get(
+                "manifest_sha256"
+            ),
+            "incoming_change_manifest_sha256": attempt_input_contract.get(
+                "incoming_changes", {}
+            ).get("manifest_sha256"),
+            "semantic_prompt_sha256": semantic_prompt_binding["prompt_sha256"],
+            "isolation_backend": durable_runtime.get("isolation_backend"),
+            "container_name": durable_runtime.get("container_name"),
+            "container_id": durable_runtime.get("container_id"),
+            "isolation_attestation": durable_runtime.get("isolation_attestation"),
+            "provider_exit_code": returncode,
+        }
+        execution_receipt_sha256 = _canonical_sha256(execution_receipt_body)
+        execution_receipt = {
+            **execution_receipt_body,
+            "receipt_sha256": execution_receipt_sha256,
+        }
+        execution_receipt_path = _persist_immutable_payload(
+            (
+                layout.root
+                / "execution-receipts"
+                / slugify(str(project.get("project_id") or "project"), "project")
+                / slugify(str(actor.get("attempt_id") or actor_id), "attempt")
+            ).resolve(),
+            execution_receipt_sha256,
+            json.dumps(
+                execution_receipt_body,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8"),
+        )
+        execution_receipt["path"] = str(execution_receipt_path)
+        try:
+            attempt_output_contract = build_attempt_output_contract(
+                collaboration_contract=semantic_contract,
+                attempt_input=attempt_input_contract,
+                prompt_binding=semantic_prompt_binding,
+                execution_receipt_sha256=execution_receipt_sha256,
+                report_sha256="sha256:" + report_sha256,
+                report_size_bytes=len(report_bytes),
+                outgoing_change_manifest_sha256=str(outgoing_manifest_sha256),
+                outgoing_change_count=outgoing_change_count,
+                outgoing_total_upsert_bytes=outgoing_total_bytes,
+            )
+        except HandoffContractError as exc:
+            raise SystemExit(f"semantic attempt output failed closed: {exc}") from exc
+
+        def persist_attempt_output() -> None:
+            current_actor = _validate_worker_fence(
+                layout,
+                actor_id,
+                attempt_id=attempt_id,
+                launch_token=launch_token,
+                allow_provider_started=True,
+            )
+            current_task = load_task(layout, str(current_actor.get("task_id")))
+            matched = False
+            for current_attempt in current_task.get("attempts") or []:
+                if current_attempt.get("attempt_id") == current_actor.get("attempt_id"):
+                    for field, value in (
+                        ("execution_receipt", execution_receipt),
+                        ("attempt_output", attempt_output_contract),
+                    ):
+                        prior = current_attempt.get(field)
+                        if prior is not None and prior != value:
+                            raise SystemExit(f"sealed {field} changed after provider exit")
+                        current_attempt[field] = value
+                    current_attempt["attempt_output_sha256"] = attempt_output_contract[
+                        "attempt_output_sha256"
+                    ]
+                    current_attempt["collaboration_phase"] = "output_sealed"
+                    matched = True
+                    break
+            if not matched:
+                raise SystemExit("sealed attempt output has no authoritative attempt")
+            save_task(layout, current_task)
+            runtime = current_actor.setdefault("runtime", {})
+            runtime["execution_receipt"] = execution_receipt
+            runtime["attempt_output_sha256"] = attempt_output_contract[
+                "attempt_output_sha256"
+            ]
+            save_actor(layout, current_actor)
+            append_event(
+                layout,
+                "actor_attempt_output_sealed",
+                actor_id=actor_id,
+                task_id=current_actor.get("task_id"),
+                attempt_id=current_actor.get("attempt_id"),
+                attempt_output_sha256=attempt_output_contract[
+                    "attempt_output_sha256"
+                ],
+                execution_receipt_sha256=execution_receipt["receipt_sha256"],
+                outgoing_change_manifest_sha256=outgoing_manifest_sha256,
+            )
+
+        _control_mutation(
+            layout,
+            command_name="runner_seal_attempt_output",
+            command_id=f"RUNNER-SEAL-OUTPUT-{attempt_id or actor_id}",
+            payload={
+                "actor_id": actor_id,
+                "attempt_id": attempt_id,
+                "attempt_output_sha256": attempt_output_contract[
+                    "attempt_output_sha256"
+                ],
+                "execution_receipt_sha256": execution_receipt["receipt_sha256"],
+            },
+            mutate=persist_attempt_output,
+        )
+    if task_id:
+        # Required attempts must seal their execution/report output before the
+        # canonical report becomes recoverable.  A crash at the named fault
+        # point now leaves enough durable receipts for scheduler recovery to
+        # collect without re-running the provider.
+        _actor_fault("after_attempt_report_before_publish")
+        publish_task_report(layout, actor, report)
     _actor_fault("after_report_before_finalize")
 
     def finalize_runner() -> None:
@@ -2354,6 +3439,7 @@ def _run_actor_once(
                     "schema_version": SCHEMA_VERSION,
                     "task_id": task_id,
                     "state": collected_state,
+                    "worker_outcome": worker_outcome,
                     "updated_at": now_iso(),
                     "error": None if returncode == 0 else f"actor process exited {returncode}",
                     "actor_id": actor_id,
@@ -2376,6 +3462,7 @@ def _run_actor_once(
                     current_attempt["report_sha256"] = report_sha256
                     current_attempt["report_size"] = len(report_bytes)
                     current_attempt["provider_exit_code"] = returncode
+                    current_attempt["worker_outcome"] = worker_outcome
                     current_attempt["provider_execution_state"] = "finished"
                     if projection_receipt is not None:
                         current_attempt["context_projection"] = projection_receipt
@@ -2408,7 +3495,6 @@ def _run_actor_once(
                     metadata={"command": "record_usage", "args": usage_args},
                 )
             needs_escalation = returncode != 0 or final_report_status in {"failed", "escalate"}
-            actor_tier = actor.get("tier") or ("low" if actor.get("provider") == "longcat" else "high")
             envelope = current_task.get("route_budget_envelope")
             plan_allows_next = True
             if isinstance(envelope, dict) and envelope.get("status") == "active":
@@ -2419,35 +3505,16 @@ def _run_actor_once(
                     and type(current_index) is int
                     and current_index + 1 < len(envelope.get("planned_steps") or [])
                 )
-            if (
-                actor_tier in {"low", "medium"}
-                and needs_escalation
-                and project.get("auto_escalate", True)
-                and plan_allows_next
-            ):
-                command = "escalate_task"
-                command_args = {
-                    "task": task_id,
-                    "actor": actor_id,
-                    "attempt": actor.get("attempt_id"),
-                    "reason": f"{actor.get('provider')} ({actor.get('tier')}) attempt requested escalation or exited {returncode}",
-                    "start": True,
-                }
-                body = "Escalate this bounded task to the next stronger provider tier."
-            else:
-                command = "collect_task"
-                command_args = {
-                    "task": task_id,
-                    "actor": actor_id,
-                    "attempt": actor.get("attempt_id"),
-                    "state": collected_state,
-                    "summary": f"{actor.get('provider')} worker exited {returncode}; report ready.",
-                }
-                body = (
-                    "The admitted route plan is exhausted; the worker report is ready for manager review."
-                    if needs_escalation and not plan_allows_next
-                    else "Worker report is ready for manager review."
-                )
+            command, command_args, body = _completion_scheduler_command(
+                task_id=str(task_id),
+                actor_id=actor_id,
+                attempt_id=actor.get("attempt_id"),
+                provider=actor.get("provider"),
+                returncode=returncode,
+                collected_state=collected_state,
+                needs_escalation=needs_escalation,
+                plan_allows_next=plan_allows_next,
+            )
             send_message(
                 layout,
                 sender=actor_id,

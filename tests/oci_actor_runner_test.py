@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 from costmarshal_v2.actor_runner import (  # noqa: E402
     _expected_oci_container_name,
+    _completion_scheduler_command,
     _projection_receipt,
     _required_worker_bundle,
     actor_execution_workspace,
@@ -26,6 +27,7 @@ from costmarshal_v2.actor_runner import (  # noqa: E402
 )
 from costmarshal_v2.governance import GovernanceError  # noqa: E402
 from costmarshal_v2.paths import ProjectLayout  # noqa: E402
+from costmarshal_v2.routing import route_plan_fingerprint  # noqa: E402
 from costmarshal_v2.scheduler import bind_actor_prompt, prepare_collaboration_contract  # noqa: E402
 from costmarshal_v2.state import (  # noqa: E402
     load_actor,
@@ -439,6 +441,21 @@ class RecoveryLogsOverflowAdapter(FakeOciAdapter):
 def main() -> int:
     temp = Path(tempfile.mkdtemp(prefix="costmarshal-v2-oci-actor-runner-"))
     try:
+        completion_command, completion_args, completion_body = (
+            _completion_scheduler_command(
+                task_id="V2-0001",
+                actor_id="agent-v2-0001",
+                attempt_id="ATT-low-failed",
+                provider="low-api",
+                returncode=1,
+                collected_state="escalate",
+                needs_escalation=True,
+                plan_allows_next=True,
+            )
+        )
+        assert completion_command == "collect_task"
+        assert completion_args["state"] == "waiting_leader"
+        assert "explicit rejected result" in completion_body
         workspace = temp / "workspace"
         workspace.mkdir()
         (workspace / "README.md").write_text("bounded workspace\n", encoding="utf-8")
@@ -479,7 +496,20 @@ def main() -> int:
                 str(secrets_file),
             )["project"]
         )
-        cli(temp, "new-task", "--project", str(project_dir), "--title", "container", "--purpose", "run isolated")
+        cli(
+            temp,
+            "new-task",
+            "--project",
+            str(project_dir),
+            "--title",
+            "container",
+            "--purpose",
+            "run isolated",
+            "--estimated-input-tokens",
+            "50000",
+            "--estimated-output-tokens",
+            "10000",
+        )
         with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
             dispatched = cli(
                 temp,
@@ -493,6 +523,32 @@ def main() -> int:
         layout = ProjectLayout(root=temp / "runtime", project_dir=project_dir)
         actor = load_actor(layout, dispatched["actor_id"])
         project = load_project(layout)
+        routed_task = load_task(layout, "V2-0001")
+        routed_attempt = routed_task["attempts"][-1]
+        routed_step = json.loads(
+            json.dumps(routed_task["route_decision"]["planned_steps"][0])
+        )
+        routed_step["execution_identity"] = routed_attempt["execution_identity"]
+        routed_step["model"] = routed_attempt["model"]
+        routed_step["profile"] = routed_attempt["profile"]
+        routed_step["profile_binding"] = routed_attempt["profile_binding"]
+        routed_fingerprint = route_plan_fingerprint(
+            [routed_step],
+            input_tokens=routed_task["estimated_input_tokens"],
+            cached_input_tokens=routed_task["estimated_cached_input_tokens"],
+            output_tokens=routed_task["estimated_output_tokens"],
+        )
+        routed_task["route_budget_envelope"] = {
+            "envelope_id": "ENV-oci-semantic-fixture",
+            "plan_fingerprint": routed_fingerprint,
+            "planned_steps": [routed_step],
+            "status": "active",
+        }
+        routed_attempt["route_envelope_id"] = "ENV-oci-semantic-fixture"
+        routed_attempt["route_plan_fingerprint"] = routed_fingerprint
+        routed_attempt["route_plan_step_index"] = 0
+        routed_attempt["route_plan_step"] = routed_step
+        save_task(layout, routed_task)
         actor["isolation"] = {
             "mode": "required",
             "project_opt_in": False,
@@ -714,6 +770,13 @@ raise SystemExit(run_actor(
         assert finished["runtime"]["container_command"] == FakeOciAdapter.started_command
         status = json.loads((project_dir / "tasks" / "V2-0001" / "status.json").read_text(encoding="utf-8"))
         assert status["state"] == "waiting_leader"
+        sealed_task = load_task(layout, "V2-0001")
+        sealed_attempt = sealed_task["attempts"][-1]
+        assert sealed_task["handoff_contract"]["kind"] == "costmarshal-collaboration-contract"
+        assert sealed_attempt["attempt_input"]["kind"] == "costmarshal-attempt-input"
+        assert sealed_attempt["semantic_prompt_binding"]["kind"] == "costmarshal-prompt-binding"
+        assert sealed_attempt["attempt_output"]["kind"] == "costmarshal-attempt-output"
+        assert sealed_attempt["collaboration_phase"] == "output_sealed"
 
         # A scheduler restart may know only the deterministic name and exact argv.
         # The runner must attach, discover the immutable ID, and import the existing
@@ -957,7 +1020,11 @@ raise SystemExit(actor_runner.run_actor(
         cleanup_uncertain = load_actor(layout, cleanup_actor["id"])
         assert cleanup_uncertain["status"] == "needs_recovery"
         assert cleanup_uncertain["runtime"]["oci_lifecycle_state"] == "uncertain_cleanup"
-        assert cleanup_uncertain["runtime"]["provider_execution_state"] == "started"
+        assert (
+            cleanup_uncertain["runtime"]["provider_execution_state"]
+            == "finished_pending_finalize"
+        )
+        assert cleanup_uncertain["runtime"]["provider_completion"]["receipt_sha256"]
         assert cleanup_uncertain["runtime"]["credential_cleanup"]["status"] == "pending"
         assert Path(cleanup_uncertain["runtime"]["credential_cleanup"]["path"]).is_file()
         assert not (

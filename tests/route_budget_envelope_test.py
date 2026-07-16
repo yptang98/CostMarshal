@@ -66,7 +66,7 @@ def make_project(temp: Path, name: str, budget: float | str) -> Path:
             input_per_1m=price,
             cached_input_per_1m=price,
             output_per_1m=price,
-            fixed_request=0.0,
+            fixed_attempt=0.0,
         )
     catalog_path = temp / f"catalog-{name}.json"
     catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
@@ -193,13 +193,17 @@ def reject_latest_attempt(temp: Path, project: Path, task_id: str, label: str) -
 
 
 def remove_seed_evidence(project: Path) -> None:
-    for task_dir in (project / "tasks").glob("EVID-*"):
+    seeded_ids = {f"V2-{1000 + index:04d}" for index in range(20)}
+    for task_id in seeded_ids:
+        task_dir = project / "tasks" / task_id
+        if not task_dir.is_dir():
+            continue
         shutil.rmtree(task_dir)
     results = project / "reports" / "results.jsonl"
     retained = [
         row
         for row in results.read_text(encoding="utf-8").splitlines()
-        if row.strip() and not str(json.loads(row).get("task_id") or "").startswith("EVID-")
+        if row.strip() and str(json.loads(row).get("task_id") or "") not in seeded_ids
     ]
     results.write_text("".join(f"{row}\n" for row in retained), encoding="utf-8")
 
@@ -510,6 +514,15 @@ def main() -> int:
         assert "model/profile override" in (override.stdout + override.stderr)
         assert task_payload(revision_project, override_task)["attempts"] == []
 
+        revision_project_json = revision_project / "project.json"
+        revision_state = json.loads(revision_project_json.read_text(encoding="utf-8"))
+        for provider in revision_state["provider_catalog"]["providers"]:
+            if provider["provider_id"] in {"deepseek", "codex"}:
+                provider["enabled"] = False
+        revision_project_json.write_text(
+            json.dumps(revision_state, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
         early_stop = run_json(
             temp,
             "new-task",
@@ -534,6 +547,13 @@ def main() -> int:
         early_payload = task_payload(revision_project, early_stop)
         early_attempt = early_payload["attempts"][0]
         assert len(early_payload["route_budget_envelope"]["planned_steps"]) == 1
+        for provider in revision_state["provider_catalog"]["providers"]:
+            if provider["provider_id"] in {"deepseek", "codex"}:
+                provider["enabled"] = True
+        revision_project_json.write_text(
+            json.dumps(revision_state, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
         reject_latest_attempt(temp, revision_project, early_stop, "early-stop")
         automatic = run(
             temp,
@@ -560,6 +580,8 @@ def main() -> int:
             str(revision_project),
             "--task",
             early_stop,
+            "--provider",
+            "codex",
             "--reason",
             "leader explicitly authorizes a newly admitted step",
             "--unsafe-native",
@@ -668,7 +690,7 @@ def main() -> int:
                     input_per_1m=20.0,
                     cached_input_per_1m=20.0,
                     output_per_1m=20.0,
-                    fixed_request=0.0,
+                    fixed_attempt=0.0,
                 )
         project_json.write_text(json.dumps(project_state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         drifted = run(

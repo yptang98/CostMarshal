@@ -15,7 +15,7 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
 2. Provider identity and tier are separate. Tiers are exactly `low`, `medium`, and `high`.
 3. Risk/difficulty/task-type safety floors cannot be bypassed by a cheaper provider request.
 4. A task is done only after an explicit leader result with `accepted_by_leader=true`.
-5. Workers may return only `waiting_leader`, `failed`, or `escalate` through collect.
+5. Workers may report failed/escalate evidence, but actor-authored collect commands may request only `waiting_leader`; task outcome and continuation are leader-owned.
 6. Every worker command is fenced to its actor and attempt; stale commands must not mutate the current attempt.
 7. Budgeted dispatch requires reviewed pricing and non-zero token estimates.
 8. Production workers require an attested OCI boundary; required mode never falls back to native execution.
@@ -24,6 +24,7 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
 11. SQLite cutover is explicit and marker-driven. A present but invalid marker fails closed; JSON/JSONL are compatibility views after cutover.
 12. ArchMarshal integration is read-only. Never auto-adopt, apply, start, end, or modify ArchMarshal.
 13. Every admitted provider profile is an exact-byte SHA-256 snapshot bound to the route, attempt, runtime effect, and OCI identity; launch/recovery never re-resolves mutable profile source bytes.
+14. Every provider attempt is collected before continuation. A worker never authorizes more spend; a sealed required attempt with an admitted successor needs an explicit leader rejection with a bounded handoff before the next tier can start. A terminal rejection without a handoff cannot later continue that sealed route.
 
 ## Standard workflow
 
@@ -34,9 +35,10 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
 5. Run `route` to inspect safety floor, chain, cost, and acceptance prior when economics matter.
 6. Dispatch only after the route explanation and claims are acceptable.
 7. Keep `run-scheduler` active while actors execute.
-8. Review the completion report, isolated worktree diff, tests, and evidence.
-9. Record the leader result. When evidence is insufficient, continue to the next provider step in the admitted monotonic chain; that step may skip a tier.
-10. Run `validate`, and use `recover` after an unclean stop.
+8. Review the completion report, tests, and evidence. For a sealed write output, run `preview-changes` before acceptance; it must not modify the source workspace.
+9. Record the leader result. When sealed evidence is insufficient, reject it with a bounded `--handoff`, then explicitly continue to the next provider step in the admitted monotonic chain; that step may skip a tier.
+10. After accepting reviewed changes, run `apply-changes` once to obtain the hash-bound contract, then repeat with `--apply --preview-sha ... --command-id ...`. The command stages but never commits the exact candidate tree. Change preview and explicit apply are currently limited to file-authority projects and fail closed after SQLite cutover until Git effects use the recoverable outbox.
+11. Run `validate`, and use `recover` after an unclean stop.
 
 ## Commands
 
@@ -58,7 +60,16 @@ python scripts/costmarshal.py dispatch --project <project-dir> --task V2-0001 --
 python scripts/costmarshal.py run-scheduler --project <project-dir>
 
 # Accept only after leader review.
-python scripts/costmarshal.py record-result --project <project-dir> --task V2-0001 --attempt <attempt-id> --status done --quality-score 5 --accepted-by-leader
+python scripts/costmarshal.py record-result --command-id CMD-RESULT-ACCEPT-001 --project <project-dir> --task V2-0001 --attempt <attempt-id> --status done --quality-score 5 --accepted-by-leader
+
+# Reject a sealed required attempt and bind the exact successor handoff.
+python scripts/costmarshal.py record-result --command-id CMD-RESULT-REJECT-001 --project <project-dir> --task V2-0001 --attempt <attempt-id> --status escalate --quality-score 2 --handoff "Bounded findings, failed checks, and the exact remaining decision."
+python scripts/costmarshal.py escalate --project <project-dir> --task V2-0001 --reason "Leader rejected the current result" --start
+
+# For a sealed write result, preview before acceptance; explicitly apply after acceptance.
+python scripts/costmarshal.py preview-changes --command-id CMD-CHANGE-PREVIEW-001 --project <project-dir> --task V2-0001 --attempt <attempt-id>
+python scripts/costmarshal.py apply-changes --project <project-dir> --task V2-0001 --attempt <attempt-id>
+python scripts/costmarshal.py apply-changes --project <project-dir> --task V2-0001 --attempt <attempt-id> --apply --preview-sha <sha256:...> --command-id CMD-CHANGE-APPLY-001
 
 # Inspect and recover.
 python scripts/costmarshal.py dashboard --project <project-dir>
@@ -84,6 +95,18 @@ python scripts/costmarshal.py state-store --project <project-dir>
 
 With complete reviewed prices and token estimates, exhaustively compare every safe monotonic provider subchain, including early-stop and tier-skip plans, using expected cost per leader-accepted result. Reject more than 16 enabled compatible providers in one tier. Enforce the task `--min-success-probability` when supplied, otherwise freeze the optional project `default_min_success_probability` into a new auto-routed task. Without either SLA, explain that collaboration is permitted but not required. Before the first dispatch, bind each selected step to its price basis and exact-byte provider profile identity, then reserve the sum of all step estimates in a task-level admission envelope; never use probability-weighted expected cost as the reservation. Continuations consume that envelope and immutable profile snapshot without double counting or re-reading mutable source config, and drift fails closed. Without complete economic inputs, choose the minimum safe available tier. Explain the fallback; do not manufacture a price.
 
+Each admitted acceptance prior binds the exact trusted result IDs and a canonical
+digest of those rows. Before a continuation spends the next tier, require every
+bound row to remain trusted and byte-equivalent; unrelated newly trusted rows do
+not invalidate the frozen plan.
+
+A non-zero success floor needs at least 10 trusted v3 observations at every exact
+task/profile/conditional lineage position. Cold-start projects therefore fail
+closed unless the reviewed task explicitly uses `0`. v2 result rows are retained
+only as historical audit data and never train v3 routing. Describe this as a
+conservative history-based acceptance floor, not a formal availability SLA or a
+multiple-comparison-adjusted guarantee.
+
 Budget admission/reconciliation uses integer nano-CNY internally and rejects values with more than 9 decimal places. Decode catalog monetary JSON without binary-float conversion, canonicalize reviewed rates as exact decimal strings, multiply them by integer tokens, and round any fractional nano-CNY reservation upward. Reprice cumulative usage once from the immutable attempt snapshot; a caller-priced/unverified row is sticky even when it reports zero tokens and cannot later be washed clean by a final row. Budget envelopes are admission/accounting controls over token estimates, not external hard-spend guarantees. Do not claim a hard monetary cap unless the selected provider proxy enforces request/token or money ceilings.
 
 ## Provider catalog
@@ -94,7 +117,10 @@ Treat pricing as reviewed configuration. Use `null` for unknown values. A provid
 - `enabled`, `priority`
 - canonical `pricing`: `currency`, `source`, `reviewed_at`, `effective_at`,
   `expires_at`, `snapshot_id`, `snapshot_hash`, `input_per_1m`,
-  `cached_input_per_1m`, `output_per_1m`, and `fixed_request`
+  `cached_input_per_1m`, `output_per_1m`, and `fixed_attempt`. Per-wire-request
+  fixed fees are unsupported because an attempt may issue multiple requests.
+  Hash-valid beta snapshots with `fixed_request=0` remain readable; non-zero
+  legacy request fees fail closed without request-count metering.
 - `capabilities`
 
 Canonical snapshots are hash-bound and must be current at routing time. Expired,
@@ -118,6 +144,7 @@ Task `--require-capability` values are hard constraints: providers lacking every
 - Images must be digest pinned and use pull-never, read-only rootfs, non-root UID, dropped capabilities, no-new-privileges, limits, and explicit mounts.
 - Required dispatch uses the attested OCI adapter and bundled digest-buildable worker image; unrestricted bridge networking is forbidden, and missing live engine/image/canary/provider-proxy evidence fails closed.
 - OCI start/recovery verifies the exact managed environment contract, and the worker requires the admitted profile SHA-256 before provider execution. Missing profile bindings never fall back to mutable user configuration.
+- After provider completion, required mode persists project/attempt-scoped, content-addressed report, recursively redacted event, and completion receipts before cleanup. `finished_pending_finalize` recovery may only attach/inspect/cleanup the exact terminal OCI identity and finalize from those bytes; it must never call the provider again.
 - Development compatibility requires `init --allow-unsafe-native-workers` and `dispatch --unsafe-native`; the attestation records `strong_isolation=false`. Required or ready ArchMarshal governance forbids new native provider launches, so governed work must use required OCI isolation.
 
 ## Worker write policy
@@ -148,6 +175,6 @@ Run every command in README's Required local verification section. At minimum, c
 
 ## Transaction and beta boundary
 
-An explicit `migrate-state --apply` cutover makes SQLite WAL authoritative for scheduler control state; compatibility views are materialized after commit under a cross-process materializer lock and repaired on restart. Stable command IDs are payload-hashed, while spawn/stop I/O is represented by owner-leased effects outside the transaction; slow effects renew their lease and a crashed owner becomes recoverable after expiry. Do not enable cutover while actors are live.
+An explicit `migrate-state --apply` cutover makes SQLite WAL authoritative for scheduler control state; compatibility views are materialized after commit under a cross-process materializer lock and repaired on restart. Stable command IDs are payload-hashed, while spawn/stop I/O is represented by owner-leased effects outside the transaction; slow effects renew their lease and a crashed owner becomes recoverable after expiry. `preview-changes` and explicit `apply-changes --apply` are blocked after cutover rather than running Git effects inside a database transaction. Do not enable cutover while actors are live.
 
 Do not describe v2.4-beta as economically optimal or universally production-ready yet. Spawn/stop use a leased transactional effect worker and required dispatch uses the OCI snapshot/profile/credential/report adapter, but external effects are fenced/recoverable rather than magically exactly-once. A non-beta release still requires the machine-readable real-provider shadow matrix and live malicious OCI evidence for the reviewed digest. These are explicit release gates, not silent fallbacks.

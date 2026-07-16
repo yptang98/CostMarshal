@@ -91,13 +91,24 @@ def reject_latest_attempt(temp: Path, env: dict[str, str], project: Path, task_i
 
 
 def remove_paired_evidence(project: Path) -> None:
-    for task_dir in (project / "tasks").glob("EVID-*"):
-        shutil.rmtree(task_dir)
+    seeded_task_ids: set[str] = set()
+    for task_dir in (project / "tasks").iterdir():
+        task_path = task_dir / "task.json"
+        if not task_path.is_file():
+            continue
+        task = json.loads(task_path.read_text(encoding="utf-8"))
+        task_spec = (task.get("handoff_contract") or {}).get("task_spec") or {}
+        if (
+            task_spec.get("title") == "paired evidence"
+            and task_spec.get("purpose") == "project success fixture"
+        ):
+            seeded_task_ids.add(str(task.get("id") or task_dir.name))
+            shutil.rmtree(task_dir)
     results_path = project / "reports" / "results.jsonl"
     retained = [
         line
         for line in results_path.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not str(json.loads(line).get("task_id") or "").startswith("EVID-")
+        if line.strip() and str(json.loads(line).get("task_id") or "") not in seeded_task_ids
     ]
     results_path.write_text(
         "".join(f"{line}\n" for line in retained),
@@ -164,7 +175,7 @@ def main() -> int:
             )["project"]
         )
         seed_paired_route_evidence(temp, project)
-        run_json(
+        first_task_id = run_json(
             temp,
             env,
             "new-task",
@@ -178,7 +189,7 @@ def main() -> int:
             "1000000",
             "--min-success-probability",
             "0.15",
-        )
+        )["task_id"]
         run_json(
             temp,
             env,
@@ -186,10 +197,10 @@ def main() -> int:
             "--project",
             str(project),
             "--task",
-            "V2-0001",
+            first_task_id,
             "--unsafe-native",
         )
-        first = load_task(project, "V2-0001")
+        first = load_task(project, first_task_id)
         envelope = first["route_budget_envelope"]
         bindings = [step["profile_binding"] for step in envelope["planned_steps"]]
         assert [row["status"] for row in bindings] == ["available", "available", "available"]
@@ -206,17 +217,17 @@ def main() -> int:
 
         changed_medium = medium_text.replace("https://medium.example/v1", "https://medium-new.example/v1")
         medium_source.write_text(changed_medium, encoding="utf-8")
-        first_attempt = reject_latest_attempt(temp, env, project, "V2-0001")
+        first_attempt = reject_latest_attempt(temp, env, project, first_task_id)
         run_json(
             temp,
             env,
             "escalate",
             "--command-id",
-            "CMD-profile-escalate-V2-0001",
+            f"CMD-profile-escalate-{first_task_id}",
             "--project",
             str(project),
             "--task",
-            "V2-0001",
+            first_task_id,
             "--attempt",
             str(first_attempt["attempt_id"]),
             "--from-actor",
@@ -225,7 +236,7 @@ def main() -> int:
             "exercise immutable continuation",
             "--unsafe-native",
         )
-        continued = load_task(project, "V2-0001")
+        continued = load_task(project, first_task_id)
         medium_attempt = continued["attempts"][-1]
         assert medium_attempt["provider"] == "deepseek"
         assert medium_attempt["profile_binding"] == bindings[1]
@@ -236,7 +247,7 @@ def main() -> int:
         # synthetic paired fixture so the second admission has exact evidence
         # for the changed bytes; old-profile observations must not leak across.
         reset_paired_evidence(temp, project)
-        run_json(
+        second_task_id = run_json(
             temp,
             env,
             "new-task",
@@ -250,7 +261,7 @@ def main() -> int:
             "1000000",
             "--min-success-probability",
             "0.15",
-        )
+        )["task_id"]
         run_json(
             temp,
             env,
@@ -258,17 +269,17 @@ def main() -> int:
             "--project",
             str(project),
             "--task",
-            "V2-0002",
+            second_task_id,
             "--unsafe-native",
         )
-        second = load_task(project, "V2-0002")
+        second = load_task(project, second_task_id)
         assert second["route_budget_envelope"]["plan_fingerprint"] != envelope["plan_fingerprint"]
         assert (
             second["route_budget_envelope"]["planned_steps"][2]["profile_binding"]["sha256"]
             == bindings[2]["sha256"]
         )
 
-        run_json(
+        missing_task_id = run_json(
             temp,
             env,
             "new-task",
@@ -282,7 +293,7 @@ def main() -> int:
             "1000000",
             "--min-success-probability",
             "0.15",
-        )
+        )["task_id"]
         medium_source.unlink()
         missing_dispatch = subprocess.run(
             [
@@ -294,7 +305,7 @@ def main() -> int:
                 "--project",
                 str(project),
                 "--task",
-                "V2-0003",
+                missing_task_id,
                 "--unsafe-native",
             ],
             text=True,
@@ -312,7 +323,7 @@ def main() -> int:
                 "no priced provider chain satisfies minimum success probability",
             )
         ), missing_text
-        missing_task = load_task(project, "V2-0003")
+        missing_task = load_task(project, missing_task_id)
         assert missing_task["attempts"] == []
         assert "route_budget_envelope" not in missing_task
         medium_source.write_text(changed_medium, encoding="utf-8")
