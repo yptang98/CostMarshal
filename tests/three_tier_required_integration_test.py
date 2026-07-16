@@ -452,7 +452,13 @@ def main() -> int:
                 "off",
             )["project"]
         )
-        layout = ProjectLayout(root=temp / "runtime", project_dir=project_dir)
+        # Mirror resolve_project's canonical-path invariant. This is material
+        # on Windows runners where tempfile may return an 8.3 short alias while
+        # immutable CAS receipts persist the resolved long path.
+        layout = ProjectLayout(
+            root=(temp / "runtime").resolve(),
+            project_dir=project_dir.resolve(),
+        )
         project = load_project(layout)
         seed_paired_route_evidence(temp, project_dir)
         task_id = cli(
