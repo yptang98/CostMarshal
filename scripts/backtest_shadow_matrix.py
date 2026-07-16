@@ -4,7 +4,7 @@
 The harness never calls a provider, reads provider credentials, or synthesizes
 missing outcomes. Release scope requires an externally trusted detached
 signature over the exact bytes of a previously collected matrix in which every
-task has independently blind-reviewed low/medium/high outcomes.
+task has independently blind-reviewed outcomes for every frozen provider.
 """
 
 from __future__ import annotations
@@ -24,7 +24,8 @@ import tempfile
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+DATASET_SCHEMA_VERSION = 2
+REPORT_SCHEMA_VERSION = 1
 TIERS = ("low", "medium", "high")
 TIER_RANK = {tier: index for index, tier in enumerate(TIERS)}
 SHA256 = re.compile(r"sha256:[0-9a-f]{64}")
@@ -40,7 +41,7 @@ from costmarshal_v2.routing import (  # noqa: E402
 
 POLICY_MANIFEST_SCHEMA_VERSION = 1
 POLICY_ROUTING_ENGINE = "costmarshal_v2.routing.decide_route"
-ATTESTATION_NAMESPACE = "costmarshal-backtest-v1"
+ATTESTATION_NAMESPACE = "costmarshal-backtest-v2"
 
 
 def now_iso() -> str:
@@ -211,10 +212,21 @@ def finite_non_negative(value: Any) -> bool:
     )
 
 
-def valid_chain(value: Any, floor: str) -> bool:
-    if not isinstance(value, list) or not value or any(tier not in TIER_RANK for tier in value):
+def valid_provider_chain(
+    value: Any,
+    floor: str,
+    providers: dict[str, dict[str, Any]],
+) -> bool:
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(not isinstance(provider_id, str) or provider_id not in providers for provider_id in value)
+        or len(value) != len(set(value))
+    ):
         return False
-    ranks = [TIER_RANK[tier] for tier in value]
+    if any(providers[provider_id].get("enabled") is not True for provider_id in value):
+        return False
+    ranks = [TIER_RANK[providers[provider_id]["tier"]] for provider_id in value]
     return ranks == sorted(set(ranks)) and ranks[0] >= TIER_RANK[floor]
 
 
@@ -250,19 +262,6 @@ def validate_policy_manifest(dataset: dict[str, Any], blockers: list[str]) -> di
         catalog = validate_provider_catalog(manifest.get("provider_catalog"))
     except (RoutingValidationError, TypeError, ValueError) as exc:
         blockers.append(f"policy_manifest.provider_catalog is invalid: {exc}")
-    if catalog is not None:
-        enabled_counts = {
-            tier: sum(
-                row.get("enabled") is True and row.get("tier") == tier
-                for row in catalog["providers"]
-            )
-            for tier in TIERS
-        }
-        if enabled_counts != {tier: 1 for tier in TIERS}:
-            blockers.append(
-                "policy_manifest.provider_catalog must contain exactly one enabled provider per tier "
-                "because shadow outcomes are keyed by tier"
-            )
     history = manifest.get("history")
     if not isinstance(history, list) or any(not isinstance(row, dict) for row in history):
         blockers.append("policy_manifest.history must be a list of objects")
@@ -280,6 +279,19 @@ def validate_policy_manifest(dataset: dict[str, Any], blockers: list[str]) -> di
         "catalog": catalog,
         "history": history,
         "task_routes": task_routes,
+        "enabled_providers": {
+            row["provider_id"]: row
+            for row in catalog["providers"]
+            if row.get("enabled") is True
+        },
+        "enabled_provider_counts": {
+            tier: sum(
+                row.get("enabled") is True and row.get("tier") == tier
+                for row in catalog["providers"]
+            )
+            for tier in TIERS
+        },
+        "route_recompute_cache": {},
     }
 
 
@@ -341,47 +353,65 @@ def recompute_policy_chains(
     baseline_request = _route_request(entry.get("baseline_request"), f"{label}.baseline_request", blockers)
     if candidate_request is None or baseline_request is None:
         return None
+    route_inputs = {
+        "task": routing_task,
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached_input_tokens,
+        "output_tokens": output_tokens,
+        "now": route_now,
+        "candidate_request": candidate_request,
+        "baseline_request": baseline_request,
+    }
     try:
-        candidate = decide_route(
-            routing_task,
-            context["catalog"],
-            history=context["history"],
-            input_tokens=input_tokens,
-            cached_input_tokens=cached_input_tokens,
-            output_tokens=output_tokens,
-            now=route_now,
-            **candidate_request,
-        )
-        baseline_task = dict(routing_task)
-        baseline_task.pop("min_success_probability", None)
-        baseline = decide_route(
-            baseline_task,
-            context["catalog"],
-            history=context["history"],
-            input_tokens=input_tokens,
-            cached_input_tokens=cached_input_tokens,
-            output_tokens=output_tokens,
-            now=route_now,
-            **baseline_request,
-        )
-    except (RoutingValidationError, TypeError, ValueError) as exc:
-        blockers.append(f"{label} cannot be recomputed by CostMarshal: {exc}")
+        route_cache_key = canonical_json(route_inputs)
+    except (TypeError, ValueError) as exc:
+        blockers.append(f"{label} cannot be canonically recomputed: {exc}")
         return None
+    cached_route = context["route_recompute_cache"].get(route_cache_key)
+    if cached_route is None:
+        try:
+            candidate = decide_route(
+                routing_task,
+                context["catalog"],
+                history=context["history"],
+                input_tokens=input_tokens,
+                cached_input_tokens=cached_input_tokens,
+                output_tokens=output_tokens,
+                now=route_now,
+                **candidate_request,
+            )
+            baseline_task = dict(routing_task)
+            baseline_task.pop("min_success_probability", None)
+            baseline = decide_route(
+                baseline_task,
+                context["catalog"],
+                history=context["history"],
+                input_tokens=input_tokens,
+                cached_input_tokens=cached_input_tokens,
+                output_tokens=output_tokens,
+                now=route_now,
+                **baseline_request,
+            )
+        except (RoutingValidationError, TypeError, ValueError) as exc:
+            blockers.append(f"{label} cannot be recomputed by CostMarshal: {exc}")
+            return None
+        cached_route = (
+            list(candidate.planned_provider_ids),
+            list(baseline.planned_provider_ids),
+            candidate.tier_floor,
+        )
+        context["route_recompute_cache"][route_cache_key] = cached_route
 
-    candidate_ids = list(candidate.planned_provider_ids)
-    baseline_ids = list(baseline.planned_provider_ids)
+    candidate_ids, baseline_ids, candidate_floor = cached_route
     if entry.get("candidate_provider_ids") != candidate_ids:
         blockers.append(f"{label}.candidate_provider_ids differs from CostMarshal output")
     if entry.get("baseline_provider_ids") != baseline_ids:
         blockers.append(f"{label}.baseline_provider_ids differs from CostMarshal output")
     providers = {row["provider_id"]: row for row in context["catalog"]["providers"]}
-    try:
-        candidate_tiers = [providers[provider_id]["tier"] for provider_id in candidate_ids]
-        baseline_tiers = [providers[provider_id]["tier"] for provider_id in baseline_ids]
-    except KeyError:
+    if any(provider_id not in providers for provider_id in [*candidate_ids, *baseline_ids]):
         blockers.append(f"{label} references a provider outside the bound catalog")
         return None
-    return candidate_tiers, baseline_tiers, candidate.tier_floor
+    return list(candidate_ids), list(baseline_ids), candidate_floor
 
 
 def validate_dataset(
@@ -393,8 +423,14 @@ def validate_dataset(
     blockers: list[str] = []
     if not isinstance(dataset, dict):
         return [], ["dataset root must be an object"], {tier: 0 for tier in TIERS}, None
-    if dataset.get("schema_version") != SCHEMA_VERSION:
-        blockers.append(f"schema_version must be {SCHEMA_VERSION}")
+    dataset_schema_version = dataset.get("schema_version")
+    if dataset_schema_version == 1:
+        blockers.append(
+            "legacy schema_version 1 tier-keyed evidence is blocked; "
+            "schema_version 2 provider-ID-keyed evidence is required"
+        )
+    elif dataset_schema_version != DATASET_SCHEMA_VERSION:
+        blockers.append(f"schema_version must be {DATASET_SCHEMA_VERSION}")
     if dataset.get("real_provider_shadow_matrix") is not True:
         blockers.append("real_provider_shadow_matrix must be true")
     if dataset.get("synthetic") is not False:
@@ -405,6 +441,8 @@ def validate_dataset(
         "real_provider_calls_completed",
         "credentialed_collection_completed",
         "provider_call_ids_hashed",
+        "blind_review_records_frozen_before_unblinding",
+        "unblinding_maps_frozen_catalog_provider_ids",
     )
     if not isinstance(attestation, dict):
         blockers.append("collection_attestation must be an object")
@@ -427,6 +465,10 @@ def validate_dataset(
                 blockers.append(f"blinding.{field} must be true")
 
     policy_context = validate_policy_manifest(dataset, blockers)
+    enabled_providers: dict[str, dict[str, Any]] = (
+        policy_context["enabled_providers"] if policy_context is not None else {}
+    )
+    enabled_provider_ids = set(enabled_providers)
 
     tasks = dataset.get("tasks")
     if not isinstance(tasks, list):
@@ -465,12 +507,18 @@ def validate_dataset(
             blockers.append(f"{label}.safety_floor must be low, medium, or high")
             continue
         floor_counts[floor] += 1
-        candidate_chain = raw.get("candidate_chain")
-        baseline_chain = raw.get("baseline_chain")
-        if not valid_chain(candidate_chain, floor):
-            blockers.append(f"{label}.candidate_chain must be strictly increasing and respect {floor} floor")
-        if not valid_chain(baseline_chain, floor):
-            blockers.append(f"{label}.baseline_chain must be strictly increasing and respect {floor} floor")
+        candidate_provider_ids = raw.get("candidate_provider_ids")
+        baseline_provider_ids = raw.get("baseline_provider_ids")
+        if not valid_provider_chain(candidate_provider_ids, floor, enabled_providers):
+            blockers.append(
+                f"{label}.candidate_provider_ids must name an enabled, strictly tier-increasing "
+                f"provider chain that respects the {floor} floor"
+            )
+        if not valid_provider_chain(baseline_provider_ids, floor, enabled_providers):
+            blockers.append(
+                f"{label}.baseline_provider_ids must name an enabled, strictly tier-increasing "
+                f"provider chain that respects the {floor} floor"
+            )
 
         policy_chains_valid = False
         if policy_context is not None:
@@ -483,11 +531,15 @@ def validate_dataset(
                         f"{label}.safety_floor differs from CostMarshal policy output {expected_floor}"
                     )
                     policy_chains_valid = False
-                if candidate_chain != expected_candidate:
-                    blockers.append(f"{label}.candidate_chain differs from CostMarshal policy output")
+                if candidate_provider_ids != expected_candidate:
+                    blockers.append(
+                        f"{label}.candidate_provider_ids differs from CostMarshal policy output"
+                    )
                     policy_chains_valid = False
-                if baseline_chain != expected_baseline:
-                    blockers.append(f"{label}.baseline_chain differs from CostMarshal policy output")
+                if baseline_provider_ids != expected_baseline:
+                    blockers.append(
+                        f"{label}.baseline_provider_ids differs from CostMarshal policy output"
+                    )
                     policy_chains_valid = False
 
         policy_locked = parse_time(raw.get("policy_locked_at"), f"{label}.policy_locked_at", blockers)
@@ -504,18 +556,33 @@ def validate_dataset(
 
         outcomes = raw.get("outcomes")
         normalized_outcomes: dict[str, dict[str, Any]] = {}
-        if not isinstance(outcomes, dict) or set(outcomes) != set(TIERS):
-            blockers.append(f"{label}.outcomes must contain exactly low, medium, and high")
+        outcome_bindings: dict[str, tuple[str, str]] = {}
+        if not isinstance(outcomes, dict):
+            blockers.append(f"{label}.outcomes must be an object keyed by provider_id")
+        elif set(outcomes) != enabled_provider_ids:
+            blockers.append(
+                f"{label}.outcomes provider IDs must exactly match every enabled provider "
+                "in the frozen policy catalog"
+            )
         else:
-            for tier in TIERS:
-                outcome = outcomes[tier]
-                outcome_label = f"{label}.outcomes.{tier}"
+            for provider_id in sorted(enabled_provider_ids):
+                outcome = outcomes[provider_id]
+                outcome_label = f"{label}.outcomes.{provider_id}"
                 if not isinstance(outcome, dict):
                     blockers.append(f"{outcome_label} must be an object")
                     continue
-                forbidden = {"provider_id", "model", "reviewer_visible_tier"}.intersection(outcome)
-                if forbidden:
-                    blockers.append(f"{outcome_label} exposes forbidden identity fields: {sorted(forbidden)}")
+                required_outcome_fields = {
+                    "blind_result_id",
+                    "provider_call_id_hash",
+                    "accepted",
+                    "quality_score",
+                    "actual_cost_cny",
+                }
+                if set(outcome) != required_outcome_fields:
+                    blockers.append(
+                        f"{outcome_label} must contain exactly the blind result, provider-call hash, "
+                        "acceptance, quality, and cost fields"
+                    )
                 blind_id = outcome.get("blind_result_id")
                 if not isinstance(blind_id, str) or not blind_id.strip():
                     blockers.append(f"{outcome_label}.blind_result_id must be non-empty")
@@ -540,23 +607,74 @@ def validate_dataset(
                 if not finite_non_negative(cost):
                     blockers.append(f"{outcome_label}.actual_cost_cny must be non-negative")
                 if type(accepted) is bool and finite_non_negative(cost):
-                    normalized_outcomes[tier] = {
+                    normalized_outcomes[provider_id] = {
                         "accepted": accepted,
                         "quality_score": quality,
                         "actual_cost_cny": float(cost),
                     }
+                if (
+                    isinstance(blind_id, str)
+                    and blind_id.strip()
+                    and isinstance(call_hash, str)
+                    and SHA256.fullmatch(call_hash)
+                ):
+                    outcome_bindings[provider_id] = (blind_id, call_hash)
+
+        unblinding = raw.get("unblinding")
+        if not isinstance(unblinding, dict):
+            blockers.append(f"{label}.unblinding must map blind_result_id to provider identity")
+        else:
+            expected_blind_ids = {binding[0] for binding in outcome_bindings.values()}
+            if set(unblinding) != expected_blind_ids:
+                blockers.append(
+                    f"{label}.unblinding blind IDs must exactly match the task outcomes"
+                )
+            mapped_provider_ids: list[str] = []
+            for blind_id, mapping in unblinding.items():
+                mapping_label = f"{label}.unblinding.{blind_id}"
+                if not isinstance(mapping, dict) or set(mapping) != {
+                    "provider_id",
+                    "provider_call_id_hash",
+                }:
+                    blockers.append(
+                        f"{mapping_label} must contain exactly provider_id and provider_call_id_hash"
+                    )
+                    continue
+                provider_id = mapping.get("provider_id")
+                call_hash = mapping.get("provider_call_id_hash")
+                if not isinstance(provider_id, str) or provider_id not in enabled_provider_ids:
+                    blockers.append(
+                        f"{mapping_label}.provider_id must name an enabled frozen-catalog provider"
+                    )
+                    continue
+                mapped_provider_ids.append(provider_id)
+                binding = outcome_bindings.get(provider_id)
+                if binding != (blind_id, call_hash):
+                    blockers.append(
+                        f"{mapping_label} does not match the outcome bound to provider {provider_id}; "
+                        "missing, duplicate, or swapped unblinding is forbidden"
+                    )
+            if len(mapped_provider_ids) != len(set(mapped_provider_ids)):
+                blockers.append(f"{label}.unblinding maps more than one blind result to a provider")
+            if set(mapped_provider_ids) != enabled_provider_ids:
+                blockers.append(
+                    f"{label}.unblinding provider IDs must exactly match every enabled provider "
+                    "in the frozen policy catalog"
+                )
         if (
-            valid_chain(candidate_chain, floor)
-            and valid_chain(baseline_chain, floor)
+            valid_provider_chain(candidate_provider_ids, floor, enabled_providers)
+            and valid_provider_chain(baseline_provider_ids, floor, enabled_providers)
             and policy_chains_valid
-            and len(normalized_outcomes) == 3
+            and len(normalized_outcomes) == len(enabled_provider_ids)
+            and isinstance(unblinding, dict)
+            and len(outcome_bindings) == len(enabled_provider_ids)
         ):
             normalized.append(
                 {
                     "task_id": task_id,
                     "safety_floor": floor,
-                    "candidate_chain": list(candidate_chain),
-                    "baseline_chain": list(baseline_chain),
+                    "candidate_provider_ids": list(candidate_provider_ids),
+                    "baseline_provider_ids": list(baseline_provider_ids),
                     "task_budget_cny": None if task_budget is None else float(task_budget),
                     "outcomes": normalized_outcomes,
                 }
@@ -583,8 +701,8 @@ def evaluate_chain(task: dict[str, Any], chain_name: str) -> tuple[bool, float, 
     accepted = False
     total_cost = 0.0
     attempts = 0
-    for tier in task[chain_name]:
-        outcome = task["outcomes"][tier]
+    for provider_id in task[chain_name]:
+        outcome = task["outcomes"][provider_id]
         total_cost += float(outcome["actual_cost_cny"])
         attempts += 1
         if outcome["accepted"]:
@@ -594,8 +712,12 @@ def evaluate_chain(task: dict[str, Any], chain_name: str) -> tuple[bool, float, 
 
 
 def evaluate_task(task: dict[str, Any]) -> dict[str, Any]:
-    candidate_accepted, candidate_cost, candidate_attempts = evaluate_chain(task, "candidate_chain")
-    baseline_accepted, baseline_cost, baseline_attempts = evaluate_chain(task, "baseline_chain")
+    candidate_accepted, candidate_cost, candidate_attempts = evaluate_chain(
+        task, "candidate_provider_ids"
+    )
+    baseline_accepted, baseline_cost, baseline_attempts = evaluate_chain(
+        task, "baseline_provider_ids"
+    )
     task_budget = task.get("task_budget_cny")
     return {
         "task_id": task["task_id"],
@@ -674,7 +796,8 @@ def bootstrap(rows: list[dict[str, Any]], *, samples: int, seed: int) -> dict[st
 
 def base_report(*, dataset: Path | None, dataset_hash: str | None) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "dataset_schema_version": None,
         "generated_at": now_iso(),
         "git_sha": current_git_sha(),
         "status": "blocked",
@@ -706,6 +829,7 @@ def evaluation_config(
 ) -> dict[str, Any]:
     return {
         "schema_version": 1,
+        "dataset_schema_version": DATASET_SCHEMA_VERSION,
         "git_sha": git_sha,
         "dataset_sha256": dataset_hash,
         "policy_manifest_sha256": policy_manifest_hash,
@@ -808,9 +932,17 @@ def run(args: argparse.Namespace) -> int:
     report.update(
         {
             "study_id": dataset.get("study_id") if isinstance(dataset, dict) else None,
+            "dataset_schema_version": (
+                dataset.get("schema_version") if isinstance(dataset, dict) else None
+            ),
             "synthetic": dataset.get("synthetic") if isinstance(dataset, dict) else None,
             "floor_counts": floor_counts,
             "task_count": len(dataset.get("tasks") or []) if isinstance(dataset, dict) else 0,
+            "enabled_provider_counts": (
+                policy_context.get("enabled_provider_counts")
+                if policy_context is not None
+                else None
+            ),
         }
     )
     if blockers:

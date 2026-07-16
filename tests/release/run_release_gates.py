@@ -404,6 +404,8 @@ def validate_backtest(payload: dict[str, Any]) -> list[str]:
     blockers: list[str] = []
     if payload.get("schema_version") != 1:
         blockers.append("schema_version must be 1")
+    if payload.get("dataset_schema_version") != 2:
+        blockers.append("provider-ID-keyed dataset_schema_version must be 2")
     if payload.get("status") != "pass":
         blockers.append("status must be pass")
     if payload.get("evidence_scope") != "release":
@@ -447,6 +449,8 @@ def validate_backtest(payload: dict[str, Any]) -> list[str]:
     else:
         if config.get("git_sha") != sha:
             blockers.append("evaluation_config.git_sha must match the checked-out commit")
+        if config.get("dataset_schema_version") != 2:
+            blockers.append("evaluation_config must bind provider-ID-keyed dataset schema 2")
         if config.get("dataset_sha256") != dataset_hash:
             blockers.append("evaluation_config must bind the dataset hash")
         if config.get("policy_manifest_sha256") != policy_hash:
@@ -471,13 +475,19 @@ def validate_backtest(payload: dict[str, Any]) -> list[str]:
         for tier in ("low", "medium", "high")
     ):
         blockers.append("each safety floor must contain at least 20 tasks")
+    provider_counts = payload.get("enabled_provider_counts")
+    if not isinstance(provider_counts, dict) or any(
+        type(provider_counts.get(tier)) is not int or provider_counts[tier] < 1
+        for tier in ("low", "medium", "high")
+    ):
+        blockers.append("the frozen catalog must enable at least one provider in each tier")
     if payload.get("blockers") != []:
         blockers.append("passing backtest evidence must have no blockers")
     attestation = payload.get("external_attestation")
     if not isinstance(attestation, dict):
         blockers.append("external_attestation must be present")
     else:
-        if attestation.get("namespace") != "costmarshal-backtest-v1":
+        if attestation.get("namespace") != "costmarshal-backtest-v2":
             blockers.append("external attestation namespace is invalid")
         signer = attestation.get("signer_identity")
         if not isinstance(signer, str) or not signer or any(character.isspace() for character in signer):

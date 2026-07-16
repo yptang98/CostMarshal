@@ -16,7 +16,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 HARNESS = ROOT / "scripts" / "backtest_shadow_matrix.py"
 TIERS = ("low", "medium", "high")
-ATTESTATION_NAMESPACE = "costmarshal-backtest-v1"
+ATTESTATION_NAMESPACE = "costmarshal-backtest-v2"
 sys.path.insert(0, str(ROOT))
 
 from costmarshal_v2.routing import decide_route, default_provider_catalog  # noqa: E402
@@ -46,8 +46,22 @@ def attested_matrix_fixture(task_count: int = 210, *, task_budget_cny: float = 2
     """Build a deterministic schema fixture; it is not real release evidence."""
 
     catalog = default_provider_catalog()
+    expensive_low = catalog["providers"][0]
+    expensive_low["priority"] = 1
+    budget_low = json.loads(json.dumps(expensive_low))
+    budget_low.update(
+        {
+            "provider_id": "budget-low",
+            "profile": "budget-low",
+            "model": "Budget-Low",
+            "env_key": "BUDGET_LOW_API_KEY",
+            "priority": 200,
+        }
+    )
+    catalog["providers"].insert(1, budget_low)
     prices = {
-        "longcat": (0.01, 0.01),
+        "longcat": (0.5, 0.5),
+        "budget-low": (0.01, 0.01),
         "deepseek": (0.1, 0.1),
         "codex": (10.0, 10.0),
     }
@@ -56,6 +70,16 @@ def attested_matrix_fixture(task_count: int = 210, *, task_budget_cny: float = 2
     providers = {row["provider_id"]: row for row in catalog["providers"]}
     low_medium_high_history = paired_chain_history()
     history: list[dict] = list(low_medium_high_history)
+    for row in low_medium_high_history:
+        if row["provider_id"] != "longcat":
+            continue
+        projected = json.loads(json.dumps(row))
+        projected["provider_id"] = "budget-low"
+        projected["model"] = "Budget-Low"
+        projected["profile"] = "budget-low"
+        for field in ("id", "task_id", "attempt_id", "route_envelope_id"):
+            projected[field] += "-budget-low"
+        history.append(projected)
     for row in low_medium_high_history:
         if row["provider_id"] not in {"deepseek", "codex"}:
             continue
@@ -95,13 +119,9 @@ def attested_matrix_fixture(task_count: int = 210, *, task_budget_cny: float = 2
             "task_type": "analysis",
             "required_capabilities": [],
         }
-        if floor == "low":
-            routing_task["min_success_probability"] = 0.8
-        elif floor == "medium":
-            routing_task["min_success_probability"] = 0.8
         input_tokens = 500_000
         output_tokens = 500_000
-        candidate_request = {"requested_provider_id": None, "requested_tier": None}
+        candidate_request = {"requested_provider_id": None, "requested_tier": floor}
         baseline_request = {"requested_provider_id": "codex", "requested_tier": None}
         cached_routes = route_cache.get(floor)
         if cached_routes is None:
@@ -128,22 +148,31 @@ def attested_matrix_fixture(task_count: int = 210, *, task_budget_cny: float = 2
             route_cache[floor] = (candidate, baseline)
         else:
             candidate, baseline = cached_routes
-        candidate_chain = [providers[row]["tier"] for row in candidate.planned_provider_ids]
-        baseline_chain = [providers[row]["tier"] for row in baseline.planned_provider_ids]
-        accepted = {
-            "low": index % 5 != 0,
-            "medium": index % 10 != 0,
-            "high": index % 20 != 0,
+        candidate_provider_ids = list(candidate.planned_provider_ids)
+        baseline_provider_ids = list(baseline.planned_provider_ids)
+        accepted = {tier: index % 20 != 0 for tier in TIERS}
+        costs = {
+            "longcat": 0.5,
+            "budget-low": 0.05,
+            "deepseek": 0.2,
+            "codex": 1.0,
         }
-        costs = {"low": 0.1, "medium": 0.2, "high": 1.0}
         outcomes = {}
-        for tier in TIERS:
-            outcomes[tier] = {
-                "blind_result_id": f"blind-{index}-{tier}",
-                "provider_call_id_hash": hashed(f"provider-call-{index}-{tier}"),
+        unblinding = {}
+        for provider_id, provider in providers.items():
+            tier = provider["tier"]
+            blind_result_id = f"blind-{index}-{provider_id}"
+            provider_call_id_hash = hashed(f"provider-call-{index}-{provider_id}")
+            outcomes[provider_id] = {
+                "blind_result_id": blind_result_id,
+                "provider_call_id_hash": provider_call_id_hash,
                 "accepted": accepted[tier],
                 "quality_score": 5 if accepted[tier] else 2,
-                "actual_cost_cny": costs[tier],
+                "actual_cost_cny": costs[provider_id],
+            }
+            unblinding[blind_result_id] = {
+                "provider_id": provider_id,
+                "provider_call_id_hash": provider_call_id_hash,
             }
         task_id = f"BT-{index:04d}"
         tasks.append(
@@ -151,12 +180,13 @@ def attested_matrix_fixture(task_count: int = 210, *, task_budget_cny: float = 2
                 "task_id": task_id,
                 "task_input_sha256": hashed(f"task-input-{index}"),
                 "safety_floor": floor,
-                "candidate_chain": candidate_chain,
-                "baseline_chain": baseline_chain,
+                "candidate_provider_ids": candidate_provider_ids,
+                "baseline_provider_ids": baseline_provider_ids,
                 "task_budget_cny": task_budget_cny,
                 "policy_locked_at": locked_at,
                 "review_completed_at": "2026-07-02T00:00:00Z",
                 "outcomes": outcomes,
+                "unblinding": unblinding,
             }
         )
         task_routes[task_id] = {
@@ -181,7 +211,7 @@ def attested_matrix_fixture(task_count: int = 210, *, task_budget_cny: float = 2
     manifest_hash = canonical_hash(manifest)
     manifest["manifest_sha256"] = manifest_hash
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "study_id": "unit-test-shadow-matrix-fixture",
         "real_provider_shadow_matrix": True,
         "synthetic": False,
@@ -189,6 +219,8 @@ def attested_matrix_fixture(task_count: int = 210, *, task_budget_cny: float = 2
             "real_provider_calls_completed": True,
             "credentialed_collection_completed": True,
             "provider_call_ids_hashed": True,
+            "blind_review_records_frozen_before_unblinding": True,
+            "unblinding_maps_frozen_catalog_provider_ids": True,
         },
         "blinding": {
             "reviewer_blinded_to_provider": True,
@@ -303,8 +335,8 @@ class BacktestHarnessTest(unittest.TestCase):
             temp = Path(raw)
             payload = attested_matrix_fixture()
             payload["tasks"][1]["task_input_sha256"] = payload["tasks"][0]["task_input_sha256"]
-            payload["tasks"][1]["outcomes"]["low"]["provider_call_id_hash"] = (
-                payload["tasks"][0]["outcomes"]["low"]["provider_call_id_hash"]
+            payload["tasks"][1]["outcomes"]["budget-low"]["provider_call_id_hash"] = (
+                payload["tasks"][0]["outcomes"]["budget-low"]["provider_call_id_hash"]
             )
             dataset = temp / "matrix.json"
             dataset.write_text(json.dumps(payload), encoding="utf-8")
@@ -448,7 +480,7 @@ class BacktestHarnessTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="costmarshal-backtest-forged-chain-") as raw:
             temp = Path(raw)
             matrix = attested_matrix_fixture()
-            matrix["tasks"][0]["candidate_chain"] = ["high"]
+            matrix["tasks"][0]["candidate_provider_ids"] = ["codex"]
             manifest = matrix["policy_manifest"]
             manifest["task_routes"]["BT-0000"]["candidate_provider_ids"] = ["codex"]
             manifest_body = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
@@ -511,35 +543,69 @@ class BacktestHarnessTest(unittest.TestCase):
             self.assertGreater(report["budget_overruns"], 0)
             self.assertTrue(any("budget overruns" in row for row in report["blockers"]))
 
-    def test_tier_keyed_matrix_rejects_ambiguous_same_tier_providers(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="costmarshal-backtest-ambiguous-tier-") as raw:
+    def test_provider_keyed_matrix_supports_two_low_providers_and_cheaper_peer(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="costmarshal-backtest-provider-peers-") as raw:
             temp = Path(raw)
             matrix = attested_matrix_fixture()
-            duplicate = dict(matrix["policy_manifest"]["provider_catalog"]["providers"][0])
-            duplicate["provider_id"] = "another-low"
-            duplicate["priority"] = 200
-            matrix["policy_manifest"]["provider_catalog"]["providers"].append(duplicate)
-            manifest = matrix["policy_manifest"]
-            manifest_body = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
-            manifest_hash = canonical_hash(manifest_body)
-            manifest["manifest_sha256"] = manifest_hash
-            matrix["policy_manifest_sha256"] = manifest_hash
+            low_task = matrix["tasks"][0]
+            self.assertEqual(low_task["candidate_provider_ids"][0], "budget-low")
+            self.assertEqual(
+                set(low_task["outcomes"]),
+                {"longcat", "budget-low", "deepseek", "codex"},
+            )
+            dataset = temp / "matrix.json"
+            dataset.write_text(json.dumps(matrix), encoding="utf-8")
+            completed, report = invoke(temp, "--dataset", str(dataset))
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(report["status"], "pass")
+            self.assertEqual(
+                report["enabled_provider_counts"], {"low": 2, "medium": 1, "high": 1}
+            )
+
+    def test_missing_duplicate_or_swapped_provider_unblinding_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="costmarshal-backtest-provider-tamper-") as raw:
+            temp = Path(raw)
+            matrix = attested_matrix_fixture()
+
+            first = matrix["tasks"][0]
+            first["outcomes"]["longcat"], first["outcomes"]["budget-low"] = (
+                first["outcomes"]["budget-low"],
+                first["outcomes"]["longcat"],
+            )
+
+            second = matrix["tasks"][1]
+            del second["outcomes"]["budget-low"]
+
+            third = matrix["tasks"][2]
+            budget_blind_id = third["outcomes"]["budget-low"]["blind_result_id"]
+            third["unblinding"][budget_blind_id]["provider_id"] = "longcat"
+
             dataset = temp / "matrix.json"
             dataset.write_text(json.dumps(matrix), encoding="utf-8")
             completed, report = invoke(temp, "--dataset", str(dataset))
             self.assertEqual(completed.returncode, 2, completed.stderr)
             self.assertEqual(report["status"], "blocked")
-            self.assertTrue(
-                any("exactly one enabled provider per tier" in row for row in report["blockers"])
-            )
+            self.assertTrue(any("swapped unblinding is forbidden" in row for row in report["blockers"]))
+            self.assertTrue(any("outcomes provider IDs must exactly match" in row for row in report["blockers"]))
+            self.assertTrue(any("more than one blind result" in row for row in report["blockers"]))
+
+    def test_legacy_tier_keyed_schema_is_explicitly_blocked(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="costmarshal-backtest-legacy-tier-") as raw:
+            temp = Path(raw)
+            dataset = temp / "matrix.json"
+            dataset.write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
+            completed, report = invoke(temp, "--dataset", str(dataset))
+            self.assertEqual(completed.returncode, 2, completed.stderr)
+            self.assertEqual(report["status"], "blocked")
+            self.assertTrue(any("legacy schema_version 1 tier-keyed evidence" in row for row in report["blockers"]))
 
     def test_undefined_bootstrap_cost_ratios_cannot_be_silently_dropped(self) -> None:
         with tempfile.TemporaryDirectory(prefix="costmarshal-backtest-bootstrap-coverage-") as raw:
             temp = Path(raw)
             matrix = attested_matrix_fixture()
             for index, task in enumerate(matrix["tasks"]):
-                task["outcomes"]["high"]["accepted"] = index == 0
-                task["outcomes"]["high"]["quality_score"] = 5 if index == 0 else 1
+                task["outcomes"]["codex"]["accepted"] = index == 0
+                task["outcomes"]["codex"]["quality_score"] = 5 if index == 0 else 1
             dataset = temp / "matrix.json"
             dataset.write_text(json.dumps(matrix), encoding="utf-8")
             completed, report = invoke(temp, "--dataset", str(dataset))

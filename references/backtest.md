@@ -24,7 +24,7 @@ detached signature from an explicitly trusted signer.
 ## External detached attestation
 
 Release evaluation uses the system `ssh-keygen -Y verify` implementation with
-the fixed namespace `costmarshal-backtest-v1`. The caller must explicitly supply:
+the fixed namespace `costmarshal-backtest-v2`. The caller must explicitly supply:
 
 - an OpenSSH `allowed_signers` file maintained outside the dataset;
 - the detached signature over the exact dataset bytes;
@@ -35,7 +35,7 @@ For example, an authorized collection/review service signs the frozen dataset:
 ```powershell
 ssh-keygen -Y sign `
   -f C:\secure\attestation-ed25519 `
-  -n costmarshal-backtest-v1 `
+  -n costmarshal-backtest-v2 `
   C:\secure\real-shadow-matrix.json
 ```
 
@@ -76,31 +76,37 @@ cannot be combined with signature options.
 ## Dataset contract
 
 Release evidence requires at least 200 unique tasks and coverage of low,
-medium, and high safety floors. Every task contains exactly three separately
-blind-reviewed outcomes: low, medium, and high. Reviewer-visible records must
-not expose provider, model, or tier identity. Provider call identifiers are
-stored only as SHA-256 hashes. Provider-call hashes must be globally unique,
-and each task must carry a globally unique `task_input_sha256`; duplicated
-calls or duplicated task inputs are rejected rather than counted as independent
-samples.
+medium, and high safety floors. Dataset schema v2 requires every task to contain
+one separately blind-reviewed outcome for every enabled provider in the frozen
+policy catalog. Multiple providers may share a tier. Reviewer-visible records
+must not expose provider, model, or tier identity. The signed, post-review
+dataset keys outcomes by provider ID only after unblinding and separately maps
+each blind result ID to that frozen provider ID and its provider-call hash.
 
-Because outcomes are keyed by tier, this release-evidence schema requires the
-bound catalog to contain exactly one enabled provider in each of low, medium,
-and high. Core CostMarshal routing may support more providers per tier, but that
-deployment needs a provider-ID-keyed study schema rather than this matrix.
+Provider call identifiers are stored only as SHA-256 hashes. Blind result IDs,
+provider-call hashes, task input hashes, and provider mappings must be complete
+and unique. A missing provider outcome, duplicate mapping, or swap between two
+provider outcomes and their unblinding entries is blocked. The outer dataset
+signature protects the exact mapping bytes; the preregistered policy-manifest
+hash protects the provider catalog and route policy that existed before review.
+Legacy schema v1 tier-keyed matrices are explicitly blocked rather than guessed
+or silently upgraded. They must be recollected/exported under schema v2 and
+signed with the v2 attestation namespace.
 
 Top-level fields:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "study_id": "reviewed-study-id",
   "real_provider_shadow_matrix": true,
   "synthetic": false,
   "collection_attestation": {
     "real_provider_calls_completed": true,
     "credentialed_collection_completed": true,
-    "provider_call_ids_hashed": true
+    "provider_call_ids_hashed": true,
+    "blind_review_records_frozen_before_unblinding": true,
+    "unblinding_maps_frozen_catalog_provider_ids": true
   },
   "blinding": {
     "reviewer_blinded_to_provider": true,
@@ -112,6 +118,10 @@ Top-level fields:
   "tasks": []
 }
 ```
+
+The empty outcome objects above abbreviate the same exact five-field outcome
+shape shown for `reviewed-low-a`; empty or partial outcomes are invalid in an
+actual dataset, and every blind ID and provider-call hash must be unique.
 
 ## Hash-bound policy manifest
 
@@ -167,34 +177,45 @@ post-review route recomputation from being re-hashed as if it were pre-locked.
 NaN). The top-level `policy_manifest_sha256` must repeat it. The evaluator
 requires the manifest commit to equal the checked-out commit, reruns
 `costmarshal_v2.routing.decide_route` for both policies, verifies the recorded
-provider IDs, maps them to tiers through the bound catalog, and rejects any task
-chain or safety floor that differs. The manifest `locked_at` must equal every
+provider-ID chains directly, maps them to tiers through the bound catalog to
+enforce monotonicity and safety floors, and rejects any task chain or safety
+floor that differs. The manifest `locked_at` must equal every
 task's `policy_locked_at` and precede blind-review completion.
 
-Each task records the resulting pre-unblinding candidate and baseline chains.
-Chains must be strictly increasing, cannot start below the safety floor, and
-must exactly match the recomputed hash-bound policy manifest:
+Each task records the resulting pre-unblinding candidate and baseline provider
+chains. Their tiers must be strictly increasing, cannot start below the safety
+floor, and the provider IDs must exactly match the recomputed hash-bound policy
+manifest. Outcomes are provider-ID keyed only in the signed post-unblinding
+dataset; the separate map proves which blind record and provider-call hash were
+assigned to each frozen provider:
 
 ```json
 {
   "task_id": "BT-0001",
   "task_input_sha256": "sha256:<64 lowercase hex>",
   "safety_floor": "low",
-  "candidate_chain": ["low", "medium", "high"],
-  "baseline_chain": ["high"],
+  "candidate_provider_ids": ["reviewed-low-a", "reviewed-medium", "reviewed-high"],
+  "baseline_provider_ids": ["reviewed-high"],
   "task_budget_cny": 2.0,
   "policy_locked_at": "2026-07-01T00:00:00Z",
   "review_completed_at": "2026-07-02T00:00:00Z",
   "outcomes": {
-    "low": {
-      "blind_result_id": "opaque-low-result",
+    "reviewed-low-a": {
+      "blind_result_id": "opaque-result-001",
       "provider_call_id_hash": "sha256:<64 lowercase hex>",
       "accepted": true,
       "quality_score": 5,
       "actual_cost_cny": 0.1
     },
-    "medium": {},
-    "high": {}
+    "reviewed-low-b": {},
+    "reviewed-medium": {},
+    "reviewed-high": {}
+  },
+  "unblinding": {
+    "opaque-result-001": {
+      "provider_id": "reviewed-low-a",
+      "provider_call_id_hash": "sha256:<same 64 lowercase hex>"
+    }
   }
 }
 ```
