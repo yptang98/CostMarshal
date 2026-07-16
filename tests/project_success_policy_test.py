@@ -145,7 +145,10 @@ def seed_paired_route_evidence(temp: Path, project: Path) -> None:
         },
     }
     rows: list[dict] = []
-    layout = ProjectLayout(root=temp / "runtime", project_dir=project)
+    layout = ProjectLayout(
+        root=(temp / "runtime").resolve(),
+        project_dir=project.resolve(),
+    )
     snapshot_root = layout.root / "profile-snapshots" / "evidence"
     snapshot_root.mkdir(parents=True, exist_ok=True)
     (snapshot_root / "longcat.config.toml").write_bytes(
@@ -809,7 +812,10 @@ def main() -> int:
             encoding="utf-8",
         )
         trusted_after_tamper, tamper_issues = audit_result_evidence(
-            ProjectLayout(root=temp / "runtime", project_dir=project)
+            ProjectLayout(
+                root=(temp / "runtime").resolve(),
+                project_dir=project.resolve(),
+            )
         )
         trusted_ids = {row["id"] for row in trusted_after_tamper}
         assert "RES-longcat-4" not in trusted_ids
