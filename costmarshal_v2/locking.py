@@ -106,9 +106,29 @@ def project_write_lock(layout: ProjectLayout, *, timeout_seconds: float = 15.0) 
 
 @contextmanager
 def scheduler_instance_lock(layout: ProjectLayout, *, timeout_seconds: float = 0.25) -> Iterator[None]:
-    """Allow only one long-running scheduler loop per project."""
+    """Serialize short runtime-effect lease/execute sections per project."""
 
     with advisory_file_lock(layout.project_dir / "locks" / "scheduler.instance.lock", timeout_seconds=timeout_seconds):
+        yield
+
+
+@contextmanager
+def scheduler_daemon_lock(
+    layout: ProjectLayout,
+    *,
+    timeout_seconds: float = 0.25,
+) -> Iterator[None]:
+    """Allow one scheduler daemon without blocking emergency runtime effects.
+
+    The daemon owns this lock across its loop and sleep interval. Runtime-effect
+    execution uses ``scheduler_instance_lock`` only while actually draining, so
+    an explicit emergency STOP is never delayed by the daemon poll interval.
+    """
+
+    with advisory_file_lock(
+        layout.project_dir / "locks" / "scheduler.daemon.lock",
+        timeout_seconds=timeout_seconds,
+    ):
         yield
 
 
@@ -134,5 +154,6 @@ __all__ = [
     "advisory_file_lock",
     "materializer_lock",
     "project_write_lock",
+    "scheduler_daemon_lock",
     "scheduler_instance_lock",
 ]

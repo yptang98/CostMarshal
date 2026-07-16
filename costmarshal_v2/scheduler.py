@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -55,13 +56,35 @@ from .routing import (
     decide_route,
     default_provider_catalog,
     estimate_cost_cny as estimate_provider_cost,
+    estimate_cost_nano_cny as estimate_provider_cost_units,
     next_stronger_provider,
+    pricing_snapshot_status,
+    provider_price_basis,
     project_provider_catalog,
     provider_by_id,
+    route_plan_fingerprint,
     validate_provider_catalog,
 )
-from .governance import GovernanceError, inspect_governance, validate_governance_binding
-from .locking import ProjectLockTimeout, project_write_lock, scheduler_instance_lock
+from .governance import (
+    GovernanceError,
+    enforce_governance_contract,
+    governance_launcher_path,
+    inspect_governance,
+)
+from .locking import (
+    ProjectLockTimeout,
+    project_write_lock,
+    scheduler_daemon_lock,
+    scheduler_instance_lock,
+)
+from .profile_binding import (
+    ProfileBindingError,
+    install_profile_snapshot,
+    read_named_profile,
+    synthetic_default_profile,
+    validate_profile_binding,
+    verify_profile_snapshot,
+)
 from .worker_isolation import (
     IsolationError,
     OciCliBackend,
@@ -487,8 +510,133 @@ def require_non_negative_float(value: float | None, label: str) -> float | None:
     return result
 
 
-def total_tokens(input_tokens: int, output_tokens: int) -> int:
-    return input_tokens + output_tokens
+def require_probability(value: float | None, label: str) -> float | None:
+    result = require_non_negative_float(value, label)
+    if result is not None and result > 1.0:
+        raise SystemExit(f"{label} must be between 0 and 1")
+    return result
+
+
+def total_tokens(
+    input_tokens: int,
+    output_tokens: int,
+    cached_input_tokens: int = 0,
+) -> int:
+    return input_tokens + cached_input_tokens + output_tokens
+
+
+LEGACY_PRICE_SNAPSHOT_SCHEMA = "costmarshal-beta-legacy-price-v1"
+
+
+def _legacy_price_snapshot_hash(payload: dict[str, Any]) -> str:
+    canonical = dict(payload)
+    canonical.pop("snapshot_hash", None)
+    encoded = json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def build_legacy_price_snapshot(provider: dict[str, Any]) -> dict[str, Any] | None:
+    """Bind beta legacy rates to an attempt without calling them reviewed."""
+
+    if provider.get("pricing") is not None:
+        return None
+    input_price = provider.get("input_cny_per_1m")
+    output_price = provider.get("output_cny_per_1m")
+    if input_price is None or output_price is None:
+        return None
+    try:
+        normalized_input = _money_text(input_price, "legacy input price")
+        normalized_output = _money_text(output_price, "legacy output price")
+    except ValueError:
+        return None
+    snapshot = {
+        "schema_version": LEGACY_PRICE_SNAPSHOT_SCHEMA,
+        "provider_id": str(provider.get("provider_id") or ""),
+        "currency": "CNY",
+        "input_per_1m": normalized_input,
+        "output_per_1m": normalized_output,
+    }
+    snapshot["snapshot_hash"] = _legacy_price_snapshot_hash(snapshot)
+    return snapshot
+
+
+def _attempt_pricing_spec(
+    project: dict[str, Any],
+    attempt: dict[str, Any] | None,
+    provider_id: str,
+) -> tuple[dict[str, Any] | None, str, bool]:
+    """Return the immutable pricing spec bound to an attempt.
+
+    The boolean says whether the spec is durably bound and can settle budget.
+    Historical beta attempts without a stored basis may still be estimated from
+    the current legacy catalog, but that estimate remains explicitly unverified.
+    """
+
+    if attempt is not None:
+        attempt_provider = str(attempt.get("provider") or "")
+        if attempt_provider and attempt_provider != provider_id:
+            raise RoutingValidationError(
+                f"attempt provider {attempt_provider} does not match usage provider {provider_id}"
+            )
+        route = attempt.get("route_decision")
+        if isinstance(route, dict):
+            route_provider = str(route.get("provider_id") or "")
+            if route_provider and route_provider != provider_id:
+                raise RoutingValidationError(
+                    f"route provider {route_provider} does not match usage provider {provider_id}"
+                )
+            snapshot = route.get("price_snapshot")
+            if snapshot is not None:
+                if not isinstance(snapshot, dict):
+                    raise RoutingValidationError("attempt price_snapshot must be an object")
+                snapshot_hash = str(snapshot.get("snapshot_hash") or "")
+                return (
+                    {"pricing": snapshot},
+                    f"attempt_price_snapshot:{snapshot_hash}",
+                    True,
+                )
+        legacy = attempt.get("legacy_price_snapshot")
+        if legacy is not None:
+            if not isinstance(legacy, dict):
+                raise RoutingValidationError("attempt legacy_price_snapshot must be an object")
+            expected_keys = {
+                "schema_version",
+                "provider_id",
+                "currency",
+                "input_per_1m",
+                "output_per_1m",
+                "snapshot_hash",
+            }
+            if set(legacy) != expected_keys:
+                raise RoutingValidationError("attempt legacy_price_snapshot has unexpected fields")
+            if legacy.get("schema_version") != LEGACY_PRICE_SNAPSHOT_SCHEMA:
+                raise RoutingValidationError("attempt legacy_price_snapshot schema is unsupported")
+            if legacy.get("provider_id") != provider_id or legacy.get("currency") != "CNY":
+                raise RoutingValidationError("attempt legacy_price_snapshot identity mismatch")
+            if legacy.get("snapshot_hash") != _legacy_price_snapshot_hash(legacy):
+                raise RoutingValidationError("attempt legacy_price_snapshot hash mismatch")
+            spec = {
+                "input_cny_per_1m": legacy.get("input_per_1m"),
+                "output_cny_per_1m": legacy.get("output_per_1m"),
+            }
+            return (
+                spec,
+                f"attempt_legacy_price_snapshot:{legacy['snapshot_hash']}",
+                True,
+            )
+
+        current = provider_by_id(project_provider_catalog(project), provider_id)
+        if current.get("pricing") is None:
+            return current, "provider_catalog_legacy_unbound", False
+        return None, "attempt_price_snapshot_missing", False
+
+    current = provider_by_id(project_provider_catalog(project), provider_id)
+    return current, "provider_catalog_without_attempt", False
 
 
 def cost_source(estimated_cost_cny: float | None) -> str:
@@ -509,6 +657,11 @@ def set_task_state(
     if not allow_any_transition and not can_transition_task(current, state):
         raise SystemExit(f"Invalid task state transition: {task['id']} {current} -> {state}")
     task["status"] = state
+    if state in {"done", "failed", "cancelled"}:
+        try:
+            release_route_budget_envelope(task, f"task_{state}")
+        except ValueError as exc:
+            raise SystemExit(f"Task budget reconciliation failed closed: {exc}") from exc
     save_task(layout, task)
     status_payload = {
         "schema_version": SCHEMA_VERSION,
@@ -904,19 +1057,36 @@ def command_init(args: Any) -> None:
     catalog_path = getattr(args, "provider_catalog", None)
     try:
         if catalog_path:
-            raw_catalog = json.loads(Path(catalog_path).expanduser().read_text(encoding="utf-8"))
+            raw_catalog = json.loads(
+                Path(catalog_path).expanduser().read_text(encoding="utf-8"),
+                parse_float=str,
+            )
             provider_catalog = validate_provider_catalog(raw_catalog)
         else:
             provider_catalog = validate_provider_catalog(default_provider_catalog())
     except (OSError, json.JSONDecodeError, RoutingValidationError) as exc:
         raise SystemExit(f"Invalid provider catalog: {exc}") from exc
-    project_budget = require_non_negative_float(getattr(args, "project_budget_cny", None), "project-budget-cny")
+    raw_project_budget = getattr(args, "project_budget_cny", None)
+    try:
+        project_budget = (
+            None
+            if raw_project_budget is None
+            else _money_text(raw_project_budget, "project-budget-cny")
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    default_min_success = require_probability(
+        getattr(args, "default_min_success_probability", None),
+        "default-min-success-probability",
+    )
     governance_mode = str(getattr(args, "governance", None) or "auto")
+    governance_launcher = getattr(args, "archmarshal_launcher", None)
     governance_wrapper = getattr(args, "archmarshal_wrapper", None)
     try:
         governance_inspection = inspect_governance(
             workspace,
             mode=governance_mode,
+            launcher_path=governance_launcher,
             wrapper_path=governance_wrapper,
         )
     except GovernanceError as exc:
@@ -955,16 +1125,21 @@ def command_init(args: Any) -> None:
         },
         "provider_catalog": provider_catalog,
         "routing_policy": {
-            "version": 1,
+            "version": 2,
             "mode": "cost-performance",
             "tier_order": ["low", "medium", "high"],
             "project_budget_cny": project_budget,
+            "default_min_success_probability": default_min_success,
             "prices_require_review": True,
         },
         "governance": {
             "provider": "archmarshal",
             "mode": governance_mode,
-            "wrapper_path": str(Path(governance_wrapper).expanduser().resolve()) if governance_wrapper else None,
+            "launcher_path": (
+                str(Path(governance_launcher or governance_wrapper).expanduser().resolve())
+                if governance_launcher or governance_wrapper
+                else None
+            ),
             "status": governance_inspection.get("status"),
             "ready": bool(governance_inspection.get("ready")),
             "doctor_state": governance_inspection.get("doctor_state"),
@@ -1030,18 +1205,14 @@ def start_actor(
 ) -> dict[str, Any]:
     project = load_project(layout)
     governance = project.get("governance") or {"mode": "off"}
-    if governance.get("mode") == "required" or governance.get("ready"):
-        try:
-            validation = validate_governance_binding(
-                governance.get("binding"),
-                project.get("workspace"),
-                mode="required",
-                wrapper_path=governance.get("wrapper_path"),
-            )
-        except GovernanceError as exc:
-            raise SystemExit(f"ArchMarshal governance gate blocked actor launch [{exc.code}]: {exc}") from exc
-        if not validation.get("valid"):
-            raise SystemExit("ArchMarshal governance gate blocked actor launch: binding is not valid")
+    try:
+        enforce_governance_contract(
+            governance,
+            project.get("workspace"),
+            operation="actor launch",
+        )
+    except GovernanceError as exc:
+        raise SystemExit(f"ArchMarshal governance gate blocked actor launch [{exc.code}]: {exc}") from exc
     if actor.get("role") == "agent" and actor.get("command_template"):
         if (actor.get("isolation") or {}).get("mode") == "required":
             raise SystemExit("Custom worker commands cannot bypass required OCI isolation")
@@ -1120,11 +1291,13 @@ def _spawn_effect_id(attempt_id: str) -> str:
 
 def _spawn_effect_payload(actor: dict[str, Any]) -> dict[str, Any]:
     launch_token = str(actor.get("launch_token") or "")
+    profile_binding = actor.get("profile_binding") or {}
     return {
         "actor_id": str(actor["id"]),
         "task_id": str(actor.get("task_id") or ""),
         "attempt_id": str(actor.get("attempt_id") or ""),
         "launch_token_sha256": hashlib.sha256(launch_token.encode("utf-8")).hexdigest(),
+        "profile_sha256": str(profile_binding.get("sha256") or "").removeprefix("sha256:"),
     }
 
 
@@ -1279,6 +1452,8 @@ def _registered_spawn_observation(actor: dict[str, Any]) -> dict[str, Any] | Non
     payload = _spawn_effect_payload(actor)
     runtime = actor.get("runtime") or {}
     if runtime.get("registered_launch_token_sha256") != payload["launch_token_sha256"]:
+        return None
+    if runtime.get("registered_profile_sha256") != payload["profile_sha256"]:
         return None
     if runtime.get("provider_execution_state") not in {"started", "finished"}:
         return None
@@ -1847,6 +2022,12 @@ def render_task_brief(task: dict[str, Any]) -> str:
             f"- Requested tier: {task.get('tier_request') or 'auto'}",
             f"- Preview route: {(task.get('route_preview') or {}).get('provider_id') or 'not evaluated'}",
             f"- Required capabilities: {', '.join(task.get('required_capabilities') or []) or 'none'}",
+            (
+                "- Estimated tokens (ordinary input / cached input / output): "
+                f"{int(task.get('estimated_input_tokens') or 0)} / "
+                f"{int(task.get('estimated_cached_input_tokens') or 0)} / "
+                f"{int(task.get('estimated_output_tokens') or 0)}"
+            ),
             "",
             "## Acceptance Criteria",
             "\n".join(f"- {item}" for item in task.get("acceptance", [])) or "- Leader acceptance is required.",
@@ -1887,14 +2068,47 @@ def command_new_task(args: Any) -> None:
     provider_request = str(getattr(args, "provider", None) or "auto").lower()
     tier_request = str(getattr(args, "tier", None) or "auto").lower()
     estimated_input_tokens = require_non_negative_int(getattr(args, "estimated_input_tokens", 0), "estimated-input-tokens")
+    estimated_cached_input_tokens = require_non_negative_int(
+        getattr(args, "estimated_cached_input_tokens", 0),
+        "estimated-cached-input-tokens",
+    )
     estimated_output_tokens = require_non_negative_int(getattr(args, "estimated_output_tokens", 0), "estimated-output-tokens")
-    max_cost_cny = require_non_negative_float(getattr(args, "max_cost_cny", None), "max-cost-cny")
+    raw_max_cost = getattr(args, "max_cost_cny", None)
+    try:
+        max_cost_cny = (
+            None
+            if raw_max_cost is None
+            else _money_text(raw_max_cost, "max-cost-cny")
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    explicit_min_success = require_probability(
+        getattr(args, "min_success_probability", None),
+        "min-success-probability",
+    )
+    project_min_success = require_probability(
+        (project.get("routing_policy") or {}).get("default_min_success_probability"),
+        "stored default-min-success-probability",
+    )
+    auto_economic_route = provider_request == "auto" and tier_request == "auto"
+    if explicit_min_success is not None:
+        effective_min_success = explicit_min_success
+        min_success_source = "task-explicit"
+    elif auto_economic_route and project_min_success is not None:
+        effective_min_success = project_min_success
+        min_success_source = "project-default"
+    elif auto_economic_route:
+        effective_min_success = None
+        min_success_source = "legacy-none"
+    else:
+        effective_min_success = None
+        min_success_source = "explicit-route-not-applicable"
     routing_stub = {
         "risk": getattr(args, "risk", "low"),
         "difficulty": getattr(args, "difficulty", "normal"),
         "task_type": args.task_type,
         "required_capabilities": getattr(args, "required_capabilities", None) or [],
-        "min_success_probability": getattr(args, "min_success_probability", None),
+        "min_success_probability": effective_min_success,
     }
     try:
         route_preview = decide_route(
@@ -1904,6 +2118,7 @@ def command_new_task(args: Any) -> None:
             requested_tier=None if tier_request == "auto" else tier_request,
             history=result_rows(layout),
             input_tokens=estimated_input_tokens,
+            cached_input_tokens=estimated_cached_input_tokens,
             output_tokens=estimated_output_tokens,
         )
     except RoutingValidationError as exc:
@@ -1947,10 +2162,12 @@ def command_new_task(args: Any) -> None:
         "agent_name": args.agent,
         "model": args.model,
         "estimated_input_tokens": estimated_input_tokens,
+        "estimated_cached_input_tokens": estimated_cached_input_tokens,
         "estimated_output_tokens": estimated_output_tokens,
         "max_cost_cny": max_cost_cny,
         "required_capabilities": getattr(args, "required_capabilities", None) or [],
-        "min_success_probability": getattr(args, "min_success_probability", None),
+        "min_success_probability": effective_min_success,
+        "min_success_probability_source": min_success_source,
         "route_preview": route_preview.to_dict(),
         "created_at": now_iso(),
         "updated_at": now_iso(),
@@ -1991,12 +2208,36 @@ def command_route(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
     project = load_project(layout)
     catalog = project_provider_catalog(project)
+    explicit_min_success = require_probability(
+        getattr(args, "min_success_probability", None),
+        "min-success-probability",
+    )
+    project_min_success = require_probability(
+        (project.get("routing_policy") or {}).get("default_min_success_probability"),
+        "stored default-min-success-probability",
+    )
+    auto_economic_route = args.provider == "auto" and args.tier == "auto"
+    effective_min_success = (
+        explicit_min_success
+        if explicit_min_success is not None
+        else project_min_success if auto_economic_route else None
+    )
+    min_success_source = (
+        "task-explicit"
+        if explicit_min_success is not None
+        else "project-default"
+        if auto_economic_route and project_min_success is not None
+        else "legacy-none"
+        if auto_economic_route
+        else "explicit-route-not-applicable"
+    )
     task = {
         "risk": args.risk,
         "difficulty": args.difficulty,
         "task_type": args.task_type,
         "required_capabilities": getattr(args, "required_capabilities", None) or [],
-        "min_success_probability": getattr(args, "min_success_probability", None),
+        "min_success_probability": effective_min_success,
+        "min_success_probability_source": min_success_source,
     }
     try:
         decision = decide_route(
@@ -2006,6 +2247,10 @@ def command_route(args: Any) -> None:
             requested_tier=None if args.tier == "auto" else args.tier,
             history=result_rows(layout),
             input_tokens=require_non_negative_int(args.estimated_input_tokens, "estimated-input-tokens"),
+            cached_input_tokens=require_non_negative_int(
+                args.estimated_cached_input_tokens,
+                "estimated-cached-input-tokens",
+            ),
             output_tokens=require_non_negative_int(args.estimated_output_tokens, "estimated-output-tokens"),
         )
     except RoutingValidationError as exc:
@@ -2032,18 +2277,28 @@ def command_budget_status(args: Any) -> None:
     project = load_project(layout)
     limit = (project.get("routing_policy") or {}).get("project_budget_cny")
     attempts: list[dict[str, Any]] = []
+    tasks: list[dict[str, Any]] = []
     reconciliation_errors: list[str] = []
-    commitment = 0.0
+    commitment_units = 0
     for task in task_rows(layout):
+        task_error = None
+        task_commitment_value = None
+        try:
+            task_commitment_units = _task_budget_commitment_units(task)
+            task_commitment_value = _money_from_units(task_commitment_units)
+            commitment_units += task_commitment_units
+        except ValueError as exc:
+            task_error = str(exc)
+            reconciliation_errors.append(f"{task['id']}: {task_error}")
         for attempt in task.get("attempts") or []:
             error = None
             attempt_commitment = None
             try:
                 attempt_commitment = attempt_budget_commitment(attempt)
-                commitment += attempt_commitment
             except ValueError as exc:
                 error = str(exc)
-                reconciliation_errors.append(f"{task['id']}: {error}")
+                if task_error is None:
+                    reconciliation_errors.append(f"{task['id']}: {error}")
             attempts.append(
                 {
                     "task_id": task["id"],
@@ -2058,19 +2313,37 @@ def command_budget_status(args: Any) -> None:
                     "reconciliation_error": error,
                 }
             )
-    commitment_value = None if reconciliation_errors else round(commitment, 9)
+        tasks.append(
+            {
+                "task_id": task["id"],
+                "status": task.get("status"),
+                "commitment_cny": task_commitment_value,
+                "route_budget_envelope": task.get("route_budget_envelope"),
+                "reconciliation_status": "unknown" if task_error else "ok",
+                "reconciliation_error": task_error,
+            }
+        )
+    commitment_value = (
+        None if reconciliation_errors else _money_from_units(commitment_units)
+    )
+    remaining_value = None
+    if limit is not None and commitment_value is not None:
+        try:
+            remaining_value = _money_from_units(
+                _money_units(limit, "stored project budget") - commitment_units
+            )
+        except ValueError as exc:
+            reconciliation_errors.append(f"project budget: {exc}")
+            commitment_value = None
     print_json(
         {
             "status": "blocked" if reconciliation_errors else "ok",
             "project": str(layout.project_dir),
             "limit_cny": limit,
             "commitment_cny": commitment_value,
-            "remaining_cny": (
-                None
-                if limit is None or commitment_value is None
-                else round(float(limit) - commitment_value, 9)
-            ),
+            "remaining_cny": remaining_value,
             "reconciliation_errors": reconciliation_errors,
+            "tasks": tasks,
             "attempts": attempts,
         }
     )
@@ -2082,16 +2355,15 @@ def command_governance_status(args: Any) -> None:
     governance = project.get("governance") or {"mode": "off", "ready": False}
     validation: dict[str, Any] | None = None
     error: str | None = None
-    if governance.get("ready") or governance.get("mode") == "required":
-        try:
-            validation = validate_governance_binding(
-                governance.get("binding"),
-                project.get("workspace"),
-                mode="required",
-                wrapper_path=governance.get("wrapper_path"),
-            )
-        except GovernanceError as exc:
-            error = f"{exc.code}: {exc}"
+    try:
+        contract = enforce_governance_contract(
+            governance,
+            project.get("workspace"),
+            operation="governance status",
+        )
+        validation = contract.get("validation")
+    except GovernanceError as exc:
+        error = f"{exc.code}: {exc}"
     print_json(
         {
             "status": "ok" if error is None else "blocked",
@@ -2113,12 +2385,16 @@ def command_governance_rebind(args: Any) -> None:
     governance = project.get("governance") or {"mode": "off", "ready": False}
     if governance.get("mode") == "off":
         raise SystemExit("governance rebind requires an existing auto/required integration")
-    wrapper_path = governance.get("wrapper_path")
+    launcher_path = (
+        getattr(args, "archmarshal_launcher", None)
+        or getattr(args, "archmarshal_wrapper", None)
+        or governance_launcher_path(governance)
+    )
     try:
         inspection = inspect_governance(
             project.get("workspace"),
             mode="required",
-            wrapper_path=wrapper_path,
+            launcher_path=launcher_path,
         )
     except GovernanceError as exc:
         raise SystemExit(f"ArchMarshal governance rebind blocked [{exc.code}]: {exc}") from exc
@@ -2149,6 +2425,7 @@ def command_governance_rebind(args: Any) -> None:
         )
     governance.update(
         {
+            "launcher_path": str(Path(launcher_path).expanduser().resolve()),
             "status": "ready",
             "ready": True,
             "doctor_state": inspection.get("doctor_state"),
@@ -2158,6 +2435,7 @@ def command_governance_rebind(args: Any) -> None:
             "rebound_at": now_iso(),
         }
     )
+    governance.pop("wrapper_path", None)
     project["governance"] = governance
     save_project(layout, project)
     append_event(
@@ -2183,6 +2461,17 @@ def command_dispatch(args: Any) -> None:
     force = bool(getattr(args, "force", False))
     if task.get("status") in {"done", "failed", "cancelled"} and not force:
         raise SystemExit(f"Task is already terminal: {args.task}")
+    existing_attempts = task.get("attempts") or []
+    if (
+        existing_attempts
+        and existing_attempts[-1].get("status")
+        in {"preparing", "dispatched", "launch_pending", "starting", "running", "needs_recovery"}
+        and not getattr(args, "escalation_reason", None)
+    ):
+        raise SystemExit(
+            f"Task already has an active attempt: {existing_attempts[-1].get('attempt_id')}; "
+            "use the fenced escalation workflow"
+        )
     conflicts = active_lock_conflicts(layout, args.task, task.get("claimed_paths") or [])
     if conflicts:
         raise SystemExit(
@@ -2194,74 +2483,260 @@ def command_dispatch(args: Any) -> None:
         )
     project = load_project(layout)
     governance = project.get("governance") or {"mode": "off"}
-    governance_mode = str(governance.get("mode") or "off")
-    if governance_mode == "required" or governance.get("ready"):
-        try:
-            validation = validate_governance_binding(
-                governance.get("binding"),
-                project.get("workspace"),
-                mode="required",
-                wrapper_path=governance.get("wrapper_path"),
-            )
-        except GovernanceError as exc:
-            raise SystemExit(f"ArchMarshal governance gate blocked dispatch [{exc.code}]: {exc}") from exc
-        if not validation.get("valid"):
-            raise SystemExit("ArchMarshal governance gate blocked dispatch: binding is not valid")
+    try:
+        governance_contract = enforce_governance_contract(
+            governance,
+            project.get("workspace"),
+            operation="dispatch",
+        )
+    except GovernanceError as exc:
+        raise SystemExit(f"ArchMarshal governance gate blocked dispatch [{exc.code}]: {exc}") from exc
     unsafe_native = bool(getattr(args, "unsafe_native", False))
-    if unsafe_native and (
-        governance_mode == "required" or governance.get("ready") is True
-    ):
+    if unsafe_native and governance_contract.get("governed"):
         raise SystemExit("ArchMarshal active governance forbids unsafe-native workers")
     try:
         catalog = project_provider_catalog(project)
+        persisted_envelope = validate_route_budget_envelope(task)
+        routing_task = task
+        if persisted_envelope is not None and persisted_envelope.get("status") == "active":
+            # The whole-chain SLA was already checked when the immutable plan
+            # was admitted. A continuation routes one explicit bound step and
+            # is validated against that plan below.
+            routing_task = dict(task)
+            routing_task.pop("min_success_probability", None)
+        stored_provider_request = str(task.get("provider_request") or "auto").lower()
+        stored_tier_request = str(task.get("tier_request") or "auto").lower()
         raw_provider = getattr(args, "provider", None)
-        if raw_provider is None:
-            raw_provider = task.get("provider_request") or "auto"
         raw_tier = getattr(args, "tier", None)
-        if raw_tier is None:
-            raw_tier = task.get("tier_request") or "auto"
+        if not getattr(args, "escalation_reason", None):
+            if raw_provider is not None and str(raw_provider).lower() != stored_provider_request:
+                raise RoutingValidationError(
+                    "dispatch cannot change the task's frozen provider routing mode; create a new task"
+                )
+            if raw_tier is not None and str(raw_tier).lower() != stored_tier_request:
+                raise RoutingValidationError(
+                    "dispatch cannot change the task's frozen tier routing mode; create a new task"
+                )
+            raw_provider = stored_provider_request
+            raw_tier = stored_tier_request
+        else:
+            raw_provider = raw_provider if raw_provider is not None else stored_provider_request
+            raw_tier = raw_tier if raw_tier is not None else stored_tier_request
         decision = decide_route(
-            task,
+            routing_task,
             catalog,
             requested_provider_id=None if raw_provider == "auto" else str(raw_provider).lower(),
             requested_tier=None if raw_tier == "auto" else str(raw_tier).lower(),
             history=result_rows(layout),
             input_tokens=int(task.get("estimated_input_tokens") or 0),
+            cached_input_tokens=int(task.get("estimated_cached_input_tokens") or 0),
             output_tokens=int(task.get("estimated_output_tokens") or 0),
         )
     except (RoutingValidationError, ValueError) as exc:
         raise SystemExit(f"Unable to route task: {exc}") from exc
-    max_cost = require_non_negative_float(task.get("max_cost_cny"), "stored task budget")
-    project_budget = require_non_negative_float(
-        (project.get("routing_policy") or {}).get("project_budget_cny"),
-        "stored project budget",
-    )
+    provider_spec = provider_by_id(catalog, decision.provider_id)
+    max_cost = task.get("max_cost_cny")
+    project_budget = (project.get("routing_policy") or {}).get("project_budget_cny")
+    try:
+        max_cost_units = (
+            None if max_cost is None else _money_units(max_cost, "stored task budget")
+        )
+        project_budget_units = (
+            None
+            if project_budget is None
+            else _money_units(project_budget, "stored project budget")
+        )
+    except ValueError as exc:
+        raise SystemExit(f"Budget configuration failed closed: {exc}") from exc
     if max_cost is not None or project_budget is not None:
-        if not int(task.get("estimated_input_tokens") or 0) and not int(task.get("estimated_output_tokens") or 0):
+        if (
+            not int(task.get("estimated_input_tokens") or 0)
+            and not int(task.get("estimated_cached_input_tokens") or 0)
+            and not int(task.get("estimated_output_tokens") or 0)
+        ):
             raise SystemExit("Budgeted dispatch requires non-zero estimated input or output tokens")
-        if decision.estimated_cost_cny is None:
-            raise SystemExit(f"Budgeted dispatch requires reviewed prices for provider {decision.provider_id}")
-    if max_cost is not None:
-        try:
-            task_spend = sum(attempt_budget_commitment(row) for row in task.get("attempts") or [])
-        except ValueError as exc:
-            raise SystemExit(f"Task budget reconciliation failed closed: {exc}") from exc
-        if decision.estimated_cost_cny is not None and task_spend + decision.estimated_cost_cny > max_cost:
+        if decision.worst_case_chain_cost_cny is None:
             raise SystemExit(
-                f"Task budget exceeded: spent={round(task_spend, 6)} planned={decision.estimated_cost_cny} max={max_cost}"
+                f"Budgeted dispatch requires a fully priced executable chain for provider {decision.provider_id}"
             )
+        if any(
+            (step.get("price_basis") or {}).get("kind") != "canonical"
+            for step in decision.planned_steps
+        ):
+            raise SystemExit(
+                "Budgeted dispatch requires current reviewed canonical pricing for every planned provider; "
+                "beta legacy flat prices are compatibility-only"
+            )
+    try:
+        financial_contract_required = bool(
+            max_cost is not None
+            or project_budget is not None
+            or persisted_envelope is not None
+            or decision.worst_case_chain_cost_cny is not None
+        )
+        if financial_contract_required:
+            attempt_commitment_units = sum(
+                _attempt_budget_commitment_units(row)
+                for row in task.get("attempts") or []
+            )
+            current_task_commitment_units = _task_budget_commitment_units(task)
+            current_task_commitment = _money_from_units(current_task_commitment_units)
+        else:
+            # An unpriced compatibility task with no configured budget has no
+            # financial contract to reconcile. It remains visibly unknown in
+            # `budget`, but can preserve legacy safe-tier escalation behavior.
+            attempt_commitment_units = 0
+            current_task_commitment = 0.0
+            current_task_commitment_units = 0
+        existing_envelope = persisted_envelope
+        active_envelope = (
+            existing_envelope
+            if existing_envelope is not None and existing_envelope.get("status") == "active"
+            else None
+        )
+        candidate_envelope: dict[str, Any] | None = None
+        superseded_envelope: dict[str, Any] | None = None
+        route_plan_step_index: int | None = None
+        route_plan_step: dict[str, Any] | None = None
+        if active_envelope is not None:
+            next_bound_step = _envelope_step_index(task, active_envelope)
+            replan_active = bool(getattr(args, "replan_active", False))
+            if replan_active:
+                if not bool(getattr(args, "allow_plan_revision", False)):
+                    raise ValueError(
+                        f"task {task.get('id') or '?'} automatic escalation cannot revise an active plan"
+                    )
+                superseded_envelope = active_envelope
+                candidate_envelope = make_route_budget_envelope(
+                    layout,
+                    project,
+                    task,
+                    decision,
+                    baseline_commitment_units=attempt_commitment_units,
+                )
+                if candidate_envelope is None:
+                    raise ValueError(
+                        f"task {task.get('id') or '?'} active plan revision requires a fully priced step"
+                    )
+                effective_envelope = candidate_envelope
+                route_plan_step_index = 0
+                route_plan_step = candidate_envelope["planned_steps"][0]
+            elif next_bound_step < len(active_envelope["planned_steps"]):
+                route_plan_step_index, route_plan_step = validate_envelope_dispatch_step(
+                    task,
+                    active_envelope,
+                    decision,
+                    provider_spec,
+                )
+                effective_envelope = active_envelope
+            else:
+                # A manually requested escalation after a completed one-step
+                # plan is an explicit revision, not an unbudgeted tail call.
+                if not bool(getattr(args, "allow_plan_revision", False)):
+                    raise ValueError(
+                        f"task {task.get('id') or '?'} route plan is exhausted; "
+                        "automatic escalation cannot revise the admitted plan"
+                    )
+                superseded_envelope = active_envelope
+                candidate_envelope = make_route_budget_envelope(
+                    layout,
+                    project,
+                    task,
+                    decision,
+                    baseline_commitment_units=attempt_commitment_units,
+                )
+                if candidate_envelope is None:
+                    raise ValueError(
+                        f"task {task.get('id') or '?'} explicit plan revision requires a fully priced step"
+                    )
+                effective_envelope = candidate_envelope
+                route_plan_step_index = 0
+                route_plan_step = candidate_envelope["planned_steps"][0]
+        else:
+            candidate_envelope = make_route_budget_envelope(
+                layout,
+                project,
+                task,
+                decision,
+                baseline_commitment_units=attempt_commitment_units,
+            )
+            effective_envelope = candidate_envelope
+            if candidate_envelope is not None:
+                route_plan_step_index = 0
+                route_plan_step = candidate_envelope["planned_steps"][0]
+        decision_step_cost = (decision.planned_steps[0] if decision.planned_steps else {}).get(
+            "estimated_cost_cny"
+        )
+        hop_commitment_units = _money_units(
+            decision_step_cost or 0,
+            f"task {task.get('id') or '?'} dispatch estimated_cost_cny",
+        )
+        projected_attempt_commitment_units = attempt_commitment_units + hop_commitment_units
+        future_step_commitment_units = 0
+        if effective_envelope is not None and route_plan_step_index is not None:
+            future_step_commitment_units = sum(
+                _money_units(
+                    step.get("estimated_cost_cny"),
+                    f"task {task.get('id') or '?'} route plan future step estimated_cost_cny",
+                )
+                for step in effective_envelope["planned_steps"][route_plan_step_index + 1 :]
+            )
+        projected_task_commitment_units = (
+            projected_attempt_commitment_units + future_step_commitment_units
+        )
+        incremental_commitment_units = max(
+            0,
+            projected_task_commitment_units - current_task_commitment_units,
+        )
+        projected_task_commitment = _money_from_units(projected_task_commitment_units)
+        incremental_commitment = _money_from_units(incremental_commitment_units)
+    except ValueError as exc:
+        raise SystemExit(f"Task budget reconciliation failed closed: {exc}") from exc
+    if max_cost_units is not None and projected_task_commitment_units > max_cost_units:
+        raise SystemExit(
+            f"Task budget exceeded: committed={round(current_task_commitment, 6)} "
+            f"projected={projected_task_commitment} max={max_cost}"
+        )
     if project_budget is not None:
         try:
-            known_spend = project_budget_commitment(layout)
+            known_spend_units = _project_budget_commitment_units(layout)
+            known_spend = _money_from_units(known_spend_units)
         except ValueError as exc:
             raise SystemExit(f"Project budget reconciliation failed closed: {exc}") from exc
-        if decision.estimated_cost_cny is not None and known_spend + decision.estimated_cost_cny > project_budget:
+        assert project_budget_units is not None
+        if known_spend_units + incremental_commitment_units > project_budget_units:
             raise SystemExit(
-                f"Project budget exceeded: spent={round(known_spend, 6)} planned={decision.estimated_cost_cny} max={project_budget}"
+                f"Project budget exceeded: committed={round(known_spend, 6)} "
+                f"incremental={incremental_commitment} projected={round(known_spend + incremental_commitment, 9)} "
+                f"max={project_budget}"
             )
     session = load_session(layout)
     attempt_id = new_id("ATT")
     launch_token = secrets.token_urlsafe(32)
+    direct_step: dict[str, Any] | None = None
+    try:
+        dry_run = bool(getattr(args, "dry_run", False))
+        if route_plan_step is not None and route_plan_step.get("profile_binding") is not None:
+            profile_binding = validate_profile_binding(route_plan_step["profile_binding"])
+        else:
+            direct_step = json.loads(
+                json.dumps(
+                    route_plan_step or decision.planned_steps[0],
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+            )
+            direct_step = _bind_route_step_profiles(
+                layout,
+                project,
+                attempt_id,
+                [direct_step],
+            )[0]
+            profile_binding = validate_profile_binding(direct_step["profile_binding"])
+        if bool(getattr(args, "start", False)):
+            validate_profile_binding(profile_binding, require_available=True)
+    except (ProfileBindingError, RoutingValidationError) as exc:
+        raise SystemExit(f"Provider profile binding failed closed: {exc}") from exc
     default_actor_id = (
         f"agent-{args.task.lower()}"
         if not task.get("attempts")
@@ -2272,7 +2747,6 @@ def command_dispatch(args: Any) -> None:
         raise SystemExit(f"Actor already exists: {actor_id}")
     provider = decision.provider_id
     tier = decision.tier
-    provider_spec = provider_by_id(catalog, provider)
     requested_model = getattr(args, "model", None)
     requested_profile = getattr(args, "profile", None)
     if not task.get("attempts"):
@@ -2280,6 +2754,15 @@ def command_dispatch(args: Any) -> None:
         requested_profile = requested_profile or task.get("profile")
     model = requested_model if requested_model and requested_model != "inherit" else (decision.model or "inherit")
     profile = requested_profile or decision.profile
+    if route_plan_step is not None:
+        planned_model = route_plan_step.get("model") or "inherit"
+        planned_profile = route_plan_step.get("profile")
+        if model != planned_model or profile != planned_profile:
+            raise SystemExit(
+                "Dispatch model/profile override does not match the price-bound route plan: "
+                f"planned model={planned_model!r} profile={planned_profile!r}, "
+                f"requested model={model!r} profile={profile!r}"
+            )
     command_template = getattr(args, "command", None)
     actor = make_actor(
         layout,
@@ -2298,6 +2781,7 @@ def command_dispatch(args: Any) -> None:
         attempt_id=attempt_id,
         launch_token=launch_token,
     )
+    actor["profile_binding"] = profile_binding
     isolation = preflight_worker_isolation(
         layout,
         project,
@@ -2306,12 +2790,49 @@ def command_dispatch(args: Any) -> None:
         unsafe_native=unsafe_native,
     )
     actor["isolation"] = isolation
+    semantic_preview = {
+        "actor": actor,
+        "route_decision": decision.to_dict(),
+        "route_budget_envelope": effective_envelope,
+        "budget_projection": {
+            "current_task_commitment_cny": current_task_commitment,
+            "incremental_commitment_cny": incremental_commitment,
+            "projected_task_commitment_cny": projected_task_commitment,
+        },
+    }
+    expected_admission_fingerprint = getattr(
+        args,
+        "expected_prepared_admission_fingerprint",
+        None,
+    )
+    if expected_admission_fingerprint is not None:
+        observed_admission = _prepared_escalation_admission(semantic_preview)
+        if _prepared_escalation_fingerprint(observed_admission) != expected_admission_fingerprint:
+            raise SystemExit("Escalation successor admission changed before persistence")
+    if not dry_run:
+        try:
+            if effective_envelope is not None:
+                _materialize_envelope_profiles(layout, project, effective_envelope)
+            elif direct_step is not None:
+                _materialize_step_profile(layout, project, direct_step)
+        except (ProfileBindingError, RoutingValidationError) as exc:
+            raise SystemExit(f"Provider profile binding failed closed: {exc}") from exc
     if args.dry_run:
         plan = start_actor(layout, actor, dry_run=True) if args.start else {"planned_commands": []}
         actor_preview = dict(actor)
         if actor_preview.get("launch_token"):
             actor_preview["launch_token"] = "<redacted>"
-        print_json({"status": "ok", "dry_run": True, "actor": actor_preview, "route_decision": decision.to_dict(), "start_plan": plan})
+        print_json(
+            {
+                "status": "ok",
+                "dry_run": True,
+                "actor": actor_preview,
+                "route_decision": decision.to_dict(),
+                "route_budget_envelope": effective_envelope,
+                "budget_projection": semantic_preview["budget_projection"],
+                "start_plan": plan,
+            }
+        )
         return
     deferred_start = bool(args.start and current_transaction() is not None and control_store_enabled(layout))
     if deferred_start and actor.get("command_template"):
@@ -2330,6 +2851,20 @@ def command_dispatch(args: Any) -> None:
     task["tier"] = tier
     task["profile"] = profile
     task["route_decision"] = decision.to_dict()
+    if candidate_envelope is not None:
+        if superseded_envelope is not None:
+            archived_envelope = json.loads(
+                json.dumps(superseded_envelope, ensure_ascii=False, allow_nan=False)
+            )
+            archived_envelope["status"] = "released"
+            archived_envelope["released_at"] = now_iso()
+            archived_envelope["release_reason"] = (
+                "explicit_active_plan_revision"
+                if bool(getattr(args, "replan_active", False))
+                else "explicit_plan_revision"
+            )
+            task.setdefault("route_budget_envelope_history", []).append(archived_envelope)
+        task["route_budget_envelope"] = candidate_envelope
     task.setdefault("attempts", []).append(
         {
             "attempt": len(task.get("attempts") or []) + 1,
@@ -2340,14 +2875,32 @@ def command_dispatch(args: Any) -> None:
             "tier": tier,
             "profile": profile,
             "model": model,
+            "profile_binding": profile_binding,
             "status": "launch_pending" if deferred_start else "running" if args.start else "dispatched",
             "started_at": None if deferred_start else now_iso() if args.start else None,
             "finished_at": None,
             "route_decision": decision.to_dict(),
             "escalation_reason": getattr(args, "escalation_reason", None),
             "dispatch_command_id": command_id,
-            "reserved_cost_cny": decision.estimated_cost_cny,
+            "reserved_cost_cny": (
+                route_plan_step.get("estimated_cost_cny")
+                if route_plan_step is not None
+                else decision_step_cost
+            ),
             "actual_cost_cny": 0.0,
+            "route_envelope_id": (
+                effective_envelope.get("envelope_id")
+                if effective_envelope is not None
+                else None
+            ),
+            "route_plan_fingerprint": (
+                effective_envelope.get("plan_fingerprint")
+                if effective_envelope is not None
+                else None
+            ),
+            "route_plan_step_index": route_plan_step_index,
+            "route_plan_step": route_plan_step,
+            "legacy_price_snapshot": build_legacy_price_snapshot(provider_spec),
             "isolation": isolation,
         }
     )
@@ -2405,6 +2958,22 @@ def command_dispatch(args: Any) -> None:
         tier=tier,
         profile=profile,
         model=model,
+        route_plan_fingerprint=(
+            effective_envelope.get("plan_fingerprint")
+            if effective_envelope is not None
+            else None
+        ),
+        route_envelope_id=(
+            effective_envelope.get("envelope_id")
+            if effective_envelope is not None
+            else None
+        ),
+        route_plan_step_index=route_plan_step_index,
+        route_plan_reserved_cost_cny=(
+            effective_envelope.get("reserved_cost_cny")
+            if effective_envelope is not None
+            else None
+        ),
         started=bool(args.start and not deferred_start),
         start_queued=deferred_start,
     )
@@ -2417,6 +2986,21 @@ def command_dispatch(args: Any) -> None:
             "started": bool(args.start and not deferred_start),
             "start_queued": deferred_start,
             "start": start_payload,
+            "route_plan_fingerprint": (
+                effective_envelope.get("plan_fingerprint")
+                if effective_envelope is not None
+                else None
+            ),
+            "route_envelope_id": (
+                effective_envelope.get("envelope_id")
+                if effective_envelope is not None
+                else None
+            ),
+            "route_plan_step_index": route_plan_step_index,
+            "budget_projection": {
+                "incremental_commitment_cny": incremental_commitment,
+                "projected_task_commitment_cny": projected_task_commitment,
+            },
         }
     )
 
@@ -2656,6 +3240,9 @@ def execute_scheduler_command(
             tier=str(command_args.get("tier") or "auto"),
             profile=command_args.get("profile"),
             estimated_input_tokens=int(command_args.get("estimated_input_tokens") or 0),
+            estimated_cached_input_tokens=int(
+                command_args.get("estimated_cached_input_tokens") or 0
+            ),
             estimated_output_tokens=int(command_args.get("estimated_output_tokens") or 0),
             max_cost_cny=command_args.get("max_cost_cny"),
             required_capabilities=as_list(command_args.get("required_capabilities")),
@@ -2695,7 +3282,7 @@ def execute_scheduler_command(
             task=task_id,
             reason=str(command_args.get("reason") or "Worker requested a stronger provider tier"),
             actor_id=command_args.get("actor_id"),
-            from_actor=command_args.get("actor") or sender,
+            from_actor=(command_args.get("actor") or sender) if sender != LEADER_ID else None,
             attempt=command_args.get("attempt"),
             profile=command_args.get("profile"),
             model=command_args.get("model"),
@@ -2735,6 +3322,7 @@ def execute_scheduler_command(
             attempt=command_args.get("attempt"),
             model=command_args.get("model"),
             input_tokens=int(command_args.get("input_tokens") or 0),
+            cached_input_tokens=int(command_args.get("cached_input_tokens") or 0),
             output_tokens=int(command_args.get("output_tokens") or 0),
             estimated_cost_cny=command_args.get("estimated_cost_cny"),
             summary=command_args.get("summary"),
@@ -2750,6 +3338,7 @@ def execute_scheduler_command(
             attempt=command_args.get("attempt"),
             model=command_args.get("model"),
             input_tokens=int(command_args.get("input_tokens") or 0),
+            cached_input_tokens=int(command_args.get("cached_input_tokens") or 0),
             output_tokens=int(command_args.get("output_tokens") or 0),
             estimated_cost_cny=command_args.get("estimated_cost_cny"),
             final_usage=as_bool(command_args.get("final_usage") or command_args.get("final")),
@@ -2866,7 +3455,7 @@ def process_scheduler_inbox(layout: ProjectLayout, *, limit: int | None = None, 
 
 
 def scheduler_cycle(layout: ProjectLayout, *, relay_limit: int | None = None, command_limit: int | None = None, dry_run: bool = False) -> dict[str, Any]:
-    # The wrapper has already passed the read-only governance gate.  Repair
+    # The canonical launcher has already passed the read-only governance gate. Repair
     # committed compatibility views before actor/outbox/inbox reads even when
     # there is no runtime effect to lease.  This closes the crash window for
     # runner finalization, usage, collect, and mailbox-only transactions.  The
@@ -2915,7 +3504,7 @@ def scheduler_cycle(layout: ProjectLayout, *, relay_limit: int | None = None, co
     }
 
 
-def _command_run_scheduler_with_instance_lock(args: Any) -> None:
+def _command_run_scheduler_loop(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
     _validate_governance_preflight(layout, operation="run-scheduler")
     ensure_runtime_dirs(layout)
@@ -2978,10 +3567,149 @@ def command_run_scheduler(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
     _validate_governance_preflight(layout, operation="run-scheduler")
     try:
-        with scheduler_instance_lock(layout):
-            _command_run_scheduler_with_instance_lock(args)
+        with scheduler_daemon_lock(layout):
+            _command_run_scheduler_loop(args)
     except ProjectLockTimeout as exc:
         raise SystemExit(f"another scheduler instance is already active: {exc}") from exc
+
+
+def _escalation_request_payload(args: Any) -> dict[str, Any]:
+    def optional_text(name: str, *, lower: bool = False) -> str | None:
+        raw = getattr(args, name, None)
+        if raw is None:
+            return None
+        value = str(raw)
+        return value.lower() if lower else value
+
+    return {
+        "reason": str(getattr(args, "reason", "")),
+        "requested_provider": optional_text("provider", lower=True),
+        "requested_tier": optional_text("to_tier", lower=True),
+        "profile": optional_text("profile"),
+        "model": optional_text("model"),
+        "start": bool(getattr(args, "start", False)),
+        "replan": bool(getattr(args, "replan", False)),
+        "unsafe_native": bool(getattr(args, "unsafe_native", False)),
+        "force": bool(getattr(args, "force", False)),
+        "expected_attempt": optional_text("attempt"),
+        "expected_actor": optional_text("from_actor"),
+        "actor_id": optional_text("actor_id"),
+    }
+
+
+def _escalation_request_fingerprint(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _stable_profile_binding(binding: Any) -> Any:
+    if not isinstance(binding, dict):
+        return binding
+    return {
+        key: value
+        for key, value in binding.items()
+        if key != "snapshot_relpath"
+    }
+
+
+def _prepared_escalation_admission(preview: dict[str, Any]) -> dict[str, Any]:
+    actor = preview.get("actor") if isinstance(preview.get("actor"), dict) else {}
+    decision = preview.get("route_decision") if isinstance(preview.get("route_decision"), dict) else {}
+    envelope = (
+        preview.get("route_budget_envelope")
+        if isinstance(preview.get("route_budget_envelope"), dict)
+        else None
+    )
+    steps = (
+        json.loads(json.dumps(envelope.get("planned_steps") or [], ensure_ascii=False, allow_nan=False))
+        if envelope is not None
+        else []
+    )
+    for step in steps:
+        if isinstance(step, dict) and "profile_binding" in step:
+            step["profile_binding"] = _stable_profile_binding(step.get("profile_binding"))
+    admission = {
+        "provider": actor.get("provider"),
+        "tier": actor.get("tier"),
+        "profile": actor.get("profile"),
+        "model": actor.get("model"),
+        "agent_name": actor.get("agent_name"),
+        "env_key": actor.get("env_key"),
+        "command_template": actor.get("command_template"),
+        "runner": actor.get("runner"),
+        "runtime_backend": (
+            (actor.get("runtime") or {}).get("backend")
+            if isinstance(actor.get("runtime"), dict)
+            else None
+        ),
+        "isolation": actor.get("isolation"),
+        "profile_binding": _stable_profile_binding(actor.get("profile_binding")),
+        "route_decision": decision,
+        "admitted_steps": steps,
+        "budget_projection": preview.get("budget_projection"),
+    }
+    # Assert JSON-canonicality now; this payload is a durable replay fence.
+    json.dumps(admission, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return admission
+
+
+def _prepared_escalation_fingerprint(admission: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        admission,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_escalation_replay_payload(
+    origin: dict[str, Any],
+    successor: dict[str, Any] | None,
+    args: Any,
+    command_id: str,
+) -> None:
+    requested = _escalation_request_payload(args)
+    requested_fingerprint = _escalation_request_fingerprint(requested)
+    recorded = origin.get("escalation_request")
+    recorded_fingerprint = origin.get("escalation_request_fingerprint")
+    if recorded is not None or recorded_fingerprint is not None:
+        if not isinstance(recorded, dict) or not isinstance(recorded_fingerprint, str):
+            raise SystemExit(f"Escalation command {command_id} has a corrupt request binding")
+        if _escalation_request_fingerprint(recorded) != recorded_fingerprint:
+            raise SystemExit(f"Escalation command {command_id} has a corrupt request fingerprint")
+        if recorded_fingerprint != requested_fingerprint or recorded != requested:
+            raise SystemExit(
+                f"Escalation command {command_id} was replayed with a different request payload"
+            )
+        return
+
+    # Compatibility for attempts created before request fingerprints existed.
+    if origin.get("escalation_reason") != requested["reason"]:
+        raise SystemExit(f"Escalation command {command_id} was replayed with a different reason")
+    if requested["requested_provider"] is not None and (
+        origin.get("escalation_target_provider") != requested["requested_provider"]
+    ):
+        raise SystemExit(
+            f"Escalation command {command_id} was replayed with a different target provider"
+        )
+    if requested["requested_tier"] is not None and (
+        origin.get("escalation_target_tier") != requested["requested_tier"]
+    ):
+        raise SystemExit(f"Escalation command {command_id} was replayed with a different target tier")
+    if successor is not None:
+        for field in ("profile", "model"):
+            if requested[field] is not None and successor.get(field) != requested[field]:
+                raise SystemExit(
+                    f"Escalation command {command_id} was replayed with a different {field}"
+                )
 
 
 def command_escalate(args: Any) -> None:
@@ -2989,15 +3717,63 @@ def command_escalate(args: Any) -> None:
     require_task(layout, args.task)
     task = load_task(layout, args.task)
     command_id = getattr(args, "command_id", None)
+    incomplete_origin: dict[str, Any] | None = None
     if command_id:
-        existing = next((row for row in task.get("attempts") or [] if row.get("escalation_command_id") == command_id), None)
-        if existing:
-            print_json({"status": "ok", "idempotent_replay": True, "task_id": args.task, "attempt_id": existing.get("attempt_id")})
+        attempts_for_command = task.get("attempts") or []
+        origins = [
+            row
+            for row in attempts_for_command
+            if row.get("escalation_command_id") == command_id
+        ]
+        successors = [
+            row
+            for row in attempts_for_command
+            if row.get("dispatch_command_id") == command_id
+        ]
+        if len(origins) > 1 or len(successors) > 1:
+            raise SystemExit(
+                f"Escalation command {command_id} has duplicate origin or successor attempts"
+            )
+        if successors:
+            if not origins:
+                raise SystemExit(
+                    f"Escalation command {command_id} has a successor without an origin attempt"
+                )
+            _validate_escalation_replay_payload(
+                origins[0],
+                successors[0],
+                args,
+                command_id,
+            )
+            print_json(
+                {
+                    "status": "ok",
+                    "idempotent_replay": True,
+                    "task_id": args.task,
+                    "attempt_id": successors[0].get("attempt_id"),
+                }
+            )
             return
+        if origins:
+            incomplete_origin = origins[0]
+            _validate_escalation_replay_payload(
+                incomplete_origin,
+                None,
+                args,
+                command_id,
+            )
+            if incomplete_origin is not attempts_for_command[-1]:
+                raise SystemExit(
+                    f"Escalation command {command_id} is incomplete but its origin is no longer current"
+                )
+            if incomplete_origin.get("status") != "escalated":
+                raise SystemExit(
+                    f"Escalation command {command_id} has an invalid incomplete origin state"
+                )
     attempts = task.get("attempts") or []
     if not attempts:
         raise SystemExit(f"Task has no provider attempt to escalate: {args.task}")
-    previous = attempts[-1]
+    previous = incomplete_origin or attempts[-1]
     expected_attempt = getattr(args, "attempt", None)
     expected_actor = getattr(args, "from_actor", None)
     if expected_attempt and previous.get("attempt_id") != expected_attempt:
@@ -3020,6 +3796,7 @@ def command_escalate(args: Any) -> None:
                 requested_tier=str(explicit_tier),
                 history=result_rows(layout),
                 input_tokens=int(task.get("estimated_input_tokens") or 0),
+                cached_input_tokens=int(task.get("estimated_cached_input_tokens") or 0),
                 output_tokens=int(task.get("estimated_output_tokens") or 0),
             )
             target = provider_by_id(catalog, decision.provider_id)
@@ -3044,6 +3821,7 @@ def command_escalate(args: Any) -> None:
                 task_type=str(task.get("task_type") or "analysis"),
                 difficulty=str(task.get("difficulty") or "normal"),
                 input_tokens=int(task.get("estimated_input_tokens") or 0),
+                cached_input_tokens=int(task.get("estimated_cached_input_tokens") or 0),
                 output_tokens=int(task.get("estimated_output_tokens") or 0),
             )
         if target is None:
@@ -3054,8 +3832,23 @@ def command_escalate(args: Any) -> None:
             )
     except RoutingValidationError as exc:
         raise SystemExit(f"Unable to escalate task: {exc}") from exc
+    if incomplete_origin is not None:
+        if incomplete_origin.get("escalation_reason") != args.reason:
+            raise SystemExit(
+                f"Escalation command {command_id} was replayed with a different reason"
+            )
+        recorded_target = incomplete_origin.get("escalation_target_provider")
+        if recorded_target and recorded_target != target["provider_id"]:
+            raise SystemExit(
+                f"Escalation command {command_id} was replayed with a different target provider"
+            )
     actor_id = getattr(args, "actor_id", None)
-    def escalation_dispatch_args(*, dry_run: bool, dispatch_command_id: str | None) -> SimpleNamespace:
+    def escalation_dispatch_args(
+        *,
+        dry_run: bool,
+        dispatch_command_id: str | None,
+        expected_prepared_admission_fingerprint: str | None = None,
+    ) -> SimpleNamespace:
         return SimpleNamespace(
             root=args.root,
             project=args.project,
@@ -3071,9 +3864,12 @@ def command_escalate(args: Any) -> None:
             dry_run=dry_run,
             force=True,
             escalation_reason=args.reason,
+            allow_plan_revision=expected_attempt is None and expected_actor is None,
+            replan_active=bool(getattr(args, "replan", False)),
             unsafe_native=bool(getattr(args, "unsafe_native", False))
             or (previous.get("isolation") or {}).get("mode") == "unsafe-native",
             command_id=dispatch_command_id,
+            expected_prepared_admission_fingerprint=expected_prepared_admission_fingerprint,
         )
 
     if bool(getattr(args, "dry_run", False)):
@@ -3082,24 +3878,63 @@ def command_escalate(args: Any) -> None:
     # Validate routing, governance, budget, claims, and launch planning before
     # ending the current attempt. A real spawn failure remains a recoverable
     # new attempt rather than leaving the task with no active successor.
-    with contextlib.redirect_stdout(io.StringIO()):
+    preview_stream = io.StringIO()
+    with contextlib.redirect_stdout(preview_stream):
         command_dispatch(escalation_dispatch_args(dry_run=True, dispatch_command_id=None))
-    attempts[-1]["status"] = "escalated"
-    attempts[-1]["finished_at"] = now_iso()
-    attempts[-1]["escalation_reason"] = args.reason
-    attempts[-1]["escalation_command_id"] = command_id
-    save_task(layout, task)
-    append_event(
-        layout,
-        "task_escalation_requested",
-        task_id=args.task,
-        actor_id=actor_id,
-        from_provider=current_provider,
-        to_provider=target["provider_id"],
-        to_tier=target["tier"],
-        reason=args.reason,
+    try:
+        prepared_admission = _prepared_escalation_admission(
+            json.loads(preview_stream.getvalue())
+        )
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise SystemExit("Escalation dry-run did not produce a canonical prepared admission") from exc
+    prepared_fingerprint = _prepared_escalation_fingerprint(prepared_admission)
+    if incomplete_origin is not None:
+        recorded_admission = incomplete_origin.get("escalation_prepared_admission")
+        recorded_fingerprint = incomplete_origin.get("escalation_prepared_admission_fingerprint")
+        if not isinstance(recorded_admission, dict) or not isinstance(recorded_fingerprint, str):
+            raise SystemExit(
+                f"Escalation command {command_id} lacks its prepared successor admission"
+            )
+        if _prepared_escalation_fingerprint(recorded_admission) != recorded_fingerprint:
+            raise SystemExit(
+                f"Escalation command {command_id} has a corrupt prepared successor admission"
+            )
+        if recorded_fingerprint != prepared_fingerprint or recorded_admission != prepared_admission:
+            raise SystemExit(
+                f"Escalation command {command_id} successor admission drifted after the origin commit"
+            )
+    if incomplete_origin is None:
+        previous["status"] = "escalated"
+        previous["finished_at"] = now_iso()
+        previous["escalation_reason"] = args.reason
+        previous["escalation_command_id"] = command_id
+        previous["escalation_target_provider"] = target["provider_id"]
+        previous["escalation_target_tier"] = target["tier"]
+        previous["escalation_request"] = _escalation_request_payload(args)
+        previous["escalation_request_fingerprint"] = _escalation_request_fingerprint(
+            previous["escalation_request"]
+        )
+        previous["escalation_prepared_admission"] = prepared_admission
+        previous["escalation_prepared_admission_fingerprint"] = prepared_fingerprint
+        save_task(layout, task)
+        append_event(
+            layout,
+            "task_escalation_requested",
+            task_id=args.task,
+            actor_id=actor_id,
+            from_provider=current_provider,
+            to_provider=target["provider_id"],
+            to_tier=target["tier"],
+            reason=args.reason,
+        )
+        _scheduler_fault("escalation.after_origin_before_successor")
+    command_dispatch(
+        escalation_dispatch_args(
+            dry_run=False,
+            dispatch_command_id=command_id,
+            expected_prepared_admission_fingerprint=prepared_fingerprint,
+        )
     )
-    command_dispatch(escalation_dispatch_args(dry_run=False, dispatch_command_id=command_id))
 
 
 def command_heartbeat(args: Any) -> None:
@@ -3212,9 +4047,41 @@ def command_collect(args: Any) -> None:
     attempt_id = getattr(args, "attempt", None)
     if not attempt_id and actor_id and actor_exists(layout, actor_id):
         attempt_id = load_actor(layout, actor_id).get("attempt_id")
+    attempts = task.get("attempts") or []
+    latest_attempt = attempts[-1] if attempts else None
+    if attempt_id and latest_attempt and attempt_id != latest_attempt.get("attempt_id"):
+        raise SystemExit(
+            f"Stale collect attempt rejected for task {args.task}: {attempt_id}; "
+            f"latest is {latest_attempt.get('attempt_id')}"
+        )
+    if actor_id and latest_attempt and latest_attempt.get("actor_id") not in {None, actor_id}:
+        raise SystemExit(
+            f"Stale collect actor rejected for task {args.task}: {actor_id}; "
+            f"latest is {latest_attempt.get('actor_id')}"
+        )
     report_path = Path(args.report).expanduser().resolve() if args.report else task_dir(layout, args.task) / "completion-report.md"
     if args.state in {"done", "failed", "escalate", "waiting_leader"} and not report_path.is_file():
         raise SystemExit(f"Report file not found: {report_path}")
+    try:
+        resolved_report = report_path.resolve(strict=True)
+        resolved_report.relative_to(task_dir(layout, args.task).resolve())
+        if report_path.is_symlink() or not resolved_report.is_file():
+            raise ValueError("report is not a regular task file")
+        report_bytes = resolved_report.read_bytes()
+        if len(report_bytes) > 1024 * 1024:
+            raise ValueError("report exceeds 1 MiB")
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"Report receipt is invalid: {exc}") from exc
+    if actor_id and actor_exists(layout, actor_id):
+        actor_for_receipt = load_actor(layout, actor_id)
+        runtime_state = (actor_for_receipt.get("runtime") or {}).get("provider_execution_state")
+        if actor_for_receipt.get("status") in {"running", "starting", "needs_recovery"} or runtime_state in {
+            "started",
+            "launch_pending_authorization",
+        }:
+            raise SystemExit("Cannot collect a report while provider execution is active or uncertain")
+    else:
+        runtime_state = None
     task["report_path"] = relpath(report_path, layout.project_dir)
     task["collected_at"] = now_iso()
     if args.summary:
@@ -3226,6 +4093,14 @@ def command_collect(args: Any) -> None:
             if attempt.get("attempt_id") == attempt_id:
                 attempt["status"] = args.state
                 attempt["finished_at"] = attempt.get("finished_at") or now_iso()
+                attempt["report_path"] = relpath(resolved_report, layout.project_dir)
+                attempt["report_sha256"] = hashlib.sha256(report_bytes).hexdigest()
+                attempt["report_size"] = len(report_bytes)
+                attempt["provider_execution_state"] = (
+                    runtime_state
+                    if runtime_state in {"finished", "finished_recovered"}
+                    else "manual_report_collected"
+                )
                 matched = True
                 break
         if not matched:
@@ -3275,28 +4150,97 @@ def command_record_result(args: Any) -> None:
     attempt = next((row for row in attempts if row.get("attempt_id") == requested_attempt), None) if requested_attempt else (attempts[-1] if attempts else None)
     if requested_attempt and attempt is None:
         raise SystemExit(f"Attempt not found for task {args.task}: {requested_attempt}")
+    if attempt is not None and attempts and attempt is not attempts[-1]:
+        raise SystemExit(
+            f"Stale leader result attempt rejected for task {args.task}: "
+            f"{attempt.get('attempt_id')}; latest is {attempts[-1].get('attempt_id')}"
+        )
+    if attempt is None:
+        raise SystemExit(f"Leader result requires a bound provider attempt for task {args.task}")
+    if attempt.get("status") not in {"waiting_leader", "failed", "escalate"}:
+        raise SystemExit(
+            f"Leader result rejected while latest attempt is {attempt.get('status')}; collect a finished report first"
+        )
+    actor_id = args.actor or attempt.get("actor_id") or task.get("agent_id")
+    if not actor_id or attempt.get("actor_id") != actor_id or not actor_exists(layout, str(actor_id)):
+        raise SystemExit("Leader result actor/attempt binding is missing or stale")
+    result_actor = load_actor(layout, str(actor_id))
+    runtime_state = (result_actor.get("runtime") or {}).get("provider_execution_state")
+    if result_actor.get("status") in {"running", "starting", "needs_recovery"} or runtime_state in {
+        "started",
+        "launch_pending_authorization",
+    }:
+        raise SystemExit("Leader result rejected while provider execution is active or uncertain")
+    report_relpath = attempt.get("report_path")
+    report_sha256 = attempt.get("report_sha256")
+    report_size = attempt.get("report_size")
+    if not isinstance(report_relpath, str) or not isinstance(report_sha256, str) or type(report_size) is not int:
+        raise SystemExit("Leader result requires a bound report receipt")
+    try:
+        result_report = (layout.project_dir / report_relpath).resolve(strict=True)
+        result_report.relative_to(task_dir(layout, args.task).resolve())
+        report_payload = result_report.read_bytes()
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"Leader result report receipt is unavailable: {exc}") from exc
+    if len(report_payload) != report_size or hashlib.sha256(report_payload).hexdigest() != report_sha256:
+        raise SystemExit("Leader result report receipt does not match the collected bytes")
     input_tokens = require_non_negative_int(args.input_tokens, "input-tokens")
+    cached_input_tokens = require_non_negative_int(
+        getattr(args, "cached_input_tokens", 0),
+        "cached-input-tokens",
+    )
     output_tokens = require_non_negative_int(args.output_tokens, "output-tokens")
     if attempt:
         input_tokens = input_tokens or int(attempt.get("input_tokens") or 0)
+        cached_input_tokens = cached_input_tokens or int(
+            attempt.get("cached_input_tokens") or 0
+        )
         output_tokens = output_tokens or int(attempt.get("output_tokens") or 0)
-    estimated_cost_cny = require_non_negative_float(args.estimated_cost_cny, "estimated-cost-cny")
+    try:
+        estimated_cost_cny = (
+            None
+            if args.estimated_cost_cny is None
+            else _money_text(args.estimated_cost_cny, "estimated-cost-cny")
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     provider_id = (attempt or {}).get("provider") or task.get("provider")
-    pricing_source = "caller" if estimated_cost_cny is not None else "not_provided"
-    cost_verified = estimated_cost_cny is not None
+    pricing_source = "caller_unverified" if estimated_cost_cny is not None else "not_provided"
+    cost_verified = False
     if estimated_cost_cny is None and attempt and attempt.get("estimated_cost_cny") is not None:
-        estimated_cost_cny = float(attempt["estimated_cost_cny"])
+        estimated_cost_cny = attempt["estimated_cost_cny"]
         pricing_source = str(attempt.get("cost_source") or "attempt_usage")
-        cost_verified = bool(attempt.get("actual_cost_verified"))
+        cost_verified = bool(attempt.get("cost_settled"))
     elif estimated_cost_cny is None and provider_id:
         try:
-            spec = provider_by_id(project_provider_catalog(project), str(provider_id))
-            estimated_cost_cny = estimate_provider_cost(spec, input_tokens=input_tokens, output_tokens=output_tokens)
+            spec, bound_source, price_bound = _attempt_pricing_spec(
+                project,
+                attempt,
+                str(provider_id),
+            )
+            if spec is not None:
+                estimated_units = estimate_provider_cost_units(
+                    spec,
+                    input_tokens=input_tokens,
+                    cached_input_tokens=cached_input_tokens,
+                    output_tokens=output_tokens,
+                )
+                estimated_cost_cny = (
+                    None
+                    if estimated_units is None
+                    else _money_text(
+                        Decimal(estimated_units) / _MONEY_SCALE,
+                        "result estimated cost",
+                    )
+                )
+            pricing_source = bound_source
             if estimated_cost_cny is not None:
-                pricing_source = "provider_catalog"
                 # A zero-token estimate is not proof that a provider request
                 # was free; it commonly means the usage event was missing.
-                cost_verified = input_tokens + output_tokens > 0
+                # Leader-supplied result tokens are useful for reporting, but
+                # they are not a provider final-usage receipt and cannot release
+                # the attempt hold.
+                cost_verified = False
         except RoutingValidationError as exc:
             raise SystemExit(f"Unable to price result: {exc}") from exc
     actor_id = args.actor or (attempt or {}).get("actor_id") or task.get("agent_id")
@@ -3324,8 +4268,9 @@ def command_record_result(args: Any) -> None:
         "accepted_by_leader": bool(args.accepted_by_leader),
         "quality_score": args.quality_score,
         "input_tokens": input_tokens,
+        "cached_input_tokens": cached_input_tokens,
         "output_tokens": output_tokens,
-        "total_tokens": total_tokens(input_tokens, output_tokens),
+        "total_tokens": total_tokens(input_tokens, output_tokens, cached_input_tokens),
         "estimated_cost_cny": estimated_cost_cny,
         "cost_source": pricing_source,
         "summary": compact_text(args.summary) if args.summary else "",
@@ -3339,13 +4284,8 @@ def command_record_result(args: Any) -> None:
         attempt["leader_result_id"] = row["id"]
         attempt["accepted_by_leader"] = row["accepted_by_leader"]
         attempt["quality_score"] = row["quality_score"]
-        if estimated_cost_cny is not None:
-            attempt["actual_cost_cny"] = max(float(attempt.get("actual_cost_cny") or 0.0), estimated_cost_cny)
-        attempt["actual_cost_verified"] = bool(cost_verified)
-        attempt["cost_settled"] = bool(cost_verified)
-        if cost_verified:
-            attempt.pop("cost_settlement_blocked_reason", None)
-        else:
+        attempt["result_estimated_cost_cny"] = estimated_cost_cny
+        if not attempt.get("cost_settled"):
             attempt["cost_settlement_blocked_reason"] = "actual cost is not verified"
         attempt["estimated_cost_cny"] = estimated_cost_cny
         attempt["cost_source"] = pricing_source
@@ -3383,9 +4323,20 @@ def command_record_leader_work(args: Any) -> None:
     if args.risk not in RISKS:
         raise SystemExit(f"Invalid risk: {args.risk}")
     input_tokens = require_non_negative_int(args.input_tokens, "input-tokens")
+    cached_input_tokens = require_non_negative_int(
+        getattr(args, "cached_input_tokens", 0),
+        "cached-input-tokens",
+    )
     output_tokens = require_non_negative_int(args.output_tokens, "output-tokens")
     minutes = require_non_negative_int(args.minutes, "minutes")
-    estimated_cost_cny = require_non_negative_float(args.estimated_cost_cny, "estimated-cost-cny")
+    try:
+        estimated_cost_cny = (
+            None
+            if args.estimated_cost_cny is None
+            else _money_text(args.estimated_cost_cny, "estimated-cost-cny")
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     project = load_project(layout)
     row = {
         "id": new_id("LWK"),
@@ -3403,8 +4354,9 @@ def command_record_leader_work(args: Any) -> None:
         "minutes": minutes,
         "wall_seconds": minutes * 60,
         "input_tokens": input_tokens,
+        "cached_input_tokens": cached_input_tokens,
         "output_tokens": output_tokens,
-        "total_tokens": total_tokens(input_tokens, output_tokens),
+        "total_tokens": total_tokens(input_tokens, output_tokens, cached_input_tokens),
         "estimated_cost_cny": estimated_cost_cny,
         "cost_source": cost_source(estimated_cost_cny),
         "note": args.note or "",
@@ -3427,22 +4379,83 @@ def command_record_usage(args: Any) -> None:
     task_id = args.task or actor.get("task_id")
     if task_id:
         require_task(layout, task_id)
+    if args.task and actor.get("task_id") and str(args.task) != str(actor.get("task_id")):
+        raise SystemExit(
+            f"Usage actor/task binding mismatch: actor {args.actor} belongs to {actor.get('task_id')}, not {args.task}"
+        )
+    attempt_id = getattr(args, "attempt", None) or actor.get("attempt_id")
+    if getattr(args, "attempt", None) and actor.get("attempt_id") != attempt_id:
+        raise SystemExit(
+            f"Usage actor/attempt binding mismatch: actor {args.actor} belongs to {actor.get('attempt_id')}, not {attempt_id}"
+        )
+    bound_attempt: dict[str, Any] | None = None
+    if task_id and attempt_id:
+        bound_task = load_task(layout, task_id)
+        bound_attempt = next(
+            (row for row in bound_task.get("attempts") or [] if row.get("attempt_id") == attempt_id),
+            None,
+        )
+        if bound_attempt is None:
+            raise SystemExit(f"Usage attempt {attempt_id} is not bound to task {task_id}")
+        if bound_attempt.get("actor_id") != args.actor:
+            raise SystemExit(
+                f"Usage actor/attempt binding mismatch: attempt {attempt_id} belongs to {bound_attempt.get('actor_id')}"
+            )
+        for field in ("provider", "tier", "profile", "model"):
+            actor_value = actor.get(field)
+            attempt_value = bound_attempt.get(field)
+            if (actor_value or None) != (attempt_value or None):
+                raise SystemExit(f"Usage {field} binding mismatch for attempt {attempt_id}")
+        if bound_attempt.get("usage_final"):
+            raise SystemExit(f"Usage is already final for attempt {attempt_id}")
     input_tokens = require_non_negative_int(args.input_tokens, "input-tokens")
+    cached_input_tokens = require_non_negative_int(
+        getattr(args, "cached_input_tokens", 0),
+        "cached-input-tokens",
+    )
     output_tokens = require_non_negative_int(args.output_tokens, "output-tokens")
-    estimated_cost_cny = require_non_negative_float(getattr(args, "estimated_cost_cny", None), "estimated-cost-cny")
+    raw_reported_cost = getattr(args, "estimated_cost_cny", None)
+    try:
+        estimated_cost_cny = (
+            None
+            if raw_reported_cost is None
+            else _money_text(raw_reported_cost, "estimated-cost-cny")
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     project = load_project(layout)
-    pricing_source = "caller" if estimated_cost_cny is not None else "not_provided"
-    cost_verified = estimated_cost_cny is not None
+    pricing_source = "caller_unverified" if estimated_cost_cny is not None else "not_provided"
+    cost_verified = False
     if estimated_cost_cny is None and actor.get("provider"):
         try:
-            spec = provider_by_id(project_provider_catalog(project), str(actor.get("provider")))
-            estimated_cost_cny = estimate_provider_cost(spec, input_tokens=input_tokens, output_tokens=output_tokens)
+            spec, bound_source, price_bound = _attempt_pricing_spec(
+                project,
+                bound_attempt,
+                str(actor.get("provider")),
+            )
+            if spec is not None:
+                estimated_units = estimate_provider_cost_units(
+                    spec,
+                    input_tokens=input_tokens,
+                    cached_input_tokens=cached_input_tokens,
+                    output_tokens=output_tokens,
+                )
+                estimated_cost_cny = (
+                    None
+                    if estimated_units is None
+                    else _money_text(
+                        Decimal(estimated_units) / _MONEY_SCALE,
+                        "usage estimated cost",
+                    )
+                )
+            pricing_source = bound_source
             if estimated_cost_cny is not None:
-                pricing_source = "provider_catalog"
-                cost_verified = input_tokens + output_tokens > 0
+                cost_verified = (
+                    price_bound
+                    and input_tokens + cached_input_tokens + output_tokens > 0
+                )
         except RoutingValidationError as exc:
             raise SystemExit(f"Unable to price usage: {exc}") from exc
-    attempt_id = getattr(args, "attempt", None) or actor.get("attempt_id")
     row = {
         "id": new_id("USG"),
         "command_id": command_id,
@@ -3459,8 +4472,9 @@ def command_record_usage(args: Any) -> None:
         "profile": actor.get("profile"),
         "model": args.model or actor.get("model") or "inherit",
         "input_tokens": input_tokens,
+        "cached_input_tokens": cached_input_tokens,
         "output_tokens": output_tokens,
-        "total_tokens": total_tokens(input_tokens, output_tokens),
+        "total_tokens": total_tokens(input_tokens, output_tokens, cached_input_tokens),
         "estimated_cost_cny": estimated_cost_cny,
         "cost_source": pricing_source,
         "final_usage": bool(getattr(args, "final_usage", False)),
@@ -3472,30 +4486,88 @@ def command_record_usage(args: Any) -> None:
         for attempt in task.get("attempts") or []:
             if attempt.get("attempt_id") == attempt_id:
                 attempt["input_tokens"] = int(attempt.get("input_tokens") or 0) + input_tokens
+                attempt["cached_input_tokens"] = int(
+                    attempt.get("cached_input_tokens") or 0
+                ) + cached_input_tokens
                 attempt["output_tokens"] = int(attempt.get("output_tokens") or 0) + output_tokens
                 attempt["total_tokens"] = int(attempt.get("total_tokens") or 0) + row["total_tokens"]
-                if estimated_cost_cny is not None:
-                    attempt["actual_cost_cny"] = round(float(attempt.get("actual_cost_cny") or 0.0) + estimated_cost_cny, 9)
-                    attempt["estimated_cost_cny"] = attempt["actual_cost_cny"]
-                if cost_verified:
-                    attempt["actual_cost_verified"] = True
+                if (
+                    row["total_tokens"] > 0 or raw_reported_cost is not None
+                ) and not cost_verified:
+                    attempt["usage_cost_unverified"] = True
+                authoritative_units: int | None = None
+                authoritative_source = pricing_source
+                provider_id = attempt.get("provider") or actor.get("provider")
+                if provider_id:
+                    try:
+                        cumulative_spec, cumulative_source, cumulative_bound = _attempt_pricing_spec(
+                            project,
+                            attempt,
+                            str(provider_id),
+                        )
+                        if cumulative_spec is not None and cumulative_bound:
+                            authoritative_units = estimate_provider_cost_units(
+                                cumulative_spec,
+                                input_tokens=attempt["input_tokens"],
+                                cached_input_tokens=attempt["cached_input_tokens"],
+                                output_tokens=attempt["output_tokens"],
+                            )
+                            authoritative_source = cumulative_source
+                    except RoutingValidationError as exc:
+                        raise SystemExit(f"Unable to reconcile cumulative usage: {exc}") from exc
+                if authoritative_units is not None:
+                    authoritative_cost = _money_text(
+                        Decimal(authoritative_units) / _MONEY_SCALE,
+                        "cumulative usage cost",
+                    )
+                    attempt["actual_cost_cny"] = authoritative_cost
+                    attempt["estimated_cost_cny"] = authoritative_cost
+                cumulative_verified = bool(
+                    authoritative_units is not None
+                    and attempt["total_tokens"] > 0
+                    and not attempt.get("usage_cost_unverified")
+                )
+                attempt["actual_cost_verified"] = cumulative_verified
                 if bool(getattr(args, "final_usage", False)):
-                    attempt["cost_settled"] = bool(cost_verified)
-                    if cost_verified:
+                    attempt["usage_final"] = True
+                    attempt["cost_settled"] = cumulative_verified
+                    if cumulative_verified:
                         attempt.pop("cost_settlement_blocked_reason", None)
                     else:
-                        attempt["cost_settlement_blocked_reason"] = "final usage did not contain verifiable cost"
-                attempt["cost_source"] = pricing_source
+                        attempt["cost_settlement_blocked_reason"] = (
+                            "final cumulative usage contains unverified tokens or lacks immutable pricing"
+                        )
+                attempt["cost_source"] = authoritative_source
                 break
         save_task(layout, task)
-    actor_usage = actor.setdefault("usage", {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "estimated_cost_cny": 0.0, "unknown_cost_count": 0})
+    actor_usage = actor.setdefault(
+        "usage",
+        {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "estimated_cost_cny": 0.0,
+            "unknown_cost_count": 0,
+        },
+    )
     actor_usage["input_tokens"] = int(actor_usage.get("input_tokens") or 0) + input_tokens
+    actor_usage["cached_input_tokens"] = int(
+        actor_usage.get("cached_input_tokens") or 0
+    ) + cached_input_tokens
     actor_usage["output_tokens"] = int(actor_usage.get("output_tokens") or 0) + output_tokens
     actor_usage["total_tokens"] = int(actor_usage.get("total_tokens") or 0) + row["total_tokens"]
     if estimated_cost_cny is None:
         actor_usage["unknown_cost_count"] = int(actor_usage.get("unknown_cost_count") or 0) + 1
     else:
-        actor_usage["estimated_cost_cny"] = round(float(actor_usage.get("estimated_cost_cny") or 0.0) + estimated_cost_cny, 6)
+        actor_cost_units = _money_units(
+            actor_usage.get("estimated_cost_cny") or 0,
+            "actor accumulated usage cost",
+        ) + _money_units(estimated_cost_cny, "usage row estimated cost")
+        actor_usage["estimated_cost_cny"] = _money_text(
+            Decimal(actor_cost_units) / _MONEY_SCALE,
+            "actor accumulated usage cost",
+        )
     actor["heartbeat_at"] = now_iso()
     save_actor(layout, actor)
     sync_actor_summary(layout, actor)
@@ -3536,14 +4608,455 @@ def usage_rows(layout: ProjectLayout) -> list[dict[str, Any]]:
     return read_jsonl(layout.usage_jsonl)
 
 
-def attempt_budget_commitment(attempt: dict[str, Any]) -> float:
+ROUTE_BUDGET_ENVELOPE_SCHEMA = "costmarshal-route-budget-envelope-v2"
+_MONEY_SCALE = 1_000_000_000
+_MONEY_QUANTUM = Decimal("0.000000001")
+
+
+def _profile_snapshot_relpath(
+    project_id: str,
+    owner_id: str,
+    index: int,
+    profile: str | None,
+) -> str:
+    label = slugify(profile or "default", "profile")
+    return (
+        Path("profile-snapshots")
+        / slugify(project_id, "project")
+        / slugify(owner_id, "owner")
+        / f"{index:02d}-{label}.config.toml"
+    ).as_posix()
+
+
+def _bind_route_step_profiles(
+    layout: ProjectLayout,
+    project: dict[str, Any],
+    owner_id: str,
+    steps: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    catalog = project_provider_catalog(project)
+    bound_steps = json.loads(json.dumps(steps, ensure_ascii=False, allow_nan=False))
+    for index, step in enumerate(bound_steps):
+        provider = provider_by_id(catalog, str(step.get("provider_id") or ""))
+        profile = step.get("profile")
+        snapshot_relpath = _profile_snapshot_relpath(
+            str(project.get("project_id") or "project"),
+            owner_id,
+            index,
+            profile if isinstance(profile, str) else None,
+        )
+        if profile is None:
+            _, binding = synthetic_default_profile(snapshot_relpath=snapshot_relpath)
+        else:
+            material = read_named_profile(
+                str(profile),
+                expected_env_key=provider.get("env_key"),
+                snapshot_relpath=snapshot_relpath,
+            )
+            if material is None:
+                raise ProfileBindingError(
+                    f"provider profile is unavailable at route admission: {profile}"
+                )
+            binding = material[1]
+        step["profile_binding"] = binding
+    return bound_steps
+
+
+def _materialize_step_profile(
+    layout: ProjectLayout,
+    project: dict[str, Any],
+    step: dict[str, Any],
+) -> dict[str, Any]:
+    binding = validate_profile_binding(step.get("profile_binding"))
+    if binding.get("status") != "available":
+        return binding
+    try:
+        verify_profile_snapshot(layout.root, binding)
+        return binding
+    except ProfileBindingError:
+        pass
+    if binding.get("source_kind") == "synthetic-default":
+        payload, current = synthetic_default_profile(
+            snapshot_relpath=str(binding["snapshot_relpath"]),
+        )
+    else:
+        provider = provider_by_id(
+            project_provider_catalog(project),
+            str(step.get("provider_id") or ""),
+        )
+        material = read_named_profile(
+            str(binding.get("logical_name") or ""),
+            expected_env_key=provider.get("env_key"),
+            snapshot_relpath=str(binding["snapshot_relpath"]),
+        )
+        if material is None:
+            raise ProfileBindingError("admitted provider profile disappeared before snapshot commit")
+        payload, current = material
+    if current != binding:
+        raise ProfileBindingError("provider profile changed after route admission; replan explicitly")
+    install_profile_snapshot(layout.root, payload, binding)
+    return binding
+
+
+def _materialize_envelope_profiles(
+    layout: ProjectLayout,
+    project: dict[str, Any],
+    envelope: dict[str, Any],
+) -> None:
+    for step in envelope.get("planned_steps") or []:
+        if step.get("profile_binding") is not None:
+            _materialize_step_profile(layout, project, step)
+
+
+def _budget_money(value: Any, label: str) -> float:
+    return _money_from_units(_money_units(value, label))
+
+
+def _money_decimal(value: Any, label: str) -> Decimal:
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be a finite non-negative number")
+    try:
+        decimal_value = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a finite non-negative number") from exc
+    if not decimal_value.is_finite() or decimal_value < 0:
+        raise ValueError(f"{label} must be a finite non-negative number")
+    try:
+        normalized = decimal_value.quantize(_MONEY_QUANTUM)
+    except InvalidOperation as exc:
+        raise ValueError(f"{label} is outside the supported 9-decimal money range") from exc
+    if normalized != decimal_value:
+        raise ValueError(f"{label} must have at most 9 decimal places")
+    return normalized
+
+
+def _money_units(value: Any, label: str) -> int:
+    return int(_money_decimal(value, label) * _MONEY_SCALE)
+
+
+def _money_text(value: Any, label: str) -> str:
+    normalized = _money_decimal(value, label)
+    rendered = format(normalized, "f").rstrip("0").rstrip(".")
+    return rendered or "0"
+
+
+def _money_from_units(units: int) -> float:
+    return units / _MONEY_SCALE
+
+
+def _acceptance_probability(raw: Any, label: str) -> float:
+    if isinstance(raw, bool):
+        raise ValueError(f"{label} must be a finite probability")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a finite probability") from exc
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise ValueError(f"{label} must be between 0 and 1")
+    return value
+
+
+def _enforce_task_success_floor(
+    layout: ProjectLayout,
+    task: dict[str, Any],
+    candidate_steps: list[dict[str, Any]],
+) -> float | None:
+    """Enforce the frozen SLA across prior attempts and a revised continuation."""
+
+    raw_minimum = task.get("min_success_probability")
+    if raw_minimum is None:
+        return None
+    minimum = _acceptance_probability(
+        raw_minimum,
+        f"task {task.get('id') or '?'} minimum success probability",
+    )
+    survival = 1.0
+    probability_rows: list[tuple[str, Any]] = []
+    for attempt in task.get("attempts") or []:
+        execution_state = attempt.get("provider_execution_state")
+        actor_id = attempt.get("actor_id")
+        if execution_state not in {"finished", "finished_recovered"} and actor_id and actor_exists(layout, str(actor_id)):
+            execution_state = (load_actor(layout, str(actor_id)).get("runtime") or {}).get(
+                "provider_execution_state"
+            )
+        if execution_state not in {"finished", "finished_recovered"}:
+            continue
+        bound_step = attempt.get("route_plan_step")
+        if isinstance(bound_step, dict):
+            prior = bound_step.get("acceptance_prior")
+        else:
+            route = attempt.get("route_decision")
+            prior = route.get("acceptance_prior") if isinstance(route, dict) else None
+        if not isinstance(prior, dict):
+            raise ValueError(
+                f"task {task.get('id') or '?'} cannot prove the success SLA because an existing attempt lacks its acceptance prior"
+            )
+        probability_rows.append(
+            (
+                f"attempt {attempt.get('attempt_id') or attempt.get('attempt') or '?'} acceptance prior",
+                prior.get("conservative_probability"),
+            )
+        )
+    for index, step in enumerate(candidate_steps):
+        prior = step.get("acceptance_prior")
+        if not isinstance(prior, dict):
+            raise ValueError(
+                f"task {task.get('id') or '?'} candidate step {index} lacks its acceptance prior"
+            )
+        probability_rows.append(
+            (
+                f"candidate step {index} acceptance prior",
+                prior.get("conservative_probability"),
+            )
+        )
+    for label, raw_probability in probability_rows:
+        survival *= 1.0 - _acceptance_probability(raw_probability, label)
+    combined = round(1.0 - survival, 9)
+    if combined + 1e-12 < minimum:
+        raise ValueError(
+            f"task {task.get('id') or '?'} revised route success probability {combined} "
+            f"is below its frozen minimum {minimum}"
+        )
+    return combined
+
+
+def validate_route_budget_envelope(task: dict[str, Any]) -> dict[str, Any] | None:
+    """Validate the immutable whole-chain reservation stored on a task."""
+
+    raw = task.get("route_budget_envelope")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope must be an object")
+    expected_fields = {
+        "schema_version",
+        "envelope_id",
+        "plan_fingerprint",
+        "estimated_input_tokens",
+        "estimated_cached_input_tokens",
+        "estimated_output_tokens",
+        "planned_steps",
+        "reserved_cost_cny",
+        "baseline_commitment_cny",
+        "status",
+        "created_at",
+        "released_at",
+        "release_reason",
+    }
+    if set(raw) != expected_fields:
+        raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope has unexpected fields")
+    if raw.get("schema_version") != ROUTE_BUDGET_ENVELOPE_SCHEMA:
+        raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope schema is unsupported")
+    if not isinstance(raw.get("envelope_id"), str) or not raw["envelope_id"].startswith("ENV-"):
+        raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope envelope_id is invalid")
+    status = raw.get("status")
+    if status not in {"active", "released"}:
+        raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope status is invalid")
+    if not isinstance(raw.get("created_at"), str) or not raw["created_at"]:
+        raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope created_at is invalid")
+    if status == "active":
+        if raw.get("released_at") is not None or raw.get("release_reason") is not None:
+            raise ValueError(f"task {task.get('id') or '?'} active route_budget_envelope is marked released")
+    elif not isinstance(raw.get("released_at"), str) or not raw.get("released_at"):
+        raise ValueError(f"task {task.get('id') or '?'} released route_budget_envelope lacks released_at")
+    elif not isinstance(raw.get("release_reason"), str) or not raw.get("release_reason"):
+        raise ValueError(f"task {task.get('id') or '?'} released route_budget_envelope lacks release_reason")
+    token_fields = (
+        "estimated_input_tokens",
+        "estimated_cached_input_tokens",
+        "estimated_output_tokens",
+    )
+    for field in token_fields:
+        if type(raw.get(field)) is not int or raw[field] < 0:
+            raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope {field} is invalid")
+    steps = raw.get("planned_steps")
+    if not isinstance(steps, list) or not steps:
+        raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope planned_steps is invalid")
+    step_cost_units = 0
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict):
+            raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope step {index} is invalid")
+        if step.get("index") != index:
+            raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope steps are not contiguous")
+        if not isinstance(step.get("provider_id"), str) or not step.get("provider_id"):
+            raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope step {index} lacks provider_id")
+        if step.get("tier") not in TIER_RANK:
+            raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope step {index} has invalid tier")
+        if not isinstance(step.get("acceptance_prior"), dict):
+            raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope step {index} lacks acceptance_prior")
+        if not isinstance(step.get("price_basis"), dict):
+            raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope step {index} lacks price_basis")
+        if step.get("profile_binding") is not None:
+            try:
+                validate_profile_binding(step.get("profile_binding"))
+            except ProfileBindingError as exc:
+                raise ValueError(
+                    f"task {task.get('id') or '?'} route_budget_envelope step {index} profile binding is invalid"
+                ) from exc
+        step_cost_units += _money_units(
+            step.get("estimated_cost_cny"),
+            f"task {task.get('id') or '?'} route_budget_envelope step {index} estimated_cost_cny",
+        )
+    reserved_units = _money_units(
+        raw.get("reserved_cost_cny"),
+        f"task {task.get('id') or '?'} route_budget_envelope reserved_cost_cny",
+    )
+    _budget_money(
+        raw.get("baseline_commitment_cny"),
+        f"task {task.get('id') or '?'} route_budget_envelope baseline_commitment_cny",
+    )
+    if reserved_units != step_cost_units:
+        raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope reserve does not equal its planned steps")
+    try:
+        fingerprint = route_plan_fingerprint(
+            steps,
+            input_tokens=raw["estimated_input_tokens"],
+            cached_input_tokens=raw["estimated_cached_input_tokens"],
+            output_tokens=raw["estimated_output_tokens"],
+        )
+    except (RoutingValidationError, TypeError, ValueError) as exc:
+        raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope fingerprint input is invalid") from exc
+    if raw.get("plan_fingerprint") != fingerprint:
+        raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope fingerprint mismatch")
+    return raw
+
+
+def make_route_budget_envelope(
+    layout: ProjectLayout,
+    project: dict[str, Any],
+    task: dict[str, Any],
+    decision: Any,
+    *,
+    baseline_commitment_units: int,
+) -> dict[str, Any] | None:
+    steps = list(decision.planned_steps)
+    if not steps or decision.worst_case_chain_cost_cny is None:
+        return None
+    _enforce_task_success_floor(layout, task, steps)
+    envelope_id = new_id("ENV")
+    try:
+        steps = _bind_route_step_profiles(layout, project, envelope_id, steps)
+    except (ProfileBindingError, RoutingValidationError) as exc:
+        raise ValueError(f"provider profile admission failed: {exc}") from exc
+    plan_fingerprint = route_plan_fingerprint(
+        steps,
+        input_tokens=decision.estimated_input_tokens,
+        cached_input_tokens=decision.estimated_cached_input_tokens,
+        output_tokens=decision.estimated_output_tokens,
+    )
+    reserve_units = sum(
+        _money_units(
+            step.get("estimated_cost_cny"),
+            f"task {task.get('id') or '?'} admitted route step estimated_cost_cny",
+        )
+        for step in steps
+    )
+    reserve = _money_text(
+        Decimal(reserve_units) / _MONEY_SCALE,
+        "route budget envelope reserve",
+    )
+    envelope = {
+        "schema_version": ROUTE_BUDGET_ENVELOPE_SCHEMA,
+        "envelope_id": envelope_id,
+        "plan_fingerprint": plan_fingerprint,
+        "estimated_input_tokens": decision.estimated_input_tokens,
+        "estimated_cached_input_tokens": decision.estimated_cached_input_tokens,
+        "estimated_output_tokens": decision.estimated_output_tokens,
+        "planned_steps": json.loads(json.dumps(steps, ensure_ascii=False, allow_nan=False)),
+        "reserved_cost_cny": reserve,
+        "baseline_commitment_cny": _money_text(
+            Decimal(baseline_commitment_units) / _MONEY_SCALE,
+            "route budget envelope baseline commitment",
+        ),
+        "status": "active",
+        "created_at": now_iso(),
+        "released_at": None,
+        "release_reason": None,
+    }
+    preview = dict(task)
+    preview["route_budget_envelope"] = envelope
+    validate_route_budget_envelope(preview)
+    return envelope
+
+
+def release_route_budget_envelope(task: dict[str, Any], reason: str) -> None:
+    envelope = validate_route_budget_envelope(task)
+    if envelope is None or envelope.get("status") != "active":
+        return
+    envelope["status"] = "released"
+    envelope["released_at"] = now_iso()
+    envelope["release_reason"] = reason
+
+
+def _envelope_step_index(task: dict[str, Any], envelope: dict[str, Any]) -> int:
+    envelope_id = envelope["envelope_id"]
+    indexes: list[int] = []
+    for attempt in task.get("attempts") or []:
+        if attempt.get("route_envelope_id") != envelope_id:
+            continue
+        index = attempt.get("route_plan_step_index")
+        if type(index) is not int or index < 0:
+            raise ValueError(f"task {task.get('id') or '?'} has an invalid route plan step binding")
+        indexes.append(index)
+    if sorted(indexes) != list(range(len(indexes))):
+        raise ValueError(f"task {task.get('id') or '?'} route plan step bindings are not contiguous")
+    return len(indexes)
+
+
+def validate_envelope_dispatch_step(
+    task: dict[str, Any],
+    envelope: dict[str, Any],
+    decision: Any,
+    provider_spec: dict[str, Any],
+) -> tuple[int, dict[str, Any]]:
+    index = _envelope_step_index(task, envelope)
+    steps = envelope["planned_steps"]
+    if index >= len(steps):
+        raise ValueError(f"task {task.get('id') or '?'} route budget envelope has no remaining step")
+    step = steps[index]
+    if decision.provider_id != step.get("provider_id") or decision.tier != step.get("tier"):
+        raise ValueError(
+            f"task {task.get('id') or '?'} route plan requires step {index} "
+            f"{step.get('provider_id')} ({step.get('tier')}), not {decision.provider_id} ({decision.tier})"
+        )
+    current_basis = provider_price_basis(provider_spec)
+    if current_basis != step.get("price_basis"):
+        raise ValueError(
+            f"task {task.get('id') or '?'} route plan price basis drifted before step {index}; replan explicitly"
+        )
+    planned_cost_units = _money_units(
+        step.get("estimated_cost_cny"),
+        f"task {task.get('id') or '?'} route plan step {index} estimated_cost_cny",
+    )
+    current_step = decision.planned_steps[0] if decision.planned_steps else None
+    if current_step is None or _money_units(
+        current_step.get("estimated_cost_cny"),
+        f"task {task.get('id') or '?'} current route estimated_cost_cny",
+    ) != planned_cost_units:
+        raise ValueError(f"task {task.get('id') or '?'} route plan cost drifted before step {index}; replan explicitly")
+    forecast = (
+        decision.estimated_input_tokens,
+        decision.estimated_cached_input_tokens,
+        decision.estimated_output_tokens,
+    )
+    bound_forecast = (
+        envelope["estimated_input_tokens"],
+        envelope["estimated_cached_input_tokens"],
+        envelope["estimated_output_tokens"],
+    )
+    if forecast != bound_forecast:
+        raise ValueError(f"task {task.get('id') or '?'} route plan token forecast drifted; replan explicitly")
+    return index, step
+
+
+def _attempt_budget_commitment_units(attempt: dict[str, Any]) -> int:
     active_or_unsettled = (
         attempt.get("status")
         in {"preparing", "dispatched", "launch_pending", "running", "starting", "needs_recovery"}
         or not attempt.get("cost_settled")
     )
 
-    def amount(field: str, *, required: bool, default: float = 0.0) -> float:
+    def amount_units(field: str, *, required: bool, default: int = 0) -> int:
         raw = attempt.get(field)
         if raw is None:
             if required:
@@ -3551,35 +5064,57 @@ def attempt_budget_commitment(attempt: dict[str, Any]) -> float:
             return default
         if isinstance(raw, bool):
             raise ValueError(f"attempt {attempt.get('attempt_id') or '?'} has invalid {field}")
-        try:
-            value = float(raw)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"attempt {attempt.get('attempt_id') or '?'} has invalid {field}") from exc
-        if not math.isfinite(value) or value < 0:
-            raise ValueError(f"attempt {attempt.get('attempt_id') or '?'} has non-finite or negative {field}")
-        return value
+        return _money_units(
+            raw,
+            f"attempt {attempt.get('attempt_id') or attempt.get('attempt') or '?'} {field}",
+        )
 
-    actual = amount("actual_cost_cny", required=True)
-    reserved = amount("reserved_cost_cny", required=active_or_unsettled)
+    actual_units = amount_units("actual_cost_cny", required=True)
+    reserved_units = amount_units("reserved_cost_cny", required=active_or_unsettled)
     if active_or_unsettled:
-        return actual + max(0.0, reserved - actual)
-    return actual
+        return max(actual_units, reserved_units)
+    return actual_units
+
+
+def attempt_budget_commitment(attempt: dict[str, Any]) -> float:
+    return _money_from_units(_attempt_budget_commitment_units(attempt))
+
+
+def _task_budget_commitment_units(task: dict[str, Any]) -> int:
+    attempt_units = sum(
+        _attempt_budget_commitment_units(attempt)
+        for attempt in task.get("attempts") or []
+    )
+    envelope = validate_route_budget_envelope(task)
+    if envelope is None or envelope.get("status") != "active":
+        return attempt_units
+    next_step = _envelope_step_index(task, envelope)
+    future_units = sum(
+        _money_units(
+            step.get("estimated_cost_cny"),
+            f"task {task.get('id') or '?'} route_budget_envelope future step estimated_cost_cny",
+        )
+        for step in envelope["planned_steps"][next_step:]
+    )
+    return attempt_units + future_units
+
+
+def task_budget_commitment(task: dict[str, Any]) -> float:
+    return _money_from_units(_task_budget_commitment_units(task))
+
+
+def _project_budget_commitment_units(layout: ProjectLayout) -> int:
+    return sum(_task_budget_commitment_units(task) for task in task_rows(layout))
 
 
 def project_budget_commitment(layout: ProjectLayout) -> float:
-    return round(
-        sum(
-            attempt_budget_commitment(attempt)
-            for task in task_rows(layout)
-            for attempt in task.get("attempts") or []
-        ),
-        9,
-    )
+    return _money_from_units(_project_budget_commitment_units(layout))
 
 
 def empty_token_bucket() -> dict[str, Any]:
     return {
         "input_tokens": 0,
+        "cached_input_tokens": 0,
         "output_tokens": 0,
         "total_tokens": 0,
         "estimated_cost_cny": 0.0,
@@ -3593,6 +5128,9 @@ def empty_token_bucket() -> dict[str, Any]:
 
 def add_token_values(bucket: dict[str, Any], row: dict[str, Any], *, source: str) -> None:
     bucket["input_tokens"] = int(bucket.get("input_tokens") or 0) + int(row.get("input_tokens") or 0)
+    bucket["cached_input_tokens"] = int(
+        bucket.get("cached_input_tokens") or 0
+    ) + int(row.get("cached_input_tokens") or 0)
     bucket["output_tokens"] = int(bucket.get("output_tokens") or 0) + int(row.get("output_tokens") or 0)
     bucket["total_tokens"] = int(bucket.get("total_tokens") or 0) + int(row.get("total_tokens") or 0)
     if row.get("estimated_cost_cny") is None:
@@ -3609,6 +5147,9 @@ def add_token_values(bucket: dict[str, Any], row: dict[str, Any], *, source: str
 
 def add_token_bucket(bucket: dict[str, Any], source_bucket: dict[str, Any]) -> None:
     bucket["input_tokens"] = int(bucket.get("input_tokens") or 0) + int(source_bucket.get("input_tokens") or 0)
+    bucket["cached_input_tokens"] = int(
+        bucket.get("cached_input_tokens") or 0
+    ) + int(source_bucket.get("cached_input_tokens") or 0)
     bucket["output_tokens"] = int(bucket.get("output_tokens") or 0) + int(source_bucket.get("output_tokens") or 0)
     bucket["total_tokens"] = int(bucket.get("total_tokens") or 0) + int(source_bucket.get("total_tokens") or 0)
     bucket["estimated_cost_cny"] = round(float(bucket.get("estimated_cost_cny") or 0.0) + float(source_bucket.get("estimated_cost_cny") or 0.0), 6)
@@ -3662,6 +5203,7 @@ def summarize_results(rows: list[dict[str, Any]]) -> dict[str, Any]:
     by_status: dict[str, int] = {}
     by_agent: dict[str, dict[str, Any]] = {}
     input_tokens = 0
+    cached_input_tokens = 0
     output_tokens = 0
     total_token_count = 0
     estimated_cost_cny = 0.0
@@ -3685,6 +5227,7 @@ def summarize_results(rows: list[dict[str, Any]]) -> dict[str, Any]:
             quality_total += quality
             quality_count += 1
         input_tokens += int(row.get("input_tokens") or 0)
+        cached_input_tokens += int(row.get("cached_input_tokens") or 0)
         output_tokens += int(row.get("output_tokens") or 0)
         total_token_count += int(row.get("total_tokens") or 0)
         if row.get("estimated_cost_cny") is None:
@@ -3704,6 +5247,7 @@ def summarize_results(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "by_status": by_status,
         "by_agent": by_agent,
         "input_tokens": input_tokens,
+        "cached_input_tokens": cached_input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_token_count,
         "estimated_cost_cny": round(estimated_cost_cny, 6),
@@ -3715,6 +5259,7 @@ def summarize_results(rows: list[dict[str, Any]]) -> dict[str, Any]:
 def summarize_leader_self_work(rows: list[dict[str, Any]]) -> dict[str, Any]:
     total_minutes = 0
     input_tokens = 0
+    cached_input_tokens = 0
     output_tokens = 0
     total_token_count = 0
     estimated_cost_cny = 0.0
@@ -3724,6 +5269,7 @@ def summarize_leader_self_work(rows: list[dict[str, Any]]) -> dict[str, Any]:
     for row in rows:
         total_minutes += int(row.get("minutes") or 0)
         input_tokens += int(row.get("input_tokens") or 0)
+        cached_input_tokens += int(row.get("cached_input_tokens") or 0)
         output_tokens += int(row.get("output_tokens") or 0)
         total_token_count += int(row.get("total_tokens") or 0)
         if row.get("estimated_cost_cny") is None:
@@ -3739,6 +5285,7 @@ def summarize_leader_self_work(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "total_minutes": total_minutes,
         "total_wall_seconds": total_minutes * 60,
         "input_tokens": input_tokens,
+        "cached_input_tokens": cached_input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_token_count,
         "estimated_cost_cny": round(estimated_cost_cny, 6),
@@ -3751,6 +5298,7 @@ def summarize_leader_self_work(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 def summarize_usage(rows: list[dict[str, Any]]) -> dict[str, Any]:
     input_tokens = 0
+    cached_input_tokens = 0
     output_tokens = 0
     total_token_count = 0
     estimated_cost_cny = 0.0
@@ -3758,14 +5306,27 @@ def summarize_usage(rows: list[dict[str, Any]]) -> dict[str, Any]:
     by_actor: dict[str, dict[str, Any]] = {}
     for row in rows:
         input_value = int(row.get("input_tokens") or 0)
+        cached_input_value = int(row.get("cached_input_tokens") or 0)
         output_value = int(row.get("output_tokens") or 0)
         total_value = int(row.get("total_tokens") or 0)
         input_tokens += input_value
+        cached_input_tokens += cached_input_value
         output_tokens += output_value
         total_token_count += total_value
         actor_id = row.get("actor_id") or "unknown"
-        bucket = by_actor.setdefault(actor_id, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "estimated_cost_cny": 0.0, "unknown_cost_count": 0})
+        bucket = by_actor.setdefault(
+            actor_id,
+            {
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "estimated_cost_cny": 0.0,
+                "unknown_cost_count": 0,
+            },
+        )
         bucket["input_tokens"] += input_value
+        bucket["cached_input_tokens"] += cached_input_value
         bucket["output_tokens"] += output_value
         bucket["total_tokens"] += total_value
         if row.get("estimated_cost_cny") is None:
@@ -3778,6 +5339,7 @@ def summarize_usage(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "count": len(rows),
         "input_tokens": input_tokens,
+        "cached_input_tokens": cached_input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_token_count,
         "estimated_cost_cny": round(estimated_cost_cny, 6),
@@ -3801,6 +5363,7 @@ def task_rows(layout: ProjectLayout) -> list[dict[str, Any]]:
                 "profile": task.get("profile"),
                 "model": task.get("model"),
                 "attempts": task.get("attempts") or [],
+                "route_budget_envelope": task.get("route_budget_envelope"),
                 "report_path": task.get("report_path"),
                 "summary": task.get("summary"),
                 "leader_result": task.get("leader_result"),
@@ -3942,8 +5505,8 @@ def render_dashboard(payload: dict[str, Any]) -> str:
         [
             "",
             "## Agent Token Totals",
-            "| Agent Actor | Agent | Input | Output | Total | Cost CNY | Source |",
-            "| --- | --- | ---: | ---: | ---: | ---: | --- |",
+            "| Agent Actor | Agent | Input | Cached Input | Output | Total | Cost CNY | Source |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
         ]
     )
     agent_rows = [row for row in payload["processes"] if row.get("role") == "agent"]
@@ -3951,10 +5514,10 @@ def render_dashboard(payload: dict[str, Any]) -> str:
         for row in agent_rows:
             tokens = row.get("token_usage") or empty_token_bucket()
             lines.append(
-                f"| {row.get('id')} | {row.get('agent_name') or row.get('id')} | {tokens.get('input_tokens', 0)} | {tokens.get('output_tokens', 0)} | {tokens.get('total_tokens', 0)} | {tokens.get('estimated_cost_cny', 0.0)} | {tokens.get('source') or 'none'} |"
+                f"| {row.get('id')} | {row.get('agent_name') or row.get('id')} | {tokens.get('input_tokens', 0)} | {tokens.get('cached_input_tokens', 0)} | {tokens.get('output_tokens', 0)} | {tokens.get('total_tokens', 0)} | {tokens.get('estimated_cost_cny', 0.0)} | {tokens.get('source') or 'none'} |"
             )
     else:
-        lines.append("| - | - | 0 | 0 | 0 | 0.0 | none |")
+        lines.append("| - | - | 0 | 0 | 0 | 0 | 0.0 | none |")
     results = payload["result_summary"]
     usage = payload["usage_summary"]
     lines.extend(
@@ -4045,7 +5608,7 @@ def command_status(args: Any) -> None:
             f"- Records: {results['count']}",
             f"- Accepted by leader: {results['accepted']} (rate {results['accept_rate']})",
             f"- Avg quality: {results['avg_quality']}",
-            f"- Tokens: in {results['input_tokens']} / out {results['output_tokens']} / total {results['total_tokens']}",
+            f"- Tokens: in {results['input_tokens']} / cached {results['cached_input_tokens']} / out {results['output_tokens']} / total {results['total_tokens']}",
             f"- Est. cost CNY: {results['estimated_cost_cny']} (unknown {results['unknown_cost_count']})",
         ]
     )
@@ -4061,7 +5624,7 @@ def command_status(args: Any) -> None:
             "",
             "## Actor Usage Ledger",
             f"- Records: {usage['count']}",
-            f"- Tokens: in {usage['input_tokens']} / out {usage['output_tokens']} / total {usage['total_tokens']}",
+            f"- Tokens: in {usage['input_tokens']} / cached {usage['cached_input_tokens']} / out {usage['output_tokens']} / total {usage['total_tokens']}",
             f"- Est. cost CNY: {usage['estimated_cost_cny']} (unknown {usage['unknown_cost_count']})",
         ]
     )
@@ -4072,7 +5635,7 @@ def command_status(args: Any) -> None:
             "## Leader Self-Work",
             f"- Records: {leader_work['count']}",
             f"- Minutes: {leader_work['total_minutes']}",
-            f"- Tokens: in {leader_work['input_tokens']} / out {leader_work['output_tokens']} / total {leader_work['total_tokens']}",
+            f"- Tokens: in {leader_work['input_tokens']} / cached {leader_work['cached_input_tokens']} / out {leader_work['output_tokens']} / total {leader_work['total_tokens']}",
             f"- Est. cost CNY: {leader_work['estimated_cost_cny']} (unknown {leader_work['unknown_cost_count']})",
         ]
     )
@@ -4100,20 +5663,16 @@ def command_recover(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
     project = load_project(layout)
     governance = project.get("governance") or {"mode": "off"}
-    if governance.get("mode") == "required" or governance.get("ready"):
-        try:
-            validation = validate_governance_binding(
-                governance.get("binding"),
-                project.get("workspace"),
-                mode="required",
-                wrapper_path=governance.get("wrapper_path"),
-            )
-        except GovernanceError as exc:
-            raise SystemExit(
-                f"ArchMarshal governance gate blocked recovery [{exc.code}]: {exc}"
-            ) from exc
-        if not validation.get("valid"):
-            raise SystemExit("ArchMarshal governance gate blocked recovery: binding is not valid")
+    try:
+        enforce_governance_contract(
+            governance,
+            project.get("workspace"),
+            operation="recovery",
+        )
+    except GovernanceError as exc:
+        raise SystemExit(
+            f"ArchMarshal governance gate blocked recovery [{exc.code}]: {exc}"
+        ) from exc
     ensure_runtime_dirs(layout)
     session = load_session(layout)
     backend = backend_from_session(session)
@@ -4334,13 +5893,45 @@ def read_rows_for_validation(path: Path, label: str, issues: list[str]) -> list[
 def validate_non_negative_number(value: Any, label: str, issues: list[str], *, allow_none: bool = False) -> None:
     if value is None and allow_none:
         return
+    if isinstance(value, bool):
+        issues.append(f"{label} must be numeric")
+        return
     try:
         numeric = float(value)
     except (TypeError, ValueError):
         issues.append(f"{label} must be numeric")
         return
+    if not math.isfinite(numeric):
+        issues.append(f"{label} must be finite")
+        return
     if numeric < 0:
         issues.append(f"{label} must be non-negative")
+
+
+def validate_non_negative_integer(value: Any, label: str, issues: list[str]) -> bool:
+    if type(value) is not int or value < 0:
+        issues.append(f"{label} must be a non-negative integer")
+        return False
+    return True
+
+
+def validate_token_triplet(row: dict[str, Any], label: str, issues: list[str]) -> None:
+    input_value = row.get("input_tokens")
+    cached_value = row.get("cached_input_tokens", 0)
+    output_value = row.get("output_tokens")
+    total_value = row.get("total_tokens")
+    valid = all(
+        (
+            validate_non_negative_integer(input_value, f"{label} input_tokens", issues),
+            validate_non_negative_integer(cached_value, f"{label} cached_input_tokens", issues),
+            validate_non_negative_integer(output_value, f"{label} output_tokens", issues),
+            validate_non_negative_integer(total_value, f"{label} total_tokens", issues),
+        )
+    )
+    if valid and total_value != input_value + cached_value + output_value:
+        issues.append(
+            f"{label} total_tokens must equal input_tokens + cached_input_tokens + output_tokens"
+        )
 
 
 def validate_layout(layout: ProjectLayout) -> list[str]:
@@ -4427,13 +6018,88 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
                 continue
             if paths_conflict(claim.get("path", ""), other.get("path", "")):
                 issues.append(f"active claim conflict: {claim.get('path')} ({claim.get('task_id')}) overlaps {other.get('path')} ({other.get('task_id')})")
-    for task in task_rows(layout):
+    for task_json in sorted(layout.tasks_dir.glob("*/task.json")):
+        task = read_json(task_json, {})
         if task.get("agent_id") and task["agent_id"] not in actor_ids:
             issues.append(f"{task['id']} references missing actor {task['agent_id']}")
         if task.get("status") == "done":
             leader_result = task.get("leader_result") or {}
             if leader_result.get("status") != "done" or leader_result.get("accepted_by_leader") is not True:
                 issues.append(f"{task['id']} is done without an accepted leader result")
+        validate_non_negative_integer(
+            task.get("estimated_input_tokens", 0),
+            f"{task['id']} estimated_input_tokens",
+            issues,
+        )
+        validate_non_negative_integer(
+            task.get("estimated_cached_input_tokens", 0),
+            f"{task['id']} estimated_cached_input_tokens",
+            issues,
+        )
+        validate_non_negative_integer(
+            task.get("estimated_output_tokens", 0),
+            f"{task['id']} estimated_output_tokens",
+            issues,
+        )
+        envelope_by_id: dict[str, dict[str, Any]] = {}
+        current_envelope: dict[str, Any] | None = None
+        try:
+            current_envelope = validate_route_budget_envelope(task)
+            if current_envelope is not None:
+                envelope_by_id[str(current_envelope["envelope_id"])] = current_envelope
+            if (
+                current_envelope is not None
+                or task.get("max_cost_cny") is not None
+                or (project.get("routing_policy") or {}).get("project_budget_cny") is not None
+            ):
+                task_budget_commitment(task)
+        except ValueError as exc:
+            issues.append(f"{task['id']} has invalid route budget envelope: {exc}")
+        envelope_history = task.get("route_budget_envelope_history") or []
+        if not isinstance(envelope_history, list):
+            issues.append(f"{task['id']} route_budget_envelope_history must be a list")
+            envelope_history = []
+        for envelope_index, historical_envelope in enumerate(envelope_history):
+            preview_task = {
+                "id": task.get("id"),
+                "route_budget_envelope": historical_envelope,
+            }
+            try:
+                validated_history = validate_route_budget_envelope(preview_task)
+                if validated_history is None or validated_history.get("status") != "released":
+                    raise ValueError("historical route budget envelope must be released")
+                envelope_id = str(validated_history["envelope_id"])
+                if envelope_id in envelope_by_id:
+                    raise ValueError(f"duplicate envelope_id {envelope_id}")
+                envelope_by_id[envelope_id] = validated_history
+            except ValueError as exc:
+                issues.append(
+                    f"{task['id']} route_budget_envelope_history[{envelope_index}] is invalid: {exc}"
+                )
+        if current_envelope is not None and current_envelope.get("status") == "active" and catalog is not None:
+            try:
+                next_step = _envelope_step_index(task, current_envelope)
+                required_capabilities = set(task.get("required_capabilities") or [])
+                for step in current_envelope["planned_steps"][next_step:]:
+                    profile_binding = validate_profile_binding(
+                        step.get("profile_binding"),
+                        require_available=True,
+                    )
+                    verify_profile_snapshot(layout.root, profile_binding)
+                    current_provider = provider_by_id(catalog, str(step.get("provider_id") or ""))
+                    if not current_provider.get("enabled"):
+                        raise ValueError(f"future provider {current_provider['provider_id']} is disabled")
+                    if not required_capabilities.issubset(set(current_provider.get("capabilities") or [])):
+                        raise ValueError(f"future provider {current_provider['provider_id']} lost required capabilities")
+                    if provider_price_basis(current_provider) != step.get("price_basis"):
+                        raise ValueError(f"future provider {current_provider['provider_id']} price basis drifted")
+                    pricing_state = pricing_snapshot_status(current_provider)
+                    if pricing_state not in {"current", "beta-legacy"}:
+                        raise ValueError(
+                            f"future provider {current_provider['provider_id']} pricing is {pricing_state}"
+                        )
+            except (ProfileBindingError, RoutingValidationError, ValueError) as exc:
+                issues.append(f"{task['id']} active route budget envelope is not executable: {exc}")
         try:
             normalized_claims = list(normalize_path_list(task.get("claimed_paths") or [], kind="claim"))
             normalized_allowed = list(normalize_path_list(task.get("allowed_paths") or [], kind="allowed"))
@@ -4452,6 +6118,55 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
             if attempt_id in attempt_ids:
                 issues.append(f"{task['id']} has duplicate attempt_id {attempt_id}")
             attempt_ids.add(attempt_id)
+            envelope_id = attempt.get("route_envelope_id")
+            plan_fingerprint = attempt.get("route_plan_fingerprint")
+            if envelope_id is not None or plan_fingerprint is not None:
+                bound_envelope = envelope_by_id.get(str(envelope_id))
+                step_index = attempt.get("route_plan_step_index")
+                if bound_envelope is None:
+                    issues.append(f"{task['id']} attempt {attempt_id} references an unknown route plan")
+                elif plan_fingerprint != bound_envelope.get("plan_fingerprint"):
+                    issues.append(f"{task['id']} attempt {attempt_id} route plan fingerprint mismatch")
+                elif type(step_index) is not int or not 0 <= step_index < len(bound_envelope["planned_steps"]):
+                    issues.append(f"{task['id']} attempt {attempt_id} has invalid route plan step index")
+                else:
+                    planned_step = bound_envelope["planned_steps"][step_index]
+                    if attempt.get("route_plan_step") != planned_step:
+                        issues.append(f"{task['id']} attempt {attempt_id} route plan step binding mismatch")
+                    if attempt.get("provider") != planned_step.get("provider_id"):
+                        issues.append(f"{task['id']} attempt {attempt_id} route plan provider mismatch")
+                    if (attempt.get("model") or "inherit") != (planned_step.get("model") or "inherit"):
+                        issues.append(f"{task['id']} attempt {attempt_id} route plan model mismatch")
+                    if attempt.get("profile") != planned_step.get("profile"):
+                        issues.append(f"{task['id']} attempt {attempt_id} route plan profile mismatch")
+                    if (
+                        planned_step.get("profile_binding") is not None
+                        and attempt.get("profile_binding") != planned_step.get("profile_binding")
+                    ):
+                        issues.append(f"{task['id']} attempt {attempt_id} route plan profile binding mismatch")
+            if attempt.get("profile_binding") is None and attempt.get("status") in {
+                "preparing",
+                "dispatched",
+                "launch_pending",
+                "starting",
+                "running",
+                "needs_recovery",
+            }:
+                issues.append(f"{task['id']} active attempt {attempt_id} is missing its profile binding")
+            if attempt.get("profile_binding") is not None:
+                try:
+                    binding = validate_profile_binding(attempt.get("profile_binding"))
+                    if binding.get("status") == "available":
+                        verify_profile_snapshot(layout.root, binding)
+                except ProfileBindingError as exc:
+                    issues.append(
+                        f"{task['id']} attempt {attempt_id} profile binding is invalid: {exc}"
+                    )
+                actor_id = attempt.get("actor_id")
+                if actor_id and actor_exists(layout, str(actor_id)):
+                    actor_data = load_actor(layout, str(actor_id))
+                    if actor_data.get("profile_binding") != attempt.get("profile_binding"):
+                        issues.append(f"{task['id']} attempt {attempt_id} actor profile binding mismatch")
             if catalog is not None:
                 try:
                     spec = provider_by_id(catalog, str(attempt.get("provider") or ""))
@@ -4459,6 +6174,21 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
                         issues.append(f"{task['id']} attempt {attempt_id} tier/provider mismatch")
                 except RoutingValidationError as exc:
                     issues.append(f"{task['id']} attempt {attempt_id} has invalid provider: {exc}")
+            provider_id = str(attempt.get("provider") or "")
+            if provider_id:
+                try:
+                    pricing_spec, _, _ = _attempt_pricing_spec(project, attempt, provider_id)
+                    if pricing_spec is not None:
+                        estimate_provider_cost(
+                            pricing_spec,
+                            input_tokens=0,
+                            cached_input_tokens=0,
+                            output_tokens=0,
+                        )
+                except RoutingValidationError as exc:
+                    issues.append(
+                        f"{task['id']} attempt {attempt_id} has invalid price binding: {exc}"
+                    )
         task_path = task_dir(layout, task["id"])
         for rel in ["task.json", "brief.md", "status.json", "completion-report.md"]:
             if not (task_path / rel).exists():
@@ -4489,9 +6219,7 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
         quality = row.get("quality_score")
         if type(quality) is not int or quality not in {1, 2, 3, 4, 5}:
             issues.append(f"{label} quality_score must be 1-5")
-        validate_non_negative_number(row.get("input_tokens"), f"{label} input_tokens", issues)
-        validate_non_negative_number(row.get("output_tokens"), f"{label} output_tokens", issues)
-        validate_non_negative_number(row.get("total_tokens"), f"{label} total_tokens", issues)
+        validate_token_triplet(row, label, issues)
         validate_non_negative_number(row.get("estimated_cost_cny"), f"{label} estimated_cost_cny", issues, allow_none=True)
     leader_work_rows_to_validate = read_rows_for_validation(layout.leader_work_jsonl, "leader-work.jsonl", issues)
     for index, row in enumerate(leader_work_rows_to_validate, start=1):
@@ -4509,10 +6237,8 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
             issues.append(f"{label} scope is required")
         if not row.get("reason"):
             issues.append(f"{label} reason is required")
-        validate_non_negative_number(row.get("minutes"), f"{label} minutes", issues)
-        validate_non_negative_number(row.get("input_tokens"), f"{label} input_tokens", issues)
-        validate_non_negative_number(row.get("output_tokens"), f"{label} output_tokens", issues)
-        validate_non_negative_number(row.get("total_tokens"), f"{label} total_tokens", issues)
+        validate_non_negative_integer(row.get("minutes"), f"{label} minutes", issues)
+        validate_token_triplet(row, label, issues)
         validate_non_negative_number(row.get("estimated_cost_cny"), f"{label} estimated_cost_cny", issues, allow_none=True)
     usage_rows_to_validate = read_rows_for_validation(layout.usage_jsonl, "usage.jsonl", issues)
     for index, row in enumerate(usage_rows_to_validate, start=1):
@@ -4525,9 +6251,7 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
         task_id = row.get("task_id")
         if task_id and task_id not in task_ids:
             issues.append(f"{label} references missing task {task_id}")
-        validate_non_negative_number(row.get("input_tokens"), f"{label} input_tokens", issues)
-        validate_non_negative_number(row.get("output_tokens"), f"{label} output_tokens", issues)
-        validate_non_negative_number(row.get("total_tokens"), f"{label} total_tokens", issues)
+        validate_token_triplet(row, label, issues)
         validate_non_negative_number(row.get("estimated_cost_cny"), f"{label} estimated_cost_cny", issues, allow_none=True)
     store = control_store_status(layout)
     if store.get("status") == "invalid":
@@ -4627,23 +6351,16 @@ def _validate_governance_preflight(layout: ProjectLayout, *, operation: str) -> 
         raise GovernancePreflightBlocked(
             f"ArchMarshal governance gate blocked {operation}: governance state is invalid"
         )
-    if governance.get("mode") != "required" and not governance.get("ready"):
-        return
     try:
-        validation = validate_governance_binding(
-            governance.get("binding"),
+        enforce_governance_contract(
+            governance,
             project.get("workspace"),
-            mode="required",
-            wrapper_path=governance.get("wrapper_path"),
+            operation=operation,
         )
     except GovernanceError as exc:
         raise GovernancePreflightBlocked(
             f"ArchMarshal governance gate blocked {operation} [{exc.code}]: {exc}"
         ) from exc
-    if not validation.get("valid"):
-        raise GovernancePreflightBlocked(
-            f"ArchMarshal governance gate blocked {operation}: binding is not valid"
-        )
 
 
 def _command_requires_governance_preflight(function: Any, args: Any) -> bool:

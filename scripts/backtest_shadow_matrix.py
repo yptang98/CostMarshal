@@ -319,12 +319,16 @@ def recompute_policy_chains(
         blockers.append(f"{label}.task must be an object")
         return None
     input_tokens = entry.get("input_tokens")
+    cached_input_tokens = entry.get("cached_input_tokens", 0)
     output_tokens = entry.get("output_tokens")
     if type(input_tokens) is not int or input_tokens < 0:
         blockers.append(f"{label}.input_tokens must be a non-negative integer")
         return None
     if type(output_tokens) is not int or output_tokens < 0:
         blockers.append(f"{label}.output_tokens must be a non-negative integer")
+        return None
+    if type(cached_input_tokens) is not int or cached_input_tokens < 0:
+        blockers.append(f"{label}.cached_input_tokens must be a non-negative integer")
         return None
     route_now = entry.get("now")
     parsed_route_now = parse_time(route_now, f"{label}.now", blockers)
@@ -343,15 +347,19 @@ def recompute_policy_chains(
             context["catalog"],
             history=context["history"],
             input_tokens=input_tokens,
+            cached_input_tokens=cached_input_tokens,
             output_tokens=output_tokens,
             now=route_now,
             **candidate_request,
         )
+        baseline_task = dict(routing_task)
+        baseline_task.pop("min_success_probability", None)
         baseline = decide_route(
-            routing_task,
+            baseline_task,
             context["catalog"],
             history=context["history"],
             input_tokens=input_tokens,
+            cached_input_tokens=cached_input_tokens,
             output_tokens=output_tokens,
             now=route_now,
             **baseline_request,

@@ -41,6 +41,12 @@ def cli(temp: Path, *args: str) -> dict:
 
 
 def write_wrapper(path: Path) -> None:
+    assert path.name == "run_archmarshal.py"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.with_name("invoke_archmarshal.py").write_text(
+        "# fake canonical invoke wrapper\n",
+        encoding="utf-8",
+    )
     path.write_text(
         textwrap.dedent(
             f"""\
@@ -55,13 +61,14 @@ def write_wrapper(path: Path) -> None:
                     "mode": "ready",
                     "verified": True,
                     "engine_api": "archmarshal-engine-api-v1",
-                    "engine_version": "0.14.0",
+                    "engine_version": "0.15.0",
                     "source_tree_sha256": "{SOURCE_HASH}",
                 }}))
                 raise SystemExit(0)
             if len(arguments) == 2 and arguments[0] == "doctor":
                 print(json.dumps({{
                     "api_version": "archmarshal-cli-v1",
+                    "payload_schema_version": "archmarshal-doctor-v1",
                     "mode": "read_only",
                     "source_mutation": False,
                     "workspace_root": str(Path(arguments[1]).resolve()),
@@ -146,7 +153,7 @@ def main() -> int:
         head.parent.mkdir(parents=True)
         marker.write_bytes(ownership_bytes("workspace-original"))
         head.write_text(SKILL_HEAD + "\n", encoding="ascii")
-        wrapper = temp / "invoke_archmarshal.py"
+        wrapper = temp / "run_archmarshal.py"
         write_wrapper(wrapper)
 
         initialized = cli(
@@ -162,7 +169,7 @@ def main() -> int:
             "local",
             "--governance",
             "auto",
-            "--archmarshal-wrapper",
+            "--archmarshal-launcher",
             str(wrapper),
             "--allow-unsafe-native-workers",
         )
@@ -291,7 +298,7 @@ def main() -> int:
         assert blocked.returncode != 0, "direct actor entry accepted stale governance"
         error = blocked.stdout + blocked.stderr
         assert "governance gate blocked actor launch" in error.lower(), error
-        assert "forbid unsafe-native provider launch" in error, error
+        assert "governance_binding_drift" in error, error
         assert not provider_counter.exists(), "stale governance reached the native provider"
         assert after == before, "governance failure mutated the CostMarshal project"
 
@@ -406,7 +413,7 @@ def main() -> int:
         barrier_error = barrier_stdout + barrier_stderr
         assert barrier_process.returncode != 0, "post-Popen governance drift reached provider"
         assert "governance gate blocked actor launch" in barrier_error.lower(), barrier_error
-        assert "forbid unsafe-native provider launch" in barrier_error, barrier_error
+        assert "governance_binding_drift" in barrier_error, barrier_error
         assert not provider_counter.exists(), "governance drift delivered the provider prompt"
         blocked_actor = json.loads(actor_path.read_text(encoding="utf-8"))
         blocked_task = json.loads(

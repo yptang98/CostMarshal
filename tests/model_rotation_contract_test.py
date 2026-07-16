@@ -82,6 +82,24 @@ print(json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 11, 'outpu
         profile_text = (profile_home / "longcat.config.toml").read_text(encoding="utf-8")
         assert 'env_key = "LONGCAT_API_KEY"' in profile_text
         assert "experimental_bearer_token" not in profile_text
+        run_json(
+            temp,
+            env,
+            "configure-provider",
+            "--codex-home",
+            str(profile_home),
+            "--profile",
+            "deepseek",
+            "--provider-id",
+            "deepseek",
+            "--base-url",
+            "https://api.deepseek.example/v1",
+            "--model",
+            "deepseek-test",
+            "--env-key",
+            "DEEPSEEK_API_KEY",
+        )
+        env["CODEX_HOME"] = str(profile_home)
 
         init = run_json(
             temp,
@@ -122,8 +140,16 @@ print(json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 11, 'outpu
             logs = list((project / "transcripts").glob("*.log"))
             detail = "\n".join(path.read_text(encoding="utf-8", errors="replace") for path in logs)
             raise AssertionError(f"timed out waiting for actor process\n{detail}") from exc
-        run_json(temp, env, "run-scheduler", "--project", str(project), "--once")
-        wait_until(lambda: fake_log.is_file() and len(fake_log.read_text(encoding="utf-8").splitlines()) >= 2)
+        first_scheduler = run_json(temp, env, "run-scheduler", "--project", str(project), "--once")
+        try:
+            wait_until(lambda: fake_log.is_file() and len(fake_log.read_text(encoding="utf-8").splitlines()) >= 2)
+        except AssertionError as exc:
+            logs = list((project / "transcripts").glob("*.log"))
+            detail = "\n".join(path.read_text(encoding="utf-8", errors="replace") for path in logs)
+            task_detail = (project / "tasks" / "V2-0001" / "task.json").read_text(encoding="utf-8")
+            raise AssertionError(
+                f"timed out waiting for medium actor\nscheduler={first_scheduler}\n{detail}\n{task_detail}"
+            ) from exc
         run_json(temp, env, "run-scheduler", "--project", str(project), "--once")
         wait_until(lambda: fake_log.is_file() and len(fake_log.read_text(encoding="utf-8").splitlines()) >= 3)
         run_json(temp, env, "run-scheduler", "--project", str(project), "--once")

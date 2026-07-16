@@ -15,11 +15,14 @@ import hashlib
 import json
 import math
 import re
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from itertools import product
 from typing import Any, Iterable, Mapping, Sequence
 
 
 CATALOG_SCHEMA_VERSION = 1
+ROUTE_PLAN_SCHEMA_VERSION = "costmarshal-route-plan-v1"
+MAX_ENABLED_PROVIDERS_PER_TIER = 16
 TIERS = ("low", "medium", "high")
 TIER_RANK = {tier: index for index, tier in enumerate(TIERS)}
 RISKS = {"low", "medium", "high"}
@@ -43,6 +46,7 @@ MEDIUM_TIER_TASK_TYPES = {
 }
 
 _PROVIDER_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+_PROFILE_ID = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,62}[A-Za-z0-9])?")
 _PROVIDER_FIELDS = {
     "provider_id",
     "tier",
@@ -87,10 +91,10 @@ class PricingSnapshot:
     expires_at: str
     snapshot_id: str
     snapshot_hash: str
-    input_per_1m: float
-    cached_input_per_1m: float | None
-    output_per_1m: float
-    fixed_request: float
+    input_per_1m: str | float
+    cached_input_per_1m: str | float | None
+    output_per_1m: str | float
+    fixed_request: str | float
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -120,10 +124,16 @@ class RouteDecision:
     tier_floor: str
     requested_provider_id: str | None
     requested_tier: str | None
+    estimated_input_tokens: int
+    estimated_cached_input_tokens: int
+    estimated_output_tokens: int
     estimated_cost_cny: float | None
     acceptance_prior: AcceptancePrior
     candidate_provider_ids: tuple[str, ...]
     planned_provider_ids: tuple[str, ...]
+    planned_steps: tuple[dict[str, Any], ...]
+    worst_case_chain_cost_cny: float | None
+    plan_fingerprint: str
     expected_chain_cost_cny: float | None
     expected_success_probability: float | None
     expected_cost_per_accepted_cny: float | None
@@ -138,6 +148,7 @@ class RouteDecision:
         payload = asdict(self)
         payload["candidate_provider_ids"] = list(self.candidate_provider_ids)
         payload["planned_provider_ids"] = list(self.planned_provider_ids)
+        payload["planned_steps"] = deepcopy(list(self.planned_steps))
         payload["price_snapshot"] = self.price_snapshot.to_dict() if self.price_snapshot else None
         return payload
 
@@ -270,18 +281,23 @@ def _normalize_pricing_snapshot(
         raise RoutingValidationError(f"{label}.effective_at must be earlier than expires_at")
     if reviewed_dt >= expires_dt:
         raise RoutingValidationError(f"{label}.reviewed_at must be earlier than expires_at")
-    input_price = _require_plain_number(raw.get("input_per_1m"), f"{label}.input_per_1m")
-    output_price = _require_plain_number(raw.get("output_per_1m"), f"{label}.output_per_1m")
-    cached_price = _require_plain_number(
-        raw.get("cached_input_per_1m"),
-        f"{label}.cached_input_per_1m",
-        allow_none=True,
+    input_price = _decimal_money_text(
+        _money_decimal(raw.get("input_per_1m"), f"{label}.input_per_1m")
     )
-    fixed_request = _require_plain_number(
-        raw.get("fixed_request", 0.0),
-        f"{label}.fixed_request",
+    output_price = _decimal_money_text(
+        _money_decimal(raw.get("output_per_1m"), f"{label}.output_per_1m")
     )
-    assert input_price is not None and output_price is not None and fixed_request is not None
+    raw_cached_price = raw.get("cached_input_per_1m")
+    cached_price = (
+        None
+        if raw_cached_price is None
+        else _decimal_money_text(
+            _money_decimal(raw_cached_price, f"{label}.cached_input_per_1m")
+        )
+    )
+    fixed_request = _decimal_money_text(
+        _money_decimal(raw.get("fixed_request", 0), f"{label}.fixed_request")
+    )
     normalized = {
         "currency": currency,
         "source": source.strip(),
@@ -297,12 +313,25 @@ def _normalize_pricing_snapshot(
     computed_hash = "sha256:" + hashlib.sha256(
         json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     ).hexdigest()
+    legacy_normalized = {
+        **normalized,
+        "input_per_1m": float(input_price),
+        "cached_input_per_1m": None if cached_price is None else float(cached_price),
+        "output_per_1m": float(output_price),
+        "fixed_request": float(fixed_request),
+    }
+    legacy_hash = "sha256:" + hashlib.sha256(
+        json.dumps(legacy_normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
     supplied_hash = raw.get("snapshot_hash")
     if require_hash:
         if not isinstance(supplied_hash, str) or not _SNAPSHOT_HASH.fullmatch(supplied_hash):
             raise RoutingValidationError(f"{label}.snapshot_hash must be sha256:<64 lowercase hex characters>")
-        if supplied_hash != computed_hash:
+        if supplied_hash not in {computed_hash, legacy_hash}:
             raise RoutingValidationError(f"{label}.snapshot_hash does not match the canonical snapshot")
+        if supplied_hash == legacy_hash and supplied_hash != computed_hash:
+            legacy_normalized["snapshot_hash"] = legacy_hash
+            return legacy_normalized
     normalized["snapshot_hash"] = computed_hash
     return normalized
 
@@ -325,6 +354,86 @@ def _snapshot_from_provider(provider: Mapping[str, Any]) -> PricingSnapshot | No
         return None
     normalized = _normalize_pricing_snapshot(raw, "provider.pricing", require_hash=True)
     return PricingSnapshot(**normalized)
+
+
+def provider_price_basis(provider: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the deterministic price identity used by an executable route step.
+
+    Canonical snapshots retain their complete hash-bound payload. Beta legacy
+    rates remain explicitly labelled and are included only for compatibility;
+    they are not upgraded to reviewed pricing by this representation.
+    """
+
+    snapshot = _snapshot_from_provider(provider)
+    if snapshot is not None:
+        return {"kind": "canonical", "snapshot": snapshot.to_dict()}
+    input_price = provider.get("input_cny_per_1m")
+    output_price = provider.get("output_cny_per_1m")
+    if input_price is not None and output_price is not None:
+        try:
+            normalized_input = _decimal_money_text(
+                _money_decimal(input_price, "provider.input_cny_per_1m")
+            )
+            normalized_output = _decimal_money_text(
+                _money_decimal(output_price, "provider.output_cny_per_1m")
+            )
+        except RoutingValidationError:
+            return {"kind": "unpriced"}
+        return {
+            "kind": "beta-legacy",
+            "currency": "CNY",
+            "input_per_1m": normalized_input,
+            "output_per_1m": normalized_output,
+        }
+    return {"kind": "unpriced"}
+
+
+def route_plan_fingerprint(
+    planned_steps: Sequence[Mapping[str, Any]],
+    *,
+    input_tokens: int,
+    cached_input_tokens: int,
+    output_tokens: int,
+) -> str:
+    """Hash the complete route plan and its three-dimensional token forecast."""
+
+    _require_token_count(input_tokens, "input_tokens")
+    _require_token_count(cached_input_tokens, "cached_input_tokens")
+    _require_token_count(output_tokens, "output_tokens")
+    payload = {
+        "schema_version": ROUTE_PLAN_SCHEMA_VERSION,
+        "estimated_input_tokens": input_tokens,
+        "estimated_cached_input_tokens": cached_input_tokens,
+        "estimated_output_tokens": output_tokens,
+        "planned_steps": deepcopy(list(planned_steps)),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _route_plan_step(
+    provider: Mapping[str, Any],
+    prior: AcceptancePrior,
+    cost: Decimal | None,
+    *,
+    index: int,
+) -> dict[str, Any]:
+    return {
+        "index": index,
+        "provider_id": str(provider["provider_id"]),
+        "tier": str(provider["tier"]),
+        "profile": provider.get("profile"),
+        "model": provider.get("model"),
+        "estimated_cost_cny": None if cost is None else _decimal_money_text(cost),
+        "acceptance_prior": prior.to_dict(),
+        "price_basis": provider_price_basis(provider),
+    }
 
 
 def pricing_snapshot_status(
@@ -402,8 +511,10 @@ def validate_provider_catalog(catalog: Mapping[str, Any]) -> dict[str, Any]:
         profile = raw.get("profile")
         model = raw.get("model")
         env_key = raw.get("env_key")
-        if profile is not None and (not isinstance(profile, str) or not profile.strip()):
-            raise RoutingValidationError(f"{label}.profile must be null or a non-empty string")
+        if profile is not None and (
+            not isinstance(profile, str) or not _PROFILE_ID.fullmatch(profile)
+        ):
+            raise RoutingValidationError(f"{label}.profile must be null or a safe identifier")
         if model is not None and (not isinstance(model, str) or not model.strip()):
             raise RoutingValidationError(f"{label}.model must be null or a non-empty string")
         if env_key is not None and (
@@ -430,15 +541,19 @@ def validate_provider_catalog(catalog: Mapping[str, Any]) -> dict[str, Any]:
         input_price = None
         output_price = None
         if pricing is None:
-            input_price = _require_plain_number(
-                raw.get("input_cny_per_1m"),
-                f"{label}.input_cny_per_1m",
-                allow_none=True,
+            input_price = (
+                None
+                if raw.get("input_cny_per_1m") is None
+                else _decimal_money_text(
+                    _money_decimal(raw.get("input_cny_per_1m"), f"{label}.input_cny_per_1m")
+                )
             )
-            output_price = _require_plain_number(
-                raw.get("output_cny_per_1m"),
-                f"{label}.output_cny_per_1m",
-                allow_none=True,
+            output_price = (
+                None
+                if raw.get("output_cny_per_1m") is None
+                else _decimal_money_text(
+                    _money_decimal(raw.get("output_cny_per_1m"), f"{label}.output_cny_per_1m")
+                )
             )
         capabilities = raw.get("capabilities", [])
         if not isinstance(capabilities, list) or any(
@@ -543,18 +658,46 @@ def provider_by_id(catalog: Mapping[str, Any], provider_id: str) -> dict[str, An
     raise RoutingValidationError(f"unknown provider_id: {provider_id}")
 
 
-def estimate_cost_cny(
+_NANO_CNY = 1_000_000_000
+_NANO_QUANTUM = Decimal("0.000000001")
+
+
+def _money_decimal(value: Any, label: str) -> Decimal:
+    if isinstance(value, bool):
+        raise RoutingValidationError(f"{label} must be a finite non-negative number")
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise RoutingValidationError(f"{label} must be a finite non-negative number") from exc
+    if not result.is_finite() or result < 0:
+        raise RoutingValidationError(f"{label} must be a finite non-negative number")
+    try:
+        normalized = result.quantize(_NANO_QUANTUM)
+    except InvalidOperation as exc:
+        raise RoutingValidationError(f"{label} is outside the supported nano-CNY range") from exc
+    if normalized != result:
+        raise RoutingValidationError(f"{label} must have at most 9 decimal places")
+    return normalized
+
+
+def _decimal_money_text(value: Decimal) -> str:
+    rendered = format(value.quantize(_NANO_QUANTUM), "f").rstrip("0").rstrip(".")
+    return rendered or "0"
+
+
+def estimate_cost_nano_cny(
     provider: Mapping[str, Any],
     *,
     input_tokens: int,
     output_tokens: int,
     cached_input_tokens: int = 0,
-) -> float | None:
-    """Estimate cost from canonical or beta legacy CNY prices.
+) -> int | None:
+    """Return the conservative exact integer nano-CNY provider estimate.
 
     Canonical snapshots support ordinary input, cached input, output, and a
     fixed per-request fee. Unknown required dimensions yield ``None`` rather
-    than a misleading partial estimate.
+    than a misleading partial estimate. Fractional nano-CNY usage rounds up so
+    a route reservation can never understate the reviewed quote.
     """
 
     input_count = _require_token_count(input_tokens, "input_tokens")
@@ -572,31 +715,56 @@ def estimate_cost_cny(
         cached_price = snapshot["cached_input_per_1m"]
         if cached_count and cached_price is None:
             return None
-        cost = (
-            input_count * float(snapshot["input_per_1m"])
-            + cached_count * float(cached_price or 0.0)
-            + output_count * float(snapshot["output_per_1m"])
-        ) / 1_000_000
-        return round(cost + float(snapshot["fixed_request"]), 9)
-    input_price = _require_plain_number(
-        provider.get("input_cny_per_1m"), "provider.input_cny_per_1m", allow_none=True
-    )
-    output_price = _require_plain_number(
-        provider.get("output_cny_per_1m"), "provider.output_cny_per_1m", allow_none=True
-    )
-    if input_price is None or output_price is None:
+        variable_numerator = (
+            input_count * int(_money_decimal(snapshot["input_per_1m"], "pricing.input_per_1m") * _NANO_CNY)
+            + cached_count * int(_money_decimal(cached_price or 0, "pricing.cached_input_per_1m") * _NANO_CNY)
+            + output_count * int(_money_decimal(snapshot["output_per_1m"], "pricing.output_per_1m") * _NANO_CNY)
+        )
+        variable_units = (variable_numerator + 1_000_000 - 1) // 1_000_000
+        fixed_units = int(
+            _money_decimal(snapshot["fixed_request"], "pricing.fixed_request") * _NANO_CNY
+        )
+        return fixed_units + variable_units
+    raw_input_price = provider.get("input_cny_per_1m")
+    raw_output_price = provider.get("output_cny_per_1m")
+    if raw_input_price is None or raw_output_price is None:
         return None
+    input_price = _money_decimal(raw_input_price, "provider.input_cny_per_1m")
+    output_price = _money_decimal(raw_output_price, "provider.output_cny_per_1m")
     if cached_count:
         raise RoutingValidationError(
             "beta legacy pricing does not support cached_input_tokens; use a canonical pricing snapshot"
         )
-    return round((input_count * input_price + output_count * output_price) / 1_000_000, 9)
+    variable_numerator = (
+        input_count * int(input_price * _NANO_CNY)
+        + output_count * int(output_price * _NANO_CNY)
+    )
+    return (variable_numerator + 1_000_000 - 1) // 1_000_000
+
+
+def estimate_cost_cny(
+    provider: Mapping[str, Any],
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    cached_input_tokens: int = 0,
+) -> float | None:
+    """Display form of :func:`estimate_cost_nano_cny`; ledgers use its integer result."""
+
+    units = estimate_cost_nano_cny(
+        provider,
+        input_tokens=input_tokens,
+        cached_input_tokens=cached_input_tokens,
+        output_tokens=output_tokens,
+    )
+    return None if units is None else units / _NANO_CNY
 
 
 def _economic_pricing_gate(
     providers: Sequence[Mapping[str, Any]],
     *,
     now: datetime | str | None,
+    require_cached_input: bool = False,
 ) -> tuple[bool, str, str | None]:
     """Return whether providers share usable, current CNY pricing.
 
@@ -610,6 +778,8 @@ def _economic_pricing_gate(
     if not any(snapshot_modes):
         statuses = [pricing_snapshot_status(provider, now=now) for provider in providers]
         if all(status == "beta-legacy" for status in statuses):
+            if require_cached_input:
+                return False, "cached-input-unsupported:beta-legacy", "CNY"
             return True, "beta-legacy", "CNY"
         return False, "missing", None
     if not all(snapshot_modes):
@@ -625,6 +795,11 @@ def _economic_pricing_gate(
     statuses = [pricing_snapshot_status(provider, now=now) for provider in providers]
     if not all(status == "current" for status in statuses):
         return False, "+".join(sorted(set(statuses))), currency
+    if require_cached_input and any(
+        snapshot is not None and snapshot.cached_input_per_1m is None
+        for snapshot in snapshots
+    ):
+        return False, "cached-input-price-missing", currency
     return True, "current", currency
 
 
@@ -741,9 +916,10 @@ def _rank_candidates(
     difficulty: str,
     input_tokens: int,
     output_tokens: int,
+    cached_input_tokens: int = 0,
     allow_costs: bool = True,
-) -> list[tuple[dict[str, Any], AcceptancePrior, float | None]]:
-    rows: list[tuple[dict[str, Any], AcceptancePrior, float | None]] = []
+) -> list[tuple[dict[str, Any], AcceptancePrior, Decimal | None]]:
+    rows: list[tuple[dict[str, Any], AcceptancePrior, Decimal | None]] = []
     history_rows = list(history or [])
     for provider in providers:
         prior = leader_acceptance_prior(
@@ -752,11 +928,17 @@ def _rank_candidates(
             task_type=task_type,
             difficulty=difficulty,
         )
-        cost = (
-            estimate_cost_cny(provider, input_tokens=input_tokens, output_tokens=output_tokens)
+        cost_units = (
+            estimate_cost_nano_cny(
+                provider,
+                input_tokens=input_tokens,
+                cached_input_tokens=cached_input_tokens,
+                output_tokens=output_tokens,
+            )
             if allow_costs
             else None
         )
+        cost = None if cost_units is None else Decimal(cost_units) / _NANO_CNY
         rows.append((provider, prior, cost))
     rows.sort(
         key=lambda item: (
@@ -779,6 +961,7 @@ def _auto_chain_plans(
     difficulty: str,
     input_tokens: int,
     output_tokens: int,
+    cached_input_tokens: int = 0,
 ) -> list[dict[str, Any]]:
     """Enumerate start-provider chains and price expected accepted outcomes."""
 
@@ -793,27 +976,35 @@ def _auto_chain_plans(
             task_type=task_type,
             difficulty=difficulty,
         )
+        start_cost_units = estimate_cost_nano_cny(
+            start,
+            input_tokens=input_tokens,
+            cached_input_tokens=cached_input_tokens,
+            output_tokens=output_tokens,
+        )
         start_row = (
             start,
             start_prior,
-            estimate_cost_cny(start, input_tokens=input_tokens, output_tokens=output_tokens),
+            None if start_cost_units is None else Decimal(start_cost_units) / _NANO_CNY,
         )
-        stronger_groups: list[list[tuple[dict[str, Any], AcceptancePrior, float | None]]] = []
+        stronger_groups: list[list[tuple[dict[str, Any], AcceptancePrior, Decimal | None] | None]] = []
         for tier in TIERS[TIER_RANK[start["tier"]] + 1 :]:
             peers = [provider for provider in enabled if provider["tier"] == tier]
             if peers:
                 stronger_groups.append(
-                    _rank_candidates(
+                    [None, *_rank_candidates(
                         peers,
                         history=history_rows,
                         task_type=task_type,
                         difficulty=difficulty,
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
-                    )
+                        cached_input_tokens=cached_input_tokens,
+                    )]
                 )
         combinations = product(*stronger_groups) if stronger_groups else [()]
-        for continuation in combinations:
+        for optional_continuation in combinations:
+            continuation = [row for row in optional_continuation if row is not None]
             chain = [start_row, *continuation]
             if any(cost is None for _, _, cost in chain):
                 continue
@@ -821,17 +1012,25 @@ def _auto_chain_plans(
             expected_cost = 0.0
             for _, prior, cost in chain:
                 assert cost is not None
-                expected_cost += survival * cost
+                expected_cost += survival * float(cost)
                 survival *= 1.0 - prior.conservative_probability
             success_probability = 1.0 - survival
             if success_probability <= 0:
                 continue
+            planned_steps = tuple(
+                _route_plan_step(item_provider, item_prior, item_cost, index=index)
+                for index, (item_provider, item_prior, item_cost) in enumerate(chain)
+            )
             plans.append(
                 {
                     "provider": start,
                     "prior": start_prior,
                     "cost": chain[0][2],
                     "chain": tuple(item[0]["provider_id"] for item in chain),
+                    "steps": planned_steps,
+                    "worst_case_cost": float(
+                        sum((item[2] for item in chain if item[2] is not None), Decimal(0))
+                    ),
                     "expected_cost": round(expected_cost, 9),
                     "success_probability": round(success_probability, 9),
                     "objective": round(expected_cost / success_probability, 9),
@@ -856,6 +1055,7 @@ def decide_route(
     requested_tier: str | None = None,
     history: Iterable[Mapping[str, Any]] | None = None,
     input_tokens: int = 0,
+    cached_input_tokens: int = 0,
     output_tokens: int = 0,
     now: datetime | str | None = None,
 ) -> RouteDecision:
@@ -865,6 +1065,7 @@ def decide_route(
     normalized = validate_provider_catalog(catalog)
     floor = auto_tier_floor(values)
     _require_token_count(input_tokens, "input_tokens")
+    _require_token_count(cached_input_tokens, "cached_input_tokens")
     _require_token_count(output_tokens, "output_tokens")
     if requested_tier == "auto":
         requested_tier = None
@@ -880,6 +1081,21 @@ def decide_route(
     if not enabled:
         detail = f" with capabilities {sorted(required_capabilities)}" if required_capabilities else ""
         raise RoutingValidationError(f"provider_catalog has no enabled providers{detail}")
+    enabled_counts = {
+        tier: sum(provider["tier"] == tier for provider in enabled)
+        for tier in TIERS
+    }
+    oversized_tiers = {
+        tier: count
+        for tier, count in enabled_counts.items()
+        if count > MAX_ENABLED_PROVIDERS_PER_TIER
+    }
+    if oversized_tiers:
+        detail = ", ".join(f"{tier}={count}" for tier, count in sorted(oversized_tiers.items()))
+        raise RoutingValidationError(
+            f"too many enabled capability-compatible providers for bounded route optimization ({detail}); "
+            f"maximum per tier is {MAX_ENABLED_PROVIDERS_PER_TIER}"
+        )
 
     if requested_provider_id is not None:
         matches = [row for row in enabled if row["provider_id"] == requested_provider_id]
@@ -936,10 +1152,12 @@ def decide_route(
     optimization_pricing_ready, optimization_pricing_status, optimization_pricing_currency = _economic_pricing_gate(
         pricing_scope,
         now=now,
+        require_cached_input=cached_input_tokens > 0,
     )
     candidate_pricing_ready, candidate_pricing_status, candidate_pricing_currency = _economic_pricing_gate(
         candidates,
         now=now,
+        require_cached_input=cached_input_tokens > 0,
     )
     uses_canonical_pricing = any(provider.get("pricing") is not None for provider in pricing_scope)
     selection_pricing_ready = (
@@ -961,11 +1179,14 @@ def decide_route(
         difficulty=values["difficulty"],
         input_tokens=input_tokens,
         output_tokens=output_tokens,
+        cached_input_tokens=cached_input_tokens,
         allow_costs=selection_pricing_ready,
     )
     provider, prior, cost = ranked[0]
     candidate_ids = tuple(item[0]["provider_id"] for item in ranked)
     planned_provider_ids = (provider["provider_id"],)
+    planned_steps: tuple[dict[str, Any], ...] = ()
+    worst_case_chain_cost: float | None = None
     expected_chain_cost = None
     expected_success = None
     expected_cost_per_accepted = None
@@ -973,7 +1194,7 @@ def decide_route(
     economics_ready = (
         requested_provider_id is None
         and requested_tier is None
-        and input_tokens + output_tokens > 0
+        and input_tokens + cached_input_tokens + output_tokens > 0
         and optimization_pricing_ready
     )
     if values.get("min_success_probability") is not None and not economics_ready:
@@ -990,6 +1211,7 @@ def decide_route(
             difficulty=values["difficulty"],
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cached_input_tokens=cached_input_tokens,
         )
         if plans:
             minimum_success = values.get("min_success_probability")
@@ -1003,8 +1225,12 @@ def decide_route(
             provider = best["provider"]
             prior = best["prior"]
             cost = best["cost"]
-            candidate_ids = tuple(plan["provider"]["provider_id"] for plan in plans)
+            candidate_ids = tuple(
+                dict.fromkeys(plan["provider"]["provider_id"] for plan in plans)
+            )
             planned_provider_ids = best["chain"]
+            planned_steps = best["steps"]
+            worst_case_chain_cost = best["worst_case_cost"]
             expected_chain_cost = best["expected_cost"]
             expected_success = best["success_probability"]
             expected_cost_per_accepted = best["objective"]
@@ -1013,13 +1239,28 @@ def decide_route(
                 f"cost-performance optimization selected {provider['provider_id']} as the first "
                 f"step of chain {' -> '.join(planned_provider_ids)}"
             )
+            if minimum_success is None:
+                reason += (
+                    "; no success-probability floor is configured, so multi-provider "
+                    "collaboration is permitted but not required"
+                )
     if not selection_pricing_ready:
         cost = None
         reason = f"{reason}; economic pricing gate degraded to safe-tier routing ({pricing_status})"
     elif not optimization_pricing_ready and requested_provider_id is None and requested_tier is None:
         reason = f"{reason}; cross-tier optimization unavailable ({optimization_pricing_status})"
+    if not planned_steps:
+        planned_steps = (_route_plan_step(provider, prior, cost, index=0),)
+        worst_case_chain_cost = None if cost is None else float(cost)
+    plan_fingerprint = route_plan_fingerprint(
+        planned_steps,
+        input_tokens=input_tokens,
+        cached_input_tokens=cached_input_tokens,
+        output_tokens=output_tokens,
+    )
     selected_snapshot = _snapshot_from_provider(provider) if selection_pricing_ready else None
-    cost_text = f"estimated cost CNY {cost}" if cost is not None else "cost unknown"
+    cost_value = None if cost is None else float(cost)
+    cost_text = f"estimated cost CNY {cost_value}" if cost_value is not None else "cost unknown"
     objective_text = (
         f", expected chain cost CNY {expected_chain_cost}, expected success {expected_success}, "
         f"expected cost per accepted result CNY {expected_cost_per_accepted}"
@@ -1030,7 +1271,10 @@ def decide_route(
         f"Tier floor {floor} from risk={values['risk']}, difficulty={values['difficulty']}, "
         f"task_type={values['task_type']}; {reason}; chose {provider['provider_id']} "
         f"({provider['tier']}) from [{', '.join(candidate_ids)}], {cost_text}, "
-        f"conservative leader-acceptance prior {prior.conservative_probability}{objective_text}."
+        "estimated tokens ordinary-input/cached-input/output "
+        f"{input_tokens}/{cached_input_tokens}/{output_tokens}, conservative leader-acceptance "
+        f"prior {prior.conservative_probability}, worst-case chain cost CNY "
+        f"{worst_case_chain_cost}{objective_text}."
     )
     return RouteDecision(
         provider_id=provider["provider_id"],
@@ -1040,10 +1284,16 @@ def decide_route(
         tier_floor=floor,
         requested_provider_id=requested_provider_id,
         requested_tier=requested_tier,
-        estimated_cost_cny=cost,
+        estimated_input_tokens=input_tokens,
+        estimated_cached_input_tokens=cached_input_tokens,
+        estimated_output_tokens=output_tokens,
+        estimated_cost_cny=cost_value,
         acceptance_prior=prior,
         candidate_provider_ids=candidate_ids,
         planned_provider_ids=planned_provider_ids,
+        planned_steps=planned_steps,
+        worst_case_chain_cost_cny=worst_case_chain_cost,
+        plan_fingerprint=plan_fingerprint,
         expected_chain_cost_cny=expected_chain_cost,
         expected_success_probability=expected_success,
         expected_cost_per_accepted_cny=expected_cost_per_accepted,
@@ -1066,6 +1316,7 @@ def next_stronger_provider(
     task_type: str = "analysis",
     difficulty: str = "normal",
     input_tokens: int = 0,
+    cached_input_tokens: int = 0,
     output_tokens: int = 0,
     now: datetime | str | None = None,
 ) -> dict[str, Any] | None:
@@ -1086,6 +1337,9 @@ def next_stronger_provider(
         )
     if not isinstance(task_type, str) or not task_type.strip():
         raise RoutingValidationError("task_type must be a non-empty string")
+    _require_token_count(input_tokens, "input_tokens")
+    _require_token_count(cached_input_tokens, "cached_input_tokens")
+    _require_token_count(output_tokens, "output_tokens")
     if isinstance(required_capabilities, (str, bytes)):
         raise RoutingValidationError("required_capabilities must be a sequence of strings")
     capabilities: set[str] = set()
@@ -1103,6 +1357,7 @@ def next_stronger_provider(
         pricing_ready, pricing_status, pricing_currency = _economic_pricing_gate(
             [provider],
             now=now,
+            require_cached_input=cached_input_tokens > 0,
         )
         ranked = _rank_candidates(
             [provider],
@@ -1111,19 +1366,41 @@ def next_stronger_provider(
             difficulty=difficulty,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cached_input_tokens=cached_input_tokens,
             allow_costs=pricing_ready,
         )
         chosen, prior, cost = ranked[0]
         snapshot = _snapshot_from_provider(chosen) if pricing_ready else None
         return {
             **deepcopy(chosen),
-            "estimated_cost_cny": cost,
+            "estimated_cost_cny": None if cost is None else float(cost),
             "acceptance_prior": prior.to_dict(),
             "pricing_status": pricing_status,
             "pricing_currency": pricing_currency,
             "price_snapshot": snapshot.to_dict() if snapshot else None,
             "reason": reason,
         }
+
+    if preferred_provider_ids:
+        preferred = [str(provider_id) for provider_id in preferred_provider_ids]
+        try:
+            current_index = preferred.index(current_provider_id)
+        except ValueError:
+            current_index = -1
+        if current_index >= 0 and current_index < len(preferred) - 1:
+            planned_next_id = preferred[current_index + 1]
+            planned_next = next(
+                (provider for provider in enabled if provider["provider_id"] == planned_next_id),
+                None,
+            )
+            if (
+                planned_next is not None
+                and TIER_RANK[planned_next["tier"]] > TIER_RANK[current["tier"]]
+            ):
+                return selected(
+                    planned_next,
+                    f"continued reviewed cost-performance chain after {current_provider_id}",
+                )
 
     for tier in TIERS[TIER_RANK[current["tier"]] + 1 :]:
         candidates = [provider for provider in enabled if provider["tier"] == tier]
@@ -1146,6 +1423,7 @@ def next_stronger_provider(
             pricing_ready, pricing_status, pricing_currency = _economic_pricing_gate(
                 candidates,
                 now=now,
+                require_cached_input=cached_input_tokens > 0,
             )
             ranked = _rank_candidates(
                 candidates,
@@ -1154,6 +1432,7 @@ def next_stronger_provider(
                 difficulty=difficulty,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
+                cached_input_tokens=cached_input_tokens,
                 allow_costs=pricing_ready,
             )
             provider, _, _ = ranked[0]

@@ -21,7 +21,7 @@ CLI = ROOT / "scripts" / "costmarshal.py"
 sys.path.insert(0, str(ROOT))
 
 from costmarshal_v2.control_store import control_transaction, effect_status  # noqa: E402
-from costmarshal_v2.locking import scheduler_instance_lock  # noqa: E402
+from costmarshal_v2.locking import scheduler_daemon_lock  # noqa: E402
 from costmarshal_v2.paths import resolve_project  # noqa: E402
 from costmarshal_v2.session_backend import pid_is_alive  # noqa: E402
 from costmarshal_v2.state import load_actor  # noqa: E402
@@ -619,7 +619,9 @@ def main() -> int:
         daemon_release = threading.Event()
 
         def hold_daemon_lock() -> None:
-            with scheduler_instance_lock(slow_layout, timeout_seconds=5):
+            # Model a daemon sleeping for an arbitrarily long poll interval.
+            # Its lifetime lock must not block the short runtime-effect mutex.
+            with scheduler_daemon_lock(slow_layout, timeout_seconds=5):
                 daemon_acquired.set()
                 daemon_release.wait(10)
 
@@ -637,11 +639,21 @@ def main() -> int:
             "--reason",
             "existing daemon owns drainer",
             "--command-id",
-            "CMD-DAEMON-DEFERRED-STOP",
+            "CMD-DAEMON-LONG-INTERVAL-STOP",
         )
-        assert daemon_stop["runtime"]["status"] == "queued"
-        assert daemon_stop["runtime"]["drain_deferred"] is True
-        assert daemon_stop["runtime"]["effect_status"] == "pending"
+        assert daemon_stop["runtime"]["status"] == "applied"
+        assert daemon_stop["runtime"]["drain_deferred"] is False
+        assert daemon_stop["runtime"]["effect_status"] == "applied"
+        assert effect_status(slow_layout, daemon_stop["runtime"]["effect_id"])["status"] == "applied"
+        assert daemon_thread.is_alive(), "the sleeping daemon must still own its lifetime lock"
+        with sqlite3.connect(slow_project / "scheduler" / "state.db") as connection:
+            assert connection.execute(
+                "SELECT status, attempts FROM effects WHERE effect_id=?",
+                (daemon_stop["runtime"]["effect_id"],),
+            ).fetchone() == ("applied", 1)
+            assert connection.execute(
+                "SELECT status FROM commands WHERE command_id='CMD-DAEMON-LONG-INTERVAL-STOP'"
+            ).fetchone()[0] == "completed"
         daemon_release.set()
         daemon_thread.join(5)
         assert not daemon_thread.is_alive()
@@ -650,7 +662,7 @@ def main() -> int:
             limit=1,
             _governance_prevalidated=True,
         )
-        assert daemon_cycle["processed"][0]["effect_id"] == daemon_stop["runtime"]["effect_id"]
+        assert daemon_cycle["processed"] == []
         assert effect_status(slow_layout, daemon_stop["runtime"]["effect_id"])["status"] == "applied"
 
         emergency_workspace = temp / "emergency-workspace"
@@ -892,7 +904,7 @@ def main() -> int:
                         "corrupt_project_emergency_stop_only",
                         "governance_drift_emergency_stop_replay",
                         "slow_stop_lease_heartbeat_single_execution",
-                        "daemon_owned_stop_drain_deferred_without_duplicate",
+                        "daemon_sleep_does_not_block_emergency_stop",
                         "no_effect_commit_view_reconciled_by_scheduler",
                     ],
                     "provider_calls": provider_calls,

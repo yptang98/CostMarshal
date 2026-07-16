@@ -115,6 +115,8 @@ class WorkerExecutionSpec:
     workspace_mode: Literal["ro", "rw"]
     profile_path: Path
     output_exchange: Path
+    profile_sha256: str | None = None
+    profile_size_bytes: int | None = None
     credential_path: Path | None = None
     provider_env_key: str | None = None
     credential_cleanup: Literal["preserve", "delete-after-use"] = "preserve"
@@ -308,6 +310,13 @@ def validate_execution_spec(
         raise IsolationValidationError("network_invalid", "network name must be a lowercase safe identifier")
     if spec.provider_env_key is not None and not ENV_KEY_RE.fullmatch(spec.provider_env_key):
         raise IsolationValidationError("provider_env_key_invalid", "provider env key must be an uppercase identifier")
+    if (spec.profile_sha256 is None) != (spec.profile_size_bytes is None):
+        raise IsolationValidationError("profile_identity_invalid", "profile hash and size must be declared together")
+    if spec.profile_sha256 is not None:
+        if not re.fullmatch(r"[0-9a-f]{64}", spec.profile_sha256):
+            raise IsolationValidationError("profile_identity_invalid", "profile sha256 must be 64 lowercase hex characters")
+        if type(spec.profile_size_bytes) is not int or not 0 <= spec.profile_size_bytes <= 256 * 1024:
+            raise IsolationValidationError("profile_identity_invalid", "profile size is invalid")
     if spec.credential_path is not None and spec.provider_env_key is None:
         raise IsolationValidationError("credential_contract_invalid", "a credential mount requires its provider env key")
     if spec.provider_env_key is not None and spec.credential_path is None:
@@ -340,6 +349,10 @@ def validate_execution_spec(
         raise IsolationValidationError("workspace_invalid", "worker workspace must be a directory")
     if not profile.is_file():
         raise IsolationValidationError("profile_invalid", "worker profile must be a regular file")
+    if spec.profile_sha256 is not None:
+        payload = profile.read_bytes()
+        if len(payload) != spec.profile_size_bytes or hashlib.sha256(payload).hexdigest() != spec.profile_sha256:
+            raise IsolationValidationError("profile_identity_mismatch", "worker profile does not match its admitted identity")
     if not output.is_dir():
         raise IsolationValidationError("output_invalid", "worker output exchange must be a directory")
     if require_empty_output and any(output.iterdir()):
@@ -701,6 +714,11 @@ class OciCliBackend:
                 "CODEX_HOME=/home/worker/.codex",
                 "--env",
                 "COSTMARSHAL_PROFILE_PATH=/bootstrap/profile.config.toml",
+                *(
+                    ["--env", f"COSTMARSHAL_PROFILE_SHA256={spec.profile_sha256}"]
+                    if spec.profile_sha256 is not None
+                    else []
+                ),
                 "--env",
                 "COSTMARSHAL_OUTPUT_PATH=/out/final.md",
                 "--env",
@@ -1175,6 +1193,8 @@ def _managed_container_identity(spec: WorkerExecutionSpec) -> tuple[str, dict[st
         "io.costmarshal.attempt": spec.attempt_id,
         "io.costmarshal.identity": suffix,
     }
+    if spec.profile_sha256 is not None:
+        labels["io.costmarshal.profile-sha256"] = spec.profile_sha256
     return name, labels
 
 
@@ -1444,6 +1464,35 @@ class OciWorkerExecutionAdapter:
         expected_uid, expected_gid = self.backend._container_user()
         if str(config.get("User") or "") != f"{expected_uid}:{expected_gid}":
             raise WorkerExecutionError("container_user_mismatch", "managed container user did not match")
+
+        raw_env = config.get("Env")
+        if not isinstance(raw_env, list) or any(not isinstance(item, str) or "=" not in item for item in raw_env):
+            raise WorkerExecutionError("container_environment_mismatch", "managed container environment was invalid")
+        actual_env: dict[str, str] = {}
+        for item in raw_env:
+            key, value = item.split("=", 1)
+            if key in actual_env:
+                raise WorkerExecutionError("container_environment_mismatch", "managed container repeated an environment key")
+            actual_env[key] = value
+        expected_env = {
+            "CODEX_HOME": "/home/worker/.codex",
+            "COSTMARSHAL_PROFILE_PATH": "/bootstrap/profile.config.toml",
+            "COSTMARSHAL_OUTPUT_PATH": "/out/final.md",
+            "COSTMARSHAL_WORKSPACE_MODE": handle.spec.workspace_mode,
+        }
+        if handle.spec.profile_sha256 is not None:
+            expected_env["COSTMARSHAL_PROFILE_SHA256"] = handle.spec.profile_sha256
+        if handle.spec.credential_path is not None:
+            expected_env["COSTMARSHAL_PROVIDER_ENV_KEY"] = str(handle.spec.provider_env_key)
+            expected_env["COSTMARSHAL_PROVIDER_SECRET_FILE"] = "/run/secrets/provider"
+        managed_keys = {
+            key for key in actual_env if key == "CODEX_HOME" or key.startswith("COSTMARSHAL_")
+        }
+        if managed_keys != set(expected_env) or any(actual_env.get(key) != value for key, value in expected_env.items()):
+            raise WorkerExecutionError(
+                "container_environment_mismatch",
+                "managed container environment did not match",
+            )
 
         host = payload.get("HostConfig") if isinstance(payload.get("HostConfig"), dict) else {}
         security_opt = {str(item).lower() for item in (host.get("SecurityOpt") or [])}

@@ -12,6 +12,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "scripts" / "costmarshal.py"
+sys.path.insert(0, str(ROOT))
+
+from costmarshal_v2.profiles import provider_profile_text  # noqa: E402
 
 
 def run(temp: Path, *args: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
@@ -47,6 +50,23 @@ def command(message_id: str, actor: str, task: str, name: str, args: dict) -> di
 def main() -> int:
     temp = Path(tempfile.mkdtemp(prefix="costmarshal-v2-reliability-"))
     try:
+        codex_home = temp / "codex-home"
+        codex_home.mkdir()
+        for profile, provider_id, env_key in (
+            ("longcat", "longcat", "LONGCAT_API_KEY"),
+            ("deepseek", "deepseek", "DEEPSEEK_API_KEY"),
+        ):
+            (codex_home / f"{profile}.config.toml").write_text(
+                provider_profile_text(
+                    provider_id=provider_id,
+                    display_name=provider_id,
+                    base_url=f"https://{provider_id}.example/v1",
+                    model="test-model",
+                    env_key=env_key,
+                ),
+                encoding="utf-8",
+            )
+        os.environ["CODEX_HOME"] = str(codex_home)
         workspace = temp / "workspace"
         workspace.mkdir()
         init = run_json(temp, "init", "--name", "reliability", "--objective", "replay fencing", "--workspace", str(workspace), "--backend", "local", "--governance", "off", "--allow-unsafe-native-workers")

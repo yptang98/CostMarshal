@@ -425,15 +425,16 @@ def main() -> int:
             )["project"]
         )
         cli(temp, "new-task", "--project", str(project_dir), "--title", "container", "--purpose", "run isolated")
-        dispatched = cli(
-            temp,
-            "dispatch",
-            "--project",
-            str(project_dir),
-            "--task",
-            "V2-0001",
-            "--unsafe-native",
-        )
+        with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
+            dispatched = cli(
+                temp,
+                "dispatch",
+                "--project",
+                str(project_dir),
+                "--task",
+                "V2-0001",
+                "--unsafe-native",
+            )
         layout = ProjectLayout(root=temp / "runtime", project_dir=project_dir)
         actor = load_actor(layout, dispatched["actor_id"])
         project = load_project(layout)
@@ -498,14 +499,18 @@ def main() -> int:
                     actor,
                     execution_workspace=workspace,
                     workspace_mode="read-only",
+                    allow_credential_creation=False,
                 )
             except SystemExit as exc:
-                assert "base_url is invalid" in str(exc)
+                assert "existing OCI credential is unavailable" in str(exc)
             else:
-                raise AssertionError("provider base_url query was accepted")
+                raise AssertionError("recovery-only profile check unexpectedly created a credential")
+        bound_profile = next((layout.root / "worker-bundles").rglob("profile.config.toml"))
+        assert bound_profile.read_text(encoding="utf-8") == valid_profile
         assert not list((layout.root / "worker-bundles").rglob("provider.secret"))
 
         insecure_actor = json.loads(json.dumps(actor))
+        insecure_actor.pop("profile_binding", None)
         insecure_actor["isolation"]["execution"]["network_mode"] = "none"
         insecure_actor["isolation"]["execution"]["network_name"] = None
         profile_path.write_text(valid_profile.replace("https://", "http://"), encoding="utf-8")
@@ -519,9 +524,9 @@ def main() -> int:
                     workspace_mode="read-only",
                 )
             except SystemExit as exc:
-                assert "base_url is invalid" in str(exc)
+                assert "profile binding is required" in str(exc)
             else:
-                raise AssertionError("HTTP provider URL was accepted without provider-proxy isolation")
+                raise AssertionError("required worker accepted a missing profile binding")
         assert not list((layout.root / "worker-bundles").rglob("provider.secret"))
         profile_path.write_text(valid_profile, encoding="utf-8")
 
@@ -695,7 +700,7 @@ raise SystemExit(run_actor(
                 "costmarshal_v2.actor_runner.OciWorkerExecutionAdapter",
                 FakeOciAdapter,
             ), patch(
-                "costmarshal_v2.actor_runner.validate_governance_binding",
+                "costmarshal_v2.actor_runner.enforce_governance_contract",
                 side_effect=GovernanceError(
                     "governance_binding_drift",
                     "fixture governance drift after durable provider start",
@@ -810,7 +815,7 @@ raise SystemExit(actor_runner.run_actor(
                 "costmarshal_v2.actor_runner.OciWorkerExecutionAdapter",
                 HardExitOciAdapter,
             ), patch(
-                "costmarshal_v2.actor_runner.validate_governance_binding",
+                "costmarshal_v2.actor_runner.enforce_governance_contract",
                 side_effect=GovernanceError(
                     "governance_binding_drift",
                     "fixture governance drift after external provider start",

@@ -11,7 +11,12 @@ from .control_store import (
     preview_legacy_migration,
     reconcile_project_views,
 )
-from .locking import ProjectLockTimeout, project_write_lock, scheduler_instance_lock
+from .locking import (
+    ProjectLockTimeout,
+    project_write_lock,
+    scheduler_daemon_lock,
+    scheduler_instance_lock,
+)
 from .paths import default_root, resolve_project
 from .profiles import command_configure_profiles, command_configure_provider
 from .scheduler import (
@@ -56,9 +61,10 @@ def command_migrate_state(args: argparse.Namespace) -> None:
         payload = preview_legacy_migration(layout)
     else:
         try:
-            with scheduler_instance_lock(layout, timeout_seconds=0.25):
-                with project_write_lock(layout):
-                    payload = migrate_legacy_store(layout)
+            with scheduler_daemon_lock(layout, timeout_seconds=0.25):
+                with scheduler_instance_lock(layout, timeout_seconds=0.25):
+                    with project_write_lock(layout):
+                        payload = migrate_legacy_store(layout)
         except ProjectLockTimeout as exc:
             raise SystemExit(f"state migration requires exclusive scheduler/project ownership: {exc}") from exc
     print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -110,10 +116,24 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--workspace", help="Writable workspace used by Codex and LongCat actors; defaults to the current directory")
     init.add_argument("--secrets-file", help="Optional local env file loaded only into actor subprocesses")
     init.add_argument("--provider-catalog", type=Path, help="Reviewed JSON provider catalog; defaults to LongCat/DeepSeek/Codex low/medium/high tiers")
-    init.add_argument("--project-budget-cny", type=float, help="Optional hard project budget; requires reviewed prices for routed providers")
-    init.add_argument("--governance", choices=["off", "auto", "required"], default="auto", help="ArchMarshal governance gate; checks are read-only and require an explicit wrapper")
-    init.add_argument("--archmarshal-wrapper", type=Path, help="Exact reviewed invoke_archmarshal.py path used for read-only governance checks")
-    init.add_argument("--no-auto-escalate", dest="auto_escalate", action="store_false", default=True, help="Do not automatically route failed attempts to the next stronger tier")
+    init.add_argument("--project-budget-cny", help="Optional hard project budget (up to 9 decimal places); requires reviewed prices for routed providers")
+    init.add_argument(
+        "--default-min-success-probability",
+        type=float,
+        help="Optional project success-probability SLA (0..1), frozen onto each new auto-routed task unless overridden",
+    )
+    init.add_argument("--governance", choices=["off", "auto", "required"], default="auto", help="ArchMarshal governance gate; checks are strictly read-only")
+    init.add_argument(
+        "--archmarshal-launcher",
+        type=Path,
+        help="Exact reviewed canonical run_archmarshal.py path for read-only governance checks",
+    )
+    init.add_argument(
+        "--archmarshal-wrapper",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
+    init.add_argument("--no-auto-escalate", dest="auto_escalate", action="store_false", default=True, help="Do not automatically continue failed attempts to the next admitted provider step")
     init.add_argument("--session-name", help="Backend session name; defaults to cmv2-<project>")
     init.add_argument("--backend", choices=["auto", "tmux", "local"], default="auto", help="Actor runtime backend; auto chooses a platform-appropriate backend")
     init.add_argument("--backend-command", help="Backend executable, for example a tmux binary when --backend tmux")
@@ -159,9 +179,20 @@ def build_parser() -> argparse.ArgumentParser:
     new_task.add_argument("--profile")
     new_task.add_argument("--agent", default="auto")
     new_task.add_argument("--model", default="inherit")
-    new_task.add_argument("--estimated-input-tokens", type=int, default=0)
+    new_task.add_argument(
+        "--estimated-input-tokens",
+        type=int,
+        default=0,
+        help="Estimated ordinary (non-cached) input tokens",
+    )
+    new_task.add_argument(
+        "--estimated-cached-input-tokens",
+        type=int,
+        default=0,
+        help="Estimated cached input tokens billed at the reviewed cached-input rate",
+    )
     new_task.add_argument("--estimated-output-tokens", type=int, default=0)
-    new_task.add_argument("--max-cost-cny", type=float)
+    new_task.add_argument("--max-cost-cny", help="Task budget in CNY, with up to 9 decimal places")
     new_task.add_argument("--require-capability", action="append", dest="required_capabilities")
     new_task.add_argument("--min-success-probability", type=float)
     new_task.add_argument("--acceptance", action="append")
@@ -179,7 +210,18 @@ def build_parser() -> argparse.ArgumentParser:
     route.add_argument("--difficulty", choices=["simple", "normal", "hard"], default="normal")
     route.add_argument("--provider", default="auto")
     route.add_argument("--tier", choices=["auto", "low", "medium", "high"], default="auto")
-    route.add_argument("--estimated-input-tokens", type=int, default=0)
+    route.add_argument(
+        "--estimated-input-tokens",
+        type=int,
+        default=0,
+        help="Estimated ordinary (non-cached) input tokens",
+    )
+    route.add_argument(
+        "--estimated-cached-input-tokens",
+        type=int,
+        default=0,
+        help="Estimated cached input tokens billed at the reviewed cached-input rate",
+    )
     route.add_argument("--estimated-output-tokens", type=int, default=0)
     route.add_argument("--require-capability", action="append", dest="required_capabilities")
     route.add_argument("--min-success-probability", type=float)
@@ -202,6 +244,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Preview or explicitly refresh only CostMarshal's read-only ArchMarshal binding",
     )
     governance_rebind.add_argument("--project", required=True)
+    governance_rebind.add_argument("--archmarshal-launcher", type=Path)
+    governance_rebind.add_argument("--archmarshal-wrapper", type=Path, help=argparse.SUPPRESS)
     governance_rebind.add_argument("--apply", action="store_true")
     _add_command_id(governance_rebind)
     governance_rebind.set_defaults(func=command_governance_rebind)
@@ -223,7 +267,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_command_id(dispatch)
     dispatch.set_defaults(func=command_dispatch)
 
-    escalate = sub.add_parser("escalate", help="Route a failed or uncertain task to the next stronger provider tier")
+    escalate = sub.add_parser("escalate", help="Continue a failed or uncertain task to the next provider step in its admitted monotonic chain")
     escalate.add_argument("--project", required=True)
     escalate.add_argument("--task", required=True)
     escalate.add_argument("--reason", required=True)
@@ -237,6 +281,11 @@ def build_parser() -> argparse.ArgumentParser:
     escalate.add_argument("--start", action="store_true")
     escalate.add_argument("--dry-run", action="store_true")
     escalate.add_argument("--force", action="store_true")
+    escalate.add_argument(
+        "--replan",
+        action="store_true",
+        help="Explicitly archive the active remaining plan and atomically re-admit the selected next step",
+    )
     escalate.add_argument("--unsafe-native", action="store_true", help="Explicitly continue an unsafe-native attempt during manual escalation")
     _add_command_id(escalate)
     escalate.set_defaults(func=command_escalate)
@@ -309,9 +358,20 @@ def build_parser() -> argparse.ArgumentParser:
     result.add_argument("--actor")
     result.add_argument("--attempt")
     result.add_argument("--model")
-    result.add_argument("--input-tokens", type=int, default=0)
+    result.add_argument(
+        "--input-tokens",
+        type=int,
+        default=0,
+        help="Ordinary input tokens, excluding cached input tokens",
+    )
+    result.add_argument(
+        "--cached-input-tokens",
+        type=int,
+        default=0,
+        help="Cached input tokens, recorded separately from ordinary input",
+    )
     result.add_argument("--output-tokens", type=int, default=0)
-    result.add_argument("--estimated-cost-cny", type=float)
+    result.add_argument("--estimated-cost-cny", help="Unverified caller-reported cost, up to 9 decimal places")
     result.add_argument("--summary")
     result.add_argument("--note")
     _add_command_id(result)
@@ -327,9 +387,20 @@ def build_parser() -> argparse.ArgumentParser:
     leader_work.add_argument("--file", action="append")
     leader_work.add_argument("--minutes", type=int, default=0)
     leader_work.add_argument("--model", default="codex-leader")
-    leader_work.add_argument("--input-tokens", type=int, default=0)
+    leader_work.add_argument(
+        "--input-tokens",
+        type=int,
+        default=0,
+        help="Ordinary input tokens, excluding cached input tokens",
+    )
+    leader_work.add_argument(
+        "--cached-input-tokens",
+        type=int,
+        default=0,
+        help="Cached input tokens, recorded separately from ordinary input",
+    )
     leader_work.add_argument("--output-tokens", type=int, default=0)
-    leader_work.add_argument("--estimated-cost-cny", type=float)
+    leader_work.add_argument("--estimated-cost-cny", help="Audited cost, up to 9 decimal places")
     leader_work.add_argument("--note")
     _add_command_id(leader_work)
     leader_work.set_defaults(func=command_record_leader_work)
@@ -340,9 +411,20 @@ def build_parser() -> argparse.ArgumentParser:
     usage.add_argument("--task")
     usage.add_argument("--attempt")
     usage.add_argument("--model")
-    usage.add_argument("--input-tokens", type=int, default=0)
+    usage.add_argument(
+        "--input-tokens",
+        type=int,
+        default=0,
+        help="Ordinary input tokens, excluding cached input tokens",
+    )
+    usage.add_argument(
+        "--cached-input-tokens",
+        type=int,
+        default=0,
+        help="Cached input tokens, recorded separately from ordinary input",
+    )
     usage.add_argument("--output-tokens", type=int, default=0)
-    usage.add_argument("--estimated-cost-cny", type=float)
+    usage.add_argument("--estimated-cost-cny", help="Unverified caller-reported cost, up to 9 decimal places")
     usage.add_argument("--final", dest="final_usage", action="store_true", help="Mark this as terminal usage and settle the remaining reservation")
     usage.add_argument("--note")
     _add_command_id(usage)

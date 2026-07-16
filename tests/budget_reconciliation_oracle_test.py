@@ -12,7 +12,8 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from costmarshal_v2.scheduler import attempt_budget_commitment  # noqa: E402
+from costmarshal_v2.routing import route_plan_fingerprint  # noqa: E402
+from costmarshal_v2.scheduler import attempt_budget_commitment, task_budget_commitment  # noqa: E402
 
 
 ACTIVE_STATUSES = {"preparing", "dispatched", "running", "starting", "needs_recovery"}
@@ -52,6 +53,44 @@ def random_money(randomizer: random.Random) -> Decimal:
 
 
 class BudgetReconciliationOracleTest(unittest.TestCase):
+    @staticmethod
+    def envelope(*, status: str = "active", baseline: float = 0.0) -> dict[str, Any]:
+        costs = (1.0, 2.0, 3.0)
+        providers = (("low-api", "low"), ("medium-api", "medium"), ("high-api", "high"))
+        steps = [
+            {
+                "index": index,
+                "provider_id": provider_id,
+                "tier": tier,
+                "profile": None,
+                "model": None,
+                "estimated_cost_cny": costs[index],
+                "acceptance_prior": {},
+                "price_basis": {"kind": "test", "index": index},
+            }
+            for index, (provider_id, tier) in enumerate(providers)
+        ]
+        return {
+            "schema_version": "costmarshal-route-budget-envelope-v2",
+            "envelope_id": "ENV-20260716000000-oracle",
+            "plan_fingerprint": route_plan_fingerprint(
+                steps,
+                input_tokens=1_000_000,
+                cached_input_tokens=0,
+                output_tokens=0,
+            ),
+            "estimated_input_tokens": 1_000_000,
+            "estimated_cached_input_tokens": 0,
+            "estimated_output_tokens": 0,
+            "planned_steps": steps,
+            "reserved_cost_cny": 6.0,
+            "baseline_commitment_cny": baseline,
+            "status": status,
+            "created_at": "2026-07-16T00:00:00Z",
+            "released_at": "2026-07-16T00:01:00Z" if status == "released" else None,
+            "release_reason": "test" if status == "released" else None,
+        }
+
     def test_20k_random_attempts_match_independent_decimal_oracle(self) -> None:
         randomizer = random.Random(0xC057A125)
         statuses = tuple(sorted(ACTIVE_STATUSES | TERMINAL_STATUSES))
@@ -219,6 +258,71 @@ class BudgetReconciliationOracleTest(unittest.TestCase):
                     oracle_commitment(attempt)
                 with self.assertRaises(ValueError, msg=label):
                     attempt_budget_commitment(attempt)
+        with self.assertRaisesRegex(ValueError, "at most 9 decimal places"):
+            attempt_budget_commitment(
+                {
+                    "status": "running",
+                    "cost_settled": False,
+                    "reserved_cost_cny": 1.0000000001,
+                    "actual_cost_cny": 0.0,
+                }
+            )
+
+    def test_task_envelope_is_a_floor_without_double_counting_attempts(self) -> None:
+        envelope = self.envelope()
+        attempts = [
+            {
+                "attempt_id": "ATT-low",
+                "status": "escalated",
+                "cost_settled": True,
+                "reserved_cost_cny": 1.0,
+                "actual_cost_cny": 0.75,
+            },
+            {
+                "attempt_id": "ATT-medium",
+                "status": "running",
+                "cost_settled": False,
+                "reserved_cost_cny": 2.0,
+                "actual_cost_cny": 0.0,
+            },
+        ]
+        for index, attempt in enumerate(attempts):
+            attempt["route_envelope_id"] = envelope["envelope_id"]
+            attempt["route_plan_fingerprint"] = envelope["plan_fingerprint"]
+            attempt["route_plan_step_index"] = index
+            attempt["route_plan_step"] = envelope["planned_steps"][index]
+        active = {
+            "id": "V2-envelope",
+            "attempts": attempts,
+            "route_budget_envelope": envelope,
+        }
+        self.assertEqual(task_budget_commitment(active), 5.75)
+        active["attempts"][1]["actual_cost_cny"] = 7.0
+        self.assertEqual(task_budget_commitment(active), 10.75)
+
+        released = {
+            "id": "V2-released",
+            "attempts": attempts,
+            "route_budget_envelope": self.envelope(status="released"),
+        }
+        self.assertEqual(task_budget_commitment(released), 7.75)
+
+        with_history = {
+            "id": "V2-baseline",
+            "attempts": [],
+            "route_budget_envelope": self.envelope(baseline=4.5),
+        }
+        self.assertEqual(task_budget_commitment(with_history), 6.0)
+
+    def test_corrupt_envelope_fails_closed(self) -> None:
+        task = {
+            "id": "V2-corrupt",
+            "attempts": [],
+            "route_budget_envelope": self.envelope(),
+        }
+        task["route_budget_envelope"]["planned_steps"][1]["estimated_cost_cny"] = 200.0
+        with self.assertRaises(ValueError):
+            task_budget_commitment(task)
 
 
 if __name__ == "__main__":

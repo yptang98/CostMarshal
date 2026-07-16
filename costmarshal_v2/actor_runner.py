@@ -20,12 +20,19 @@ from urllib.parse import urlsplit
 from .control_store import ControlStoreError, control_store_enabled, control_transaction
 from .governance import (
     GovernanceError,
+    enforce_governance_contract,
     load_stable_governance_project,
-    validate_governance_binding,
 )
 from .mailbox import send_message
 from .locking import ProjectLockTimeout, advisory_file_lock, project_write_lock
 from .paths import ProjectLayout, resolve_project, slugify
+from .profile_binding import (
+    ProfileBindingError,
+    install_bound_copy,
+    parse_profile_bytes,
+    validate_profile_binding,
+    verify_profile_snapshot,
+)
 from .security import (
     SecurityValidationError,
     ensure_workspace_containment,
@@ -182,6 +189,27 @@ def _isolated_codex_home(layout: ProjectLayout, actor: dict[str, Any], inherited
     target = layout.project_dir / "actor-homes" / slugify(str(actor["id"]), "actor")
     target.mkdir(parents=True, exist_ok=True)
     profile = actor.get("profile")
+    binding = actor.get("profile_binding")
+    if actor.get("role") == "agent" and binding is None:
+        raise SystemExit("provider profile binding is required for an agent actor")
+    if binding is not None:
+        try:
+            validate_profile_binding(binding, require_available=True)
+            payload = verify_profile_snapshot(layout.root, binding)
+            destination = target / (f"{profile}.config.toml" if profile else "config.toml")
+            install_bound_copy(destination, payload, binding)
+        except ProfileBindingError as exc:
+            raise SystemExit(f"provider profile binding failed closed: {exc}") from exc
+        # Authentication is a separate credential channel; its bytes are not
+        # provider endpoint/config identity and are never included in the
+        # profile snapshot.
+        source_home = inherited.get("CODEX_HOME")
+        if actor.get("tier") == "high" and source_home:
+            source = Path(source_home).expanduser() / "auth.json"
+            destination = target / "auth.json"
+            if source.is_file() and not source.is_symlink() and not destination.exists():
+                shutil.copyfile(source, destination)
+        return target.resolve()
     source_home = inherited.get("CODEX_HOME")
     if profile and source_home:
         source = Path(source_home).expanduser() / f"{profile}.config.toml"
@@ -505,18 +533,76 @@ def walk_dicts(value: Any) -> Iterable[dict[str, Any]]:
             yield from walk_dicts(child)
 
 
-def usage_from_events(events: list[dict[str, Any]]) -> tuple[int, int]:
+def usage_details_from_events(events: list[dict[str, Any]]) -> tuple[int, int, int, bool]:
+    """Return ordinary input, cached input, output, and pricing completeness.
+
+    CostMarshal-native ``cached_input_tokens`` and Anthropic-style
+    ``cache_read_input_tokens`` are separate from ordinary input. OpenAI-style
+    ``input_tokens_details.cached_tokens`` is a subset of total input and is
+    subtracted before pricing. Invalid subset metadata is ignored, which keeps
+    the total input conservatively billed at the ordinary rate. Positive cache
+    creation tokens make pricing incomplete because the canonical catalog does
+    not yet carry a cache-write rate; callers must preserve the reservation.
+    """
+
     best_input = 0
+    best_cached_input = 0
+    best_total_input = 0
     best_output = 0
+    pricing_complete = True
     for event in events:
         for item in walk_dicts(event):
             input_value = item.get("input_tokens", item.get("prompt_tokens", 0))
             output_value = item.get("output_tokens", item.get("completion_tokens", 0))
-            if isinstance(input_value, int):
-                best_input = max(best_input, input_value)
-            if isinstance(output_value, int):
+            cached_value = item.get(
+                "cached_input_tokens",
+                item.get("cache_read_input_tokens", 0),
+            )
+            details = item.get("input_tokens_details", item.get("prompt_tokens_details"))
+            detail_cached = details.get("cached_tokens", 0) if isinstance(details, dict) else 0
+            cache_creation_value = item.get("cache_creation_input_tokens", 0)
+            ordinary_candidate = 0
+            cached_candidate = 0
+            has_input_dimension = False
+            if type(input_value) is int and input_value >= 0:
+                has_input_dimension = True
+                if (
+                    type(detail_cached) is int
+                    and 0 <= detail_cached <= input_value
+                ):
+                    ordinary_candidate = input_value - detail_cached
+                    cached_candidate = detail_cached
+                else:
+                    ordinary_candidate = input_value
+            if type(cached_value) is int and cached_value >= 0:
+                if cached_value:
+                    has_input_dimension = True
+                cached_candidate = max(cached_candidate, cached_value)
+            if type(cache_creation_value) is int and cache_creation_value > 0:
+                # Anthropic reports cache writes outside ordinary input. Count
+                # them in total usage, but do not pretend the ordinary input
+                # rate proves their monetary cost.
+                has_input_dimension = True
+                ordinary_candidate += cache_creation_value
+                pricing_complete = False
+            candidate_total = ordinary_candidate + cached_candidate
+            # Usage events are cumulative snapshots. Keep the ordinary/cached
+            # split from one coherent snapshot instead of taking independent
+            # maxima, which can double count when the cache ratio changes.
+            if has_input_dimension and candidate_total >= best_total_input:
+                best_input = ordinary_candidate
+                best_cached_input = cached_candidate
+                best_total_input = candidate_total
+            if type(output_value) is int and output_value >= 0:
                 best_output = max(best_output, output_value)
-    return best_input, best_output
+    return best_input, best_cached_input, best_output, pricing_complete
+
+
+def usage_from_events(events: list[dict[str, Any]]) -> tuple[int, int, int]:
+    """Backward-compatible token dimensions without the pricing-status bit."""
+
+    input_tokens, cached_input_tokens, output_tokens, _ = usage_details_from_events(events)
+    return input_tokens, cached_input_tokens, output_tokens
 
 
 def scheduler_command(
@@ -626,26 +712,21 @@ def _required_worker_bundle(
         raise SystemExit("required worker output exchange is not empty for this attempt")
 
     profile = actor.get("profile")
-    profile_text = "# CostMarshal isolated default profile\n"
+    profile_binding = actor.get("profile_binding")
+    if profile_binding is None:
+        raise SystemExit("required worker profile binding is required")
+    profile_payload = b"# CostMarshal isolated default profile\n"
+    profile_text = profile_payload.decode("utf-8")
+    try:
+        validate_profile_binding(profile_binding, require_available=True)
+        profile_payload = verify_profile_snapshot(layout.root, profile_binding)
+        profile_text = profile_payload.decode("utf-8")
+    except (ProfileBindingError, UnicodeDecodeError) as exc:
+        raise SystemExit(f"required worker profile binding failed closed: {exc}") from exc
     if profile:
-        source_home = os.environ.get("CODEX_HOME")
-        if not source_home:
-            raise SystemExit(f"required worker profile is unavailable: {profile}")
-        source = Path(source_home).expanduser() / f"{profile}.config.toml"
-        if not source.is_file() or source.is_symlink():
-            raise SystemExit(f"required worker profile is unavailable: {profile}")
-        payload = source.read_bytes()
-        if len(payload) > 256 * 1024:
-            raise SystemExit("required worker profile exceeds 256 KiB")
         try:
-            profile_text = payload.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise SystemExit("required worker profile must be UTF-8") from exc
-        if "\x00" in profile_text:
-            raise SystemExit("required worker profile contains a NUL byte")
-        try:
-            profile_data = tomllib.loads(profile_text)
-        except tomllib.TOMLDecodeError as exc:
+            profile_data = parse_profile_bytes(profile_payload)
+        except ProfileBindingError as exc:
             raise SystemExit("required worker profile is invalid TOML") from exc
         allowed_top = {
             "model_provider",
@@ -678,7 +759,10 @@ def _required_worker_bundle(
             or (parsed_url.scheme == "http" and network_mode != "provider-proxy")
         ):
             raise SystemExit("required worker profile base_url is invalid")
-    atomic_write_text(profile_path, profile_text)
+    try:
+        install_bound_copy(profile_path, profile_payload, profile_binding)
+    except ProfileBindingError as exc:
+        raise SystemExit(f"required worker profile snapshot failed closed: {exc}") from exc
 
     limits_row = execution.get("limits") or {}
     try:
@@ -706,6 +790,16 @@ def _required_worker_bundle(
         workspace_mode="rw" if workspace_mode == "workspace-write" else "ro",
         profile_path=profile_path,
         output_exchange=output_exchange,
+        profile_sha256=(
+            str(profile_binding.get("sha256") or "").removeprefix("sha256:")
+            if profile_binding is not None
+            else None
+        ),
+        profile_size_bytes=(
+            int(profile_binding["size_bytes"])
+            if profile_binding is not None
+            else None
+        ),
         isolation_mode="required",
         engine=engine,
         network_mode=network_mode,
@@ -890,6 +984,19 @@ def _validate_worker_fence(
     current = attempts[-1] if attempts else None
     if not current or current.get("attempt_id") != expected_attempt or current.get("actor_id") != actor_id:
         raise SystemExit("worker launch rejected: attempt is no longer current")
+    profile_binding = actor.get("profile_binding")
+    try:
+        if profile_binding is None:
+            raise ProfileBindingError("actor profile binding is missing")
+        validate_profile_binding(profile_binding, require_available=True)
+        if current.get("profile_binding") != profile_binding:
+            raise ProfileBindingError("actor and attempt profile bindings differ")
+        route_step = current.get("route_plan_step") or {}
+        if route_step.get("profile_binding") is not None and route_step.get("profile_binding") != profile_binding:
+            raise ProfileBindingError("attempt and route plan profile bindings differ")
+        verify_profile_snapshot(layout.root, profile_binding)
+    except ProfileBindingError as exc:
+        raise SystemExit(f"worker launch rejected: profile binding failed closed: {exc}") from exc
     if current.get("status") not in {"preparing", "dispatched", "starting", "launch_pending", "running", "needs_recovery"}:
         raise SystemExit(f"worker launch rejected: attempt is {current.get('status')}")
     return actor
@@ -945,16 +1052,22 @@ def _validate_actor_governance_before_side_effect(
         raise SystemExit(
             "ArchMarshal governance gate blocked actor launch: governance state is invalid"
         )
-    governance_mode = governance.get("mode")
-    governance_ready = governance.get("ready")
-    if governance_mode not in {"off", "auto", "required"} or not isinstance(
-        governance_ready,
-        bool,
-    ):
-        raise SystemExit(
-            "ArchMarshal governance gate blocked actor launch: governance state is invalid"
+    try:
+        contract = enforce_governance_contract(
+            governance,
+            project.get("workspace"),
+            operation="actor launch",
         )
-    governed = governance_mode == "required" or governance_ready is True
+    except GovernanceError as exc:
+        if recovery_possible:
+            # A prepared deterministic container may already exist after a
+            # hard exit between external create and identity persistence. The
+            # caller must attach/clean only and may never fresh-start.
+            return True
+        raise SystemExit(
+            f"ArchMarshal governance gate blocked actor launch [{exc.code}]: {exc}"
+        ) from exc
+    governed = bool(contract.get("governed"))
     if (
         governed
         and actor.get("role") == "agent"
@@ -963,31 +1076,6 @@ def _validate_actor_governance_before_side_effect(
         raise SystemExit(
             "ArchMarshal governance gate blocked actor launch: governed projects "
             "forbid unsafe-native provider launch; use required OCI isolation"
-        )
-    if governance_mode != "required" and not governance_ready:
-        return False
-    try:
-        validation = validate_governance_binding(
-            governance.get("binding"),
-            project.get("workspace"),
-            mode="required",
-            wrapper_path=governance.get("wrapper_path"),
-        )
-    except GovernanceError as exc:
-        if recovery_possible:
-            # A prepared deterministic container may already exist after a
-            # hard exit between external create and identity persistence.  The
-            # caller must attach/clean only; it may not fresh-start or create a
-            # missing credential while governance is stale.
-            return True
-        raise SystemExit(
-            f"ArchMarshal governance gate blocked actor launch [{exc.code}]: {exc}"
-        ) from exc
-    if not validation.get("valid"):
-        if recovery_possible:
-            return True
-        raise SystemExit(
-            "ArchMarshal governance gate blocked actor launch: binding is not valid"
         )
     return False
 
@@ -1082,6 +1170,9 @@ def _run_actor_once(
             pid_start_marker(os.getpid()) or f"unverified:{os.getpid()}:{time.time_ns()}"
         )
         runtime["registered_launch_token_sha256"] = hashlib.sha256(str(launch_token).encode("utf-8")).hexdigest()
+        runtime["registered_profile_sha256"] = str(
+            (current_actor.get("profile_binding") or {}).get("sha256") or ""
+        ).removeprefix("sha256:")
         runtime["provider_execution_state"] = (
             "started" if required_isolation else "launch_pending_authorization"
         )
@@ -1707,7 +1798,10 @@ def _run_actor_once(
                 + "\n",
             )
 
-    input_tokens, output_tokens = usage_from_events(events)
+    input_tokens, cached_input_tokens, output_tokens, usage_pricing_complete = (
+        usage_details_from_events(events)
+    )
+    usage_known = usage_known and usage_pricing_complete
     if report.is_file() and secret_values:
         report_text = report.read_text(encoding="utf-8", errors="replace")
         safe_report_text = redact_secret_values(report_text, secret_values)
@@ -1758,6 +1852,7 @@ def _run_actor_once(
                     current_attempt["report_sha256"] = report_sha256
                     current_attempt["report_size"] = len(report_bytes)
                     current_attempt["provider_exit_code"] = returncode
+                    current_attempt["provider_execution_state"] = "finished"
                     current_attempt["usage_status"] = (
                         "captured" if usage_known else "unknown_recovery_logs"
                     )
@@ -1770,6 +1865,7 @@ def _run_actor_once(
                     "attempt": actor.get("attempt_id"),
                     "model": actor.get("model"),
                     "input_tokens": input_tokens,
+                    "cached_input_tokens": cached_input_tokens,
                     "output_tokens": output_tokens,
                     "final_usage": True,
                     "note": f"provider={actor.get('provider')} profile={actor.get('profile') or '-'} exit={returncode}",
@@ -1785,7 +1881,22 @@ def _run_actor_once(
                 )
             needs_escalation = returncode != 0 or final_report_status in {"failed", "escalate"}
             actor_tier = actor.get("tier") or ("low" if actor.get("provider") == "longcat" else "high")
-            if actor_tier in {"low", "medium"} and needs_escalation and project.get("auto_escalate", True):
+            envelope = current_task.get("route_budget_envelope")
+            plan_allows_next = True
+            if isinstance(envelope, dict) and envelope.get("status") == "active":
+                current_index = current_attempt.get("route_plan_step_index") if current_attempt else None
+                plan_allows_next = bool(
+                    current_attempt
+                    and current_attempt.get("route_envelope_id") == envelope.get("envelope_id")
+                    and type(current_index) is int
+                    and current_index + 1 < len(envelope.get("planned_steps") or [])
+                )
+            if (
+                actor_tier in {"low", "medium"}
+                and needs_escalation
+                and project.get("auto_escalate", True)
+                and plan_allows_next
+            ):
                 command = "escalate_task"
                 command_args = {
                     "task": task_id,
@@ -1804,7 +1915,11 @@ def _run_actor_once(
                     "state": collected_state,
                     "summary": f"{actor.get('provider')} worker exited {returncode}; report ready.",
                 }
-                body = "Worker report is ready for manager review."
+                body = (
+                    "The admitted route plan is exhausted; the worker report is ready for manager review."
+                    if needs_escalation and not plan_allows_next
+                    else "Worker report is ready for manager review."
+                )
             send_message(
                 layout,
                 sender=actor_id,
@@ -1835,6 +1950,7 @@ def _run_actor_once(
             model=actor.get("model"),
             exit_code=returncode,
             input_tokens=input_tokens,
+            cached_input_tokens=cached_input_tokens,
             output_tokens=output_tokens,
             changed_paths=list(changed_paths),
         )
@@ -1848,6 +1964,7 @@ def _run_actor_once(
             "exit_code": returncode,
             "report_sha256": report_sha256,
             "input_tokens": input_tokens,
+            "cached_input_tokens": cached_input_tokens,
             "output_tokens": output_tokens,
         },
         mutate=finalize_runner,

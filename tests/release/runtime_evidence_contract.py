@@ -27,7 +27,7 @@ REQUIRED_RUNTIME_CRASH_POINTS = (
 )
 REQUIRED_RUNTIME_RECOVERY_SCENARIOS = (
     "corrupt_project_emergency_stop_only",
-    "daemon_owned_stop_drain_deferred_without_duplicate",
+    "daemon_sleep_does_not_block_emergency_stop",
     "governance_drift_emergency_stop_replay",
     "materializer_revision_aba_serialized",
     "materializer_transient_sharing_retry_bounded",

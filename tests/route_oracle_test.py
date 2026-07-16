@@ -116,13 +116,14 @@ def independent_oracle(
     for start in eligible:
         if TIER_RANK[start["tier"]] < TIER_RANK[floor]:
             continue
-        stronger_groups: list[list[dict]] = []
+        stronger_groups: list[list[dict | None]] = []
         for tier in TIERS[TIER_RANK[start["tier"]] + 1 :]:
             peers = sorted((row for row in eligible if row["tier"] == tier), key=peer_key)
             if peers:
-                stronger_groups.append(peers)
+                stronger_groups.append([None, *peers])
         continuations = product(*stronger_groups) if stronger_groups else [()]
-        for continuation in continuations:
+        for optional_continuation in continuations:
+            continuation = tuple(row for row in optional_continuation if row is not None)
             chain = (start, *continuation)
             survival = 1.0
             expected_cost = 0.0

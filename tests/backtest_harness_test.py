@@ -66,6 +66,10 @@ def attested_matrix_fixture(task_count: int = 210, *, task_budget_cny: float = 2
             "task_type": "analysis",
             "required_capabilities": [],
         }
+        if floor == "low":
+            routing_task["min_success_probability"] = 0.15
+        elif floor == "medium":
+            routing_task["min_success_probability"] = 0.1
         input_tokens = 500_000
         output_tokens = 500_000
         candidate_request = {"requested_provider_id": None, "requested_tier": None}
@@ -79,8 +83,10 @@ def attested_matrix_fixture(task_count: int = 210, *, task_budget_cny: float = 2
             now=route_now,
             **candidate_request,
         )
+        baseline_task = dict(routing_task)
+        baseline_task.pop("min_success_probability", None)
         baseline = decide_route(
-            routing_task,
+            baseline_task,
             catalog,
             history=history,
             input_tokens=input_tokens,

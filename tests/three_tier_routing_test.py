@@ -23,6 +23,7 @@ from costmarshal_v2.routing import (  # noqa: E402
     next_stronger_provider,
     project_provider_catalog,
     provider_by_id,
+    route_plan_fingerprint,
     validate_provider_catalog,
 )
 
@@ -69,6 +70,9 @@ class ThreeTierRoutingTest(unittest.TestCase):
         typo = default_provider_catalog()
         typo["providers"][0]["ouput_cny_per_1m"] = 1
         cases.append(typo)
+        unsafe_profile = default_provider_catalog()
+        unsafe_profile["providers"][0]["profile"] = "../stolen"
+        cases.append(unsafe_profile)
         for invalid in cases:
             with self.subTest(invalid=invalid):
                 with self.assertRaises(RoutingValidationError):
@@ -76,6 +80,17 @@ class ThreeTierRoutingTest(unittest.TestCase):
 
         with self.assertRaises(RoutingValidationError):
             project_provider_catalog({"provider_catalog": None})
+
+    def test_route_optimization_rejects_unbounded_enabled_peer_sets(self) -> None:
+        catalog = default_provider_catalog()
+        template = deepcopy(catalog["providers"][0])
+        for index in range(16):
+            peer = deepcopy(template)
+            peer["provider_id"] = f"low-peer-{index}"
+            peer["profile"] = f"low-peer-{index}"
+            catalog["providers"].append(peer)
+        with self.assertRaisesRegex(RoutingValidationError, "too many enabled"):
+            decide_route({"risk": "low", "task_type": "analysis"}, catalog)
 
     def test_auto_tier_floor_is_conservative(self) -> None:
         self.assertEqual(auto_tier_floor({"risk": "high"}), "high")
@@ -308,14 +323,72 @@ class ThreeTierRoutingTest(unittest.TestCase):
         for provider in catalog["providers"]:
             provider["input_cny_per_1m"], provider["output_cny_per_1m"] = prices[provider["provider_id"]]
         decision = decide_route(
-            {"risk": "low", "task_type": "analysis", "difficulty": "normal"},
+            {
+                "risk": "low",
+                "task_type": "analysis",
+                "difficulty": "normal",
+                "min_success_probability": 0.15,
+            },
             catalog,
             input_tokens=500_000,
             output_tokens=500_000,
         )
         self.assertEqual(decision.provider_id, "longcat")
         self.assertEqual(decision.planned_provider_ids, ("longcat", "deepseek", "codex"))
+        self.assertEqual(len(decision.candidate_provider_ids), len(set(decision.candidate_provider_ids)))
+        self.assertEqual([step["index"] for step in decision.planned_steps], [0, 1, 2])
+        self.assertEqual(decision.worst_case_chain_cost_cny, 10.11)
+        self.assertTrue(decision.plan_fingerprint.startswith("sha256:"))
+        repeated = decide_route(
+            {
+                "risk": "low",
+                "task_type": "analysis",
+                "difficulty": "normal",
+                "min_success_probability": 0.15,
+            },
+            catalog,
+            input_tokens=500_000,
+            output_tokens=500_000,
+        )
+        self.assertEqual(repeated.plan_fingerprint, decision.plan_fingerprint)
+        drifted_steps = deepcopy(list(decision.planned_steps))
+        drifted_steps[1]["estimated_cost_cny"] = 999.0
+        self.assertNotEqual(
+            route_plan_fingerprint(
+                drifted_steps,
+                input_tokens=500_000,
+                cached_input_tokens=0,
+                output_tokens=500_000,
+            ),
+            decision.plan_fingerprint,
+        )
         self.assertGreater(decision.expected_success_probability or 0, decision.acceptance_prior.conservative_probability)
+
+    def test_optimizer_enumerates_early_stop_and_skip_tier_chains(self) -> None:
+        catalog = default_provider_catalog()
+        # High is slightly less cost-efficient than low, so the unconstrained
+        # optimum stops early while the SLA-constrained optimum skips the
+        # prohibitively expensive medium tier.
+        prices = {"longcat": 1.0, "deepseek": 100.0, "codex": 1.1}
+        for provider in catalog["providers"]:
+            provider["input_cny_per_1m"] = prices[provider["provider_id"]]
+            provider["output_cny_per_1m"] = prices[provider["provider_id"]]
+        unconstrained = decide_route(
+            {"risk": "low", "task_type": "analysis"},
+            catalog,
+            input_tokens=1_000_000,
+        )
+        self.assertEqual(unconstrained.planned_provider_ids, ("longcat",))
+        constrained = decide_route(
+            {
+                "risk": "low",
+                "task_type": "analysis",
+                "min_success_probability": 0.1,
+            },
+            catalog,
+            input_tokens=1_000_000,
+        )
+        self.assertEqual(constrained.planned_provider_ids, ("longcat", "codex"))
 
     def test_required_capabilities_are_hard_route_constraints(self) -> None:
         catalog = default_provider_catalog()

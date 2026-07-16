@@ -7,6 +7,7 @@ from copy import deepcopy
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -18,17 +19,20 @@ ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "scripts" / "costmarshal.py"
 sys.path.insert(0, str(ROOT))
 
+from costmarshal_v2.actor_runner import usage_details_from_events, usage_from_events  # noqa: E402
 from costmarshal_v2.routing import (  # noqa: E402
     RoutingValidationError,
     build_pricing_snapshot,
     decide_route,
     default_provider_catalog,
     estimate_cost_cny,
+    estimate_cost_nano_cny,
     pricing_snapshot_hash,
     pricing_snapshot_status,
     provider_by_id,
     validate_provider_catalog,
 )
+from costmarshal_v2.scheduler import validate_token_triplet  # noqa: E402
 
 
 NOW = "2026-07-16T12:00:00Z"
@@ -66,6 +70,115 @@ def canonical_catalog(
 
 
 class PricingMetadataTest(unittest.TestCase):
+    def test_canonical_cost_uses_exact_conservative_nano_cny_math(self) -> None:
+        provider = canonical_catalog()["providers"][0]
+        provider["pricing"] = build_pricing_snapshot(
+            currency="CNY",
+            source="https://pricing.example/nano-exact",
+            reviewed_at="2026-07-15T00:00:00Z",
+            effective_at="2026-07-15T00:00:00Z",
+            expires_at="2026-08-15T00:00:00Z",
+            snapshot_id="nano-exact",
+            input_per_1m=428.086698109,
+            cached_input_per_1m=428.086698109,
+            output_per_1m=428.086698109,
+            fixed_request=0,
+        )
+        self.assertEqual(
+            estimate_cost_nano_cny(
+                provider,
+                input_tokens=2_173_054_922,
+                cached_input_tokens=0,
+                output_tokens=0,
+            ),
+            930_255_906_368_491,
+        )
+
+    def test_canonical_price_preserves_all_nine_decimal_places(self) -> None:
+        provider = canonical_catalog()["providers"][0]
+        provider["pricing"] = build_pricing_snapshot(
+            currency="CNY",
+            source="https://pricing.example/raw-decimal",
+            reviewed_at="2026-07-15T00:00:00Z",
+            effective_at="2026-07-15T00:00:00Z",
+            expires_at="2026-08-15T00:00:00Z",
+            snapshot_id="raw-decimal",
+            input_per_1m="999999999.123456789",
+            cached_input_per_1m="0",
+            output_per_1m="0",
+            fixed_request="0",
+        )
+        self.assertEqual(provider["pricing"]["input_per_1m"], "999999999.123456789")
+        self.assertEqual(
+            estimate_cost_nano_cny(
+                provider,
+                input_tokens=1_000_000,
+                cached_input_tokens=0,
+                output_tokens=0,
+            ),
+            999_999_999_123_456_789,
+        )
+
+    def test_init_preserves_unquoted_catalog_decimal_lexeme(self) -> None:
+        catalog = canonical_catalog()
+        catalog["providers"][0]["pricing"] = build_pricing_snapshot(
+            currency="CNY",
+            source="https://pricing.example/catalog-decimal",
+            reviewed_at="2026-07-15T00:00:00Z",
+            effective_at="2026-07-15T00:00:00Z",
+            expires_at="2026-08-15T00:00:00Z",
+            snapshot_id="catalog-decimal",
+            input_per_1m="999999999.123456789",
+            cached_input_per_1m="0",
+            output_per_1m="0",
+            fixed_request="0",
+        )
+        encoded = json.dumps(catalog, ensure_ascii=False)
+        encoded = encoded.replace('"999999999.123456789"', "999999999.123456789", 1)
+        with tempfile.TemporaryDirectory(prefix="costmarshal-catalog-decimal-") as raw:
+            temp = Path(raw)
+            workspace = temp / "workspace"
+            workspace.mkdir()
+            catalog_path = temp / "catalog.json"
+            catalog_path.write_text(encoded, encoding="utf-8")
+            environment = os.environ.copy()
+            environment["COSTMARSHAL_V2_HOME"] = str(temp / "runtime")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(CLI),
+                    "init",
+                    "--name",
+                    "catalog-decimal",
+                    "--objective",
+                    "preserve exact reviewed pricing",
+                    "--workspace",
+                    str(workspace),
+                    "--provider-catalog",
+                    str(catalog_path),
+                    "--governance",
+                    "off",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            project = Path(json.loads(completed.stdout)["project"])
+            stored = json.loads((project / "project.json").read_text(encoding="utf-8"))
+            provider = provider_by_id(stored["provider_catalog"], "longcat")
+            self.assertEqual(provider["pricing"]["input_per_1m"], "999999999.123456789")
+            self.assertEqual(
+                estimate_cost_nano_cny(
+                    provider,
+                    input_tokens=1_000_000,
+                    cached_input_tokens=0,
+                    output_tokens=0,
+                ),
+                999_999_999_123_456_789,
+            )
+
     def test_snapshot_schema_hash_and_validation_are_canonical(self) -> None:
         catalog = canonical_catalog()
         original = deepcopy(catalog)
@@ -228,6 +341,176 @@ class PricingMetadataTest(unittest.TestCase):
                 output_tokens=0,
             )
 
+    def test_cached_forecast_changes_the_economic_route(self) -> None:
+        catalog = canonical_catalog()
+        prices = {
+            "longcat": (100.0, 1.0),
+            "deepseek": (10.0, 10.0),
+            "codex": (100.0, 100.0),
+        }
+        for provider in catalog["providers"]:
+            input_price, cached_price = prices[provider["provider_id"]]
+            provider["pricing"] = build_pricing_snapshot(
+                currency="CNY",
+                source=f"https://pricing.example/{provider['provider_id']}",
+                reviewed_at="2026-07-15T00:00:00Z",
+                effective_at="2026-07-15T00:00:00Z",
+                expires_at="2026-08-15T00:00:00Z",
+                snapshot_id=f"cached-route-{provider['provider_id']}",
+                input_per_1m=input_price,
+                cached_input_per_1m=cached_price,
+                output_per_1m=0.0,
+                fixed_request=0.0,
+            )
+
+        ordinary = decide_route(
+            {"risk": "low", "task_type": "analysis"},
+            catalog,
+            input_tokens=1_000_000,
+            output_tokens=0,
+            now=NOW,
+        )
+        cached = decide_route(
+            {"risk": "low", "task_type": "analysis"},
+            catalog,
+            input_tokens=0,
+            cached_input_tokens=1_000_000,
+            output_tokens=0,
+            now=NOW,
+        )
+        self.assertEqual(ordinary.provider_id, "deepseek")
+        self.assertEqual(cached.provider_id, "longcat")
+        self.assertEqual(cached.estimated_cost_cny, 1.0)
+        self.assertEqual(cached.estimated_cached_input_tokens, 1_000_000)
+        self.assertIn("0/1000000/0", cached.explanation)
+
+    def test_cached_forecast_without_compatible_price_fails_closed(self) -> None:
+        legacy = default_provider_catalog()
+        for provider in legacy["providers"]:
+            provider["input_cny_per_1m"] = 1.0
+            provider["output_cny_per_1m"] = 2.0
+        decision = decide_route(
+            {"risk": "low", "task_type": "analysis"},
+            legacy,
+            cached_input_tokens=1000,
+            now=NOW,
+        )
+        self.assertEqual(decision.optimization_mode, "safe-tier")
+        self.assertEqual(
+            decision.pricing_status,
+            "cached-input-unsupported:beta-legacy",
+        )
+        self.assertIsNone(decision.estimated_cost_cny)
+        with self.assertRaisesRegex(RoutingValidationError, "pricing status"):
+            decide_route(
+                {
+                    "risk": "low",
+                    "task_type": "analysis",
+                    "min_success_probability": 0.1,
+                },
+                legacy,
+                cached_input_tokens=1000,
+                now=NOW,
+            )
+
+    def test_usage_parser_separates_cached_input_dimensions(self) -> None:
+        self.assertEqual(
+            usage_from_events(
+                [
+                    {
+                        "usage": {
+                            "input_tokens": 1000,
+                            "input_tokens_details": {"cached_tokens": 300},
+                            "output_tokens": 50,
+                        }
+                    }
+                ]
+            ),
+            (700, 300, 50),
+        )
+        self.assertEqual(
+            usage_from_events(
+                [
+                    {
+                        "usage": {
+                            "input_tokens": 1000,
+                            "input_tokens_details": {"cached_tokens": 0},
+                            "output_tokens": 25,
+                        }
+                    },
+                    {
+                        "usage": {
+                            "input_tokens": 1500,
+                            "input_tokens_details": {"cached_tokens": 1000},
+                            "output_tokens": 50,
+                        }
+                    },
+                ]
+            ),
+            (500, 1000, 50),
+        )
+        self.assertEqual(
+            usage_details_from_events(
+                [
+                    {
+                        "usage": {
+                            "input_tokens": 100,
+                            "cache_creation_input_tokens": 1000,
+                            "output_tokens": 10,
+                        }
+                    }
+                ]
+            ),
+            (1100, 0, 10, False),
+        )
+
+    def test_persisted_token_dimensions_require_integers_and_consistent_total(self) -> None:
+        issues: list[str] = []
+        validate_token_triplet(
+            {
+                "input_tokens": 10,
+                "cached_input_tokens": 0.5,
+                "output_tokens": True,
+                "total_tokens": 11,
+            },
+            "usage row",
+            issues,
+        )
+        self.assertTrue(any("cached_input_tokens" in issue for issue in issues))
+        self.assertTrue(any("output_tokens" in issue for issue in issues))
+
+        issues = []
+        validate_token_triplet(
+            {
+                "input_tokens": 10,
+                "cached_input_tokens": 5,
+                "output_tokens": 2,
+                "total_tokens": 16,
+            },
+            "usage row",
+            issues,
+        )
+        self.assertEqual(
+            issues,
+            [
+                "usage row total_tokens must equal input_tokens + cached_input_tokens + output_tokens"
+            ],
+        )
+        self.assertEqual(
+            usage_from_events(
+                [
+                    {
+                        "usage": {
+                            "input_tokens": 700,
+                            "cache_read_input_tokens": 300,
+                            "output_tokens": 50,
+                        }
+                    }
+                ]
+            ),
+            (700, 300, 50),
+        )
+
     def test_beta_legacy_prices_remain_explicitly_compatible(self) -> None:
         catalog = default_provider_catalog()
         for provider in catalog["providers"]:
@@ -317,8 +600,10 @@ class PricingMetadataTest(unittest.TestCase):
                 "longcat",
                 "--estimated-input-tokens",
                 "1000",
+                "--estimated-cached-input-tokens",
+                "500",
             )
-            run(
+            dispatched = run(
                 "dispatch",
                 "--project",
                 project,
@@ -328,15 +613,123 @@ class PricingMetadataTest(unittest.TestCase):
                 "longcat",
                 "--unsafe-native",
             )
+            run(
+                "new-task",
+                "--project",
+                project,
+                "--title",
+                "priced result",
+                "--purpose",
+                "Settle a leader result against its dispatch snapshot",
+                "--provider",
+                "longcat",
+                "--estimated-input-tokens",
+                "1000",
+                "--estimated-cached-input-tokens",
+                "500",
+            )
+            result_dispatch = run(
+                "dispatch",
+                "--project",
+                project,
+                "--task",
+                "V2-0002",
+                "--provider",
+                "longcat",
+                "--unsafe-native",
+            )
+            result_task = json.loads(
+                (Path(project) / "tasks" / "V2-0002" / "task.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            result_attempt_id = result_task["attempts"][0]["attempt_id"]
+
+            # Catalog updates after dispatch must not rewrite the economics of
+            # either attempt. Both usage and leader result settlement use the
+            # immutable snapshot embedded in their route decision.
+            project_path = Path(project) / "project.json"
+            project_payload = json.loads(project_path.read_text(encoding="utf-8"))
+            for provider in project_payload["provider_catalog"]["providers"]:
+                if provider["provider_id"] == "longcat":
+                    provider["pricing"] = build_pricing_snapshot(
+                        currency="CNY",
+                        source="https://pricing.example/longcat-updated",
+                        reviewed_at=reviewed,
+                        effective_at=reviewed,
+                        expires_at=expires,
+                        snapshot_id="updated-after-dispatch",
+                        input_per_1m=500.0,
+                        cached_input_per_1m=750.0,
+                        output_per_1m=900.0,
+                        fixed_request=1.0,
+                    )
+            project_path.write_text(
+                json.dumps(project_payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            usage = run(
+                "record-usage",
+                "--project",
+                project,
+                "--actor",
+                dispatched["actor_id"],
+                "--input-tokens",
+                "1000",
+                "--cached-input-tokens",
+                "500",
+                "--final",
+            )["event"]
+            self.assertEqual(usage["cached_input_tokens"], 500)
+            self.assertEqual(usage["total_tokens"], 1500)
+            self.assertEqual(usage["estimated_cost_cny"], "0.011125")
+            self.assertTrue(usage["cost_source"].startswith("attempt_price_snapshot:sha256:"))
+            run(
+                "collect",
+                "--project",
+                project,
+                "--task",
+                "V2-0002",
+                "--state",
+                "waiting_leader",
+            )
+            result = run(
+                "record-result",
+                "--project",
+                project,
+                "--task",
+                "V2-0002",
+                "--actor",
+                result_dispatch["actor_id"],
+                "--attempt",
+                result_attempt_id,
+                "--status",
+                "failed",
+                "--quality-score",
+                "1",
+                "--input-tokens",
+                "1000",
+                "--cached-input-tokens",
+                "500",
+            )["event"]
+            self.assertEqual(result["estimated_cost_cny"], "0.011125")
+            self.assertTrue(result["cost_source"].startswith("attempt_price_snapshot:sha256:"))
             task = json.loads(
                 (Path(project) / "tasks" / "V2-0001" / "task.json").read_text(encoding="utf-8")
             )
             snapshot = task["attempts"][0]["route_decision"]["price_snapshot"]
             self.assertEqual(snapshot, catalog["providers"][0]["pricing"])
             self.assertEqual(snapshot["snapshot_hash"], pricing_snapshot_hash(snapshot))
+            self.assertEqual(task["estimated_cached_input_tokens"], 500)
+            self.assertEqual(
+                task["attempts"][0]["route_decision"]["estimated_cached_input_tokens"],
+                500,
+            )
+            self.assertEqual(task["attempts"][0]["reserved_cost_cny"], "0.011125")
+            self.assertEqual(task["attempts"][0]["actual_cost_cny"], "0.011125")
             self.assertEqual(
                 task["attempts"][0]["reserved_cost_cny"],
-                task["attempts"][0]["route_decision"]["estimated_cost_cny"],
+                task["attempts"][0]["route_decision"]["planned_steps"][0]["estimated_cost_cny"],
             )
 
 

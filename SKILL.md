@@ -23,6 +23,7 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
 10. Every attempt has a launch token and lifetime runtime lock; a duplicate or outcome-unknown runner must not call the provider.
 11. SQLite cutover is explicit and marker-driven. A present but invalid marker fails closed; JSON/JSONL are compatibility views after cutover.
 12. ArchMarshal integration is read-only. Never auto-adopt, apply, start, end, or modify ArchMarshal.
+13. Every admitted provider profile is an exact-byte SHA-256 snapshot bound to the route, attempt, runtime effect, and OCI identity; launch/recovery never re-resolves mutable profile source bytes.
 
 ## Standard workflow
 
@@ -34,7 +35,7 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
 6. Dispatch only after the route explanation and claims are acceptable.
 7. Keep `run-scheduler` active while actors execute.
 8. Review the completion report, isolated worktree diff, tests, and evidence.
-9. Record the leader result. Escalate one tier when evidence is insufficient.
+9. Record the leader result. When evidence is insufficient, continue to the next provider step in the admitted monotonic chain; that step may skip a tier.
 10. Run `validate`, and use `recover` after an unclean stop.
 
 ## Commands
@@ -44,7 +45,7 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
 python scripts/costmarshal.py configure-provider --codex-home "$env:CODEX_HOME" --profile medium-api --provider-id medium-api --base-url "https://reviewed-endpoint/v1" --model "reviewed-model" --env-key MEDIUM_API_KEY
 
 # Initialize three-tier routing.
-python scripts/costmarshal.py init --name <name> --objective "<objective>" --workspace <workspace> --provider-catalog <catalog.json> --project-budget-cny <amount> --governance off --worker-image <name@sha256:digest>
+python scripts/costmarshal.py init --name <name> --objective "<objective>" --workspace <workspace> --provider-catalog <catalog.json> --project-budget-cny <amount> --default-min-success-probability <0..1> --governance off --worker-image <name@sha256:digest>
 
 # Create a bounded task.
 python scripts/costmarshal.py new-task --project <project-dir> --title "<title>" --purpose "<purpose>" --task-type implementation --risk medium --difficulty normal --estimated-input-tokens 100000 --estimated-output-tokens 10000 --claim-path src/file.py --allowed-path src/file.py
@@ -81,7 +82,9 @@ python scripts/costmarshal.py state-store --project <project-dir>
 - Low-risk bounded analysis, docs, extraction, mechanical work, small edits, summaries, tests, or verification: low floor.
 - Unknown or judgment-heavy types: medium floor.
 
-With complete reviewed prices and token estimates, compare all valid provider combinations in escalation chains using expected cost per leader-accepted result. Enforce `--min-success-probability` when supplied. Without complete inputs, choose the minimum safe available tier. Explain the fallback; do not manufacture a price.
+With complete reviewed prices and token estimates, exhaustively compare every safe monotonic provider subchain, including early-stop and tier-skip plans, using expected cost per leader-accepted result. Reject more than 16 enabled compatible providers in one tier. Enforce the task `--min-success-probability` when supplied, otherwise freeze the optional project `default_min_success_probability` into a new auto-routed task. Without either SLA, explain that collaboration is permitted but not required. Before the first dispatch, bind each selected step to its price basis and exact-byte provider profile identity, then reserve the sum of all step estimates in a task-level admission envelope; never use probability-weighted expected cost as the reservation. Continuations consume that envelope and immutable profile snapshot without double counting or re-reading mutable source config, and drift fails closed. Without complete economic inputs, choose the minimum safe available tier. Explain the fallback; do not manufacture a price.
+
+Budget admission/reconciliation uses integer nano-CNY internally and rejects values with more than 9 decimal places. Decode catalog monetary JSON without binary-float conversion, canonicalize reviewed rates as exact decimal strings, multiply them by integer tokens, and round any fractional nano-CNY reservation upward. Reprice cumulative usage once from the immutable attempt snapshot; a caller-priced/unverified row is sticky even when it reports zero tokens and cannot later be washed clean by a final row. Budget envelopes are admission/accounting controls over token estimates, not external hard-spend guarantees. Do not claim a hard monetary cap unless the selected provider proxy enforces request/token or money ceilings.
 
 ## Provider catalog
 
@@ -101,6 +104,11 @@ The old flat `input_cny_per_1m`/`output_cny_per_1m` fields remain available only
 as explicitly labelled beta compatibility; they have no freshness guarantee and
 produce no immutable price snapshot.
 
+In legacy JSON authority, a crash-replayed escalation must match the complete
+prepared successor admission, including provider/model/profile, env-key
+selector, runtime backend, full worker-isolation execution and attestation,
+immutable profile identity, route/pricing plan, and budget projection.
+
 Task `--require-capability` values are hard constraints: providers lacking every required capability are removed before tier and cost selection.
 
 ## Worker isolation policy
@@ -109,6 +117,7 @@ Task `--require-capability` values are hard constraints: providers lacking every
 - Missing engine/image/canary/network support fails before attempt persistence and budget reservation.
 - Images must be digest pinned and use pull-never, read-only rootfs, non-root UID, dropped capabilities, no-new-privileges, limits, and explicit mounts.
 - Required dispatch uses the attested OCI adapter and bundled digest-buildable worker image; unrestricted bridge networking is forbidden, and missing live engine/image/canary/provider-proxy evidence fails closed.
+- OCI start/recovery verifies the exact managed environment contract, and the worker requires the admitted profile SHA-256 before provider execution. Missing profile bindings never fall back to mutable user configuration.
 - Development compatibility requires `init --allow-unsafe-native-workers` and `dispatch --unsafe-native`; the attestation records `strong_isolation=false`. Required or ready ArchMarshal governance forbids new native provider launches, so governed work must use required OCI isolation.
 
 ## Worker write policy
@@ -122,12 +131,12 @@ Task `--require-capability` values are hard constraints: providers lacking every
 
 ## ArchMarshal governance
 
-Use `--governance required --archmarshal-wrapper <exact invoke_archmarshal.py>` only after the workspace is explicitly managed by ArchMarshal. CostMarshal stores a binding fingerprint and validates it before dispatch and actor launch. A drift blocks execution.
+Use `--governance required --archmarshal-launcher <exact run_archmarshal.py>` only after the workspace is explicitly managed by ArchMarshal. CostMarshal invokes only bootstrap-status/doctor read checks, binds the canonical launcher and sibling invoke wrapper, and validates that fingerprint before dispatch and actor launch. A drift blocks execution.
 
 When a required binding drifts, new spawn, relay, scheduler, and direct actor entry paths fail closed. An explicit `stop-actor --stop-runtime` remains available as a STOP-only emergency path; reuse its `--command-id` if recovery is needed. It must never drain a pending SPAWN.
 
-After a CostMarshal binding-format upgrade, use `governance-rebind` to preview and
-`governance-rebind --apply` to explicitly refresh only the CostMarshal-side
+After a CostMarshal binding-format upgrade, use `governance-rebind --archmarshal-launcher <exact run_archmarshal.py>` to preview and
+add `--apply` to explicitly refresh only the CostMarshal-side
 fingerprint. The prior binding remains in project audit history; ArchMarshal stays
 read-only.
 

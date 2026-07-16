@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT))
 from costmarshal_v2.governance import (  # noqa: E402
     BINDING_FORMAT,
     GovernanceError,
+    enforce_governance_contract,
     inspect_governance,
     validate_governance_binding,
 )
@@ -73,6 +74,12 @@ def environment(**updates: str | None) -> Iterator[None]:
 
 
 def write_fake_wrapper(path: Path) -> None:
+    assert path.name == "run_archmarshal.py"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.with_name("invoke_archmarshal.py").write_text(
+        "# fake canonical invoke wrapper; identity is bound by CostMarshal\n",
+        encoding="utf-8",
+    )
     path.write_text(
         textwrap.dedent(
             f"""\
@@ -92,8 +99,8 @@ def write_fake_wrapper(path: Path) -> None:
                     "api_version": "archmarshal-plugin-bootstrap-v2",
                     "mode": "ready",
                     "verified": True,
-                    "engine_api": "archmarshal-engine-api-v1",
-                    "engine_version": "0.14.0",
+                    "engine_api": os.environ.get("FAKE_ARCHMARSHAL_ENGINE_API", "archmarshal-engine-api-v1"),
+                    "engine_version": os.environ.get("FAKE_ARCHMARSHAL_ENGINE_VERSION", "0.15.0"),
                     "source_tree_sha256": "{SOURCE_HASH}",
                     "source": "SHOULD_NOT_APPEAR_IN_BINDING",
                 }}))
@@ -117,12 +124,17 @@ def write_fake_wrapper(path: Path) -> None:
                     state = "warning"
                 print(json.dumps({{
                     "api_version": "archmarshal-cli-v1",
+                    "payload_schema_version": os.environ.get("FAKE_ARCHMARSHAL_DOCTOR_SCHEMA", "archmarshal-doctor-v1"),
                     "mode": "read_only",
                     "source_mutation": False,
                     "workspace_root": workspace,
                     "state": state,
-                    "summary": {{"error": errors, "warning": warnings, "info": len(findings)}},
-                    "findings": findings,
+                    "summary": (
+                        {{"error": True, "warning": warnings, "info": len(findings)}}
+                        if os.environ.get("FAKE_ARCHMARSHAL_BAD_SUMMARY")
+                        else {{"error": errors, "warning": warnings, "info": len(findings)}}
+                    ),
+                    "findings": "invalid" if os.environ.get("FAKE_ARCHMARSHAL_BAD_FINDINGS") else findings,
                 }}))
                 raise SystemExit(0)
 
@@ -211,7 +223,7 @@ def inspect_without_workspace_changes(
 ) -> dict[str, object]:
     before = tree_state(workspace)
     with environment(FAKE_ARCHMARSHAL_STATE=state):
-        result = inspect_governance(workspace, mode=mode, wrapper_path=wrapper)
+        result = inspect_governance(workspace, mode=mode, launcher_path=wrapper)
     assert_true(tree_state(workspace) == before, f"{mode}/{state} inspection changed workspace")
     return result
 
@@ -219,7 +231,7 @@ def inspect_without_workspace_changes(
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="costmarshal-archmarshal-contract-") as tmp:
         temp = Path(tmp)
-        wrapper = temp / "invoke_archmarshal.py"
+        wrapper = temp / "run_archmarshal.py"
         call_log = temp / "wrapper-calls.log"
         write_fake_wrapper(wrapper)
 
@@ -228,12 +240,30 @@ def main() -> int:
             assert_true(off["status"] == "off" and off["binding"] is None, "off must skip governance")
             assert_true(not call_log.exists(), "off must not invoke a wrapper")
 
-            missing_wrapper = inspect_governance(temp, mode="auto", wrapper_path=None)
+            missing_wrapper = inspect_governance(temp, mode="auto", launcher_path=None)
             assert_true(missing_wrapper["status"] == "warning", "auto must warn without wrapper")
             assert_raises(
-                "archmarshal_wrapper_required",
-                lambda: inspect_governance(temp, mode="required", wrapper_path=None),
+                "archmarshal_launcher_required",
+                lambda: inspect_governance(temp, mode="required", launcher_path=None),
             )
+            assert_raises(
+                "archmarshal_canonical_launcher_required",
+                lambda: inspect_governance(
+                    temp,
+                    mode="required",
+                    launcher_path=wrapper.with_name("invoke_archmarshal.py"),
+                ),
+            )
+            with environment(FAKE_ARCHMARSHAL_ENGINE_API="unknown-engine-api"):
+                assert_raises(
+                    "archmarshal_bootstrap_unverified",
+                    lambda: inspect_governance(temp, mode="required", launcher_path=wrapper),
+                )
+            with environment(FAKE_ARCHMARSHAL_ENGINE_VERSION="0.14.0"):
+                assert_raises(
+                    "archmarshal_bootstrap_unverified",
+                    lambda: inspect_governance(temp, mode="required", launcher_path=wrapper),
+                )
 
             healthy_workspace = create_owned_workspace(temp / "healthy")
             healthy = inspect_without_workspace_changes(
@@ -243,10 +273,20 @@ def main() -> int:
             assert_true(healthy["ready"] is True and isinstance(binding, dict), "healthy must bind")
             assert_true(binding["format"] == BINDING_FORMAT, "binding format must be stable")
             assert_true(binding["engine_api"] == "archmarshal-engine-api-v1", "engine API missing")
-            assert_true(binding["engine_version"] == "0.14.0", "engine version missing")
+            assert_true(binding["engine_version"] == "0.15.0", "engine version missing")
             assert_true(binding["engine_source_sha256"] == SOURCE_HASH, "engine source hash missing")
-            assert_true(binding["wrapper_sha256"], "wrapper hash missing")
-            assert_true(binding["wrapper_size"] == wrapper.stat().st_size, "wrapper size missing")
+            assert_true(binding["launcher_sha256"], "launcher hash missing")
+            assert_true(binding["launcher_size"] == wrapper.stat().st_size, "launcher size missing")
+            assert_true(binding["invoke_wrapper_sha256"], "invoke wrapper hash missing")
+            assert_true(
+                binding["invoke_wrapper_size"] == wrapper.with_name("invoke_archmarshal.py").stat().st_size,
+                "invoke wrapper size missing",
+            )
+            assert_true(binding["doctor_api_version"] == "archmarshal-cli-v1", "doctor API missing")
+            assert_true(
+                binding["doctor_payload_schema_version"] == "archmarshal-doctor-v1",
+                "doctor schema missing",
+            )
             assert_true(binding["skill_index_head"] == INITIAL_HEAD, "Skill HEAD missing")
             assert_true(binding["ownership_marker_sha256"], "ownership marker hash missing")
             assert_true(binding["workspace_root"] == str(healthy_workspace.resolve()), "root mismatch")
@@ -260,10 +300,30 @@ def main() -> int:
                     binding,
                     healthy_workspace,
                     mode="required",
-                    wrapper_path=wrapper,
+                    launcher_path=wrapper,
                 )
             assert_true(validated["valid"] is True and validated["drift"] == [], "binding should validate")
             assert_true(tree_state(healthy_workspace) == before_validation, "validation changed workspace")
+
+            for variable, expected_issue in (
+                ("FAKE_ARCHMARSHAL_DOCTOR_SCHEMA", "archmarshal_doctor_schema_invalid"),
+                ("FAKE_ARCHMARSHAL_BAD_SUMMARY", "archmarshal_doctor_summary_invalid"),
+                ("FAKE_ARCHMARSHAL_BAD_FINDINGS", "archmarshal_doctor_findings_invalid"),
+            ):
+                value = "wrong-doctor-schema" if variable.endswith("SCHEMA") else "1"
+                with environment(**{variable: value}):
+                    error = assert_raises(
+                        "archmarshal_governance_not_ready",
+                        lambda: inspect_governance(
+                            healthy_workspace,
+                            mode="required",
+                            launcher_path=wrapper,
+                        ),
+                    )
+                assert_true(
+                    expected_issue in error.details["issue_codes"],
+                    f"{variable} did not fail closed",
+                )
 
             absent_workspace = temp / "absent" / "workspace"
             absent_workspace.mkdir(parents=True)
@@ -279,11 +339,50 @@ def main() -> int:
                     lambda: inspect_governance(
                         absent_workspace,
                         mode="required",
-                        wrapper_path=wrapper,
+                    launcher_path=wrapper,
                     ),
                 )
             assert_true(absent_error.details["doctor_state"] == "absent", "absent state not retained")
             assert_true(tree_state(absent_workspace) == before_absent_required, "required absent changed workspace")
+            auto_governance = {
+                "mode": "auto",
+                "ready": False,
+                "launcher_path": str(wrapper),
+                "binding": absent.get("binding"),
+            }
+            with environment(FAKE_ARCHMARSHAL_STATE="absent"):
+                absent_contract = enforce_governance_contract(
+                    auto_governance,
+                    absent_workspace,
+                    operation="test absent rediscovery",
+                )
+            assert_true(absent_contract["governed"] is False, "explicit absence must remain usable")
+            marker = absent_workspace / ".agent" / "ownership.json"
+            head = absent_workspace / ".agent" / "skill-overlays" / ".archmarshal" / "HEAD"
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            head.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_bytes(ownership_bytes("adopted-after-init"))
+            head.write_text(INITIAL_HEAD + "\n", encoding="ascii")
+            adopted_before = tree_state(absent_workspace)
+            with environment(FAKE_ARCHMARSHAL_STATE="healthy"):
+                assert_raises(
+                    "governance_rebind_required",
+                    lambda: enforce_governance_contract(
+                        auto_governance,
+                        absent_workspace,
+                        operation="test post-init adoption",
+                    ),
+                )
+            assert_true(tree_state(absent_workspace) == adopted_before, "rediscovery mutated workspace")
+            no_launcher = {"mode": "auto", "ready": False, "launcher_path": None}
+            assert_raises(
+                "archmarshal_launcher_required_for_detected_governance",
+                lambda: enforce_governance_contract(
+                    no_launcher,
+                    absent_workspace,
+                    operation="test detected governance",
+                ),
+            )
 
             corrupt_workspace = create_owned_workspace(temp / "corrupt")
             (corrupt_workspace / ".agent" / "ownership.json").write_text("{not-json\n", encoding="utf-8")
@@ -299,7 +398,7 @@ def main() -> int:
                     lambda: inspect_governance(
                         corrupt_workspace,
                         mode="required",
-                        wrapper_path=wrapper,
+                    launcher_path=wrapper,
                     ),
                 )
             assert_true(tree_state(corrupt_workspace) == before_corrupt_required, "corrupt check changed workspace")
@@ -317,7 +416,7 @@ def main() -> int:
                     lambda: inspect_governance(
                         partial_workspace,
                         mode="required",
-                        wrapper_path=wrapper,
+                    launcher_path=wrapper,
                     ),
                 )
             assert_true(tree_state(partial_workspace) == before_partial_required, "partial check changed workspace")
@@ -333,7 +432,7 @@ def main() -> int:
                     marker_binding,
                     marker_workspace,
                     mode="auto",
-                    wrapper_path=wrapper,
+                    launcher_path=wrapper,
                 )
                 assert_raises(
                     "governance_binding_drift",
@@ -341,7 +440,7 @@ def main() -> int:
                         marker_binding,
                         marker_workspace,
                         mode="required",
-                        wrapper_path=wrapper,
+                    launcher_path=wrapper,
                     ),
                 )
             assert_true(marker_auto["valid"] is False, "marker drift must invalidate")
@@ -364,7 +463,7 @@ def main() -> int:
                     head_binding,
                     head_workspace,
                     mode="auto",
-                    wrapper_path=wrapper,
+                    launcher_path=wrapper,
                 )
                 assert_raises(
                     "governance_binding_drift",
@@ -372,7 +471,7 @@ def main() -> int:
                         head_binding,
                         head_workspace,
                         mode="required",
-                        wrapper_path=wrapper,
+                    launcher_path=wrapper,
                     ),
                 )
             assert_true(head_auto["valid"] is False, "HEAD drift must invalidate")
@@ -382,8 +481,32 @@ def main() -> int:
             )
             assert_true(tree_state(head_workspace) == before_head_drift, "HEAD validation changed workspace")
 
+            invoke_workspace = create_owned_workspace(temp / "invoke-drift")
+            invoke_binding = inspect_without_workspace_changes(
+                invoke_workspace, wrapper, mode="required", state="healthy"
+            )["binding"]
+            invoke_wrapper = wrapper.with_name("invoke_archmarshal.py")
+            invoke_wrapper.write_text(
+                invoke_wrapper.read_text(encoding="utf-8") + "# invoke drift\n",
+                encoding="utf-8",
+            )
+            with environment(FAKE_ARCHMARSHAL_STATE="healthy"):
+                invoke_auto = validate_governance_binding(
+                    invoke_binding,
+                    invoke_workspace,
+                    mode="auto",
+                    launcher_path=wrapper,
+                )
+            assert_true(invoke_auto["valid"] is False, "invoke drift must invalidate")
+            assert_true(
+                {row["field"] for row in invoke_auto["drift"]}
+                == {"invoke_wrapper_sha256", "invoke_wrapper_size"},
+                "invoke drift must be byte-bound",
+            )
+            # Restore the fake pair before testing launcher-only drift.
+            write_fake_wrapper(wrapper)
             wrapper.write_text(
-                wrapper.read_text(encoding="utf-8") + "\n# reviewed wrapper drift\n",
+                wrapper.read_text(encoding="utf-8") + "\n# reviewed launcher drift\n",
                 encoding="utf-8",
             )
             with environment(FAKE_ARCHMARSHAL_STATE="healthy"):
@@ -391,7 +514,7 @@ def main() -> int:
                     binding,
                     healthy_workspace,
                     mode="auto",
-                    wrapper_path=wrapper,
+                    launcher_path=wrapper,
                 )
                 assert_raises(
                     "governance_binding_drift",
@@ -399,17 +522,17 @@ def main() -> int:
                         binding,
                         healthy_workspace,
                         mode="required",
-                        wrapper_path=wrapper,
+                    launcher_path=wrapper,
                     ),
                 )
-            assert_true(wrapper_auto["valid"] is False, "wrapper drift must invalidate")
+            assert_true(wrapper_auto["valid"] is False, "launcher drift must invalidate")
             assert_true(
                 {row["field"] for row in wrapper_auto["drift"]}
-                == {"wrapper_sha256", "wrapper_size"},
-                "wrapper drift must be byte-bound",
+                == {"launcher_sha256", "launcher_size"},
+                "launcher drift must be byte-bound",
             )
 
-            rebind_wrapper = temp / "invoke_archmarshal_rebind.py"
+            rebind_wrapper = temp / "rebind" / "run_archmarshal.py"
             write_fake_wrapper(rebind_wrapper)
             runtime = temp / "runtime"
             command = [
@@ -428,7 +551,7 @@ def main() -> int:
                 "local",
                 "--governance",
                 "required",
-                "--archmarshal-wrapper",
+                "--archmarshal-launcher",
                 str(rebind_wrapper),
                 "--allow-unsafe-native-workers",
             ]
@@ -445,8 +568,8 @@ def main() -> int:
             project_path = project_dir / "project.json"
             project_payload = json.loads(project_path.read_text(encoding="utf-8"))
             project_payload["governance"]["binding"]["format"] = "costmarshal-archmarshal-binding-v1"
-            project_payload["governance"]["binding"].pop("wrapper_sha256", None)
-            project_payload["governance"]["binding"].pop("wrapper_size", None)
+            project_payload["governance"]["binding"].pop("launcher_sha256", None)
+            project_payload["governance"]["binding"].pop("launcher_size", None)
             project_path.write_text(json.dumps(project_payload, indent=2) + "\n", encoding="utf-8")
             stale_bytes = project_path.read_bytes()
 
@@ -504,7 +627,7 @@ def main() -> int:
                 "status": "off",
                 "ready": False,
                 "binding": None,
-                "wrapper_path": None,
+                "launcher_path": None,
             }
             project_path.write_text(json.dumps(project_payload, indent=2) + "\n", encoding="utf-8")
             fixture_task = subprocess.run(

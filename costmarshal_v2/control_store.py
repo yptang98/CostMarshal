@@ -688,8 +688,8 @@ def migrate_legacy_store(layout: ProjectLayout) -> dict[str, Any]:
 
     If a prior process died after installing the validated database but before
     the marker, the same call verifies the manifest and finishes the cutover.
-    The caller must hold both the scheduler-instance lock and project write
-    lock for the full preview/backup/cutover operation.
+    The caller must hold the scheduler-daemon, runtime-effect, and project
+    write locks for the full preview/backup/cutover operation.
     """
 
     layout.scheduler_dir.mkdir(parents=True, exist_ok=True)

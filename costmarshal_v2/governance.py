@@ -1,9 +1,9 @@
 """Read-only ArchMarshal governance discovery and binding validation.
 
-This module deliberately has no ArchMarshal import and no wrapper discovery.
-Callers must provide the exact reviewed ``invoke_archmarshal.py`` path.  The
-only supported subprocess operations are the dependency-free bootstrap identity
-check and the read-only workspace doctor.
+This module deliberately has no ArchMarshal import and no launcher discovery.
+Callers must provide the exact reviewed canonical ``run_archmarshal.py`` path.
+The only supported subprocess operations are the dependency-free bootstrap
+identity check and the read-only workspace doctor.
 """
 
 from __future__ import annotations
@@ -20,9 +20,14 @@ from typing import Any
 
 
 GOVERNANCE_MODES = frozenset({"off", "auto", "required"})
-BINDING_FORMAT = "costmarshal-archmarshal-binding-v2"
-MAX_WRAPPER_OUTPUT_BYTES = 8 * 1024 * 1024
-MAX_WRAPPER_BYTES = 2 * 1024 * 1024
+BINDING_FORMAT = "costmarshal-archmarshal-binding-v3"
+ARCHMARSHAL_BOOTSTRAP_API = "archmarshal-plugin-bootstrap-v2"
+ARCHMARSHAL_ENGINE_API = "archmarshal-engine-api-v1"
+SUPPORTED_ARCHMARSHAL_ENGINE_VERSIONS = frozenset({"0.15.0"})
+ARCHMARSHAL_CLI_API = "archmarshal-cli-v1"
+ARCHMARSHAL_DOCTOR_API = "archmarshal-doctor-v1"
+MAX_LAUNCHER_OUTPUT_BYTES = 8 * 1024 * 1024
+MAX_LAUNCHER_BYTES = 2 * 1024 * 1024
 MAX_OWNERSHIP_BYTES = 64 * 1024
 MAX_SKILL_HEAD_BYTES = 1024
 MAX_PROJECT_BYTES = 8 * 1024 * 1024
@@ -30,11 +35,16 @@ PROJECT_SNAPSHOT_ATTEMPTS = 3
 _BINDING_FIELDS = (
     "format",
     "provider",
+    "bootstrap_api_version",
     "engine_api",
     "engine_version",
     "engine_source_sha256",
-    "wrapper_sha256",
-    "wrapper_size",
+    "launcher_sha256",
+    "launcher_size",
+    "invoke_wrapper_sha256",
+    "invoke_wrapper_size",
+    "doctor_api_version",
+    "doctor_payload_schema_version",
     "workspace_root",
     "ownership_marker_sha256",
     "skill_index_head",
@@ -145,12 +155,13 @@ def inspect_governance(
     workspace: Path | str,
     *,
     mode: str = "auto",
+    launcher_path: Path | str | None = None,
     wrapper_path: Path | str | None = None,
     timeout_seconds: float = 30.0,
 ) -> dict[str, Any]:
     """Inspect an ArchMarshal workspace without writing to it.
 
-    ``off`` performs no wrapper or workspace reads. ``auto`` converts an
+    ``off`` performs no launcher or workspace reads. ``auto`` converts an
     unavailable or not-ready integration into a warning. ``required`` raises a
     :class:`GovernanceError` unless the verified engine and doctor both report a
     healthy, read-only workspace with a usable ownership marker.
@@ -169,24 +180,49 @@ def inspect_governance(
 
     try:
         workspace_path = _workspace_path(workspace)
-        wrapper = _explicit_wrapper_path(wrapper_path)
-        wrapper_identity = _wrapper_identity(wrapper)
-        bootstrap = _invoke_wrapper(wrapper, ["--bootstrap-status"], timeout_seconds)
+        launcher, invoke_wrapper = _explicit_launcher_pair(
+            launcher_path=launcher_path,
+            wrapper_path=wrapper_path,
+        )
+        launcher_identity = _stable_file_identity(
+            launcher,
+            label="launcher",
+            hash_field="launcher_sha256",
+            size_field="launcher_size",
+        )
+        invoke_identity = _stable_file_identity(
+            invoke_wrapper,
+            label="invoke wrapper",
+            hash_field="invoke_wrapper_sha256",
+            size_field="invoke_wrapper_size",
+        )
+        bootstrap = _invoke_launcher(launcher, ["--bootstrap-status"], timeout_seconds)
         bootstrap_identity = _bootstrap_identity(bootstrap)
-        doctor = _invoke_wrapper(wrapper, ["doctor", str(workspace_path)], timeout_seconds)
+        doctor = _invoke_launcher(launcher, ["doctor", str(workspace_path)], timeout_seconds)
         doctor_state, doctor_issues = _doctor_readiness(doctor, workspace_path)
         workspace_identity, identity_issues = _workspace_identity(workspace_path)
-        if _wrapper_identity(wrapper) != wrapper_identity:
+        if _stable_file_identity(
+            launcher,
+            label="launcher",
+            hash_field="launcher_sha256",
+            size_field="launcher_size",
+        ) != launcher_identity or _stable_file_identity(
+            invoke_wrapper,
+            label="invoke wrapper",
+            hash_field="invoke_wrapper_sha256",
+            size_field="invoke_wrapper_size",
+        ) != invoke_identity:
             raise GovernanceError(
-                "archmarshal_wrapper_changed",
-                "The reviewed ArchMarshal wrapper changed during inspection.",
+                "archmarshal_launcher_changed",
+                "The reviewed ArchMarshal launcher pair changed during inspection.",
             )
         issues = [*doctor_issues, *identity_issues]
         binding = _make_binding(
             bootstrap_identity,
             workspace_path,
             workspace_identity,
-            wrapper_identity,
+            launcher_identity,
+            invoke_identity,
         )
         if doctor_state != "healthy":
             issues.insert(
@@ -224,6 +260,7 @@ def validate_governance_binding(
     workspace: Path | str,
     *,
     mode: str = "required",
+    launcher_path: Path | str | None = None,
     wrapper_path: Path | str | None = None,
     timeout_seconds: float = 30.0,
 ) -> dict[str, Any]:
@@ -246,10 +283,17 @@ def validate_governance_binding(
             "governance_binding_invalid",
             "Governance binding must be a JSON object.",
         )
+    if binding.get("format") != BINDING_FORMAT:
+        return _binding_failure(
+            normalized_mode,
+            "governance_binding_upgrade_required",
+            "The stored ArchMarshal binding format requires an explicit CostMarshal rebind.",
+        )
 
     inspection = inspect_governance(
         workspace,
         mode=normalized_mode,
+        launcher_path=launcher_path,
         wrapper_path=wrapper_path,
         timeout_seconds=timeout_seconds,
     )
@@ -327,51 +371,98 @@ def _workspace_path(workspace: Path | str) -> Path:
     return path
 
 
-def _explicit_wrapper_path(wrapper_path: Path | str | None) -> Path:
-    if wrapper_path is None or not str(wrapper_path).strip():
+def _explicit_launcher_pair(
+    *,
+    launcher_path: Path | str | None,
+    wrapper_path: Path | str | None,
+) -> tuple[Path, Path]:
+    if launcher_path is not None and wrapper_path is not None:
+        if os.path.normcase(str(Path(launcher_path).expanduser())) != os.path.normcase(
+            str(Path(wrapper_path).expanduser())
+        ):
+            raise GovernanceError(
+                "archmarshal_launcher_ambiguous",
+                "Conflicting ArchMarshal launcher paths were provided.",
+            )
+    selected = launcher_path if launcher_path is not None else wrapper_path
+    if selected is None or not str(selected).strip():
         raise GovernanceError(
-            "archmarshal_wrapper_required",
-            "An explicit reviewed ArchMarshal wrapper path is required.",
+            "archmarshal_launcher_required",
+            "An explicit reviewed canonical ArchMarshal launcher path is required.",
         )
-    lexical = Path(wrapper_path).expanduser()
-    if lexical.is_symlink():
+    lexical = Path(selected).expanduser()
+    if lexical.name != "run_archmarshal.py":
         raise GovernanceError(
-            "archmarshal_wrapper_unsafe",
-            "The explicit ArchMarshal wrapper path must not be a symbolic link.",
+            "archmarshal_canonical_launcher_required",
+            "ArchMarshal compatibility requires the canonical run_archmarshal.py launcher.",
         )
     try:
-        path = lexical.resolve(strict=True)
+        lexical_info = lexical.lstat()
+    except OSError as exc:
+        raise GovernanceError(
+            "archmarshal_launcher_unavailable",
+            "The explicit ArchMarshal launcher path is unavailable.",
+        ) from exc
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if (
+        not stat.S_ISREG(lexical_info.st_mode)
+        or stat.S_ISLNK(lexical_info.st_mode)
+        or bool(getattr(lexical_info, "st_file_attributes", 0) & reparse_flag)
+    ):
+        raise GovernanceError(
+            "archmarshal_launcher_unsafe",
+            "The explicit ArchMarshal launcher must be an unlinked regular file.",
+        )
+    try:
+        launcher = lexical.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
         raise GovernanceError(
-            "archmarshal_wrapper_unavailable",
-            "The explicit ArchMarshal wrapper path is unavailable.",
+            "archmarshal_launcher_unavailable",
+            "The explicit ArchMarshal launcher path is unavailable.",
         ) from exc
-    if not path.is_file():
+    invoke_wrapper = launcher.with_name("invoke_archmarshal.py")
+    if not invoke_wrapper.exists():
         raise GovernanceError(
-            "archmarshal_wrapper_unavailable",
-            "The explicit ArchMarshal wrapper path is not a file.",
+            "archmarshal_invoke_wrapper_unavailable",
+            "The canonical ArchMarshal invoke wrapper is unavailable beside the launcher.",
         )
-    return path
+    return launcher, invoke_wrapper
 
 
-def _wrapper_identity(wrapper: Path) -> dict[str, Any]:
+def _stable_file_identity(
+    path: Path,
+    *,
+    label: str,
+    hash_field: str,
+    size_field: str,
+) -> dict[str, Any]:
     try:
-        before = wrapper.stat()
-        if before.st_size > MAX_WRAPPER_BYTES:
+        before = path.lstat()
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or bool(getattr(before, "st_file_attributes", 0) & reparse_flag)
+        ):
             raise GovernanceError(
-                "archmarshal_wrapper_invalid",
-                "The explicit ArchMarshal wrapper exceeds the bounded size.",
+                "archmarshal_launcher_unsafe",
+                f"The reviewed ArchMarshal {label} must be an unlinked regular file.",
             )
-        raw = wrapper.read_bytes()
-        after = wrapper.stat()
+        if before.st_size > MAX_LAUNCHER_BYTES:
+            raise GovernanceError(
+                "archmarshal_launcher_invalid",
+                f"The reviewed ArchMarshal {label} exceeds the bounded size.",
+            )
+        raw = path.read_bytes()
+        after = path.lstat()
     except GovernanceError:
         raise
     except OSError as exc:
         raise GovernanceError(
-            "archmarshal_wrapper_unreadable",
-            "The explicit ArchMarshal wrapper could not be read safely.",
+            "archmarshal_launcher_unreadable",
+            f"The reviewed ArchMarshal {label} could not be read safely.",
         ) from exc
-    if len(raw) > MAX_WRAPPER_BYTES or (
+    if len(raw) > MAX_LAUNCHER_BYTES or (
         before.st_size,
         before.st_mtime_ns,
         getattr(before, "st_ino", None),
@@ -381,16 +472,16 @@ def _wrapper_identity(wrapper: Path) -> dict[str, Any]:
         getattr(after, "st_ino", None),
     ):
         raise GovernanceError(
-            "archmarshal_wrapper_changed",
-            "The reviewed ArchMarshal wrapper changed while it was read.",
+            "archmarshal_launcher_changed",
+            f"The reviewed ArchMarshal {label} changed while it was read.",
         )
     return {
-        "wrapper_sha256": hashlib.sha256(raw).hexdigest(),
-        "wrapper_size": len(raw),
+        hash_field: hashlib.sha256(raw).hexdigest(),
+        size_field: len(raw),
     }
 
 
-def _invoke_wrapper(wrapper: Path, arguments: list[str], timeout_seconds: float) -> dict[str, Any]:
+def _invoke_launcher(launcher: Path, arguments: list[str], timeout_seconds: float) -> dict[str, Any]:
     if timeout_seconds <= 0:
         raise GovernanceError(
             "archmarshal_timeout_invalid",
@@ -398,7 +489,7 @@ def _invoke_wrapper(wrapper: Path, arguments: list[str], timeout_seconds: float)
         )
     try:
         completed = subprocess.run(
-            [sys.executable, str(wrapper), *arguments],
+            [sys.executable, str(launcher), *arguments],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -411,17 +502,17 @@ def _invoke_wrapper(wrapper: Path, arguments: list[str], timeout_seconds: float)
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise GovernanceError(
-            "archmarshal_wrapper_failed",
-            "The explicit ArchMarshal wrapper could not complete its read-only check.",
+            "archmarshal_launcher_failed",
+            "The explicit ArchMarshal launcher could not complete its read-only check.",
         ) from exc
     if completed.returncode != 0:
         raise GovernanceError(
-            "archmarshal_wrapper_failed",
-            "The explicit ArchMarshal wrapper rejected its read-only check.",
+            "archmarshal_launcher_failed",
+            "The explicit ArchMarshal launcher rejected its read-only check.",
             details={"returncode": completed.returncode},
         )
     raw = completed.stdout
-    if len(raw.encode("utf-8")) > MAX_WRAPPER_OUTPUT_BYTES:
+    if len(raw.encode("utf-8")) > MAX_LAUNCHER_OUTPUT_BYTES:
         raise GovernanceError(
             "archmarshal_output_too_large",
             "ArchMarshal read-only output exceeded the bounded response size.",
@@ -446,13 +537,11 @@ def _bootstrap_identity(payload: dict[str, Any]) -> dict[str, str]:
     engine_api = payload.get("engine_api")
     engine_version = payload.get("engine_version")
     if (
-        payload.get("api_version") != "archmarshal-plugin-bootstrap-v2"
+        payload.get("api_version") != ARCHMARSHAL_BOOTSTRAP_API
         or payload.get("verified") is not True
         or payload.get("mode") != "ready"
-        or not isinstance(engine_api, str)
-        or not engine_api
-        or not isinstance(engine_version, str)
-        or not engine_version
+        or engine_api != ARCHMARSHAL_ENGINE_API
+        or engine_version not in SUPPORTED_ARCHMARSHAL_ENGINE_VERSIONS
         or not _is_sha256(source_hash)
     ):
         raise GovernanceError(
@@ -460,6 +549,7 @@ def _bootstrap_identity(payload: dict[str, Any]) -> dict[str, str]:
             "ArchMarshal bootstrap identity is missing, mismatched, or unverified.",
         )
     return {
+        "bootstrap_api_version": ARCHMARSHAL_BOOTSTRAP_API,
         "engine_api": engine_api,
         "engine_version": engine_version,
         "engine_source_sha256": source_hash,
@@ -471,11 +561,18 @@ def _doctor_readiness(
 ) -> tuple[str, list[dict[str, str]]]:
     state = payload.get("state")
     issues: list[dict[str, str]] = []
-    if payload.get("api_version") != "archmarshal-cli-v1":
+    if payload.get("api_version") != ARCHMARSHAL_CLI_API:
         issues.append(
             {
                 "code": "archmarshal_doctor_api_invalid",
                 "message": "ArchMarshal doctor returned an unsupported API envelope.",
+            }
+        )
+    if payload.get("payload_schema_version") != ARCHMARSHAL_DOCTOR_API:
+        issues.append(
+            {
+                "code": "archmarshal_doctor_schema_invalid",
+                "message": "ArchMarshal doctor returned an unsupported payload schema.",
             }
         )
     if payload.get("mode") != "read_only" or payload.get("source_mutation") is not False:
@@ -502,7 +599,12 @@ def _doctor_readiness(
         )
         state = "error"
     summary = payload.get("summary")
-    if not isinstance(summary, dict) or not isinstance(summary.get("error"), int):
+    summary_valid = (
+        isinstance(summary, dict)
+        and set(summary) == {"error", "warning", "info"}
+        and all(type(summary.get(key)) is int and summary[key] >= 0 for key in summary)
+    )
+    if not summary_valid:
         issues.append(
             {
                 "code": "archmarshal_doctor_summary_invalid",
@@ -516,12 +618,27 @@ def _doctor_readiness(
                 "message": "ArchMarshal doctor reported workspace errors.",
             }
         )
+    elif state == "healthy" and summary["warning"] != 0:
+        issues.append(
+            {
+                "code": "archmarshal_doctor_warnings",
+                "message": "ArchMarshal doctor reported warnings for a healthy workspace.",
+            }
+        )
+    findings = payload.get("findings")
+    if not isinstance(findings, list) or any(not isinstance(item, dict) for item in findings):
+        issues.append(
+            {
+                "code": "archmarshal_doctor_findings_invalid",
+                "message": "ArchMarshal doctor findings must be a bounded list of objects.",
+            }
+        )
+        findings = []
     blocking = sorted(
         {
             str(item.get("classification"))
-            for item in payload.get("findings", [])
-            if isinstance(item, dict)
-            and item.get("classification")
+            for item in findings
+            if item.get("classification")
             in {"corrupt", "partial", "partial_package", "incomplete", "unsafe"}
         }
     )
@@ -563,7 +680,7 @@ def _workspace_identity(workspace: Path) -> tuple[dict[str, str | None], list[di
 def _ownership_marker(
     path: Path,
 ) -> tuple[str | None, dict[str, Any] | None, dict[str, str] | None]:
-    if not path.exists():
+    if not os.path.lexists(path):
         return None, None, {
             "code": "archmarshal_ownership_absent",
             "message": "ArchMarshal ownership marker is absent.",
@@ -615,7 +732,7 @@ def _ownership_marker(
 
 
 def _skill_head(path: Path) -> tuple[str | None, dict[str, str] | None]:
-    if not path.exists():
+    if not os.path.lexists(path):
         return None, None
     if path.is_symlink() or not path.is_file():
         return None, {
@@ -655,13 +772,17 @@ def _make_binding(
     bootstrap: dict[str, str],
     workspace: Path,
     identity: dict[str, str | None],
-    wrapper_identity: dict[str, Any],
+    launcher_identity: dict[str, Any],
+    invoke_identity: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "format": BINDING_FORMAT,
         "provider": "archmarshal",
         **bootstrap,
-        **wrapper_identity,
+        **launcher_identity,
+        **invoke_identity,
+        "doctor_api_version": ARCHMARSHAL_CLI_API,
+        "doctor_payload_schema_version": ARCHMARSHAL_DOCTOR_API,
         "workspace_root": str(workspace),
         "ownership_marker_sha256": identity["ownership_marker_sha256"],
         "skill_index_head": identity["skill_index_head"],
@@ -716,6 +837,121 @@ def _binding_failure(
     }
 
 
+def governance_launcher_path(governance: dict[str, Any]) -> Path | str | None:
+    """Return the configured canonical launcher, with a legacy field fallback."""
+
+    launcher = governance.get("launcher_path")
+    if launcher is not None and str(launcher).strip():
+        return launcher
+    wrapper = governance.get("wrapper_path")
+    if wrapper is not None and str(wrapper).strip():
+        return wrapper
+    return None
+
+
+def enforce_governance_contract(
+    governance: dict[str, Any],
+    workspace: Path | str,
+    *,
+    operation: str,
+    timeout_seconds: float = 30.0,
+) -> dict[str, Any]:
+    """Fail closed before provider side effects, including auto rediscovery.
+
+    CostMarshal never adopts or repairs an ArchMarshal workspace. If an auto
+    project transitions from explicitly absent to managed, an explicit rebind
+    is required before execution can continue.
+    """
+
+    if not isinstance(governance, dict):
+        raise GovernanceError(
+            "governance_state_invalid",
+            f"ArchMarshal governance state is invalid for {operation}.",
+        )
+    mode = _governance_mode(str(governance.get("mode") or "off"))
+    ready = governance.get("ready", False)
+    if type(ready) is not bool:
+        raise GovernanceError(
+            "governance_state_invalid",
+            f"ArchMarshal governance readiness is invalid for {operation}.",
+        )
+    if mode == "off":
+        return {"mode": "off", "governed": False, "ready": False, "validation": None}
+
+    launcher = governance_launcher_path(governance)
+    if mode == "required" or ready:
+        validation = validate_governance_binding(
+            governance.get("binding"),
+            workspace,
+            mode="required",
+            launcher_path=launcher,
+            timeout_seconds=timeout_seconds,
+        )
+        if not validation.get("valid"):
+            raise GovernanceError(
+                "governance_binding_invalid",
+                f"ArchMarshal governance binding is invalid for {operation}.",
+            )
+        return {"mode": mode, "governed": True, "ready": True, "validation": validation}
+
+    workspace_path = _workspace_path(workspace)
+    marker_path = workspace_path / ".agent" / "ownership.json"
+    marker_hash, marker, marker_issue = _ownership_marker(marker_path)
+    marker_absent = (
+        marker_hash is None
+        and marker is None
+        and isinstance(marker_issue, dict)
+        and marker_issue.get("code") == "archmarshal_ownership_absent"
+    )
+    if launcher is None:
+        if not marker_absent:
+            raise GovernanceError(
+                "archmarshal_launcher_required_for_detected_governance",
+                "ArchMarshal governance was detected after CostMarshal initialization; configure the canonical launcher and rebind.",
+            )
+        return {"mode": mode, "governed": False, "ready": False, "validation": None}
+
+    inspection = inspect_governance(
+        workspace_path,
+        mode="auto",
+        launcher_path=launcher,
+        timeout_seconds=timeout_seconds,
+    )
+    binding = inspection.get("binding")
+    warning_codes = {
+        str(item.get("code"))
+        for item in inspection.get("warnings") or []
+        if isinstance(item, dict)
+    }
+    explicitly_absent = (
+        inspection.get("doctor_state") == "absent"
+        and isinstance(binding, dict)
+        and binding.get("ownership_marker_sha256") is None
+        and warning_codes.issubset(
+            {"archmarshal_workspace_not_ready", "archmarshal_ownership_absent"}
+        )
+    )
+    if explicitly_absent:
+        return {
+            "mode": mode,
+            "governed": False,
+            "ready": False,
+            "validation": inspection,
+        }
+    if inspection.get("ready") or (
+        isinstance(binding, dict) and binding.get("ownership_marker_sha256") is not None
+    ):
+        raise GovernanceError(
+            "governance_rebind_required",
+            "ArchMarshal governance changed after CostMarshal initialization; an explicit CostMarshal rebind is required.",
+        )
+    raise GovernanceError(
+        "governance_inspection_unavailable",
+        "ArchMarshal governance could not be proven absent before provider execution.",
+        details={"warning_codes": sorted(warning_codes)},
+    )
+
+
 def _same_path(value: str, expected: Path) -> bool:
     try:
         actual = Path(value).expanduser().resolve(strict=True)
@@ -733,9 +969,16 @@ def _is_sha256(value: object) -> bool:
 
 
 __all__ = [
+    "ARCHMARSHAL_BOOTSTRAP_API",
+    "ARCHMARSHAL_CLI_API",
+    "ARCHMARSHAL_DOCTOR_API",
+    "ARCHMARSHAL_ENGINE_API",
     "BINDING_FORMAT",
     "GOVERNANCE_MODES",
     "GovernanceError",
+    "SUPPORTED_ARCHMARSHAL_ENGINE_VERSIONS",
+    "enforce_governance_contract",
+    "governance_launcher_path",
     "inspect_governance",
     "load_stable_governance_project",
     "validate_governance_binding",

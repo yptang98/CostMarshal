@@ -12,10 +12,10 @@ Current version: `v2.4.0-beta`
 - Keeps provider identity separate from capability tier, so providers can be replaced without changing policy.
 - Applies a fail-closed safety floor from risk, difficulty, and task type.
 - Filters providers by explicit required capabilities before cost optimization.
-- Compares priced execution chains such as `low -> medium -> high`, `medium -> high`, and `high` by expected cost per leader-accepted result.
-- Escalates one tier at a time and fences stale actor attempts.
+- Exhaustively compares every safe monotonic priced chain, including early-stop and tier-skip plans, by expected cost per leader-accepted result.
+- Follows the admitted monotonic provider chain (including an explicitly selected tier skip) and fences stale actor attempts.
 - Uses durable actors, mailboxes, reports, claims, usage records, and recovery state.
-- Reserves task/project budget at dispatch and settles it from usage or leader results.
+- Binds every planned step to a price basis and reserves the full chain estimate in a task/project admission envelope before the first dispatch.
 - Requires an attested OCI boundary for production workers and never silently falls back to a native process.
 - Provides an explicit SQLite WAL cutover for crash-atomic control state, leased runtime effects, and recoverable compatibility views.
 - Supports ArchMarshal governance through explicit, read-only binding checks. It never runs ArchMarshal adopt/apply/lifecycle mutations automatically.
@@ -31,7 +31,7 @@ The safety floor always wins:
 | Low-risk bounded analysis, extraction, docs, tests, verification, or small edits | low |
 | Unknown or judgment-heavy task type | medium |
 
-When all enabled providers have reviewed prices and the task includes non-zero token estimates, CostMarshal evaluates each valid escalation chain:
+When all enabled providers have reviewed prices and the task includes non-zero token estimates, CostMarshal evaluates every valid monotonic escalation subchain. This includes single-step, early-stop, and safe tier-skip plans; `--min-success-probability` filters them before the objective is minimized:
 
 ```text
 expected_chain_cost = C1 + (1-P1)C2 + (1-P1)(1-P2)C3
@@ -41,7 +41,9 @@ objective = expected_chain_cost / success_probability
 
 `Pi` is a conservative probability derived only from explicit leader acceptance records. If pricing or token estimates are missing, routing falls back to the minimum safe tier rather than inventing a cost.
 
-Use `--min-success-probability 0..1` to impose an SLA floor on priced chains. Routing fails closed when no chain meets it.
+Use `--min-success-probability 0..1` to impose a task SLA floor on priced chains. Routing fails closed when no chain meets it. `init --default-min-success-probability P` stores a project default that is resolved and frozen into each new auto-routed task; a task-level value, including `0`, takes precedence. Omitting both keeps the beta-compatible objective, which permits but does not require multi-provider collaboration and says so in the route explanation.
+
+To bound exhaustive planning, CostMarshal accepts at most 16 enabled, capability-compatible providers in any one tier. Larger catalogs fail closed instead of creating an unbounded route search.
 
 Use the read-only route explanation command before dispatch:
 
@@ -109,7 +111,7 @@ python scripts/costmarshal.py configure-provider `
   --env-key DEEPSEEK_API_KEY
 ```
 
-Provide credentials through the process environment or a secrets file outside the actor workspace. CostMarshal injects only the selected provider key into that actor and creates a credential-free actor-specific `CODEX_HOME` containing only its profile. New required-mode projects use `CODEX_API_KEY` for the high tier; persisted host login state such as `auth.json` is never mounted into the OCI worker.
+Provide credentials through the process environment or a secrets file outside the actor workspace. At route admission CostMarshal captures and verifies each planned profile's exact bytes, binds the parsed provider identity, endpoint, environment-key identity, size, and SHA-256 into the plan, then writes an immutable runtime snapshot. Native and OCI runners use only that snapshot; changing the same-named source profile cannot change an admitted attempt, and a missing/corrupt snapshot fails before provider execution. Required OCI recovery also verifies the managed `Config.Env` contract, and the worker requires the bound profile hash before launching Codex. CostMarshal injects only the selected provider key into that actor and creates a credential-free actor-specific `CODEX_HOME` containing only its bound profile. New required-mode projects use `CODEX_API_KEY` for the high tier; persisted host login state such as `auth.json` is never mounted into the OCI worker.
 
 ## Reviewed provider catalog
 
@@ -119,7 +121,10 @@ snapshot records `currency`, provenance `source`, `reviewed_at`, `effective_at`,
 `expires_at`, `snapshot_id`, `snapshot_hash`, ordinary/cached input rates,
 output rate, and a fixed request fee. Use
 `costmarshal_v2.routing.build_pricing_snapshot(...)` to canonicalize timestamps
-and generate the SHA-256 hash; never hand-edit a hash after review.
+and monetary values as exact decimal strings before generating the SHA-256
+hash; never hand-edit a hash after review. Catalog JSON is decoded without
+binary-float conversion, so an unquoted rate with up to nine decimal places is
+also preserved exactly during `init`.
 
 Expired, future-reviewed, future-effective, mixed-currency, mixed
 canonical/legacy, or non-CNY snapshots cannot produce a CNY estimate. Routing
@@ -150,10 +155,10 @@ for provider in catalog["providers"]:
         effective_at="2026-07-16T00:00:00Z",
         expires_at="2026-08-16T00:00:00Z",
         snapshot_id=f"{provider['provider_id']}-2026-07",
-        input_per_1m=input_rate,
-        cached_input_per_1m=cached_rate,
-        output_per_1m=output_rate,
-        fixed_request=0.0,
+        input_per_1m=str(input_rate),
+        cached_input_per_1m=str(cached_rate),
+        output_per_1m=str(output_rate),
+        fixed_request="0",
     )
 Path("providers.json").write_text(
     json.dumps(catalog, indent=2, sort_keys=True) + "\n",
@@ -176,6 +181,7 @@ python scripts/costmarshal.py init `
   --workspace C:\work\my-project `
   --provider-catalog C:\config\providers.json `
   --project-budget-cny 30 `
+  --default-min-success-probability 0.15 `
   --governance off `
   --worker-image ghcr.io/example/costmarshal-worker@sha256:<reviewed-digest>
 ```
@@ -242,7 +248,7 @@ python scripts/costmarshal.py record-result `
 Only these explicit records train provider acceptance priors.
 
 If the leader rejects an attempt but wants the reviewed chain to continue, record the
-decision and then explicitly queue the next stronger tier. `record-result` does not
+decision and then explicitly queue the next provider step in the admitted monotonic chain, which may skip a tier. `record-result` does not
 silently spend more budget:
 
 ```powershell
@@ -254,10 +260,19 @@ python scripts/costmarshal.py run-scheduler --project <project-dir> --once
 ## Budget behavior
 
 - A budgeted dispatch requires non-zero token estimates and reviewed prices.
-- Dispatch reserves the planned attempt cost while holding the project writer lock.
-- Active reservations count against both task and project budgets.
-- Usage accumulates actual cost; a leader result settles any remaining estimate.
+- Admission and reconciliation convert every monetary value to exact integer nano-CNY (9 decimal places); non-finite, negative, boolean, or over-precision values fail closed instead of participating in binary-float comparisons. Reviewed per-million rates are multiplied with integer tokens and any fractional nano-CNY estimate rounds upward.
+- First dispatch reserves the sum of every planned step estimate, not the probability-weighted expected cost or only the first hop.
+- Each attempt retains its own estimate; the task envelope prevents those attempts from being counted a second time while the reviewed chain continues.
+- Success or a terminal failure releases only unused future-step capacity. An unsettled or possibly-started attempt retains its own hold.
+- Price, provider, capability, or token-forecast drift blocks the next bound step; a manual continuation after an exhausted single-step plan is recorded as an explicit plan revision.
+- `escalate --replan` is the explicit manual path for archiving an active stale tail and atomically admitting a newly selected continuation; automatic actors cannot revise their own envelope.
+- `budget` reports task envelopes and attempt settlement separately. Active commitments count against both task and project admission limits.
+- Only final, actor/attempt-bound token usage priced from the immutable step snapshot settles provider cost. Settlement reprices cumulative ordinary/cached/output tokens once (including a fixed request fee once); any earlier caller-priced or otherwise unverified usage row is sticky and prevents settlement. A leader result releases unused future steps but never converts caller-supplied cost or token claims into verified spend, so an unresolved current call retains its hold.
+- `record-result` requires the latest attempt to have left active/uncertain execution and a collected report whose path, size, and SHA-256 still match; it cannot turn a live provider attempt into `done`.
 - Replayed mailbox commands are deduplicated by message ID for task creation, dispatch, escalation, collection, usage, and results.
+- In legacy JSON authority, escalation replay verifies the complete request and the exact prepared successor admission (provider, model/profile identity, credential env-key selector, runtime backend, complete worker-isolation execution/attestation, immutable profile hash, route/pricing plan, and budget projection); if a crash persisted only the origin marker, the same command ID resumes only when that admission is unchanged and creates exactly one successor. SQLite cutover keeps the entire transition transactional.
+
+These are admission and accounting limits over reviewed token estimates. Until a provider proxy enforces request/token or monetary ceilings, they are not a guarantee that an already-started external API call can never exceed its estimate.
 
 ## ArchMarshal compatibility
 
@@ -268,12 +283,12 @@ python scripts/costmarshal.py init `
   --objective "Governed project" `
   --workspace C:\work\project `
   --governance required `
-  --archmarshal-wrapper C:\path\to\ArchMarshal\scripts\invoke_archmarshal.py
+  --archmarshal-launcher C:\path\to\ArchMarshal\scripts\run_archmarshal.py
 ```
 
-The adapter runs only ArchMarshal bootstrap-status/doctor-style read checks, stores a binding fingerprint, and blocks dispatch/launch/recovery when a required binding drifts. Protected paths include `.agent`, `.agents`, `AGENTS.md`, `AGENTS.override.md`, `.git`, `.codex`, and `.codex-plugin`.
+The adapter runs only ArchMarshal bootstrap-status/doctor-style read checks through the canonical launcher, binds both `run_archmarshal.py` and its sibling `invoke_archmarshal.py`, and blocks dispatch/launch/recovery when the binding drifts. `auto` mode also rediscovers governance before provider side effects: if an initially absent workspace is later adopted, CostMarshal fails closed until an explicit rebind. Protected paths include `.agent`, `.agents`, `AGENTS.md`, `AGENTS.override.md`, `.git`, `.codex`, and `.codex-plugin`.
 
-Governance drift also blocks scheduler spawn, relay, and actor direct-entry paths before provider side effects. The sole emergency exception is an explicit `stop-actor --stop-runtime`: after SQLite cutover it drains only that exact durable STOP effect and never leases a pending SPAWN. If another scheduler owns the runtime-effect fence, the command reports `drain_deferred=true` and that scheduler completes the queued stop. If the stop command crashes after the OS/OCI stop but before applying its observation, repeat the same `--command-id` to recover it.
+Governance drift also blocks scheduler spawn, relay, and actor direct-entry paths before provider side effects. The sole emergency exception is an explicit `stop-actor --stop-runtime`: after SQLite cutover it drains only that exact durable STOP effect and never leases a pending SPAWN. The daemon lifetime lock is separate from the short runtime-effect fence, so even a daemon sleeping with a long `--interval` cannot delay an emergency STOP. If another drainer is actively executing a runtime effect, the command reports `drain_deferred=true` and that drainer completes the queued stop. If the stop command crashes after the OS/OCI stop but before applying its observation, repeat the same `--command-id` to recover it.
 
 CostMarshal never automatically adopts a workspace, applies an ArchMarshal plan, starts/ends a managed session, or edits ArchMarshal itself. Perform those lifecycle operations explicitly through ArchMarshal, preview first, then initialize or rebind CostMarshal.
 
@@ -282,8 +297,8 @@ read-only fingerprint. This changes only CostMarshal project state and retains t
 previous binding in bounded audit history; it never mutates ArchMarshal:
 
 ```powershell
-python scripts/costmarshal.py governance-rebind --project <project-dir>
-python scripts/costmarshal.py governance-rebind --project <project-dir> --apply --command-id CMD-GOVERNANCE-REBIND-001
+python scripts/costmarshal.py governance-rebind --project <project-dir> --archmarshal-launcher C:\path\to\ArchMarshal\scripts\run_archmarshal.py
+python scripts/costmarshal.py governance-rebind --project <project-dir> --archmarshal-launcher C:\path\to\ArchMarshal\scripts\run_archmarshal.py --apply --command-id CMD-GOVERNANCE-REBIND-001
 ```
 
 ## Recovery and validation
@@ -372,7 +387,11 @@ python tests/actor_security_contract_test.py
 python tests/reliability_contract_test.py
 python tests/release_gate_test.py
 python tests/budget_contract_test.py
+python tests/route_budget_envelope_test.py
 python tests/budget_reconciliation_oracle_test.py
+python tests/project_success_policy_test.py
+python tests/profile_binding_contract_test.py
+python tests/escalation_replay_contract_test.py
 python tests/historical_state_migration_test.py
 python tests/archmarshal_compat_test.py
 python tests/profile_config_test.py
@@ -396,7 +415,7 @@ python tests/release/run_release_gates.py --reproduce-evidence
 
 ## Current hardening boundary
 
-v2.4-beta has an opt-in SQLite WAL authority, marker-last migration with backups, dirty-view recovery, payload-hashed commands, leased spawn/stop effects, launch-token and lifetime-lock fencing, crash recovery after report publication, pricing snapshots, an independent 10,000-case route oracle, and an enabled required-mode OCI adapter plus reproducible worker-image source. Cached-input pricing is supported in immutable price snapshots, but task routing currently estimates cached tokens as zero; this is conservative and leaves cache-aware forecasting as a follow-up. It remains beta until the machine-readable release gates have real low/medium/high shadow-backtest evidence and live malicious OCI escape evidence for a reviewed image digest. A unit or mocked adapter test is not treated as that external proof.
+v2.4-beta has an opt-in SQLite WAL authority, marker-last migration with backups, dirty-view recovery, payload-hashed commands, leased spawn/stop effects, launch-token and lifetime-lock fencing, crash recovery after report publication, immutable dispatch pricing, independent ordinary/cached/output token forecasting, exhaustive monotonic route-chain enumeration, whole-chain admission envelopes, an independent 10,000-case route oracle, and an enabled required-mode OCI adapter plus reproducible worker-image source. Cache-read usage is routed and settled against the attempt-bound snapshot; unsupported cache-write pricing remains unknown and preserves the budget reservation. It remains beta until the machine-readable release gates have real low/medium/high shadow-backtest evidence and live malicious OCI escape evidence for a reviewed image digest. A unit or mocked adapter test is not treated as that external proof.
 
 ## License
 

@@ -252,6 +252,16 @@ def main() -> int:
 
         report = project / "tasks" / "V2-0001" / "completion-report.md"
         report.write_text("# Completion Report: V2-0001\n\nStatus: done\n\n## Result\nSmoke done.\n", encoding="utf-8")
+        run_json(
+            temp,
+            "heartbeat",
+            "--project",
+            str(project),
+            "--actor",
+            "agent-v2-0001",
+            "--status",
+            "waiting",
+        )
         collect = run_json(temp, "collect", "--project", str(project), "--task", "V2-0001", "--state", "waiting_leader")
         assert_true(collect["actor_id"] == "agent-v2-0001", "collect should infer the task actor")
         result = run_json(

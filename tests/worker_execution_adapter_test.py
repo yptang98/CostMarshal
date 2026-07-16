@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import shutil
 import sys
 import tempfile
@@ -91,6 +92,11 @@ class LifecycleRunner:
         if self.labels_override is not None:
             labels = dict(self.labels_override)
 
+        environment: list[str] = []
+        for index, item in enumerate(argv[:-1]):
+            if item == "--env":
+                environment.append(argv[index + 1])
+
         mounts: list[dict[str, object]] = []
         for index, item in enumerate(argv[:-1]):
             if item != "--mount":
@@ -128,7 +134,7 @@ class LifecycleRunner:
                 "Cmd": argv[image_index + 1 :],
                 "Entrypoint": None,
                 "User": option("--user"),
-                "Env": [],
+                "Env": environment,
             },
             "HostConfig": {
                 "ReadonlyRootfs": True,
@@ -306,6 +312,8 @@ class WorkerExecutionAdapterTest(unittest.TestCase):
             "workspace": self.workspace,
             "workspace_mode": "rw",
             "profile_path": self.profile,
+            "profile_sha256": hashlib.sha256(self.profile.read_bytes()).hexdigest(),
+            "profile_size_bytes": len(self.profile.read_bytes()),
             "output_exchange": self.output,
             "credential_path": self.credential,
             "provider_env_key": "PROVIDER_API_KEY",
@@ -576,6 +584,7 @@ class WorkerExecutionAdapterTest(unittest.TestCase):
             ("container_image_mismatch", lambda payload: nested(payload, "Config").__setitem__("Image", "other")),
             ("container_command_mismatch", lambda payload: nested(payload, "Config").__setitem__("Cmd", ["other"])),
             ("container_user_mismatch", lambda payload: nested(payload, "Config").__setitem__("User", "0:0")),
+            ("container_environment_mismatch", lambda payload: nested(payload, "Config").__setitem__("Env", [])),
             (
                 "container_security_contract_mismatch",
                 lambda payload: nested(payload, "HostConfig").__setitem__("Privileged", True),

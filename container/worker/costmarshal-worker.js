@@ -3,10 +3,12 @@
 
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const { spawn } = require("child_process");
 
 const MAX_PROMPT_BYTES = 2 * 1024 * 1024;
 const MAX_CREDENTIAL_BYTES = 256 * 1024;
+const MAX_PROFILE_BYTES = 256 * 1024;
 const ENV_KEY = /^[A-Z_][A-Z0-9_]{0,127}$/;
 
 function fail(message, exitCode = 64) {
@@ -68,10 +70,32 @@ async function main() {
 
   const codexHome = "/home/worker/.codex";
   fs.mkdirSync(codexHome, { recursive: true, mode: 0o700 });
-  fs.copyFileSync(profile, path.join(codexHome, "config.toml"), fs.constants.COPYFILE_EXCL);
-  fs.chmodSync(path.join(codexHome, "config.toml"), 0o600);
+  const profileFd = fs.openSync(profile, "r");
+  let profileBytes;
+  try {
+    const before = fs.fstatSync(profileFd, { bigint: true });
+    if (!before.isFile() || before.size > BigInt(MAX_PROFILE_BYTES)) fail("provider profile is invalid");
+    profileBytes = fs.readFileSync(profileFd);
+    const after = fs.fstatSync(profileFd, { bigint: true });
+    if (
+      before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size ||
+      before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs
+    ) fail("provider profile changed while being read");
+  } finally {
+    fs.closeSync(profileFd);
+  }
+  const expectedProfileSha = process.env.COSTMARSHAL_PROFILE_SHA256;
+  if (!/^[0-9a-f]{64}$/.test(expectedProfileSha || "")) fail("provider profile identity is invalid");
+  const observedProfileSha = crypto.createHash("sha256").update(profileBytes).digest("hex");
+  if (observedProfileSha !== expectedProfileSha) fail("provider profile identity mismatch");
+  const installedProfile = path.join(codexHome, "config.toml");
+  fs.writeFileSync(installedProfile, profileBytes, { flag: "wx", mode: 0o600 });
+  fs.chmodSync(installedProfile, 0o600);
 
-  const childEnv = { ...process.env, CODEX_HOME: codexHome };
+  const childEnv = { CODEX_HOME: codexHome };
+  for (const key of ["PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS"]) {
+    if (process.env[key]) childEnv[key] = process.env[key];
+  }
   const secretFile = process.env.COSTMARSHAL_PROVIDER_SECRET_FILE;
   const providerEnvKey = process.env.COSTMARSHAL_PROVIDER_ENV_KEY;
   if (secretFile || providerEnvKey) {

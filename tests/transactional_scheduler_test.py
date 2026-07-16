@@ -19,6 +19,7 @@ CLI = ROOT / "scripts" / "costmarshal.py"
 sys.path.insert(0, str(ROOT))
 
 from costmarshal_v2.routing import default_provider_catalog  # noqa: E402
+from costmarshal_v2.profiles import provider_profile_text  # noqa: E402
 
 
 def run(temp: Path, *args: str, ok: bool = True, fault: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -50,6 +51,24 @@ def main() -> int:
     try:
         workspace = temp / "workspace"
         workspace.mkdir()
+        codex_home = temp / "codex-home"
+        codex_home.mkdir()
+        for profile, provider_id, env_key in (
+            ("longcat", "longcat", "LONGCAT_API_KEY"),
+            ("deepseek", "deepseek", "DEEPSEEK_API_KEY"),
+            ("deepseek-value", "deepseek-value", "DEEPSEEK_API_KEY"),
+        ):
+            (codex_home / f"{profile}.config.toml").write_text(
+                provider_profile_text(
+                    provider_id=provider_id,
+                    display_name=provider_id,
+                    base_url=f"https://{provider_id}.example/v1",
+                    model="test-model",
+                    env_key=env_key,
+                ),
+                encoding="utf-8",
+            )
+        os.environ["CODEX_HOME"] = str(codex_home)
         catalog = default_provider_catalog()
         prices = {"longcat": 0.01, "deepseek": 5.0, "codex": 10.0}
         for provider in catalog["providers"]:
@@ -96,6 +115,8 @@ def main() -> int:
             "500000",
             "--estimated-output-tokens",
             "500000",
+            "--min-success-probability",
+            "0.15",
         )
         preview = run_json(temp, "migrate-state", "--project", str(project))
         assert preview["status"] == "preview"
