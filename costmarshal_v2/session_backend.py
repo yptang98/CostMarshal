@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
 import platform
 import re
+import secrets
 import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -20,6 +23,52 @@ _TMUX_COMPONENT_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9])?
 _TMUX_LEGACY_ACTOR_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,62}[A-Za-z0-9])?\Z")
 _TMUX_SESSION_ID_RE = re.compile(r"\$[0-9]+\Z")
 _TMUX_WINDOW_ID_RE = re.compile(r"@[0-9]+\Z")
+_LINUX_PROCESS_TOKEN_PREFIX = "costmarshal-process-"
+_LINUX_PROCESS_TOKEN_RE = re.compile(r"costmarshal-process-([0-9a-f]{64})(?:\s|\)|\Z)")
+_LINUX_PROCESS_MARKER_RE = re.compile(
+    r"linux-proc-v2:([^:]+):([0-9]+):([0-9]+):([0-9]+):([0-9a-f]{64})\Z"
+)
+_LOCAL_PROCESS_SUPERVISOR = r"""
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+
+payload = json.loads(sys.argv[1])
+child = subprocess.Popen(payload["command"], shell=payload["shell"])
+returncode = child.wait()
+self_pid = os.getpid()
+process_group = os.getpgrp()
+session_id = os.getsid(0)
+proc_root = pathlib.Path("/proc")
+while True:
+    other_member = False
+    try:
+        for stat_path in proc_root.glob("[0-9]*/stat"):
+            try:
+                member_pid = int(stat_path.parent.name)
+                if member_pid == self_pid:
+                    continue
+                raw = stat_path.read_text(encoding="utf-8")
+                fields = raw[raw.rfind(")") + 2 :].split()
+                if (
+                    fields[0] != "Z"
+                    and int(fields[2]) == process_group
+                    and int(fields[3]) == session_id
+                ):
+                    other_member = True
+                    break
+            except (IndexError, OSError, ValueError):
+                continue
+    except OSError:
+        other_member = True
+    if not other_member:
+        break
+    time.sleep(0.25)
+raise SystemExit(returncode if returncode >= 0 else 128 - returncode)
+"""
 
 
 def validate_tmux_name(value: str, *, label: str) -> str:
@@ -272,23 +321,101 @@ def pid_start_marker(pid: int | None) -> str | None:
                 kernel32.CloseHandle(handle)
         except (AttributeError, OSError, ValueError):
             return None
-    stat_path = Path(f"/proc/{int(pid)}/stat")
-    try:
-        raw = stat_path.read_text(encoding="utf-8")
-        fields = raw[raw.rfind(")") + 2 :].split()
-        start_ticks = fields[19]
-        boot_id_path = Path("/proc/sys/kernel/random/boot_id")
-        boot_id = boot_id_path.read_text(encoding="ascii").strip() if boot_id_path.is_file() else "unknown"
-        return f"linux-proc:{boot_id}:{start_ticks}"
-    except (IndexError, OSError, ValueError):
-        return None
+    record = _linux_process_record(int(pid))
+    return None if record is None else str(record["marker"])
 
 
 def pid_identity_matches(pid: int | None, marker: str | None) -> bool:
     return bool(marker) and pid_start_marker(pid) == marker
 
 
-def _linux_process_group_members(process_group: int) -> dict[int, str]:
+def _linux_process_token(pid: int) -> str | None:
+    """Return the unguessable inherited launch token held by a Linux process."""
+
+    fd_root = Path(f"/proc/{pid}/fd")
+    try:
+        descriptors = list(fd_root.iterdir())
+    except OSError:
+        return None
+    for descriptor in descriptors:
+        try:
+            target = os.readlink(descriptor)
+        except OSError:
+            continue
+        match = _LINUX_PROCESS_TOKEN_RE.search(target)
+        if match is not None:
+            return match.group(1)
+    return None
+
+
+def _linux_process_stat(pid: int, *, boot_id: str | None = None) -> dict[str, Any] | None:
+    """Read cheap non-zombie Linux stat identity without walking process fds."""
+
+    stat_path = Path(f"/proc/{pid}/stat")
+    try:
+        raw = stat_path.read_text(encoding="utf-8")
+        fields = raw[raw.rfind(")") + 2 :].split()
+        state = fields[0]
+        process_group = int(fields[2])
+        session_id = int(fields[3])
+        start_ticks = fields[19]
+        if state == "Z":
+            return None
+        if boot_id is None:
+            boot_id_path = Path("/proc/sys/kernel/random/boot_id")
+            boot_id = (
+                boot_id_path.read_text(encoding="ascii").strip()
+                if boot_id_path.is_file()
+                else "unknown"
+            )
+        return {
+            "pid": pid,
+            "state": state,
+            "process_group": process_group,
+            "session_id": session_id,
+            "start_ticks": start_ticks,
+            "boot_id": boot_id,
+        }
+    except (IndexError, OSError, ValueError):
+        return None
+
+
+def _linux_process_record(pid: int, *, boot_id: str | None = None) -> dict[str, Any] | None:
+    """Read one Linux identity together with inherited launch evidence."""
+
+    record = _linux_process_stat(pid, boot_id=boot_id)
+    if record is None:
+        return None
+    token = _linux_process_token(pid)
+    marker = f"linux-proc:{record['boot_id']}:{record['start_ticks']}"
+    if token is not None:
+        marker = (
+            f"linux-proc-v2:{record['boot_id']}:{record['start_ticks']}:"
+            f"{record['process_group']}:{record['session_id']}:{token}"
+        )
+    return {**record, "token": token, "marker": marker}
+
+
+def _linux_marker_identity(marker: str | None) -> dict[str, Any] | None:
+    if not isinstance(marker, str):
+        return None
+    match = _LINUX_PROCESS_MARKER_RE.fullmatch(marker)
+    if match is None:
+        return None
+    return {
+        "boot_id": match.group(1),
+        "start_ticks": match.group(2),
+        "process_group": int(match.group(3)),
+        "session_id": int(match.group(4)),
+        "token": match.group(5),
+    }
+
+
+def _linux_process_group_members(
+    process_group: int,
+    *,
+    session_id: int | None = None,
+) -> dict[int, str]:
     """Return non-zombie group members bound to their Linux start markers."""
 
     members: dict[int, str] = {}
@@ -300,33 +427,178 @@ def _linux_process_group_members(process_group: int) -> dict[int, str]:
         boot_id = boot_id_path.read_text(encoding="ascii").strip()
         for stat_path in proc_root.glob("[0-9]*/stat"):
             try:
-                raw = stat_path.read_text(encoding="utf-8")
-                fields = raw[raw.rfind(")") + 2 :].split()
-                state = fields[0]
-                member_group = int(fields[2])
-                start_ticks = fields[19]
                 member_pid = int(stat_path.parent.name)
-            except (IndexError, OSError, ValueError):
+                stat_record = _linux_process_stat(member_pid, boot_id=boot_id)
+            except (OSError, ValueError):
                 continue
-            if member_group == process_group and state != "Z":
-                members[member_pid] = f"linux-proc:{boot_id}:{start_ticks}"
+            if (
+                stat_record is None
+                or stat_record["process_group"] != process_group
+                or (session_id is not None and stat_record["session_id"] != session_id)
+            ):
+                continue
+            record = _linux_process_record(member_pid, boot_id=boot_id)
+            if (
+                record is not None
+                and record["process_group"] == process_group
+                and (session_id is None or record["session_id"] == session_id)
+            ):
+                members[member_pid] = str(record["marker"])
     except OSError:
         return {}
     return members
 
 
-def _posix_process_group_alive(process_group: int) -> bool:
-    """Return whether a Linux process group still has a non-zombie member."""
+def _marker_has_process_token(marker: str, token: str, *, boot_id: str) -> bool:
+    identity = _linux_marker_identity(marker)
+    return bool(
+        identity is not None
+        and identity["token"] == token
+        and identity["boot_id"] == boot_id
+    )
 
-    if Path("/proc").is_dir():
-        return bool(_linux_process_group_members(process_group))
+
+def _linux_member_identity_matches(
+    pid: int,
+    marker: str,
+    *,
+    process_group: int,
+    session_id: int,
+) -> bool:
+    record = _linux_process_record(pid)
+    return bool(
+        record is not None
+        and record["marker"] == marker
+        and record["process_group"] == process_group
+        and record["session_id"] == session_id
+    )
+
+
+def _verified_local_process_group(
+    pid: int,
+    marker: str,
+    *,
+    require_owned_group: bool,
+) -> tuple[int, int, dict[int, str]] | None:
+    """Resolve a launch to members without trusting a reusable PGID alone."""
+
+    if not Path("/proc").is_dir():
+        return None
+    durable = _linux_marker_identity(marker)
+    leader_matches = pid_identity_matches(pid, marker)
+    if durable is not None:
+        process_group = int(durable["process_group"])
+        session_id = int(durable["session_id"])
+        # The durable supervisor is the session/group leader. The actor runner
+        # may later rebind runtime.pid to its own child PID, so require the
+        # recorded group to own the session rather than requiring pid == PGID.
+        if process_group != session_id:
+            return None
+        members = _linux_process_group_members(
+            process_group,
+            session_id=session_id,
+        )
+        token_member_exists = any(
+            _marker_has_process_token(
+                member_marker,
+                str(durable["token"]),
+                boot_id=str(durable["boot_id"]),
+            )
+            for member_marker in members.values()
+        )
+        if not leader_matches and not token_member_exists:
+            return None
+        return process_group, session_id, members
+
+    # Compatibility for pre-v2 Linux markers. Without an inherited launch
+    # capability, the original leader must still be present to prove ownership.
+    if not leader_matches:
+        return None
     try:
-        os.killpg(process_group, 0)
-        return True
+        process_group = os.getpgid(pid)
+        session_id = os.getsid(pid)
     except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
+        return None
+    if require_owned_group and (process_group != pid or session_id != pid):
+        return None
+    members = _linux_process_group_members(process_group, session_id=session_id)
+    if members.get(pid) != marker:
+        return None
+    return process_group, session_id, members
+
+
+def _owned_group_members(
+    *,
+    leader_pid: int,
+    leader_marker: str,
+    process_group: int,
+    session_id: int,
+    bound_members: dict[int, str],
+) -> dict[int, str]:
+    """Return current members only while a durable original identity survives."""
+
+    current = _linux_process_group_members(process_group, session_id=session_id)
+    known_member_survives = any(
+        current.get(member_pid) == member_marker
+        for member_pid, member_marker in bound_members.items()
+    )
+    durable = _linux_marker_identity(leader_marker)
+    token_member_survives = bool(
+        durable is not None
+        and any(
+            _marker_has_process_token(
+                member_marker,
+                str(durable["token"]),
+                boot_id=str(durable["boot_id"]),
+            )
+            for member_marker in current.values()
+        )
+    )
+    leader_survives = current.get(leader_pid) == leader_marker
+    if not (known_member_survives or token_member_survives or leader_survives):
+        return {}
+    return current
+
+
+def _signal_verified_members(
+    members: dict[int, str],
+    *,
+    process_group: int,
+    session_id: int,
+    signal_number: int,
+) -> list[list[str]]:
+    """Signal pidfd-pinned, start-marker-verified members without PID races."""
+
+    pidfd_open = getattr(os, "pidfd_open", None)
+    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+    if pidfd_open is None or pidfd_send_signal is None:
+        raise RuntimeError(
+            "local POSIX STOP requires pidfd_open and pidfd_send_signal; refusing PID-only signaling"
+        )
+    signal_name = "TERM" if signal_number == signal.SIGTERM else "KILL"
+    commands: list[list[str]] = []
+    for member_pid, member_marker in sorted(members.items()):
+        try:
+            pidfd = pidfd_open(member_pid, 0)
+        except ProcessLookupError:
+            continue
+        try:
+            if not _linux_member_identity_matches(
+                member_pid,
+                member_marker,
+                process_group=process_group,
+                session_id=session_id,
+            ):
+                continue
+            argv = ["pidfd-send-signal", f"-{signal_name}", "--", str(member_pid)]
+            try:
+                pidfd_send_signal(pidfd, signal_number, None, 0)
+            except ProcessLookupError:
+                continue
+            commands.append(argv)
+        finally:
+            os.close(pidfd)
+    return commands
 
 
 class TmuxBackend:
@@ -564,22 +836,66 @@ class LocalProcessBackend:
         log_handle = log_path.open("a", encoding="utf-8")
         creationflags = 0
         start_new_session = False
+        process_token_fd: int | None = None
+        stdin_source: int = subprocess.DEVNULL
+        launch_command: ActorCommand = command
+        launch_shell = isinstance(command, str)
         if os.name == "nt":
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
         else:
+            if (
+                platform.system() != "Linux"
+                or not hasattr(os, "memfd_create")
+                or not hasattr(os, "pidfd_open")
+                or not hasattr(signal, "pidfd_send_signal")
+            ):
+                log_handle.close()
+                raise RuntimeError(
+                    "local POSIX actors require Linux procfs, memfd, and pidfd signal support"
+                )
             start_new_session = True
-        process = subprocess.Popen(
-            command,
-            cwd=str(cwd),
-            shell=isinstance(command, str),
-            stdin=subprocess.DEVNULL,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            text=True,
-            creationflags=creationflags,
-            start_new_session=start_new_session,
-        )
-        log_handle.close()
+            try:
+                process_token_fd = os.memfd_create(
+                    _LINUX_PROCESS_TOKEN_PREFIX + secrets.token_hex(32),
+                    flags=0,
+                )
+            except OSError:
+                log_handle.close()
+                raise
+            # An empty memfd has the same EOF behavior as DEVNULL for reads,
+            # while standard fd 0 survives ordinary close_fds=True child
+            # spawns. Descendants therefore retain a launch capability unless
+            # they explicitly replace stdin, in which case recovery fails safe.
+            stdin_source = process_token_fd
+            supervisor_payload = json.dumps(
+                {"command": command, "shell": isinstance(command, str)},
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            launch_command = [
+                sys.executable,
+                "-c",
+                _LOCAL_PROCESS_SUPERVISOR,
+                supervisor_payload,
+            ]
+            launch_shell = False
+        try:
+            process = subprocess.Popen(
+                launch_command,
+                cwd=str(cwd),
+                shell=launch_shell,
+                stdin=stdin_source,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                text=True,
+                creationflags=creationflags,
+                start_new_session=start_new_session,
+            )
+        finally:
+            if process_token_fd is not None:
+                os.close(process_token_fd)
+            log_handle.close()
         return {
             "commands": [command_to_string([self.executable, "start", "--session", session_name, "--actor", actor_name, "--", command_display(command)])],
             "target": f"pid:{process.pid}",
@@ -593,7 +909,7 @@ class LocalProcessBackend:
     def stop_plan(self, *, target: str, pid: int | None = None) -> list[list[str]]:
         if os.name == "nt":
             return [["taskkill", "/PID", str(pid or 0), "/T", "/F"]]
-        return [["kill", "-TERM", "--", f"-{pid or 0}"]]
+        return [[self.executable, "verified-stop", "--pid", str(pid or 0)]]
 
     def stop_actor(
         self,
@@ -606,73 +922,85 @@ class LocalProcessBackend:
             raise RuntimeError("local process backend has no pid to stop")
         if not process_start_marker:
             raise RuntimeError("local process backend has no OS process identity marker; refusing unsafe PID-only stop")
-        if not pid_identity_matches(pid, process_start_marker):
-            raise RuntimeError("local process identity changed; refusing to stop a reused PID")
         if os.name == "nt":
+            if not pid_identity_matches(pid, process_start_marker):
+                raise RuntimeError("local process identity changed; refusing to stop a reused PID")
             argv = ["taskkill", "/PID", str(pid), "/T", "/F"]
             result = subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
             if result.returncode != 0 and pid_is_alive(pid):
                 raise RuntimeError(f"taskkill failed: {result.stderr.strip() or result.stdout.strip()}")
             return {"command": command_to_string(argv)}
-        try:
-            process_group = os.getpgid(pid)
-        except ProcessLookupError as exc:
+        verified_group = _verified_local_process_group(
+            pid,
+            process_start_marker,
+            require_owned_group=True,
+        )
+        if verified_group is None:
             raise RuntimeError(
-                "local actor process group disappeared before its identity could be verified"
-            ) from exc
-        if process_group != pid:
-            raise RuntimeError(
-                "local process backend actor is not its process-group leader; "
-                "refusing an unsafe group stop"
+                "local process identity changed or its durable process-group evidence disappeared; "
+                "refusing to stop a reused PID or PGID"
             )
-        bound_group_members = _linux_process_group_members(process_group)
-        if Path("/proc").is_dir() and bound_group_members.get(pid) != process_start_marker:
-            raise RuntimeError(
-                "local actor process-group membership does not match its verified start marker"
-            )
-
-        term_argv = ["kill", "-TERM", "--", f"-{process_group}"]
-        try:
-            os.killpg(process_group, signal.SIGTERM)
-        except ProcessLookupError:
-            return {"command": command_to_string(term_argv), "commands": [command_to_string(term_argv)]}
+        process_group, session_id, bound_group_members = verified_group
+        term_commands = _signal_verified_members(
+            bound_group_members,
+            process_group=process_group,
+            session_id=session_id,
+            signal_number=signal.SIGTERM,
+        )
+        commands = [command_to_string(argv) for argv in term_commands]
         deadline = time.monotonic() + 2.0
-        while _posix_process_group_alive(process_group) and time.monotonic() < deadline:
+        current_group_members = _owned_group_members(
+            leader_pid=pid,
+            leader_marker=process_start_marker,
+            process_group=process_group,
+            session_id=session_id,
+            bound_members=bound_group_members,
+        )
+        while current_group_members and time.monotonic() < deadline:
+            bound_group_members.update(current_group_members)
             time.sleep(0.05)
-        commands = [command_to_string(term_argv)]
-        if _posix_process_group_alive(process_group):
-            # Escalate only while the verified leader or another member bound
-            # before TERM still has the same creation marker in this PGID.
-            # Otherwise fail closed rather than risk signaling a reused group.
-            try:
-                leader_still_bound = (
-                    pid_identity_matches(pid, process_start_marker)
-                    and os.getpgid(pid) == process_group
-                )
-            except ProcessLookupError:
-                leader_still_bound = False
-            current_group_members = _linux_process_group_members(process_group)
-            bound_member_survives = any(
-                current_group_members.get(member_pid) == member_marker
-                for member_pid, member_marker in bound_group_members.items()
+            current_group_members = _owned_group_members(
+                leader_pid=pid,
+                leader_marker=process_start_marker,
+                process_group=process_group,
+                session_id=session_id,
+                bound_members=bound_group_members,
             )
-            safe_to_escalate = leader_still_bound or bound_member_survives
-            if not safe_to_escalate:
-                raise RuntimeError(
-                    "local actor process group did not stop and no bound member identity survives; "
-                    "refusing unsafe SIGKILL escalation"
-                )
-            kill_argv = ["kill", "-KILL", "--", f"-{process_group}"]
-            commands.append(command_to_string(kill_argv))
-            try:
-                os.killpg(process_group, signal.SIGKILL)
-            except ProcessLookupError:
-                return {"command": commands[-1], "commands": commands}
+        if current_group_members:
+            bound_group_members.update(current_group_members)
+            kill_commands = _signal_verified_members(
+                current_group_members,
+                process_group=process_group,
+                session_id=session_id,
+                signal_number=signal.SIGKILL,
+            )
+            commands.extend(command_to_string(argv) for argv in kill_commands)
             kill_deadline = time.monotonic() + 1.0
-            while _posix_process_group_alive(process_group) and time.monotonic() < kill_deadline:
+            current_group_members = _owned_group_members(
+                leader_pid=pid,
+                leader_marker=process_start_marker,
+                process_group=process_group,
+                session_id=session_id,
+                bound_members=bound_group_members,
+            )
+            while current_group_members and time.monotonic() < kill_deadline:
                 time.sleep(0.05)
-            if _posix_process_group_alive(process_group):
-                raise RuntimeError("local actor process group remained live after safe SIGKILL escalation")
+                current_group_members = _owned_group_members(
+                    leader_pid=pid,
+                    leader_marker=process_start_marker,
+                    process_group=process_group,
+                    session_id=session_id,
+                    bound_members=bound_group_members,
+                )
+            if current_group_members:
+                raise RuntimeError(
+                    "local actor process group remained live after identity-verified SIGKILL escalation"
+                )
+        if not commands:
+            commands = [
+                command_to_string(["kill", "-TERM", "--", str(member_pid)])
+                for member_pid in sorted(bound_group_members)
+            ]
         return {"command": commands[-1], "commands": commands}
 
     def actor_alive(
@@ -684,10 +1012,18 @@ class LocalProcessBackend:
         pid: int | None = None,
         process_start_marker: str | None = None,
     ) -> bool:
-        alive = pid_is_alive(pid)
-        if not alive or not process_start_marker:
-            return alive
-        return pid_identity_matches(pid, process_start_marker)
+        if not pid or not process_start_marker:
+            return False
+        if os.name == "nt":
+            return pid_identity_matches(pid, process_start_marker)
+        return (
+            _verified_local_process_group(
+                pid,
+                process_start_marker,
+                require_owned_group=True,
+            )
+            is not None
+        )
 
 
 def backend_from_session(session: dict[str, Any]) -> TmuxBackend | LocalProcessBackend:
