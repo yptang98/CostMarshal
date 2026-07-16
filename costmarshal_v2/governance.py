@@ -32,6 +32,27 @@ MAX_OWNERSHIP_BYTES = 64 * 1024
 MAX_SKILL_HEAD_BYTES = 1024
 MAX_PROJECT_BYTES = 8 * 1024 * 1024
 PROJECT_SNAPSHOT_ATTEMPTS = 3
+_LAUNCHER_ENV_ALLOWLIST = frozenset(
+    {
+        "APPDATA",
+        "CODEX_HOME",
+        "COMSPEC",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LOCALAPPDATA",
+        "PATH",
+        "PATHEXT",
+        "PROGRAMDATA",
+        "SYSTEMDRIVE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "USERPROFILE",
+        "WINDIR",
+    }
+)
 _BINDING_FIELDS = (
     "format",
     "provider",
@@ -290,6 +311,61 @@ def validate_governance_binding(
             "The stored ArchMarshal binding format requires an explicit CostMarshal rebind.",
         )
 
+    # Never execute a launcher pair whose bytes already differ from the stored
+    # binding.  The post-invocation comparison in ``inspect_governance`` closes
+    # ordinary changes during a read-only inspection, but it is too late for a
+    # static drift: unreviewed Python would already have run.
+    try:
+        launcher, invoke_wrapper = _explicit_launcher_pair(
+            launcher_path=launcher_path,
+            wrapper_path=wrapper_path,
+        )
+        current_launcher_identity = _stable_file_identity(
+            launcher,
+            label="launcher",
+            hash_field="launcher_sha256",
+            size_field="launcher_size",
+        )
+        current_invoke_identity = _stable_file_identity(
+            invoke_wrapper,
+            label="invoke wrapper",
+            hash_field="invoke_wrapper_sha256",
+            size_field="invoke_wrapper_size",
+        )
+    except GovernanceError as exc:
+        return _binding_failure(normalized_mode, exc.code, str(exc))
+    preexecution_drift = [
+        {
+            "field": field,
+            "expected": binding.get(field),
+            "actual": current.get(field),
+        }
+        for field, current in (
+            ("launcher_sha256", current_launcher_identity),
+            ("launcher_size", current_launcher_identity),
+            ("invoke_wrapper_sha256", current_invoke_identity),
+            ("invoke_wrapper_size", current_invoke_identity),
+        )
+        if binding.get(field) != current.get(field)
+    ]
+    if preexecution_drift:
+        message = "ArchMarshal launcher identity changed before the read-only check."
+        if normalized_mode == "required":
+            raise GovernanceError(
+                "governance_binding_drift",
+                message,
+                details={"drift": preexecution_drift},
+            )
+        return {
+            "mode": normalized_mode,
+            "status": "warning",
+            "ready": False,
+            "valid": False,
+            "drift": preexecution_drift,
+            "warnings": [{"code": "governance_binding_drift", "message": message}],
+            "binding": binding,
+        }
+
     inspection = inspect_governance(
         workspace,
         mode=normalized_mode,
@@ -488,6 +564,14 @@ def _invoke_launcher(launcher: Path, arguments: list[str], timeout_seconds: floa
             "ArchMarshal timeout must be positive.",
         )
     try:
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key.upper() in _LAUNCHER_ENV_ALLOWLIST
+            or key.startswith("FAKE_ARCHMARSHAL_")
+        }
+        environment["PYTHONIOENCODING"] = "utf-8"
+        environment["PYTHONUTF8"] = "1"
         completed = subprocess.run(
             [sys.executable, str(launcher), *arguments],
             stdin=subprocess.DEVNULL,
@@ -496,6 +580,7 @@ def _invoke_launcher(launcher: Path, arguments: list[str], timeout_seconds: floa
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=environment,
             timeout=timeout_seconds,
             check=False,
             shell=False,

@@ -91,6 +91,49 @@ def main() -> int:
         usage_rows = [json.loads(line) for line in (project / "reports" / "usage.jsonl").read_text(encoding="utf-8").splitlines() if line]
         assert len([row for row in usage_rows if row.get("command_id") == "MSG-idempotent-usage"]) == 1
 
+        report = project / "tasks" / "V2-0001" / "completion-report.md"
+        report.write_text(
+            "# Completion Report: V2-0001\n\nStatus: escalate\n\nNeed more capability.\n",
+            encoding="utf-8",
+        )
+        run_json(temp, "heartbeat", "--project", str(project), "--actor", actor, "--status", "waiting")
+        run_json(
+            temp,
+            "collect",
+            "--command-id",
+            "CMD-reliability-collect-low",
+            "--project",
+            str(project),
+            "--task",
+            "V2-0001",
+            "--actor",
+            actor,
+            "--attempt",
+            attempt,
+            "--state",
+            "escalate",
+        )
+        run_json(
+            temp,
+            "record-result",
+            "--command-id",
+            "CMD-reliability-reject-low",
+            "--project",
+            str(project),
+            "--task",
+            "V2-0001",
+            "--actor",
+            actor,
+            "--attempt",
+            attempt,
+            "--status",
+            "escalate",
+            "--quality-score",
+            "3",
+            "--summary",
+            "leader requires stronger capability",
+        )
+
         escalation_args = {"task": "V2-0001", "actor": actor, "attempt": attempt, "reason": "need more capability", "start": False}
         append(inbox, command("MSG-escalate-1", actor, "V2-0001", "escalate_task", escalation_args))
         append(inbox, command("MSG-escalate-stale", actor, "V2-0001", "escalate_task", escalation_args))

@@ -7,6 +7,7 @@ import hmac
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -17,6 +18,14 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit
 
+from .context_projection import (
+    ContextProjectionError,
+    apply_cumulative_change_artifact,
+    capture_projection_changes,
+    materialize_context_projection,
+    persist_change_artifact,
+    verify_materialized_context_projection,
+)
 from .control_store import ControlStoreError, control_store_enabled, control_transaction
 from .governance import (
     GovernanceError,
@@ -350,6 +359,243 @@ def workspace_path(layout: ProjectLayout, project: dict[str, Any]) -> Path:
     return resolved
 
 
+def validate_bound_actor_prompt(
+    actor: dict[str, Any],
+    prompt: Path,
+) -> str:
+    """Return the one immutable prompt payload admitted by the scheduler."""
+
+    binding = actor.get("prompt_binding")
+    if not isinstance(binding, dict):
+        raise SystemExit("worker launch rejected: immutable prompt binding is missing")
+    if binding.get("schema") != "costmarshal-context-prompt-binding-v1":
+        raise SystemExit("worker launch rejected: prompt binding schema is invalid")
+    try:
+        payload = prompt.read_bytes()
+    except OSError as exc:
+        raise SystemExit(f"worker launch rejected: actor prompt is unreadable: {exc}") from exc
+    expected_sha256 = "sha256:" + hashlib.sha256(payload).hexdigest()
+    collaboration_sha256 = (
+        actor.get("collaboration_contract") or {}
+    ).get("contract_sha256")
+    profile_sha256 = (actor.get("profile_binding") or {}).get("sha256")
+    if (
+        binding.get("attempt_id") != actor.get("attempt_id")
+        or binding.get("profile_sha256") != profile_sha256
+        or binding.get("collaboration_contract_sha256") != collaboration_sha256
+        or binding.get("size_bytes") != len(payload)
+        or binding.get("sha256") != expected_sha256
+    ):
+        raise SystemExit("worker launch rejected: actor prompt binding does not match admitted bytes")
+    try:
+        return payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise SystemExit("worker launch rejected: actor prompt is not valid UTF-8") from exc
+
+
+def _collaboration_contract_sha256(contract: dict[str, Any]) -> str:
+    body = dict(contract)
+    body.pop("contract_sha256", None)
+    encoded = json.dumps(
+        body,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _required_collaboration_contract(
+    layout: ProjectLayout,
+    actor: dict[str, Any],
+    task: dict[str, Any],
+) -> dict[str, Any]:
+    contract = actor.get("collaboration_contract")
+    if not isinstance(contract, dict) or contract.get("schema") != "costmarshal-context-access-contract-v1":
+        raise SystemExit("required worker launch rejected: collaboration contract is missing")
+    if task.get("collaboration_contract") != contract:
+        raise SystemExit("required worker launch rejected: actor/task collaboration contracts differ")
+    if contract.get("project_id") in {None, ""} or contract.get("task_id") != task.get("id"):
+        raise SystemExit("required worker launch rejected: collaboration contract task binding is invalid")
+    if contract.get("contract_sha256") != _collaboration_contract_sha256(contract):
+        raise SystemExit("required worker launch rejected: collaboration contract hash is invalid")
+    base_sha = contract.get("base_sha")
+    if not isinstance(base_sha, str) or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", base_sha):
+        raise SystemExit("required worker launch rejected: collaboration base SHA is invalid")
+    context_paths = contract.get("context_paths")
+    write_scope = contract.get("write_scope")
+    if not isinstance(context_paths, list) or not isinstance(write_scope, list):
+        raise SystemExit("required worker launch rejected: collaboration path sets are invalid")
+    current_attempt = next(
+        (
+            row
+            for row in task.get("attempts") or []
+            if row.get("attempt_id") == actor.get("attempt_id")
+        ),
+        None,
+    )
+    if (
+        not isinstance(current_attempt, dict)
+        or current_attempt.get("collaboration_contract_sha256")
+        != contract.get("contract_sha256")
+        or current_attempt.get("prompt_binding") != actor.get("prompt_binding")
+    ):
+        raise SystemExit("required worker launch rejected: attempt collaboration binding is invalid")
+    return contract
+
+
+def _projection_receipt(
+    projection_root: Path,
+    contract: dict[str, Any],
+    *,
+    incoming_change_manifest_sha256: str | None = None,
+    expected_runtime_receipt: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if projection_root.is_symlink() or not projection_root.is_dir():
+        raise SystemExit("required worker launch rejected: projection root is invalid")
+    manifest_path = projection_root / "manifest.json"
+    files_root = projection_root / "files"
+    if manifest_path.is_symlink() or files_root.is_symlink() or not files_root.is_dir():
+        raise SystemExit("required worker launch rejected: projection artifact layout is invalid")
+    try:
+        manifest_payload = manifest_path.read_bytes()
+        manifest = json.loads(manifest_payload.decode("utf-8", errors="strict"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SystemExit("required worker launch rejected: projection manifest is unreadable") from exc
+    if not isinstance(manifest, dict):
+        raise SystemExit("required worker launch rejected: projection manifest is invalid")
+    canonical_manifest = (
+        json.dumps(
+            manifest,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
+    if manifest_payload != canonical_manifest:
+        raise SystemExit("required worker launch rejected: projection manifest is not canonical")
+    body = dict(manifest)
+    manifest_sha256 = body.pop("manifest_sha256", None)
+    canonical_body = json.dumps(
+        body,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    observed_manifest_sha256 = "sha256:" + hashlib.sha256(canonical_body).hexdigest()
+    if (
+        manifest_sha256 != observed_manifest_sha256
+        or manifest.get("kind") != "costmarshal-context-projection"
+        or manifest.get("base_sha") != contract.get("base_sha")
+        or manifest.get("allowlist") != contract.get("context_paths")
+    ):
+        raise SystemExit("required worker launch rejected: projection manifest binding is invalid")
+    receipt = {
+        "schema": "costmarshal-context-projection-receipt-v1",
+        "artifact_root": str(projection_root),
+        "files_root": str(files_root),
+        "manifest_path": str(manifest_path),
+        "manifest_sha256": observed_manifest_sha256,
+        "base_sha": manifest.get("base_sha"),
+        "allowlist": manifest.get("allowlist"),
+        "file_count": manifest.get("file_count"),
+        "total_size_bytes": manifest.get("total_size_bytes"),
+        "collaboration_contract_sha256": contract.get("contract_sha256"),
+        "incoming_change_manifest_sha256": incoming_change_manifest_sha256,
+    }
+    if expected_runtime_receipt is not None and expected_runtime_receipt != receipt:
+        raise SystemExit("required worker launch rejected: persisted projection receipt changed")
+    return receipt
+
+
+def _incoming_change_artifact(
+    layout: ProjectLayout,
+    project: dict[str, Any],
+    actor: dict[str, Any],
+    task: dict[str, Any],
+    contract: dict[str, Any],
+    write_scope: tuple[str, ...],
+) -> dict[str, Any] | None:
+    attempts = task.get("attempts") or []
+    current_index = next(
+        (
+            index
+            for index, row in enumerate(attempts)
+            if row.get("attempt_id") == actor.get("attempt_id")
+        ),
+        None,
+    )
+    if current_index in {None, 0}:
+        return None
+    predecessor = attempts[int(current_index) - 1]
+    if (
+        predecessor.get("accepted_by_leader") is not False
+        or predecessor.get("recorded_result_status") not in {"failed", "escalate"}
+        or not isinstance(predecessor.get("leader_result_id"), str)
+    ):
+        raise SystemExit(
+            "required worker continuation rejected: predecessor lacks an explicit leader rejection"
+        )
+    if not write_scope:
+        return None
+    receipt = predecessor.get("change_artifact")
+    if not isinstance(receipt, dict) or receipt.get("schema") != "costmarshal-change-artifact-receipt-v1":
+        raise SystemExit(
+            "required worker continuation rejected: predecessor change artifact is missing"
+        )
+    expected_root = (
+        layout.root
+        / "task-change-artifacts"
+        / slugify(str(project.get("project_id") or "project"), "project")
+        / slugify(str(actor.get("task_id") or "task"), "task")
+    ).resolve()
+    manifest = receipt.get("manifest")
+    if not isinstance(manifest, dict):
+        raise SystemExit("required worker continuation rejected: predecessor manifest is invalid")
+    manifest_sha256 = receipt.get("manifest_sha256")
+    body = dict(manifest)
+    embedded_sha256 = body.pop("manifest_sha256", None)
+    canonical_body = json.dumps(
+        body,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    observed_sha256 = "sha256:" + hashlib.sha256(canonical_body).hexdigest()
+    expected_manifest_path = (
+        expected_root / "manifests" / f"{observed_sha256.removeprefix('sha256:')}.json"
+    )
+    try:
+        stored_manifest = expected_manifest_path.read_bytes()
+    except OSError as exc:
+        raise SystemExit(
+            "required worker continuation rejected: predecessor manifest bytes are unavailable"
+        ) from exc
+    if (
+        embedded_sha256 != observed_sha256
+        or manifest_sha256 != observed_sha256
+        or receipt.get("artifact_root") != str(expected_root)
+        or receipt.get("manifest_path") != str(expected_manifest_path)
+        or stored_manifest != canonical_body
+        or receipt.get("base_sha") != contract.get("base_sha")
+        or receipt.get("write_scope") != list(write_scope)
+        or receipt.get("collaboration_contract_sha256") != contract.get("contract_sha256")
+        or manifest.get("base_sha") != contract.get("base_sha")
+        or manifest.get("write_scope") != list(write_scope)
+        or manifest.get("change_count") != receipt.get("change_count")
+        or manifest.get("total_upsert_bytes") != receipt.get("total_upsert_bytes")
+    ):
+        raise SystemExit(
+            "required worker continuation rejected: predecessor change artifact binding is invalid"
+        )
+    return receipt
+
+
 def actor_execution_workspace(
     layout: ProjectLayout,
     project: dict[str, Any],
@@ -374,6 +620,147 @@ def actor_execution_workspace(
         )
     except SecurityValidationError as exc:
         raise SystemExit(f"worker write scope is invalid: {exc}") from exc
+    if (actor.get("isolation") or {}).get("mode") == "required":
+        contract = _required_collaboration_contract(layout, actor, task)
+        if contract.get("project_id") != project.get("project_id"):
+            raise SystemExit("required worker project binding differs from the collaboration contract")
+        if list(write_paths) != contract.get("write_scope"):
+            raise SystemExit("required worker write scope differs from the frozen collaboration contract")
+        incoming_change_artifact = _incoming_change_artifact(
+            layout,
+            project,
+            actor,
+            task,
+            contract,
+            write_paths,
+        )
+        incoming_change_manifest_sha256 = (
+            incoming_change_artifact.get("manifest_sha256")
+            if incoming_change_artifact is not None
+            else None
+        )
+        attempt = str(actor.get("attempt_id") or actor["id"])
+        destination = (
+            layout.root
+            / "worker-projections"
+            / slugify(str(project.get("project_id") or "project"), "project")
+            / slugify(attempt, "attempt")
+        ).resolve()
+        runtime_receipt = (actor.get("runtime") or {}).get("context_projection")
+        provider_may_have_started = bool(
+            (actor.get("runtime") or {}).get("provider_execution_state") == "started"
+            or (actor.get("runtime") or {}).get("oci_lifecycle_state")
+            in {"started", "finished", "uncertain_start", "uncertain_cleanup"}
+        )
+        try:
+            if destination.exists() or destination.is_symlink():
+                if provider_may_have_started:
+                    if not isinstance(runtime_receipt, dict):
+                        raise SystemExit(
+                            "required worker recovery rejected: started projection lacks a durable receipt"
+                        )
+                    _projection_receipt(
+                        destination,
+                        contract,
+                        incoming_change_manifest_sha256=incoming_change_manifest_sha256,
+                        expected_runtime_receipt=runtime_receipt,
+                    )
+                    projected_files = destination / "files"
+                else:
+                    expected_manifest_sha256 = (
+                        runtime_receipt.get("manifest_sha256")
+                        if isinstance(runtime_receipt, dict)
+                        else None
+                    )
+                    verification_projection: Path | None = None
+                    if expected_manifest_sha256 is None:
+                        # A hard exit may occur after atomic materialization but
+                        # before its receipt transaction. Recompute the expected
+                        # manifest from trusted Git objects instead of trusting a
+                        # replaceable self-hash in the orphan directory.
+                        verification_projection = destination.parent / (
+                            f".{destination.name}.verify-{secrets.token_hex(12)}"
+                        )
+                        expected_projection = materialize_context_projection(
+                            source,
+                            base_sha=str(contract["base_sha"]),
+                            allowlist=contract["context_paths"],
+                            destination=verification_projection,
+                            allow_empty=True,
+                        )
+                        expected_manifest_sha256 = str(
+                            expected_projection.manifest["manifest_sha256"]
+                        )
+                    try:
+                        if incoming_change_artifact is not None:
+                            projected = apply_cumulative_change_artifact(
+                                destination,
+                                expected_base_sha=str(contract["base_sha"]),
+                                expected_allowlist=contract["context_paths"],
+                                expected_projection_manifest_sha256=str(
+                                    expected_manifest_sha256
+                                ),
+                                write_scope=write_paths,
+                                change_manifest=incoming_change_artifact["manifest"],
+                                change_artifact_root=incoming_change_artifact[
+                                    "artifact_root"
+                                ],
+                                expected_change_manifest_sha256=str(
+                                    incoming_change_manifest_sha256
+                                ),
+                            )
+                        else:
+                            projected = verify_materialized_context_projection(
+                                destination,
+                                expected_base_sha=str(contract["base_sha"]),
+                                expected_allowlist=contract["context_paths"],
+                                expected_manifest_sha256=expected_manifest_sha256,
+                            )
+                    finally:
+                        if verification_projection is not None:
+                            shutil.rmtree(verification_projection, ignore_errors=True)
+                    projected_files = projected.files_root
+            else:
+                projected = materialize_context_projection(
+                    source,
+                    base_sha=str(contract["base_sha"]),
+                    allowlist=contract["context_paths"],
+                    destination=destination,
+                    allow_empty=True,
+                )
+                if incoming_change_artifact is not None:
+                    projected = apply_cumulative_change_artifact(
+                        projected.artifact_root,
+                        expected_base_sha=str(contract["base_sha"]),
+                        expected_allowlist=contract["context_paths"],
+                        expected_projection_manifest_sha256=str(
+                            projected.manifest["manifest_sha256"]
+                        ),
+                        write_scope=write_paths,
+                        change_manifest=incoming_change_artifact["manifest"],
+                        change_artifact_root=incoming_change_artifact["artifact_root"],
+                        expected_change_manifest_sha256=str(
+                            incoming_change_manifest_sha256
+                        ),
+                    )
+                projected_files = projected.files_root
+        except ContextProjectionError as exc:
+            raise SystemExit(f"required worker context projection failed closed: {exc}") from exc
+        if write_paths and hasattr(os, "getuid") and os.getuid() == 0:
+            try:
+                os.chown(projected_files, 65532, 65532)
+                for child in projected_files.rglob("*"):
+                    os.chown(child, 65532, 65532, follow_symlinks=False)
+            except OSError as exc:
+                raise SystemExit(
+                    "unable to assign the context projection to the non-root OCI worker"
+                ) from exc
+        return (
+            projected_files,
+            "workspace-write" if write_paths else "read-only",
+            write_paths,
+            str(contract["base_sha"]),
+        )
     if not write_paths:
         return source, "read-only", (), None
 
@@ -777,6 +1164,13 @@ def _required_worker_bundle(
     except (TypeError, ValueError) as exc:
         raise SystemExit("required worker resource limits are invalid") from exc
     forbidden_mount_roots = [layout.project_dir.resolve()]
+    if isinstance(actor.get("collaboration_contract"), dict):
+        forbidden_mount_roots.append(
+            Path(str(project.get("workspace") or "")).expanduser().resolve()
+        )
+    source_project = project.get("source_project")
+    if source_project:
+        forbidden_mount_roots.append(Path(str(source_project)).expanduser().resolve())
     aggregate_secrets = project.get("secrets_file")
     if aggregate_secrets:
         forbidden_mount_roots.append(Path(str(aggregate_secrets)).expanduser().resolve())
@@ -984,6 +1378,8 @@ def _validate_worker_fence(
     current = attempts[-1] if attempts else None
     if not current or current.get("attempt_id") != expected_attempt or current.get("actor_id") != actor_id:
         raise SystemExit("worker launch rejected: attempt is no longer current")
+    if current.get("prompt_binding") != actor.get("prompt_binding"):
+        raise SystemExit("worker launch rejected: actor and attempt prompt bindings differ")
     profile_binding = actor.get("profile_binding")
     try:
         if profile_binding is None:
@@ -1104,6 +1500,11 @@ def _run_actor_once(
         raise SystemExit(f"Actor prompt is outside the runtime: {exc}") from exc
     if prompt != expected_prompt or not prompt.is_file():
         raise SystemExit(f"Actor prompt not found: {prompt}")
+    prompt_text = (
+        validate_bound_actor_prompt(actor, prompt)
+        if actor.get("role") == "agent"
+        else prompt.read_text(encoding="utf-8")
+    )
     governance_recovery_only = (
         _validate_actor_governance_before_side_effect(
             layout,
@@ -1115,6 +1516,79 @@ def _run_actor_once(
     report.parent.mkdir(parents=True, exist_ok=True)
     execution_workspace, sandbox, write_scopes, base_sha = actor_execution_workspace(layout, project, actor)
     required_isolation = (actor.get("isolation") or {}).get("mode") == "required"
+    projection_receipt: dict[str, Any] | None = None
+    if required_isolation:
+        collaboration_contract = actor.get("collaboration_contract")
+        assert isinstance(collaboration_contract, dict)
+        projection_task = load_task(layout, str(actor.get("task_id")))
+        incoming_change_artifact = _incoming_change_artifact(
+            layout,
+            project,
+            actor,
+            projection_task,
+            collaboration_contract,
+            write_scopes,
+        )
+        incoming_change_manifest_sha256 = (
+            incoming_change_artifact.get("manifest_sha256")
+            if incoming_change_artifact is not None
+            else None
+        )
+        projection_receipt = _projection_receipt(
+            execution_workspace.parent,
+            collaboration_contract,
+            incoming_change_manifest_sha256=incoming_change_manifest_sha256,
+            expected_runtime_receipt=(actor.get("runtime") or {}).get("context_projection"),
+        )
+
+        def persist_projection_receipt() -> None:
+            current_actor = _validate_worker_fence(
+                layout,
+                actor_id,
+                attempt_id=attempt_id,
+                launch_token=launch_token,
+            )
+            runtime = current_actor.setdefault("runtime", {})
+            existing = runtime.get("context_projection")
+            if existing is not None and existing != projection_receipt:
+                raise SystemExit("required worker projection receipt changed before provider launch")
+            runtime["context_projection"] = projection_receipt
+            save_actor(layout, current_actor)
+            current_task = load_task(layout, str(current_actor.get("task_id")))
+            matched = False
+            for current_attempt in current_task.get("attempts") or []:
+                if current_attempt.get("attempt_id") == current_actor.get("attempt_id"):
+                    prior = current_attempt.get("context_projection")
+                    if prior is not None and prior != projection_receipt:
+                        raise SystemExit("attempt projection receipt changed before provider launch")
+                    current_attempt["context_projection"] = projection_receipt
+                    matched = True
+                    break
+            if not matched:
+                raise SystemExit("required worker projection receipt has no authoritative attempt")
+            save_task(layout, current_task)
+            append_event(
+                layout,
+                "actor_context_projected",
+                actor_id=actor_id,
+                task_id=current_actor.get("task_id"),
+                attempt_id=current_actor.get("attempt_id"),
+                manifest_sha256=projection_receipt.get("manifest_sha256"),
+                file_count=projection_receipt.get("file_count"),
+            )
+
+        _control_mutation(
+            layout,
+            command_name="runner_bind_context_projection",
+            command_id=f"RUNNER-CONTEXT-PROJECTION-{attempt_id or actor_id}",
+            payload={
+                "actor_id": actor_id,
+                "attempt_id": attempt_id,
+                "contract_sha256": collaboration_contract.get("contract_sha256"),
+                "manifest_sha256": projection_receipt.get("manifest_sha256"),
+            },
+            mutate=persist_projection_receipt,
+        )
     recovery_generation_value = (actor.get("runtime") or {}).get("recovery_generation")
     native_recovery_generation = (
         recovery_generation_value
@@ -1413,13 +1887,13 @@ def _run_actor_once(
                         if existing_runtime.get("container_id")
                         else None
                     ),
-                    stdin_prompt=prompt.read_text(encoding="utf-8"),
+                    stdin_prompt=prompt_text,
                 )
             else:
                 handle = adapter.start(
                     required_spec,
                     required_command,
-                    stdin_prompt=prompt.read_text(encoding="utf-8"),
+                    stdin_prompt=prompt_text,
                 )
             recovered_execution = bool(getattr(handle, "recovered", False))
             if handle.container_name != expected_container_name:
@@ -1712,7 +2186,6 @@ def _run_actor_once(
             raise
         process: subprocess.Popen[str] | None = None
         try:
-            prompt_text = prompt.read_text(encoding="utf-8")
             process = subprocess.Popen(
                 process_argv(argv),
                 cwd=str(execution_workspace),
@@ -1780,13 +2253,62 @@ def _run_actor_once(
             atomic_write_text(report, f"# Completion Report\n\nStatus: failed\n\n## Result\n{type(exc).__name__}: {exc}\n")
 
     changed_paths: tuple[str, ...] = ()
+    change_artifact_receipt: dict[str, Any] | None = None
     if write_scopes:
-        try:
-            assert base_sha is not None
-            changed_paths = worktree_changed_paths(execution_workspace, base_sha)
-            violations = tuple(path for path in changed_paths if not _path_is_within_scope(path, write_scopes))
-        except (OSError, subprocess.CalledProcessError) as exc:
-            violations = (f"<diff-check-failed:{type(exc).__name__}>",)
+        if required_isolation:
+            try:
+                assert base_sha is not None
+                collaboration_contract = actor.get("collaboration_contract")
+                assert isinstance(collaboration_contract, dict)
+                prepared_changes = capture_projection_changes(
+                    execution_workspace.parent,
+                    expected_base_sha=base_sha,
+                    expected_allowlist=collaboration_contract.get("context_paths") or [],
+                    write_scope=write_scopes,
+                    expected_manifest_sha256=(projection_receipt or {}).get(
+                        "manifest_sha256"
+                    ),
+                    previous=(incoming_change_artifact or {}).get("manifest"),
+                )
+                persisted_changes = persist_change_artifact(
+                    (
+                        layout.root
+                        / "task-change-artifacts"
+                        / slugify(str(project.get("project_id") or "project"), "project")
+                        / slugify(str(actor.get("task_id") or "task"), "task")
+                    ).resolve(),
+                    prepared_changes,
+                )
+                changed_paths = tuple(
+                    str(entry["path"])
+                    for entry in prepared_changes.manifest.get("changes") or []
+                )
+                change_artifact_receipt = {
+                    "schema": "costmarshal-change-artifact-receipt-v1",
+                    "manifest_sha256": persisted_changes.manifest_sha256,
+                    "manifest_path": str(persisted_changes.manifest_path),
+                    "artifact_root": str(persisted_changes.artifact_root),
+                    "base_sha": base_sha,
+                    "write_scope": list(write_scopes),
+                    "change_count": prepared_changes.manifest.get("change_count"),
+                    "total_upsert_bytes": prepared_changes.manifest.get("total_upsert_bytes"),
+                    "manifest": prepared_changes.manifest,
+                    "collaboration_contract_sha256": collaboration_contract.get(
+                        "contract_sha256"
+                    ),
+                }
+                violations = ()
+            except (ContextProjectionError, OSError) as exc:
+                violations = (
+                    f"<change-capture-failed:{type(exc).__name__}:{str(exc)[:512]}>",
+                )
+        else:
+            try:
+                assert base_sha is not None
+                changed_paths = worktree_changed_paths(execution_workspace, base_sha)
+                violations = tuple(path for path in changed_paths if not _path_is_within_scope(path, write_scopes))
+            except (OSError, subprocess.CalledProcessError) as exc:
+                violations = (f"<diff-check-failed:{type(exc).__name__}>",)
         if violations:
             returncode = 126
             existing = report.read_text(encoding="utf-8", errors="replace") if report.is_file() else "# Completion Report\n\n"
@@ -1841,6 +2363,8 @@ def _run_actor_once(
                     "attempt_id": actor.get("attempt_id"),
                     "execution_workspace": str(execution_workspace),
                     "changed_paths": list(changed_paths),
+                    "context_projection": projection_receipt,
+                    "change_artifact": change_artifact_receipt,
                     "report_sha256": report_sha256,
                     "report_size": len(report_bytes),
                 },
@@ -1853,6 +2377,10 @@ def _run_actor_once(
                     current_attempt["report_size"] = len(report_bytes)
                     current_attempt["provider_exit_code"] = returncode
                     current_attempt["provider_execution_state"] = "finished"
+                    if projection_receipt is not None:
+                        current_attempt["context_projection"] = projection_receipt
+                    if change_artifact_receipt is not None:
+                        current_attempt["change_artifact"] = change_artifact_receipt
                     current_attempt["usage_status"] = (
                         "captured" if usage_known else "unknown_recovery_logs"
                     )
@@ -1934,6 +2462,10 @@ def _run_actor_once(
         current_actor.setdefault("runtime", {})["exit_code"] = returncode
         current_actor["runtime"]["finished_at"] = now_iso()
         current_actor["runtime"]["changed_paths"] = list(changed_paths)
+        if projection_receipt is not None:
+            current_actor["runtime"]["context_projection"] = projection_receipt
+        if change_artifact_receipt is not None:
+            current_actor["runtime"]["change_artifact"] = change_artifact_receipt
         current_actor["runtime"]["provider_execution_state"] = "finished"
         current_actor["runtime"]["usage_status"] = (
             "captured" if usage_known else "unknown_recovery_logs"
@@ -1953,6 +2485,8 @@ def _run_actor_once(
             cached_input_tokens=cached_input_tokens,
             output_tokens=output_tokens,
             changed_paths=list(changed_paths),
+            context_projection_manifest=(projection_receipt or {}).get("manifest_sha256"),
+            change_artifact_manifest=(change_artifact_receipt or {}).get("manifest_sha256"),
         )
     _control_mutation(
         layout,
@@ -1963,6 +2497,12 @@ def _run_actor_once(
             "attempt_id": attempt_id,
             "exit_code": returncode,
             "report_sha256": report_sha256,
+            "context_projection_manifest": (projection_receipt or {}).get(
+                "manifest_sha256"
+            ),
+            "change_artifact_manifest": (change_artifact_receipt or {}).get(
+                "manifest_sha256"
+            ),
             "input_tokens": input_tokens,
             "cached_input_tokens": cached_input_tokens,
             "output_tokens": output_tokens,

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal, ROUND_CEILING
 from itertools import product
 import math
 import random
@@ -54,12 +55,23 @@ def wilson_lower(successes: float, trials: float, z: float = 1.96) -> float:
     return max(0.0, (center - margin) / denominator)
 
 
-def independent_probability(history: list[dict], provider_id: str) -> float:
+def independent_probability(history: list[dict], provider: dict, task: dict) -> float:
     rows = [
         row
         for row in history
-        if row.get("provider_id") == provider_id and type(row.get("accepted_by_leader")) is bool
+        if row.get("provider_id") == provider["provider_id"]
+        and row.get("model") == (provider.get("model") or "inherit")
+        and row.get("profile") == provider.get("profile")
+        and type(row.get("accepted_by_leader")) is bool
     ]
+    type_rows = [row for row in rows if row.get("task_type") == task["task_type"]]
+    if type_rows:
+        rows = type_rows
+        difficulty_rows = [
+            row for row in rows if row.get("difficulty") == task["difficulty"]
+        ]
+        if difficulty_rows:
+            rows = difficulty_rows
     accepted = sum(row["accepted_by_leader"] is True for row in rows)
     posterior_successes = 1.0 + accepted
     trials = 3.0 + len(rows)
@@ -67,14 +79,34 @@ def independent_probability(history: list[dict], provider_id: str) -> float:
     return round(min(mean, wilson_lower(posterior_successes, trials)), 6)
 
 
-def independent_cost(provider: dict, input_tokens: int, output_tokens: int) -> float:
-    return round(
-        (
-            input_tokens * float(provider["input_cny_per_1m"])
-            + output_tokens * float(provider["output_cny_per_1m"])
-        )
-        / 1_000_000,
-        9,
+def independent_sla_observations(history: list[dict], provider: dict, task: dict) -> int:
+    """Count only the exact execution/task scope admissible for an SLA proof."""
+
+    return sum(
+        1
+        for row in history
+        if row.get("provider_id") == provider["provider_id"]
+        and row.get("model") == (provider.get("model") or "inherit")
+        and row.get("profile") == provider.get("profile")
+        and row.get("task_type") == task["task_type"]
+        and row.get("difficulty") == task["difficulty"]
+        and type(row.get("accepted_by_leader")) is bool
+    )
+
+
+def independent_cost(provider: dict, input_tokens: int, output_tokens: int) -> Decimal:
+    input_nano = int(Decimal(str(provider["input_cny_per_1m"])) * 1_000_000_000)
+    output_nano = int(Decimal(str(provider["output_cny_per_1m"])) * 1_000_000_000)
+    nano_cny = (
+        Decimal(input_tokens * input_nano + output_tokens * output_nano)
+        / Decimal(1_000_000)
+    ).to_integral_value(rounding=ROUND_CEILING)
+    return nano_cny / Decimal(1_000_000_000)
+
+
+def display(value: Decimal) -> float:
+    return float(
+        value.quantize(Decimal("0.000000001"))
     )
 
 
@@ -96,7 +128,7 @@ def independent_oracle(
         return None
 
     probability = {
-        provider["provider_id"]: independent_probability(history, provider["provider_id"])
+        provider["provider_id"]: independent_probability(history, provider, task)
         for provider in eligible
     }
     cost = {
@@ -125,34 +157,53 @@ def independent_oracle(
         for optional_continuation in continuations:
             continuation = tuple(row for row in optional_continuation if row is not None)
             chain = (start, *continuation)
-            survival = 1.0
-            expected_cost = 0.0
-            for provider in chain:
+            survival = Decimal(1)
+            expected_cost = Decimal(0)
+            for step_index, provider in enumerate(chain):
                 provider_id = provider["provider_id"]
                 expected_cost += survival * cost[provider_id]
-                survival *= 1.0 - probability[provider_id]
-            success_probability = 1.0 - survival
+                # Random oracle rows deliberately have no task-linked route
+                # lineage. Only the first marginal can prove success; a later
+                # hop has zero conditional lower bound until paired history
+                # exists. Dedicated contract tests cover paired chains.
+                step_probability = probability[provider_id] if step_index == 0 else 0.0
+                survival *= Decimal(1) - Decimal(str(step_probability))
+            success_probability = Decimal(1) - survival
+            objective = expected_cost / success_probability
             plans.append(
                 {
                     "provider": start,
                     "chain": tuple(row["provider_id"] for row in chain),
-                    "expected_cost": round(expected_cost, 9),
-                    "success_probability": round(success_probability, 9),
-                    "objective": round(expected_cost / success_probability, 9),
-                    "first_cost": cost[start["provider_id"]],
+                    "expected_cost": display(expected_cost),
+                    "success_probability": display(success_probability),
+                    "objective": display(objective),
+                    "first_cost": float(cost[start["provider_id"]]),
+                    "_success": success_probability,
+                    "_objective": objective,
                 }
             )
     plans.sort(
         key=lambda plan: (
-            plan["objective"],
-            -plan["success_probability"],
+            plan["_objective"],
+            -plan["_success"],
             plan["provider"]["priority"],
             plan["provider"]["provider_id"],
         )
     )
     minimum_success = task.get("min_success_probability")
-    if minimum_success is not None:
-        plans = [plan for plan in plans if plan["success_probability"] >= minimum_success]
+    if minimum_success is not None and minimum_success > 0:
+        floor = Decimal(str(minimum_success))
+        plans = [
+            plan
+            for plan in plans
+            if plan["_success"] >= floor
+            and independent_sla_observations(
+                history,
+                plan["provider"],
+                task,
+            )
+            >= 10
+        ]
     return plans[0] if plans else None
 
 
@@ -193,12 +244,15 @@ def random_case(rng: random.Random, index: int) -> tuple[dict, dict, list[dict],
     history: list[dict] = []
     for provider in providers:
         observations = rng.randint(0, 12)
-        for _ in range(observations):
+        for observation in range(observations):
             history.append(
                 {
                     "provider_id": provider["provider_id"],
+                    "model": provider.get("model") or "inherit",
+                    "profile": provider.get("profile"),
                     "task_type": task_type,
                     "difficulty": task["difficulty"],
+                    "attempt_id": f"ATT-{provider['provider_id']}-{observation}",
                     "accepted_by_leader": rng.random() < rng.uniform(0.05, 0.95),
                 }
             )

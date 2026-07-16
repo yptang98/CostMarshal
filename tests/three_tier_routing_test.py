@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import sys
+import time
 from pathlib import Path
 import unittest
 
@@ -26,6 +27,111 @@ from costmarshal_v2.routing import (  # noqa: E402
     route_plan_fingerprint,
     validate_provider_catalog,
 )
+
+
+def paired_chain_history(
+    *,
+    total: int = 200,
+    low_accepts: int = 80,
+    medium_accepts: int = 60,
+    high_accepts: int = 50,
+) -> list[dict]:
+    """Build task-linked evidence from a real low->medium->high funnel."""
+
+    rows: list[dict] = []
+    low_failures = 0
+    medium_failures = 0
+    for index in range(total):
+        task_id = f"TASK-paired-{index}"
+        envelope_id = f"ENV-paired-{index}"
+        fingerprint = "sha256:" + f"{index:064x}"[-64:]
+        low_accepted = index < low_accepts
+        rows.append(
+            {
+                "id": f"RES-low-{index}",
+                "provider_id": "longcat",
+                "model": "LongCat-2.0",
+                "profile": "longcat",
+                "task_type": "analysis",
+                "difficulty": "normal",
+                "task_id": task_id,
+                "attempt_id": f"ATT-low-{index}",
+                "route_envelope_id": envelope_id,
+                "route_plan_fingerprint": fingerprint,
+                "route_plan_step_index": 0,
+                "route_predecessors": [],
+                "accepted_by_leader": low_accepted,
+            }
+        )
+        if low_accepted:
+            continue
+        medium_accepted = low_failures < medium_accepts
+        low_failures += 1
+        rows.append(
+            {
+                "id": f"RES-medium-{index}",
+                "provider_id": "deepseek",
+                "model": "inherit",
+                "profile": "deepseek",
+                "task_type": "analysis",
+                "difficulty": "normal",
+                "task_id": task_id,
+                "attempt_id": f"ATT-medium-{index}",
+                "route_envelope_id": envelope_id,
+                "route_plan_fingerprint": fingerprint,
+                "route_plan_step_index": 1,
+                "route_predecessors": [
+                    {
+                        "provider_id": "longcat",
+                        "model": "LongCat-2.0",
+                        "profile": "longcat",
+                        "profile_sha256": None,
+                        "attempt_id": f"ATT-low-{index}",
+                        "result_id": f"RES-low-{index}",
+                    }
+                ],
+                "accepted_by_leader": medium_accepted,
+            }
+        )
+        if medium_accepted:
+            continue
+        high_accepted = medium_failures < high_accepts
+        medium_failures += 1
+        rows.append(
+            {
+                "id": f"RES-high-{index}",
+                "provider_id": "codex",
+                "model": "inherit",
+                "profile": None,
+                "task_type": "analysis",
+                "difficulty": "normal",
+                "task_id": task_id,
+                "attempt_id": f"ATT-high-{index}",
+                "route_envelope_id": envelope_id,
+                "route_plan_fingerprint": fingerprint,
+                "route_plan_step_index": 2,
+                "route_predecessors": [
+                    {
+                        "provider_id": "longcat",
+                        "model": "LongCat-2.0",
+                        "profile": "longcat",
+                        "profile_sha256": None,
+                        "attempt_id": f"ATT-low-{index}",
+                        "result_id": f"RES-low-{index}",
+                    },
+                    {
+                        "provider_id": "deepseek",
+                        "model": "inherit",
+                        "profile": "deepseek",
+                        "profile_sha256": None,
+                        "attempt_id": f"ATT-medium-{index}",
+                        "result_id": f"RES-medium-{index}",
+                    },
+                ],
+                "accepted_by_leader": high_accepted,
+            }
+        )
+    return rows
 
 
 class ThreeTierRoutingTest(unittest.TestCase):
@@ -91,6 +197,44 @@ class ThreeTierRoutingTest(unittest.TestCase):
             catalog["providers"].append(peer)
         with self.assertRaisesRegex(RoutingValidationError, "too many enabled"):
             decide_route({"risk": "low", "task_type": "analysis"}, catalog)
+
+    def test_maximum_bounded_catalog_indexes_history_once(self) -> None:
+        base = default_provider_catalog()["providers"]
+        providers = []
+        for template in base:
+            for index in range(16):
+                row = deepcopy(template)
+                row["provider_id"] = f"{template['provider_id']}-{index}"
+                row["profile"] = None
+                row["model"] = f"model-{template['tier']}-{index}"
+                row["priority"] = index
+                row["input_cny_per_1m"] = 1.0 + index
+                row["output_cny_per_1m"] = 1.0 + index
+                providers.append(row)
+        history = [
+            {
+                "id": f"RES-scale-{index}",
+                "attempt_id": f"ATT-scale-{index}",
+                "provider_id": providers[index % len(providers)]["provider_id"],
+                "model": providers[index % len(providers)]["model"],
+                "profile": None,
+                "task_type": "analysis",
+                "difficulty": "normal",
+                "accepted_by_leader": index % 3 == 0,
+            }
+            for index in range(2_000)
+        ]
+        started = time.perf_counter()
+        decision = decide_route(
+            {"risk": "low", "task_type": "analysis"},
+            {"schema_version": 1, "providers": providers},
+            history=history,
+            input_tokens=1_000,
+            output_tokens=1_000,
+        )
+        elapsed = time.perf_counter() - started
+        self.assertIn(decision.provider_id, {row["provider_id"] for row in providers})
+        self.assertLess(elapsed, 10.0, f"bounded route optimization took {elapsed:.3f}s")
 
     def test_auto_tier_floor_is_conservative(self) -> None:
         self.assertEqual(auto_tier_floor({"risk": "high"}), "high")
@@ -262,6 +406,8 @@ class ThreeTierRoutingTest(unittest.TestCase):
         history = [
             {
                 "provider_id": "deepseek-alt",
+                "model": "inherit",
+                "profile": "deepseek-alt",
                 "task_type": "analysis",
                 "difficulty": "normal",
                 "accepted_by_leader": True,
@@ -271,6 +417,8 @@ class ThreeTierRoutingTest(unittest.TestCase):
         history.extend(
             {
                 "provider_id": "deepseek",
+                "model": "inherit",
+                "profile": "deepseek",
                 "task_type": "analysis",
                 "difficulty": "normal",
                 "accepted_by_leader": False,
@@ -282,6 +430,50 @@ class ThreeTierRoutingTest(unittest.TestCase):
         catalog["providers"][-1]["priority"] = 101
         priority_choice = decide_route({"risk": "medium"}, catalog, history=history)
         self.assertEqual(priority_choice.provider_id, "deepseek")
+
+    def test_acceptance_evidence_is_scoped_to_model_and_profile_identity(self) -> None:
+        history = [
+            {
+                "provider_id": "deepseek",
+                "model": "old-good",
+                "profile": "deepseek",
+                "task_type": "analysis",
+                "difficulty": "normal",
+                "accepted_by_leader": True,
+                "attempt_id": f"ATT-old-{index}",
+            }
+            for index in range(100)
+        ]
+        cold = leader_acceptance_prior(
+            history,
+            "deepseek",
+            task_type="analysis",
+            difficulty="normal",
+            execution_identity=("new-unproven", "deepseek"),
+        )
+        proven = leader_acceptance_prior(
+            history,
+            "deepseek",
+            task_type="analysis",
+            difficulty="normal",
+            execution_identity=("old-good", "deepseek"),
+        )
+        self.assertEqual(cold.observations, 0)
+        self.assertEqual(proven.observations, 100)
+        self.assertLess(cold.conservative_probability, 0.5)
+        self.assertGreater(proven.conservative_probability, 0.9)
+
+    def test_acceptance_prior_deduplicates_attempts_and_rejects_conflicts(self) -> None:
+        duplicate = {
+            "provider_id": "deepseek",
+            "accepted_by_leader": False,
+            "attempt_id": "ATT-duplicate",
+        }
+        prior = leader_acceptance_prior([duplicate, dict(duplicate)], "deepseek")
+        self.assertEqual(prior.observations, 1)
+        conflict = {**duplicate, "accepted_by_leader": True}
+        with self.assertRaisesRegex(RoutingValidationError, "conflicting leader result"):
+            leader_acceptance_prior([duplicate, conflict], "deepseek")
 
     def test_disabled_or_missing_safe_tier_fails_closed(self) -> None:
         catalog = default_provider_catalog()
@@ -327,9 +519,10 @@ class ThreeTierRoutingTest(unittest.TestCase):
                 "risk": "low",
                 "task_type": "analysis",
                 "difficulty": "normal",
-                "min_success_probability": 0.15,
+                "min_success_probability": 0.8,
             },
             catalog,
+            history=paired_chain_history(),
             input_tokens=500_000,
             output_tokens=500_000,
         )
@@ -344,9 +537,10 @@ class ThreeTierRoutingTest(unittest.TestCase):
                 "risk": "low",
                 "task_type": "analysis",
                 "difficulty": "normal",
-                "min_success_probability": 0.15,
+                "min_success_probability": 0.8,
             },
             catalog,
+            history=paired_chain_history(),
             input_tokens=500_000,
             output_tokens=500_000,
         )
@@ -364,12 +558,51 @@ class ThreeTierRoutingTest(unittest.TestCase):
         )
         self.assertGreater(decision.expected_success_probability or 0, decision.acceptance_prior.conservative_probability)
 
+    def test_unpaired_marginal_history_cannot_claim_independent_chain_success(self) -> None:
+        catalog = default_provider_catalog()
+        for provider in catalog["providers"]:
+            provider["input_cny_per_1m"] = 1.0
+            provider["output_cny_per_1m"] = 1.0
+        history: list[dict] = []
+        for provider in catalog["providers"]:
+            for index in range(100):
+                history.append(
+                    {
+                        "provider_id": provider["provider_id"],
+                        "model": provider.get("model") or "inherit",
+                        "profile": provider.get("profile"),
+                        "task_type": "analysis",
+                        "difficulty": "normal",
+                        "attempt_id": f"ATT-unpaired-{provider['provider_id']}-{index}",
+                        "accepted_by_leader": index < 50,
+                    }
+                )
+        # Every marginal lower bound is about 0.4. The former independent
+        # product claimed a three-provider chain above 0.6, even though the
+        # same outcomes could be perfectly correlated. Unpaired rows now
+        # cannot prove any continuation benefit.
+        with self.assertRaisesRegex(
+            RoutingValidationError,
+            "no priced provider chain satisfies",
+        ):
+            decide_route(
+                {
+                    "risk": "low",
+                    "task_type": "analysis",
+                    "difficulty": "normal",
+                    "min_success_probability": 0.6,
+                },
+                catalog,
+                history=history,
+                input_tokens=1_000_000,
+            )
+
     def test_optimizer_enumerates_early_stop_and_skip_tier_chains(self) -> None:
         catalog = default_provider_catalog()
         # High is slightly less cost-efficient than low, so the unconstrained
         # optimum stops early while the SLA-constrained optimum skips the
         # prohibitively expensive medium tier.
-        prices = {"longcat": 1.0, "deepseek": 100.0, "codex": 1.1}
+        prices = {"longcat": 1.0, "deepseek": 1000.0, "codex": 100.0}
         for provider in catalog["providers"]:
             provider["input_cny_per_1m"] = prices[provider["provider_id"]]
             provider["output_cny_per_1m"] = prices[provider["provider_id"]]
@@ -379,13 +612,23 @@ class ThreeTierRoutingTest(unittest.TestCase):
             input_tokens=1_000_000,
         )
         self.assertEqual(unconstrained.planned_provider_ids, ("longcat",))
+        skip_history = []
+        for row in paired_chain_history(medium_accepts=0, high_accepts=115):
+            if row["provider_id"] == "deepseek":
+                continue
+            projected = deepcopy(row)
+            if projected["provider_id"] == "codex":
+                projected["route_plan_step_index"] = 1
+                projected["route_predecessors"] = projected["route_predecessors"][:1]
+            skip_history.append(projected)
         constrained = decide_route(
             {
                 "risk": "low",
                 "task_type": "analysis",
-                "min_success_probability": 0.1,
+                "min_success_probability": 0.92,
             },
             catalog,
+            history=skip_history,
             input_tokens=1_000_000,
         )
         self.assertEqual(constrained.planned_provider_ids, ("longcat", "codex"))
@@ -419,6 +662,18 @@ class ThreeTierRoutingTest(unittest.TestCase):
             )
         with self.assertRaises(RoutingValidationError):
             decide_route({"risk": "low", "min_success_probability": 1.1}, catalog)
+
+    def test_zero_success_floor_does_not_require_economic_pricing(self) -> None:
+        decision = decide_route(
+            {
+                "risk": "low",
+                "task_type": "analysis",
+                "min_success_probability": 0.0,
+            },
+            default_provider_catalog(),
+        )
+        self.assertEqual(decision.provider_id, "longcat")
+        self.assertEqual(decision.optimization_mode, "safe-tier")
 
 
 if __name__ == "__main__":

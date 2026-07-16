@@ -45,8 +45,10 @@ REQUIRED_LOCAL_TESTS = (
     "tests/route_oracle_test.py",
     "tests/backtest_harness_test.py",
     "tests/pricing_metadata_test.py",
+    "tests/result_evidence_integrity_test.py",
     "tests/control_store_test.py",
     "tests/transactional_scheduler_test.py",
+    "tests/scheduler_authority_test.py",
     "tests/runtime_effect_store_test.py",
     "tests/runtime_effect_scheduler_test.py",
     "tests/worker_isolation_test.py",
@@ -62,6 +64,8 @@ REQUIRED_LOCAL_TESTS = (
     "tests/required_credential_preflight_test.py",
     "tests/security_contract_test.py",
     "tests/actor_security_contract_test.py",
+    "tests/context_projection_test.py",
+    "tests/handoff_contract_test.py",
     "tests/reliability_contract_test.py",
     "tests/release_gate_test.py",
     "tests/budget_contract_test.py",
@@ -74,6 +78,7 @@ REQUIRED_LOCAL_TESTS = (
     "tests/archmarshal_compat_test.py",
     "tests/profile_config_test.py",
     "tests/concurrency_contract_test.py",
+    "tests/ci_contract_test.py",
     "scripts/install_smoke_test.py",
 )
 REQUIRED_TESTS = REQUIRED_LOCAL_TESTS + (

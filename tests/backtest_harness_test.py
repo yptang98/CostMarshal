@@ -20,6 +20,7 @@ ATTESTATION_NAMESPACE = "costmarshal-backtest-v1"
 sys.path.insert(0, str(ROOT))
 
 from costmarshal_v2.routing import decide_route, default_provider_catalog  # noqa: E402
+from three_tier_routing_test import paired_chain_history  # noqa: E402
 
 
 def hashed(value: str) -> str:
@@ -53,11 +54,39 @@ def attested_matrix_fixture(task_count: int = 210, *, task_budget_cny: float = 2
     for provider in catalog["providers"]:
         provider["input_cny_per_1m"], provider["output_cny_per_1m"] = prices[provider["provider_id"]]
     providers = {row["provider_id"]: row for row in catalog["providers"]}
-    history: list[dict] = []
+    low_medium_high_history = paired_chain_history()
+    history: list[dict] = list(low_medium_high_history)
+    for row in low_medium_high_history:
+        if row["provider_id"] not in {"deepseek", "codex"}:
+            continue
+        projected = json.loads(json.dumps(row))
+        projected["task_id"] += "-medium-high"
+        projected["attempt_id"] += "-medium-high"
+        projected["id"] += "-medium-high"
+        projected["route_envelope_id"] += "-medium-high"
+        if projected["provider_id"] == "deepseek":
+            projected["route_plan_step_index"] = 0
+            projected["route_predecessors"] = []
+        else:
+            projected["route_plan_step_index"] = 1
+            projected["route_predecessors"] = [
+                {
+                    "provider_id": "deepseek",
+                    "model": "inherit",
+                    "profile": "deepseek",
+                    "profile_sha256": None,
+                    "attempt_id": row["route_predecessors"][1]["attempt_id"]
+                    + "-medium-high",
+                    "result_id": row["route_predecessors"][1]["result_id"]
+                    + "-medium-high",
+                }
+            ]
+        history.append(projected)
     locked_at = "2026-07-01T00:00:00Z"
     route_now = "2026-07-01T00:00:00Z"
     tasks = []
     task_routes = {}
+    route_cache = {}
     for index in range(task_count):
         floor = TIERS[index % 3]
         routing_task = {
@@ -67,33 +96,38 @@ def attested_matrix_fixture(task_count: int = 210, *, task_budget_cny: float = 2
             "required_capabilities": [],
         }
         if floor == "low":
-            routing_task["min_success_probability"] = 0.15
+            routing_task["min_success_probability"] = 0.8
         elif floor == "medium":
-            routing_task["min_success_probability"] = 0.1
+            routing_task["min_success_probability"] = 0.8
         input_tokens = 500_000
         output_tokens = 500_000
         candidate_request = {"requested_provider_id": None, "requested_tier": None}
         baseline_request = {"requested_provider_id": "codex", "requested_tier": None}
-        candidate = decide_route(
-            routing_task,
-            catalog,
-            history=history,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            now=route_now,
-            **candidate_request,
-        )
-        baseline_task = dict(routing_task)
-        baseline_task.pop("min_success_probability", None)
-        baseline = decide_route(
-            baseline_task,
-            catalog,
-            history=history,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            now=route_now,
-            **baseline_request,
-        )
+        cached_routes = route_cache.get(floor)
+        if cached_routes is None:
+            candidate = decide_route(
+                routing_task,
+                catalog,
+                history=history,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                now=route_now,
+                **candidate_request,
+            )
+            baseline_task = dict(routing_task)
+            baseline_task.pop("min_success_probability", None)
+            baseline = decide_route(
+                baseline_task,
+                catalog,
+                history=history,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                now=route_now,
+                **baseline_request,
+            )
+            route_cache[floor] = (candidate, baseline)
+        else:
+            candidate, baseline = cached_routes
         candidate_chain = [providers[row]["tier"] for row in candidate.planned_provider_ids]
         baseline_chain = [providers[row]["tier"] for row in baseline.planned_provider_ids]
         accepted = {

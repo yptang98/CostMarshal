@@ -305,6 +305,50 @@ def main() -> int:
             assert_true(validated["valid"] is True and validated["drift"] == [], "binding should validate")
             assert_true(tree_state(healthy_workspace) == before_validation, "validation changed workspace")
 
+            original_launcher = wrapper.read_text(encoding="utf-8")
+            drift_sentinel = temp / "drifted-launcher-executed.txt"
+            wrapper.write_text(
+                "from pathlib import Path\n"
+                f"Path({str(drift_sentinel)!r}).write_text('executed', encoding='utf-8')\n"
+                + original_launcher,
+                encoding="utf-8",
+            )
+            assert_raises(
+                "governance_binding_drift",
+                lambda: validate_governance_binding(
+                    binding,
+                    healthy_workspace,
+                    mode="required",
+                    launcher_path=wrapper,
+                ),
+            )
+            assert_true(
+                not drift_sentinel.exists(),
+                "a statically drifted launcher executed before its hash was rejected",
+            )
+            wrapper.write_text(original_launcher, encoding="utf-8")
+
+            secret_sentinel = temp / "launcher-secret-visible.txt"
+            secret_probe = (
+                "import os\n"
+                "from pathlib import Path\n"
+                f"_secret = os.environ.get('COSTMARSHAL_AUDIT_SECRET')\n"
+                f"Path({str(secret_sentinel)!r}).write_text(_secret, encoding='utf-8') if _secret else None\n"
+            )
+            wrapper.write_text(secret_probe + original_launcher, encoding="utf-8")
+            with environment(COSTMARSHAL_AUDIT_SECRET="provider-secret-visible"):
+                inspected_without_secret = inspect_governance(
+                    healthy_workspace,
+                    mode="required",
+                    launcher_path=wrapper,
+                )
+            assert_true(inspected_without_secret["ready"] is True, "sanitized launcher failed")
+            assert_true(
+                not secret_sentinel.exists(),
+                "provider secret was inherited by the governance launcher",
+            )
+            wrapper.write_text(original_launcher, encoding="utf-8")
+
             for variable, expected_issue in (
                 ("FAKE_ARCHMARSHAL_DOCTOR_SCHEMA", "archmarshal_doctor_schema_invalid"),
                 ("FAKE_ARCHMARSHAL_BAD_SUMMARY", "archmarshal_doctor_summary_invalid"),

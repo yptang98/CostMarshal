@@ -17,11 +17,23 @@ from costmarshal_v2.actor_runner import (  # noqa: E402
     actor_execution_workspace,
     build_codex_argv,
     isolated_actor_env,
+    validate_bound_actor_prompt,
     worktree_changed_paths,
+)
+from costmarshal_v2.context_projection import (  # noqa: E402
+    ContextProjectionError,
+    capture_projection_changes,
+    persist_change_artifact,
 )
 from costmarshal_v2.paths import ProjectLayout  # noqa: E402
 from costmarshal_v2.routing import default_provider_catalog  # noqa: E402
-from costmarshal_v2.state import load_actor, load_project  # noqa: E402
+from costmarshal_v2.scheduler import bind_actor_prompt, prepare_collaboration_contract  # noqa: E402
+from costmarshal_v2.state import (  # noqa: E402
+    load_actor,
+    load_project,
+    load_task,
+    save_task,
+)
 
 
 CLI = ROOT / "scripts" / "costmarshal.py"
@@ -65,6 +77,137 @@ def main() -> int:
         assert (execution / "src" / "app.py").is_file()
         (execution / "secret.tmp").write_text("ignored but still detected\n", encoding="utf-8")
         assert "secret.tmp" in worktree_changed_paths(execution, str(base_sha))
+
+        # Required OCI workers receive only the exact tracked allowlist from
+        # the frozen base, never the dirty host tree or Git metadata.
+        task = load_task(layout, "V2-0001")
+        task["allowed_context"] = ["src"]
+        collaboration_contract = prepare_collaboration_contract(project, task)
+        task["collaboration_contract"] = collaboration_contract
+        save_task(layout, task)
+        required_actor = json.loads(json.dumps(actor))
+        required_actor["isolation"] = {
+            "mode": "required",
+            "attestation": {"strong_isolation": True, "backend": "docker"},
+            "execution": {"engine": "docker", "workspace_mode": "rw"},
+        }
+        required_actor["collaboration_contract"] = collaboration_contract
+        prompt_binding = bind_actor_prompt(layout, required_actor)
+        task = load_task(layout, "V2-0001")
+        task["attempts"][-1]["collaboration_contract_sha256"] = collaboration_contract[
+            "contract_sha256"
+        ]
+        task["attempts"][-1]["prompt_binding"] = prompt_binding
+        save_task(layout, task)
+        (workspace / "src" / "app.py").write_text("print('dirty host')\n", encoding="utf-8")
+        (workspace / ".env").write_text("SECRET=untracked\n", encoding="utf-8")
+        projected, projected_sandbox, projected_scopes, projected_base = actor_execution_workspace(
+            layout,
+            project,
+            required_actor,
+        )
+        assert str(projected).startswith(str((layout.root / "worker-projections").resolve()))
+        assert projected_sandbox == "workspace-write"
+        assert projected_scopes == ("src/app.py",)
+        assert projected_base == collaboration_contract["base_sha"]
+        assert (projected / "src" / "app.py").read_text(encoding="utf-8") == "print('baseline')\n"
+        assert not (projected / ".env").exists()
+        assert not (projected / ".git").exists()
+        required_prompt = project_dir / str(required_actor["prompt_path"])
+        prompt_text = validate_bound_actor_prompt(required_actor, required_prompt)
+        assert str(workspace) not in prompt_text
+        assert "`/workspace`" in prompt_text
+        (projected / "src" / "app.py").write_text("print('worker')\n", encoding="utf-8")
+        prepared_changes = capture_projection_changes(
+            projected.parent,
+            expected_base_sha=str(projected_base),
+            expected_allowlist=["src"],
+            write_scope=projected_scopes,
+        )
+        assert [entry["path"] for entry in prepared_changes.manifest["changes"]] == [
+            "src/app.py"
+        ]
+        persisted_changes = persist_change_artifact(
+            layout.root / "test-change-artifacts",
+            prepared_changes,
+        )
+        assert persisted_changes.manifest_path.is_file()
+        (projected / "outside.txt").write_text("forbidden\n", encoding="utf-8")
+        try:
+            capture_projection_changes(
+                projected.parent,
+                expected_base_sha=str(projected_base),
+                expected_allowlist=["src"],
+                write_scope=projected_scopes,
+            )
+        except ContextProjectionError as exc:
+            assert "outside write scope" in str(exc)
+        else:
+            raise AssertionError("required projection accepted an out-of-scope write")
+        (projected / "outside.txt").unlink()
+
+        # A stronger successor starts from the same immutable base plus the
+        # explicitly rejected predecessor's cumulative artifact.
+        task_change_root = (
+            layout.root
+            / "task-change-artifacts"
+            / project["project_id"]
+            / "v2-0001"
+        )
+        routed_persisted = persist_change_artifact(task_change_root, prepared_changes)
+        predecessor_receipt = {
+            "schema": "costmarshal-change-artifact-receipt-v1",
+            "manifest_sha256": routed_persisted.manifest_sha256,
+            "manifest_path": str(routed_persisted.manifest_path),
+            "artifact_root": str(routed_persisted.artifact_root),
+            "base_sha": str(projected_base),
+            "write_scope": ["src/app.py"],
+            "change_count": prepared_changes.manifest["change_count"],
+            "total_upsert_bytes": prepared_changes.manifest["total_upsert_bytes"],
+            "manifest": prepared_changes.manifest,
+            "collaboration_contract_sha256": collaboration_contract[
+                "contract_sha256"
+            ],
+        }
+        task = load_task(layout, "V2-0001")
+        task["attempts"][-1].update(
+            {
+                "accepted_by_leader": False,
+                "recorded_result_status": "escalate",
+                "leader_result_id": "RES-predecessor",
+                "change_artifact": predecessor_receipt,
+            }
+        )
+        successor_attempt_id = "ATT-successor-projection"
+        successor_actor = json.loads(json.dumps(required_actor))
+        successor_actor["id"] = "agent-v2-0001-successor"
+        successor_actor["attempt_id"] = successor_attempt_id
+        successor_actor["runtime"] = {}
+        task["attempts"].append(
+            {
+                "attempt_id": successor_attempt_id,
+                "actor_id": successor_actor["id"],
+                "collaboration_contract_sha256": collaboration_contract[
+                    "contract_sha256"
+                ],
+            }
+        )
+        save_task(layout, task)
+        successor_binding = bind_actor_prompt(layout, successor_actor)
+        task = load_task(layout, "V2-0001")
+        task["attempts"][-1]["prompt_binding"] = successor_binding
+        save_task(layout, task)
+        successor_workspace, _, _, _ = actor_execution_workspace(
+            layout,
+            project,
+            successor_actor,
+        )
+        assert (successor_workspace / "src" / "app.py").read_text(
+            encoding="utf-8"
+        ) == "print('worker')\n"
+        assert (workspace / "src" / "app.py").read_text(
+            encoding="utf-8"
+        ) == "print('dirty host')\n"
 
         codex_home = temp / "codex-home"
         codex_home.mkdir()

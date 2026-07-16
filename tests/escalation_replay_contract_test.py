@@ -60,6 +60,52 @@ def load_task(project: Path, task_id: str = "V2-0001") -> dict:
     )
 
 
+def reject_current_attempt(temp: Path, project: Path, task_id: str, suffix: str) -> None:
+    task = load_task(project, task_id)
+    attempt = task["attempts"][-1]
+    report = project / "tasks" / task_id / "completion-report.md"
+    report.write_text(
+        f"# Completion Report: {task_id}\n\nStatus: escalate\n",
+        encoding="utf-8",
+    )
+    run_json(
+        temp,
+        "heartbeat",
+        "--project",
+        str(project),
+        "--actor",
+        attempt["actor_id"],
+        "--status",
+        "waiting",
+    )
+    run_json(
+        temp,
+        "collect",
+        "--command-id",
+        f"CMD-collect-{suffix}",
+        "--project",
+        str(project),
+        "--task",
+        task_id,
+        "--state",
+        "escalate",
+    )
+    run_json(
+        temp,
+        "record-result",
+        "--command-id",
+        f"CMD-result-{suffix}",
+        "--project",
+        str(project),
+        "--task",
+        task_id,
+        "--status",
+        "escalate",
+        "--quality-score",
+        "3",
+    )
+
+
 def main() -> int:
     temp = Path(tempfile.mkdtemp(prefix="costmarshal-escalation-replay-"))
     try:
@@ -128,6 +174,7 @@ def main() -> int:
             "longcat",
             "--unsafe-native",
         )
+        reject_current_attempt(temp, project, "V2-0001", "first")
 
         crashed = run(
             temp,
@@ -334,6 +381,7 @@ def main() -> int:
             "deepseek",
             "--unsafe-native",
         )
+        reject_current_attempt(temp, project, "V2-0002", "second")
         env_crashed = run(
             temp,
             "escalate",

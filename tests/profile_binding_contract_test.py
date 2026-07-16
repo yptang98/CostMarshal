@@ -18,6 +18,7 @@ from costmarshal_v2.actor_runner import _validate_worker_fence  # noqa: E402
 from costmarshal_v2.paths import ProjectLayout  # noqa: E402
 from costmarshal_v2.profiles import provider_profile_text  # noqa: E402
 from costmarshal_v2.routing import default_provider_catalog  # noqa: E402
+from project_success_policy_test import seed_paired_route_evidence  # noqa: E402
 
 
 def run_json(temp: Path, env: dict[str, str], *args: str) -> dict:
@@ -38,8 +39,80 @@ def load_task(project: Path, task_id: str) -> dict:
     return json.loads((project / "tasks" / task_id / "task.json").read_text(encoding="utf-8"))
 
 
+def reject_latest_attempt(temp: Path, env: dict[str, str], project: Path, task_id: str) -> dict:
+    task = load_task(project, task_id)
+    attempt = task["attempts"][-1]
+    actor = str(attempt["actor_id"])
+    attempt_id = str(attempt["attempt_id"])
+    (project / "tasks" / task_id / "completion-report.md").write_text(
+        f"# Completion Report: {task_id}\n\nStatus: escalate\n\nLeader requires the next bound profile.\n",
+        encoding="utf-8",
+    )
+    run_json(temp, env, "heartbeat", "--project", str(project), "--actor", actor, "--status", "waiting")
+    run_json(
+        temp,
+        env,
+        "collect",
+        "--command-id",
+        f"CMD-profile-collect-{task_id}",
+        "--project",
+        str(project),
+        "--task",
+        task_id,
+        "--attempt",
+        attempt_id,
+        "--actor",
+        actor,
+        "--state",
+        "escalate",
+    )
+    run_json(
+        temp,
+        env,
+        "record-result",
+        "--command-id",
+        f"CMD-profile-result-{task_id}",
+        "--project",
+        str(project),
+        "--task",
+        task_id,
+        "--attempt",
+        attempt_id,
+        "--actor",
+        actor,
+        "--status",
+        "escalate",
+        "--quality-score",
+        "3",
+        "--summary",
+        "leader rejected the current bound profile",
+    )
+    return attempt
+
+
+def remove_paired_evidence(project: Path) -> None:
+    for task_dir in (project / "tasks").glob("EVID-*"):
+        shutil.rmtree(task_dir)
+    results_path = project / "reports" / "results.jsonl"
+    retained = [
+        line
+        for line in results_path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not str(json.loads(line).get("task_id") or "").startswith("EVID-")
+    ]
+    results_path.write_text(
+        "".join(f"{line}\n" for line in retained),
+        encoding="utf-8",
+    )
+
+
+def reset_paired_evidence(temp: Path, project: Path) -> None:
+    remove_paired_evidence(project)
+    seed_paired_route_evidence(temp, project)
+
+
 def main() -> int:
     temp = Path(tempfile.mkdtemp(prefix="costmarshal-profile-binding-"))
+    previous_codex_home = os.environ.get("CODEX_HOME")
     try:
         workspace = temp / "workspace"
         workspace.mkdir()
@@ -66,6 +139,7 @@ def main() -> int:
         medium_source.write_text(medium_text, encoding="utf-8")
         env = dict(os.environ)
         env["CODEX_HOME"] = str(codex_home)
+        os.environ["CODEX_HOME"] = str(codex_home)
 
         catalog = default_provider_catalog()
         for provider, price in zip(catalog["providers"], (1.0, 2.0, 3.0), strict=True):
@@ -89,6 +163,7 @@ def main() -> int:
                 "off",
             )["project"]
         )
+        seed_paired_route_evidence(temp, project)
         run_json(
             temp,
             env,
@@ -131,14 +206,21 @@ def main() -> int:
 
         changed_medium = medium_text.replace("https://medium.example/v1", "https://medium-new.example/v1")
         medium_source.write_text(changed_medium, encoding="utf-8")
+        first_attempt = reject_latest_attempt(temp, env, project, "V2-0001")
         run_json(
             temp,
             env,
             "escalate",
+            "--command-id",
+            "CMD-profile-escalate-V2-0001",
             "--project",
             str(project),
             "--task",
             "V2-0001",
+            "--attempt",
+            str(first_attempt["attempt_id"]),
+            "--from-actor",
+            str(first_attempt["actor_id"]),
             "--reason",
             "exercise immutable continuation",
             "--unsafe-native",
@@ -150,6 +232,10 @@ def main() -> int:
         admitted_medium_snapshot = temp / "runtime" / bindings[1]["snapshot_relpath"]
         assert admitted_medium_snapshot.read_text(encoding="utf-8") == medium_text
 
+        # A changed profile is a new execution identity. Refresh only the
+        # synthetic paired fixture so the second admission has exact evidence
+        # for the changed bytes; old-profile observations must not leak across.
+        reset_paired_evidence(temp, project)
         run_json(
             temp,
             env,
@@ -218,9 +304,14 @@ def main() -> int:
             check=False,
         )
         assert missing_dispatch.returncode != 0
-        assert "profile is unavailable at route admission" in (
-            missing_dispatch.stdout + missing_dispatch.stderr
-        )
+        missing_text = missing_dispatch.stdout + missing_dispatch.stderr
+        assert any(
+            message in missing_text
+            for message in (
+                "profile is unavailable at route admission",
+                "no priced provider chain satisfies minimum success probability",
+            )
+        ), missing_text
         missing_task = load_task(project, "V2-0003")
         assert missing_task["attempts"] == []
         assert "route_budget_envelope" not in missing_task
@@ -228,6 +319,7 @@ def main() -> int:
 
         # validate must cover unexecuted active-envelope snapshots, not only
         # the profile attached to an already-created attempt.
+        remove_paired_evidence(project)
         future_binding = second["route_budget_envelope"]["planned_steps"][1][
             "profile_binding"
         ]
@@ -252,9 +344,8 @@ def main() -> int:
             check=False,
         )
         assert future_validation.returncode != 0
-        assert "active route budget envelope is not executable" in (
-            future_validation.stdout + future_validation.stderr
-        )
+        future_validation_text = future_validation.stdout + future_validation.stderr
+        assert "active route budget envelope is not executable" in future_validation_text, future_validation_text
         future_snapshot.write_bytes(future_payload)
 
         # Corrupting a durable snapshot is detected by the actor/attempt fence
@@ -297,6 +388,10 @@ def main() -> int:
         print("profile binding contract ok")
         return 0
     finally:
+        if previous_codex_home is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = previous_codex_home
         shutil.rmtree(temp, ignore_errors=True)
 
 

@@ -13,13 +13,13 @@ Requirements:
   - Read <skills-dir>/costmarshal/VERSION if it exists and report the old version.
   - Move the old installed skill folder to <skills-dir>/costmarshal.backup-<timestamp>.
   - Copy the new CostMarshal skill folder to <skills-dir>/costmarshal.
-  - Do not copy .git, __pycache__, .env files, generated `artifacts/`, local runtime folders, or secret files.
+  - Do not copy .git, .github, __pycache__, .env files, generated `artifacts/`, local runtime folders, or secret files.
   - Preserve $CODEX_HOME/costmarshal-v2 or ~/.codex/costmarshal-v2 runtime state exactly as-is.
   - Preserve legacy $CODEX_HOME/costmarshal or ~/.codex/costmarshal runtime state exactly as-is.
   - Preserve local secret files exactly as-is; do not print secret values.
 - Do not copy any local .env files or secrets.
-- Verify Python 3.10+ is available with: python --version
-- If python is unavailable on Windows, try: py -3 --version
+- Verify Python 3.11+ is available with: python --version
+- If python is unavailable on Windows, try: py -3.11 --version
 - CostMarshal v2 uses scheduler actors and pluggable runtime backends; do not run legacy v1 initialization unless I explicitly ask for it.
 - Run: python <installed-skill>/scripts/costmarshal.py --help
 - Run: python <installed-skill>/scripts/install_smoke_test.py

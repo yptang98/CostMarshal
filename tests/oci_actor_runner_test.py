@@ -19,12 +19,22 @@ sys.path.insert(0, str(ROOT))
 
 from costmarshal_v2.actor_runner import (  # noqa: E402
     _expected_oci_container_name,
+    _projection_receipt,
     _required_worker_bundle,
+    actor_execution_workspace,
     run_actor,
 )
 from costmarshal_v2.governance import GovernanceError  # noqa: E402
 from costmarshal_v2.paths import ProjectLayout  # noqa: E402
-from costmarshal_v2.state import load_actor, load_project, save_actor, save_project  # noqa: E402
+from costmarshal_v2.scheduler import bind_actor_prompt, prepare_collaboration_contract  # noqa: E402
+from costmarshal_v2.state import (  # noqa: E402
+    load_actor,
+    load_project,
+    load_task,
+    save_actor,
+    save_project,
+    save_task,
+)
 from costmarshal_v2.worker_isolation import (  # noqa: E402
     WorkerExecutionError,
     cleanup_temporary_credential,
@@ -50,6 +60,45 @@ def cli(temp: Path, *args: str) -> dict:
     if completed.returncode:
         raise AssertionError(f"command failed: {args}\n{completed.stdout}\n{completed.stderr}")
     return json.loads(completed.stdout)
+
+
+def bind_required_collaboration(
+    layout: ProjectLayout,
+    project: dict,
+    actor: dict,
+) -> dict:
+    task = load_task(layout, str(actor["task_id"]))
+    collaboration_contract = prepare_collaboration_contract(project, task)
+    task["collaboration_contract"] = collaboration_contract
+    save_task(layout, task)
+    actor["collaboration_contract"] = collaboration_contract
+    prompt_binding = bind_actor_prompt(layout, actor)
+    task = load_task(layout, str(actor["task_id"]))
+    task["attempts"][-1]["collaboration_contract_sha256"] = collaboration_contract[
+        "contract_sha256"
+    ]
+    task["attempts"][-1]["prompt_binding"] = prompt_binding
+    save_task(layout, task)
+    save_actor(layout, actor)
+    return actor
+
+
+def persist_projection_fixture(
+    layout: ProjectLayout,
+    project: dict,
+    actor: dict,
+) -> Path:
+    execution_workspace, _, _, _ = actor_execution_workspace(layout, project, actor)
+    receipt = _projection_receipt(
+        execution_workspace.parent,
+        actor["collaboration_contract"],
+    )
+    actor.setdefault("runtime", {})["context_projection"] = receipt
+    save_actor(layout, actor)
+    task = load_task(layout, str(actor["task_id"]))
+    task["attempts"][-1]["context_projection"] = receipt
+    save_task(layout, task)
+    return execution_workspace
 
 
 def queued_command_args(project_dir: Path, task_id: str, command: str) -> list[dict]:
@@ -392,6 +441,12 @@ def main() -> int:
     try:
         workspace = temp / "workspace"
         workspace.mkdir()
+        (workspace / "README.md").write_text("bounded workspace\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(workspace), "init", "--quiet"], check=True)
+        subprocess.run(["git", "-C", str(workspace), "config", "user.name", "CostMarshal Test"], check=True)
+        subprocess.run(["git", "-C", str(workspace), "config", "user.email", "costmarshal@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(workspace), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(workspace), "commit", "--quiet", "-m", "base"], check=True)
         codex_home = temp / "codex-home"
         codex_home.mkdir()
         (codex_home / "longcat.config.toml").write_text(
@@ -465,9 +520,26 @@ def main() -> int:
                 },
             },
         }
+        task = load_task(layout, "V2-0001")
+        collaboration_contract = prepare_collaboration_contract(project, task)
+        task["collaboration_contract"] = collaboration_contract
+        save_task(layout, task)
+        actor["collaboration_contract"] = collaboration_contract
+        prompt_binding = bind_actor_prompt(layout, actor)
+        task = load_task(layout, "V2-0001")
+        task["attempts"][-1]["collaboration_contract_sha256"] = collaboration_contract[
+            "contract_sha256"
+        ]
+        task["attempts"][-1]["prompt_binding"] = prompt_binding
+        save_task(layout, task)
         save_actor(layout, actor)
         project["secrets_file"] = str(secrets_file)
         save_project(layout, project)
+        bundle_execution_workspace, _, _, _ = actor_execution_workspace(
+            layout,
+            project,
+            actor,
+        )
 
         # Invalid execution metadata must fail before the selected provider
         # credential is ever materialized in the attempt bundle.
@@ -479,7 +551,7 @@ def main() -> int:
                     layout,
                     project,
                     invalid_limits_actor,
-                    execution_workspace=workspace,
+                    execution_workspace=bundle_execution_workspace,
                     workspace_mode="read-only",
                 )
             except SystemExit as exc:
@@ -497,7 +569,7 @@ def main() -> int:
                     layout,
                     project,
                     actor,
-                    execution_workspace=workspace,
+                    execution_workspace=bundle_execution_workspace,
                     workspace_mode="read-only",
                     allow_credential_creation=False,
                 )
@@ -520,7 +592,7 @@ def main() -> int:
                     layout,
                     project,
                     insecure_actor,
-                    execution_workspace=workspace,
+                    execution_workspace=bundle_execution_workspace,
                     workspace_mode="read-only",
                 )
             except SystemExit as exc:
@@ -537,7 +609,7 @@ def main() -> int:
                 layout,
                 project,
                 actor,
-                execution_workspace=workspace,
+                execution_workspace=bundle_execution_workspace,
                 workspace_mode="read-only",
             )
             assert prepared_spec.credential_path is not None
@@ -548,7 +620,7 @@ def main() -> int:
                 layout,
                 project,
                 prepared_actor,
-                execution_workspace=workspace,
+                execution_workspace=bundle_execution_workspace,
                 workspace_mode="read-only",
             )
             assert resumed_spec.credential_path == prepared_spec.credential_path
@@ -658,13 +730,18 @@ raise SystemExit(run_actor(
         )
         recovered_actor = load_actor(layout, recovered_dispatch["actor_id"])
         recovered_actor["isolation"] = json.loads(json.dumps(actor["isolation"]))
-        save_actor(layout, recovered_actor)
+        recovered_actor = bind_required_collaboration(layout, project, recovered_actor)
+        recovered_execution_workspace = persist_projection_fixture(
+            layout,
+            project,
+            recovered_actor,
+        )
         with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
             recovered_spec, recovered_command, _ = _required_worker_bundle(
                 layout,
                 project,
                 recovered_actor,
-                execution_workspace=workspace,
+                execution_workspace=recovered_execution_workspace,
                 workspace_mode="read-only",
             )
         assert recovered_spec.credential_path is not None
@@ -742,12 +819,12 @@ raise SystemExit(run_actor(
         )
         hard_actor = load_actor(layout, hard_dispatch["actor_id"])
         hard_actor["isolation"] = json.loads(json.dumps(actor["isolation"]))
-        save_actor(layout, hard_actor)
+        hard_actor = bind_required_collaboration(layout, project, hard_actor)
         hard_prompt = project_dir / str(hard_actor["prompt_path"])
         import hashlib
 
         expected_prompt_sha256 = hashlib.sha256(
-            hard_prompt.read_text(encoding="utf-8").encode("utf-8")
+            hard_prompt.read_bytes()
         ).hexdigest()
         hard_daemon = temp / "hard-exit-daemon"
         hard_child = """
@@ -865,7 +942,7 @@ raise SystemExit(actor_runner.run_actor(
         )
         cleanup_actor = load_actor(layout, cleanup_dispatch["actor_id"])
         cleanup_actor["isolation"] = json.loads(json.dumps(actor["isolation"]))
-        save_actor(layout, cleanup_actor)
+        cleanup_actor = bind_required_collaboration(layout, project, cleanup_actor)
         with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False), patch(
             "costmarshal_v2.actor_runner.OciWorkerExecutionAdapter",
             CleanupUnconfirmedAdapter,
@@ -906,6 +983,9 @@ raise SystemExit(actor_runner.run_actor(
         )
         usage_actor = load_actor(layout, usage_dispatch["actor_id"])
         usage_actor["isolation"] = json.loads(json.dumps(actor["isolation"]))
+        usage_actor = bind_required_collaboration(layout, project, usage_actor)
+        persist_projection_fixture(layout, project, usage_actor)
+        usage_actor = load_actor(layout, usage_actor["id"])
         usage_identity = SimpleNamespace(
             project_id=project["project_id"],
             actor_id=usage_actor["id"],

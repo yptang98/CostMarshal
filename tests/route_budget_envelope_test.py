@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 from costmarshal_v2.routing import build_pricing_snapshot, default_provider_catalog  # noqa: E402
 from costmarshal_v2.profiles import provider_profile_text  # noqa: E402
+from project_success_policy_test import seed_paired_route_evidence  # noqa: E402
 
 
 def run(temp: Path, *args: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
@@ -86,7 +87,9 @@ def make_project(temp: Path, name: str, budget: float | str) -> Path:
         "off",
         "--allow-unsafe-native-workers",
     )
-    return Path(created["project"])
+    project = Path(created["project"])
+    seed_paired_route_evidence(temp, project)
+    return project
 
 
 def new_chain_task(
@@ -131,6 +134,74 @@ def mark_attempts_executed(project: Path, task_id: str) -> None:
         json.dumps(task, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def reject_latest_attempt(temp: Path, project: Path, task_id: str, label: str) -> dict:
+    task = task_payload(project, task_id)
+    attempt = task["attempts"][-1]
+    report = project / "tasks" / task_id / "completion-report.md"
+    report.write_text(
+        f"# Completion Report: {task_id}\n\nStatus: escalate\n\n{label}\n",
+        encoding="utf-8",
+    )
+    run_json(
+        temp,
+        "heartbeat",
+        "--project",
+        str(project),
+        "--actor",
+        attempt["actor_id"],
+        "--status",
+        "waiting",
+    )
+    run_json(
+        temp,
+        "collect",
+        "--command-id",
+        f"CMD-collect-{label}",
+        "--project",
+        str(project),
+        "--task",
+        task_id,
+        "--attempt",
+        attempt["attempt_id"],
+        "--actor",
+        attempt["actor_id"],
+        "--state",
+        "escalate",
+    )
+    return run_json(
+        temp,
+        "record-result",
+        "--command-id",
+        f"CMD-result-{label}",
+        "--project",
+        str(project),
+        "--task",
+        task_id,
+        "--attempt",
+        attempt["attempt_id"],
+        "--actor",
+        attempt["actor_id"],
+        "--status",
+        "escalate",
+        "--quality-score",
+        "3",
+        "--summary",
+        label,
+    )
+
+
+def remove_seed_evidence(project: Path) -> None:
+    for task_dir in (project / "tasks").glob("EVID-*"):
+        shutil.rmtree(task_dir)
+    results = project / "reports" / "results.jsonl"
+    retained = [
+        row
+        for row in results.read_text(encoding="utf-8").splitlines()
+        if row.strip() and not str(json.loads(row).get("task_id") or "").startswith("EVID-")
+    ]
+    results.write_text("".join(f"{row}\n" for row in retained), encoding="utf-8")
 
 
 def main() -> int:
@@ -240,6 +311,8 @@ def main() -> int:
         active_result = run(
             temp,
             "record-result",
+            "--command-id",
+            "CMD-active-result-rejected",
             "--project",
             str(release_project),
             "--task",
@@ -298,6 +371,8 @@ def main() -> int:
         run_json(
             temp,
             "record-result",
+            "--command-id",
+            "CMD-release-chain-result",
             "--project",
             str(release_project),
             "--task",
@@ -392,6 +467,12 @@ def main() -> int:
             "--unsafe-native",
         )
         for expected_provider in ("deepseek", "codex"):
+            reject_latest_attempt(
+                temp,
+                escalation_project,
+                escalation_task,
+                f"escalation-{expected_provider}",
+            )
             run_json(
                 temp,
                 "escalate",
@@ -409,6 +490,7 @@ def main() -> int:
             assert budget["commitment_cny"] == 6.0
         final_chain = task_payload(escalation_project, escalation_task)
         assert [attempt["route_plan_step_index"] for attempt in final_chain["attempts"]] == [0, 1, 2]
+        remove_seed_evidence(escalation_project)
         assert run_json(temp, "validate", "--project", str(escalation_project))["status"] == "ok"
 
         revision_project = make_project(temp, "envelope-revision", 10.0)
@@ -452,6 +534,7 @@ def main() -> int:
         early_payload = task_payload(revision_project, early_stop)
         early_attempt = early_payload["attempts"][0]
         assert len(early_payload["route_budget_envelope"]["planned_steps"]) == 1
+        reject_latest_attempt(temp, revision_project, early_stop, "early-stop")
         automatic = run(
             temp,
             "escalate",
@@ -482,7 +565,7 @@ def main() -> int:
             "--unsafe-native",
         )
         revised = task_payload(revision_project, early_stop)
-        assert revised["attempts"][-1]["provider"] == "deepseek"
+        assert revised["attempts"][-1]["provider"] == "codex"
         assert revised["route_budget_envelope_history"][-1]["release_reason"] == "explicit_plan_revision"
 
         sla_project = make_project(temp, "envelope-sla-revision", 20.0)
@@ -496,6 +579,7 @@ def main() -> int:
             sla_task,
             "--unsafe-native",
         )
+        reject_latest_attempt(temp, sla_project, sla_task, "sla-low")
         before_rejected_revision = task_payload(sla_project, sla_task)
         rejected_revision = run(
             temp,
@@ -512,7 +596,7 @@ def main() -> int:
             "--unsafe-native",
             ok=False,
         )
-        assert "below its frozen minimum" in (
+        assert "cross-envelope predecessor-conditioned evidence" in (
             rejected_revision.stdout + rejected_revision.stderr
         )
         assert task_payload(sla_project, sla_task) == before_rejected_revision
@@ -527,8 +611,8 @@ def main() -> int:
             "consume the admitted medium step",
             "--unsafe-native",
         )
-        mark_attempts_executed(sla_project, sla_task)
-        run_json(
+        reject_latest_attempt(temp, sla_project, sla_task, "sla-medium")
+        rejected_correlated_replan = run(
             temp,
             "escalate",
             "--project",
@@ -541,16 +625,16 @@ def main() -> int:
             "--reason",
             "prior attempts now make the revised route satisfy the floor",
             "--unsafe-native",
+            ok=False,
+        )
+        assert "cross-envelope predecessor-conditioned evidence" in (
+            rejected_correlated_replan.stdout + rejected_correlated_replan.stderr
         )
         sla_replanned = task_payload(sla_project, sla_task)
         assert [row["provider"] for row in sla_replanned["attempts"]] == [
             "longcat",
             "deepseek",
-            "codex",
         ]
-        assert sla_replanned["route_budget_envelope_history"][-1]["release_reason"] == (
-            "explicit_active_plan_revision"
-        )
 
         drift_project = make_project(temp, "envelope-drift", 10.0)
         drift_task = new_chain_task(
@@ -568,7 +652,7 @@ def main() -> int:
             drift_task,
             "--unsafe-native",
         )
-        mark_attempts_executed(drift_project, drift_task)
+        reject_latest_attempt(temp, drift_project, drift_task, "drift-low")
         project_json = drift_project / "project.json"
         project_state = json.loads(project_json.read_text(encoding="utf-8"))
         for provider in project_state["provider_catalog"]["providers"]:
@@ -601,7 +685,7 @@ def main() -> int:
         )
         assert "price basis drifted" in (drifted.stdout + drifted.stderr)
         assert len(task_payload(drift_project, drift_task)["attempts"]) == 1
-        run_json(
+        unsafe_replan = run(
             temp,
             "escalate",
             "--project",
@@ -614,10 +698,11 @@ def main() -> int:
             "--reason",
             "leader atomically replaces the drifted tail within budget",
             "--unsafe-native",
+            ok=False,
         )
-        replanned = task_payload(drift_project, drift_task)
-        assert replanned["attempts"][-1]["provider"] == "codex"
-        assert replanned["route_budget_envelope_history"][-1]["release_reason"] == "explicit_active_plan_revision"
+        assert "cross-envelope predecessor-conditioned evidence" in (
+            unsafe_replan.stdout + unsafe_replan.stderr
+        )
 
         print("route budget envelope ok")
         return 0

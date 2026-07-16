@@ -504,6 +504,29 @@ class WorkerExecutionAdapterTest(unittest.TestCase):
         self.assertEqual(receipt.stdout_events[0]["usage"]["input_tokens"], 19)
         self.assertTrue(handle.recovered)
 
+    def test_prepared_recovery_rejects_unknown_same_name_without_start_or_cleanup(self) -> None:
+        adapter, runner, process, factory, handle = self.start(CapturedProcessResult(0))
+        initial_run_argv = factory.argv
+        runner.labels_override = {
+            **handle.labels,
+            "io.costmarshal.attempt": "unknown-attempt",
+        }
+        with self.assertRaises(WorkerExecutionError) as caught:
+            adapter.recover_or_start(
+                self.spec(),
+                handle.command,
+                container_name=handle.container_name,
+                stdin_prompt="perform the task",
+            )
+        self.assertEqual(caught.exception.code, "container_label_mismatch")
+        self.assertEqual(factory.argv, initial_run_argv)
+        self.assertFalse(
+            any(
+                LifecycleRunner._command(call)[:2] == ("rm", "--force")
+                for call in runner.calls
+            )
+        )
+
     def test_label_verification_blocks_stop_but_exact_id_cleanup_closes_container(self) -> None:
         adapter, runner, process, factory, handle = self.start(CapturedProcessResult(0))
         runner.labels_override = {**handle.labels, "io.costmarshal.attempt": "wrong-attempt"}
@@ -581,6 +604,7 @@ class WorkerExecutionAdapterTest(unittest.TestCase):
 
         mutations: tuple[tuple[str, Callable[[dict[str, object]], None]], ...] = (
             ("container_id_mismatch", lambda payload: payload.__setitem__("Id", "d" * 64)),
+            ("container_name_mismatch", lambda payload: payload.__setitem__("Name", "/renamed-container")),
             ("container_image_mismatch", lambda payload: nested(payload, "Config").__setitem__("Image", "other")),
             ("container_command_mismatch", lambda payload: nested(payload, "Config").__setitem__("Cmd", ["other"])),
             ("container_user_mismatch", lambda payload: nested(payload, "Config").__setitem__("User", "0:0")),

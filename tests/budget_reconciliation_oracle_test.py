@@ -63,7 +63,12 @@ class BudgetReconciliationOracleTest(unittest.TestCase):
                 "provider_id": provider_id,
                 "tier": tier,
                 "profile": None,
-                "model": None,
+                "model": f"test-model-{index}",
+                "execution_identity": {
+                    "model": f"test-model-{index}",
+                    "profile": None,
+                    "profile_sha256": "sha256:" + f"{index + 1:064x}",
+                },
                 "estimated_cost_cny": costs[index],
                 "acceptance_prior": {},
                 "price_basis": {"kind": "test", "index": index},

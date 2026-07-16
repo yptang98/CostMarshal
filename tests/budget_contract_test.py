@@ -153,6 +153,8 @@ def main() -> int:
         data(
             temp,
             "record-result",
+            "--command-id",
+            "CMD-budget-result",
             "--project",
             str(project),
             "--task",

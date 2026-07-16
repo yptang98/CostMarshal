@@ -16,10 +16,12 @@ from pathlib import Path
 
 
 SOURCE = Path(__file__).resolve().parents[1]
+MINIMUM_PYTHON = (3, 11)
 
 
 IGNORED_DIRS = {
     ".git",
+    ".github",
     "__pycache__",
     ".pytest_cache",
     ".mypy_cache",
@@ -61,6 +63,10 @@ def assert_true(condition: bool, message: str) -> None:
 
 
 def main() -> int:
+    assert_true(
+        sys.version_info >= MINIMUM_PYTHON,
+        "CostMarshal requires Python 3.11+ for installation and runtime",
+    )
     temp = Path(tempfile.mkdtemp(prefix="costmarshal-install-smoke-"))
     try:
         codex_home = temp / "codex-home"
@@ -94,6 +100,7 @@ def main() -> int:
         assert_true((install_dir / "release" / "evidence-policy.json").is_file(), "installed skill should include release trust policy")
         assert_true((install_dir / "VERSION").read_text(encoding="utf-8").strip() != old_version, "update should install the new version")
         assert_true(not (install_dir / ".git").exists(), "install copy should not include .git")
+        assert_true(not (install_dir / ".github").exists(), "install copy should not include repository CI metadata")
         assert_true(not any(install_dir.rglob("*.env")), "install copy should not include .env files")
         assert_true(not (install_dir / "artifacts").exists(), "install copy should not include generated evidence")
 
@@ -134,6 +141,7 @@ def main() -> int:
         assert_true("already exists, treat this as an update" in install_prompt, "install prompt should describe update behavior")
         assert_true("Preserve $CODEX_HOME/costmarshal-v2" in install_prompt, "install prompt should preserve v2 runtime state during updates")
         assert_true("legacy $CODEX_HOME/costmarshal" in install_prompt, "install prompt should preserve legacy runtime state during updates")
+        assert_true("Python 3.11+" in install_prompt, "install prompt should require Python 3.11+")
         assert_true("Do not delete CostMarshal runtime state unless I explicitly confirm." in uninstall_prompt, "uninstall prompt should preserve runtime state by default")
 
         shutil.rmtree(install_dir)

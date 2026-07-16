@@ -827,6 +827,91 @@ def reconcile_project_views(layout: ProjectLayout) -> dict[str, Any]:
     return {"status": "ok", "materialized": materialized}
 
 
+def audit_project_views(
+    layout: ProjectLayout,
+    *,
+    repair: bool = False,
+) -> dict[str, Any]:
+    """Detect externally restored/stale compatibility files against SQLite.
+
+    Dirty markers cover a crash between commit and materialization, but an
+    operator can also restore old JSON files after the marker was acknowledged.
+    Those files must never become an alternate source of truth.
+    """
+
+    upgrade_control_store(layout)
+    reconcile_project_views(layout)
+    connection = _connect(layout)
+    expected: dict[str, str] = {}
+    try:
+        _schema(connection)
+        for row in connection.execute("SELECT path, content FROM documents").fetchall():
+            expected[str(row["path"])] = str(row["content"])
+        ledger_paths = [
+            str(row["path"])
+            for row in connection.execute(
+                "SELECT DISTINCT path FROM ledger_entries ORDER BY path"
+            ).fetchall()
+        ]
+        for relative in ledger_paths:
+            rows = connection.execute(
+                "SELECT content FROM ledger_entries WHERE path=? ORDER BY sequence",
+                (relative,),
+            ).fetchall()
+            expected[relative] = "".join(f"{row['content']}\n" for row in rows)
+    finally:
+        connection.close()
+
+    actual_paths = {
+        _relative(layout, path): path
+        for path in sorted(layout.project_dir.rglob("*"))
+        if path.is_file() and _controlled_file(layout, path)
+    }
+    drifted: list[str] = []
+    for relative, content in expected.items():
+        path = layout.project_dir / Path(relative)
+        try:
+            actual = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            actual = None
+        if actual != content:
+            drifted.append(relative)
+    ghosts = sorted(
+        relative
+        for relative in set(actual_paths) - set(expected)
+        if not (
+            actual_paths[relative].suffix.casefold() == ".jsonl"
+            and actual_paths[relative].read_bytes() == b""
+        )
+    )
+
+    repaired: list[str] = []
+    if repair and (drifted or ghosts):
+        with materializer_lock(layout):
+            for relative in sorted(drifted):
+                path = (layout.project_dir / Path(relative)).resolve()
+                if not _controlled_file(layout, path):
+                    raise ControlStoreError(
+                        f"refusing to repair an unsafe compatibility path: {relative}"
+                    )
+                _write_atomic(path, expected[relative])
+                repaired.append(relative)
+            for relative in ghosts:
+                path = actual_paths[relative].resolve()
+                if not _controlled_file(layout, path):
+                    raise ControlStoreError(
+                        f"refusing to remove an unsafe ghost compatibility path: {relative}"
+                    )
+                path.unlink(missing_ok=True)
+                repaired.append(relative)
+    return {
+        "status": "ok" if not drifted and not ghosts else "repaired" if repair else "drifted",
+        "drifted": sorted(drifted),
+        "ghosts": ghosts,
+        "repaired": repaired,
+    }
+
+
 @dataclass
 class ActiveTransaction:
     layout: ProjectLayout
@@ -841,6 +926,7 @@ class ActiveTransaction:
     replay_error_detail: str | None = None
     result: Any = None
     final_status: str = "completed"
+    document_only: bool = False
 
     def owns(self, path: Path) -> bool:
         return _transaction_owns(self.layout, path)
@@ -848,6 +934,12 @@ class ActiveTransaction:
     def _ensure_mutable(self) -> None:
         if self.replay:
             raise ControlStoreError("an idempotent replay cannot mutate control state")
+
+    def _ensure_ledger_mutation_allowed(self) -> None:
+        if self.document_only:
+            raise ControlStoreError(
+                "scheduler runtime transaction permits document mutations only"
+            )
 
     def _relative(self, path: Path) -> str:
         if not self.owns(path):
@@ -890,6 +982,7 @@ class ActiveTransaction:
         entry_id: str | None = None,
     ) -> str:
         self._ensure_mutable()
+        self._ensure_ledger_mutation_allowed()
         relative = self._relative(path)
         content = _canonical_json(row)
         sequence = int(
@@ -928,6 +1021,7 @@ class ActiveTransaction:
         task_id: str | None = None,
     ) -> None:
         self._ensure_mutable()
+        self._ensure_ledger_mutation_allowed()
         self.connection.execute(
             "INSERT INTO outbox(outbox_id, command_id, channel, sender, recipient, task_id, "
             "payload_json, dedupe_key, status, created_at) "
@@ -957,6 +1051,7 @@ class ActiveTransaction:
         """Persist one external-effect intent and fence its command."""
 
         self._ensure_mutable()
+        self._ensure_ledger_mutation_allowed()
         if generation <= 0:
             raise ValueError("effect generation must be positive")
         payload_json = _canonical_json(payload)
@@ -1010,6 +1105,7 @@ class ActiveTransaction:
         """Fail an effect/command inside the same transaction as its state projection."""
 
         self._ensure_mutable()
+        self._ensure_ledger_mutation_allowed()
         row = self.connection.execute(
             "SELECT * FROM effects WHERE effect_id=?",
             (effect_id,),
@@ -1044,6 +1140,7 @@ class ActiveTransaction:
         aggregate_id: str | None = None,
     ) -> None:
         self._ensure_mutable()
+        self._ensure_ledger_mutation_allowed()
         self.connection.execute(
             "INSERT INTO events(event_id, command_id, event_type, aggregate_type, aggregate_id, "
             "payload_json, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)",
@@ -1138,6 +1235,46 @@ def control_transaction(
         _LOCAL.transaction = None
         connection.close()
     _fault("transaction.after_commit_before_materialize")
+    reconcile_project_views(layout)
+
+
+@contextmanager
+def control_document_transaction(layout: ProjectLayout) -> Iterator[ActiveTransaction]:
+    """Mutate authoritative control documents without creating a command row.
+
+    This narrow transaction is for scheduler heartbeat/runtime metadata only.
+    Callers must not append ledgers, queue effects/outbox work, or emit events;
+    those mutations require a durable command identity through
+    :func:`control_transaction`.
+    """
+
+    if current_transaction() is not None:
+        raise ControlStoreError("nested control transactions are not supported")
+    upgrade_control_store(layout)
+    reconcile_project_views(layout)
+    connection = _connect(layout)
+    transaction = ActiveTransaction(
+        layout=layout,
+        connection=connection,
+        command_id="__scheduler_runtime__",
+        command_name="scheduler_runtime_document",
+        payload_sha256=_sha256_text("{}"),
+        document_only=True,
+    )
+    try:
+        _schema(connection)
+        connection.execute("BEGIN IMMEDIATE")
+        _LOCAL.transaction = transaction
+        try:
+            yield transaction
+        except BaseException:
+            connection.rollback()
+            raise
+        connection.commit()
+    finally:
+        _LOCAL.transaction = None
+        connection.close()
+    _fault("runtime_document.after_commit_before_materialize")
     reconcile_project_views(layout)
 
 
@@ -1615,6 +1752,8 @@ __all__ = [
     "FAULT_ENV",
     "MARKER_NAME",
     "STORE_SCHEMA_VERSION",
+    "audit_project_views",
+    "control_document_transaction",
     "control_store_enabled",
     "control_store_pragmas",
     "control_store_status",

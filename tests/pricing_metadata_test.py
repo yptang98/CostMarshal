@@ -6,6 +6,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import os
 import subprocess
@@ -117,6 +118,86 @@ class PricingMetadataTest(unittest.TestCase):
                 output_tokens=0,
             ),
             999_999_999_123_456_789,
+        )
+
+    def test_legacy_float_hash_cannot_collapse_an_exact_decimal_price(self) -> None:
+        snapshot = build_pricing_snapshot(
+            currency="CNY",
+            source="https://pricing.example/no-float-collapse",
+            reviewed_at="2026-07-15T00:00:00Z",
+            effective_at="2026-07-15T00:00:00Z",
+            expires_at="2026-08-15T00:00:00Z",
+            snapshot_id="no-float-collapse",
+            input_per_1m="1000000000000000063.999999999",
+            cached_input_per_1m="0",
+            output_per_1m="0",
+            fixed_request="0",
+        )
+        legacy_payload = {
+            **{key: value for key, value in snapshot.items() if key != "snapshot_hash"},
+            "input_per_1m": float(snapshot["input_per_1m"]),
+            "cached_input_per_1m": float(snapshot["cached_input_per_1m"]),
+            "output_per_1m": float(snapshot["output_per_1m"]),
+            "fixed_request": float(snapshot["fixed_request"]),
+        }
+        snapshot["snapshot_hash"] = "sha256:" + hashlib.sha256(
+            json.dumps(
+                legacy_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        provider = canonical_catalog()["providers"][0]
+        provider["pricing"] = snapshot
+        with self.assertRaisesRegex(RoutingValidationError, "does not match"):
+            validate_provider_catalog(
+                {"schema_version": 1, "providers": [provider]}
+            )
+
+    def test_route_objective_uses_exact_decimal_cost_for_selection(self) -> None:
+        template = canonical_catalog()["providers"][0]
+        cheap = deepcopy(template)
+        cheap.update({"provider_id": "z-cheap", "profile": "z-cheap", "priority": 0})
+        cheap["pricing"] = build_pricing_snapshot(
+            currency="CNY",
+            source="https://pricing.example/exact-cheap",
+            reviewed_at="2026-07-15T00:00:00Z",
+            effective_at="2026-07-15T00:00:00Z",
+            expires_at="2026-08-15T00:00:00Z",
+            snapshot_id="exact-cheap",
+            input_per_1m="1000000000000000000",
+            cached_input_per_1m="0",
+            output_per_1m="0",
+            fixed_request="0",
+        )
+        expensive = deepcopy(cheap)
+        expensive.update({"provider_id": "a-expensive", "profile": "a-expensive"})
+        expensive["pricing"] = build_pricing_snapshot(
+            currency="CNY",
+            source="https://pricing.example/exact-expensive",
+            reviewed_at="2026-07-15T00:00:00Z",
+            effective_at="2026-07-15T00:00:00Z",
+            expires_at="2026-08-15T00:00:00Z",
+            snapshot_id="exact-expensive",
+            input_per_1m="1000000000000000063.999999999",
+            cached_input_per_1m="0",
+            output_per_1m="0",
+            fixed_request="0",
+        )
+        decision = decide_route(
+            {"risk": "low", "task_type": "analysis"},
+            {"schema_version": 1, "providers": [expensive, cheap]},
+            input_tokens=1_000_000,
+            now="2026-07-16T00:00:00Z",
+        )
+        self.assertEqual(decision.provider_id, "z-cheap")
+        self.assertEqual(decision.estimated_cost_cny_exact, "1000000000000000000")
+        payload = decision.to_dict()
+        self.assertEqual(payload["estimated_cost_cny_exact"], "1000000000000000000")
+        self.assertNotEqual(
+            expensive["pricing"]["input_per_1m"],
+            payload["estimated_cost_cny_exact"],
         )
 
     def test_init_preserves_unquoted_catalog_decimal_lexeme(self) -> None:
@@ -695,6 +776,8 @@ class PricingMetadataTest(unittest.TestCase):
             )
             result = run(
                 "record-result",
+                "--command-id",
+                "CMD-pricing-result",
                 "--project",
                 project,
                 "--task",

@@ -10,10 +10,12 @@ import os
 import re
 import secrets
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
 import time
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,8 +24,10 @@ from typing import Any
 from .control_store import (
     ControlStoreError,
     apply_effect,
+    audit_project_views,
     control_store_status,
     control_store_enabled,
+    control_document_transaction,
     control_transaction,
     current_transaction,
     effect_status,
@@ -49,7 +53,12 @@ from .session_backend import (
     session_backend_kind,
     session_name as backend_session_name,
 )
-from .security import SecurityValidationError, normalize_claim_path as secure_normalize_claim_path, normalize_path_list
+from .security import (
+    SecurityValidationError,
+    normalize_allowed_path as secure_normalize_allowed_path,
+    normalize_claim_path as secure_normalize_claim_path,
+    normalize_path_list,
+)
 from .routing import (
     TIER_RANK,
     RoutingValidationError,
@@ -151,6 +160,7 @@ SPAWN_EFFECT_TYPE = "spawn_actor"
 STOP_EFFECT_TYPE = "stop_actor"
 SPAWN_EFFECT_LEASE_SECONDS = 2.0
 SPAWN_EFFECT_MAX_ATTEMPTS = 5
+SCHEDULER_HEARTBEAT_SECONDS = 10.0
 GOVERNANCE_PREFLIGHT_COMMANDS = frozenset(
     {
         "command_start_leader",
@@ -766,8 +776,39 @@ def render_actor_prompt(layout: ProjectLayout, actor: dict[str, Any]) -> str:
         if claimed_paths:
             lines.extend(["", "## Claimed Write Paths"])
             lines.extend(f"- `{path}`" for path in claimed_paths)
+    collaboration_contract = actor.get("collaboration_contract")
+    if actor.get("role") == "agent" and isinstance(collaboration_contract, dict):
+        lines.extend(
+            [
+                "",
+                "## Isolated Collaboration Workspace",
+                "- Work only inside `/workspace`; host workspace and source-project paths are not mounted.",
+                f"- Fixed Git base: `{collaboration_contract.get('base_sha')}`",
+                f"- Contract: `{collaboration_contract.get('contract_sha256')}`",
+                "- Context is a tracked-file projection from that exact base; dirty and untracked host files are excluded.",
+                "",
+                "### Visible Context",
+            ]
+        )
+        context_paths = collaboration_contract.get("context_paths") or []
+        lines.extend(f"- `{path}`" for path in context_paths)
+        if not context_paths:
+            lines.append("- No repository files are visible initially.")
+        lines.extend(["", "### Writable Scope"])
+        write_scope = collaboration_contract.get("write_scope") or []
+        lines.extend(f"- `{path}`" for path in write_scope)
+        if not write_scope:
+            lines.append("- No workspace writes are permitted.")
+        lines.extend(
+            [
+                "- The runner captures allowed changes as a base-relative, content-addressed artifact for the next tier and leader review.",
+                "- Stop and escalate instead of requesting or probing paths outside this contract.",
+            ]
+        )
     workspace = project.get("workspace")
-    if workspace:
+    if workspace and not (
+        actor.get("role") == "agent" and isinstance(collaboration_contract, dict)
+    ):
         lines.extend(
             [
                 "",
@@ -777,7 +818,9 @@ def render_actor_prompt(layout: ProjectLayout, actor: dict[str, Any]) -> str:
             ]
         )
     source_project = project.get("source_project")
-    if source_project:
+    if source_project and not (
+        actor.get("role") == "agent" and isinstance(collaboration_contract, dict)
+    ):
         lines.extend(
             [
                 "",
@@ -919,6 +962,8 @@ def preflight_worker_isolation(
         profile.write_text("# CostMarshal preflight profile placeholder\n", encoding="utf-8")
         output = temporary / "out"
         output.mkdir()
+        projected_workspace = temporary / "workspace"
+        projected_workspace.mkdir()
         network_mode = "none" if mode == "unsafe-native" else str(config.get("network_mode") or "provider-proxy")
         network_name = None if network_mode == "none" else config.get("network_name")
         spec = WorkerExecutionSpec(
@@ -926,7 +971,9 @@ def preflight_worker_isolation(
             actor_id=str(actor["id"]),
             attempt_id=str(actor.get("attempt_id") or actor["id"]),
             image=str(configured_image or ""),
-            workspace=Path(str(project["workspace"])).resolve(),
+            # A preflight canary must never mount the host source workspace.
+            # Actual execution receives a separate, attempt-bound projection.
+            workspace=projected_workspace.resolve(),
             workspace_mode="rw" if (task.get("allowed_paths") or []) else "ro",
             profile_path=profile,
             output_exchange=output,
@@ -934,7 +981,12 @@ def preflight_worker_isolation(
             engine=str(config.get("engine") or "auto"),
             network_mode=network_mode,
             network_name=str(network_name) if network_name else None,
-            forbidden_mount_roots=(layout.project_dir.resolve(),) if mode == "required" else (),
+            forbidden_mount_roots=(
+                layout.project_dir.resolve(),
+                Path(str(project["workspace"])).resolve(),
+            )
+            if mode == "required"
+            else (),
             limits=limits,
         )
         try:
@@ -1241,7 +1293,22 @@ def start_actor(
             "prompt_file": str(prompt_path),
             "planned_commands": redact_launch_token([command_to_string(argv) for argv in plan], actor),
         }
-    prompt_path = refresh_actor_prompt(layout, actor)
+    prompt_binding = actor.get("prompt_binding")
+    if actor.get("role") == "agent" and isinstance(prompt_binding, dict):
+        try:
+            prompt_payload = prompt_path.read_bytes()
+        except OSError as exc:
+            raise SystemExit(f"Bound actor prompt is unavailable: {exc}") from exc
+        observed_sha256 = "sha256:" + hashlib.sha256(prompt_payload).hexdigest()
+        if (
+            prompt_binding.get("schema") != PROMPT_BINDING_SCHEMA
+            or prompt_binding.get("attempt_id") != actor.get("attempt_id")
+            or prompt_binding.get("size_bytes") != len(prompt_payload)
+            or prompt_binding.get("sha256") != observed_sha256
+        ):
+            raise SystemExit("Bound actor prompt changed after dispatch admission")
+    else:
+        prompt_path = refresh_actor_prompt(layout, actor)
     if persist_runtime_state:
         save_actor(layout, actor)
         sync_actor_summary(layout, actor)
@@ -2002,6 +2069,157 @@ def command_start_leader(args: Any) -> None:
     print_json({"status": "ok", **payload})
 
 
+# These two receipts cover only host-context access and the bootstrap prompt.
+# The scheduler-first low/medium/high semantic handoff uses handoff_contract.py
+# and deliberately has a different wire kind.
+COLLABORATION_CONTRACT_SCHEMA = "costmarshal-context-access-contract-v1"
+PROMPT_BINDING_SCHEMA = "costmarshal-context-prompt-binding-v1"
+
+
+def _canonical_contract_sha256(payload: dict[str, Any]) -> str:
+    body = dict(payload)
+    body.pop("contract_sha256", None)
+    encoded = json.dumps(
+        body,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _required_context_paths(
+    workspace: Path,
+    raw_paths: list[object],
+) -> tuple[str, ...]:
+    """Normalize required-isolation context to the configured Git workspace."""
+
+    normalized: list[str] = []
+    for raw in raw_paths:
+        if not isinstance(raw, str) or not raw.strip():
+            raise SecurityValidationError("allowed context paths must be non-empty strings")
+        candidate = Path(raw).expanduser()
+        if candidate.is_absolute():
+            resolved = candidate.resolve()
+            try:
+                relative = resolved.relative_to(workspace)
+            except ValueError as exc:
+                raise SecurityValidationError(
+                    f"required-isolation context must be inside the configured workspace: {resolved}"
+                ) from exc
+            raw = relative.as_posix()
+        normalized.append(secure_normalize_allowed_path(raw))
+    return normalize_path_list(normalized, kind="allowed")
+
+
+def _exact_workspace_base(workspace: Path, requested_base: str | None = None) -> str:
+    try:
+        git_root = Path(
+            subprocess.check_output(
+                ["git", "-C", str(workspace), "rev-parse", "--show-toplevel"],
+                text=True,
+                stderr=subprocess.STDOUT,
+            ).strip()
+        ).resolve()
+        if git_root != workspace:
+            raise SystemExit(
+                "required worker context projection requires workspace to be the Git repository root"
+            )
+        revision = requested_base or "HEAD"
+        exact = subprocess.check_output(
+            ["git", "-C", str(workspace), "rev-parse", "--verify", f"{revision}^{{commit}}"],
+            text=True,
+            stderr=subprocess.STDOUT,
+        ).strip().lower()
+    except FileNotFoundError as exc:
+        raise SystemExit("git is required for required worker context projection") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.output or "").strip()
+        raise SystemExit(
+            f"required worker context projection requires a committed Git base: {detail}"
+        ) from exc
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", exact):
+        raise SystemExit("git returned an invalid full commit id for context projection")
+    if requested_base is not None and exact != requested_base:
+        raise SystemExit("the frozen collaboration base no longer resolves to the exact commit")
+    return exact
+
+
+def prepare_collaboration_contract(
+    project: dict[str, Any],
+    task: dict[str, Any],
+) -> dict[str, Any]:
+    """Create or revalidate the immutable task collaboration boundary."""
+
+    workspace = Path(str(project.get("workspace") or "")).expanduser().resolve()
+    if not workspace.is_dir():
+        raise SystemExit("required worker context projection needs an existing workspace")
+    try:
+        context_paths = _required_context_paths(
+            workspace,
+            list(task.get("allowed_context") or []),
+        )
+        write_scope = normalize_path_list(
+            task.get("allowed_paths") or [],
+            kind="allowed",
+        )
+    except SecurityValidationError as exc:
+        raise SystemExit(f"required worker collaboration contract is invalid: {exc}") from exc
+
+    previous = task.get("collaboration_contract")
+    previous_base = previous.get("base_sha") if isinstance(previous, dict) else None
+    if previous_base is not None and not isinstance(previous_base, str):
+        raise SystemExit("stored collaboration contract has an invalid base_sha")
+    base_sha = _exact_workspace_base(workspace, previous_base)
+    contract: dict[str, Any] = {
+        "schema": COLLABORATION_CONTRACT_SCHEMA,
+        "project_id": str(project.get("project_id") or ""),
+        "task_id": str(task.get("id") or ""),
+        "base_sha": base_sha,
+        "context_paths": list(context_paths),
+        "write_scope": list(write_scope),
+        "projection": {
+            "source": "tracked-git-objects-only",
+            "workspace_mount": "/workspace",
+            "exclude_git_metadata": True,
+            "exclude_untracked_and_dirty_worktree": True,
+            "sensitive_paths": "deny",
+        },
+        "change_exchange": {
+            "format": "costmarshal-cumulative-changes",
+            "base_relative": True,
+            "content_addressed": True,
+            "leader_apply_required": True,
+        },
+    }
+    contract["contract_sha256"] = _canonical_contract_sha256(contract)
+    if previous is not None and previous != contract:
+        raise SystemExit(
+            "stored collaboration contract does not match the frozen Git base/context/write scope"
+        )
+    return contract
+
+
+def bind_actor_prompt(layout: ProjectLayout, actor: dict[str, Any]) -> dict[str, Any]:
+    """Render and hash the exact prompt admitted for one attempt."""
+
+    prompt_path = refresh_actor_prompt(layout, actor)
+    payload = prompt_path.read_bytes()
+    binding = {
+        "schema": PROMPT_BINDING_SCHEMA,
+        "attempt_id": actor.get("attempt_id"),
+        "profile_sha256": (actor.get("profile_binding") or {}).get("sha256"),
+        "collaboration_contract_sha256": (
+            actor.get("collaboration_contract") or {}
+        ).get("contract_sha256"),
+        "size_bytes": len(payload),
+        "sha256": "sha256:" + hashlib.sha256(payload).hexdigest(),
+    }
+    actor["prompt_binding"] = binding
+    return binding
+
+
 def render_task_brief(task: dict[str, Any]) -> str:
     return "\n".join(
         [
@@ -2116,12 +2334,13 @@ def command_new_task(args: Any) -> None:
             project_provider_catalog(project),
             requested_provider_id=None if provider_request == "auto" else provider_request,
             requested_tier=None if tier_request == "auto" else tier_request,
-            history=result_rows(layout),
+            history=trusted_result_rows(layout),
+            execution_identities=_routing_execution_identities(project),
             input_tokens=estimated_input_tokens,
             cached_input_tokens=estimated_cached_input_tokens,
             output_tokens=estimated_output_tokens,
         )
-    except RoutingValidationError as exc:
+    except (ProfileBindingError, RoutingValidationError) as exc:
         raise SystemExit(f"Task routing is invalid: {exc}") from exc
     task_id = args.id or next_task_id(layout)
     directory = task_dir(layout, task_id)
@@ -2245,7 +2464,8 @@ def command_route(args: Any) -> None:
             catalog,
             requested_provider_id=None if args.provider == "auto" else args.provider,
             requested_tier=None if args.tier == "auto" else args.tier,
-            history=result_rows(layout),
+            history=trusted_result_rows(layout),
+            execution_identities=_routing_execution_identities(project),
             input_tokens=require_non_negative_int(args.estimated_input_tokens, "estimated-input-tokens"),
             cached_input_tokens=require_non_negative_int(
                 args.estimated_cached_input_tokens,
@@ -2253,7 +2473,7 @@ def command_route(args: Any) -> None:
             ),
             output_tokens=require_non_negative_int(args.estimated_output_tokens, "estimated-output-tokens"),
         )
-    except RoutingValidationError as exc:
+    except (ProfileBindingError, RoutingValidationError) as exc:
         raise SystemExit(f"Unable to explain route: {exc}") from exc
     print_json(
         {
@@ -2494,6 +2714,7 @@ def command_dispatch(args: Any) -> None:
     unsafe_native = bool(getattr(args, "unsafe_native", False))
     if unsafe_native and governance_contract.get("governed"):
         raise SystemExit("ArchMarshal active governance forbids unsafe-native workers")
+    collaboration_contract: dict[str, Any] | None = None
     try:
         catalog = project_provider_catalog(project)
         persisted_envelope = validate_route_budget_envelope(task)
@@ -2527,12 +2748,13 @@ def command_dispatch(args: Any) -> None:
             catalog,
             requested_provider_id=None if raw_provider == "auto" else str(raw_provider).lower(),
             requested_tier=None if raw_tier == "auto" else str(raw_tier).lower(),
-            history=result_rows(layout),
+            history=trusted_result_rows(layout),
+            execution_identities=_routing_execution_identities(project),
             input_tokens=int(task.get("estimated_input_tokens") or 0),
             cached_input_tokens=int(task.get("estimated_cached_input_tokens") or 0),
             output_tokens=int(task.get("estimated_output_tokens") or 0),
         )
-    except (RoutingValidationError, ValueError) as exc:
+    except (ProfileBindingError, RoutingValidationError, ValueError) as exc:
         raise SystemExit(f"Unable to route task: {exc}") from exc
     provider_spec = provider_by_id(catalog, decision.provider_id)
     max_cost = task.get("max_cost_cny")
@@ -2754,6 +2976,20 @@ def command_dispatch(args: Any) -> None:
         requested_profile = requested_profile or task.get("profile")
     model = requested_model if requested_model and requested_model != "inherit" else (decision.model or "inherit")
     profile = requested_profile or decision.profile
+    bound_step_for_identity = route_plan_step or direct_step
+    bound_execution_identity = (
+        bound_step_for_identity.get("execution_identity")
+        if isinstance(bound_step_for_identity, dict)
+        else None
+    )
+    if (
+        not isinstance(bound_execution_identity, dict)
+        or bound_execution_identity.get("profile") != profile
+        or model not in {"inherit", bound_execution_identity.get("model")}
+    ):
+        raise SystemExit(
+            "Dispatch model/profile override does not match the immutable execution identity"
+        )
     if route_plan_step is not None:
         planned_model = route_plan_step.get("model") or "inherit"
         planned_profile = route_plan_step.get("profile")
@@ -2790,6 +3026,19 @@ def command_dispatch(args: Any) -> None:
         unsafe_native=unsafe_native,
     )
     actor["isolation"] = isolation
+    if not unsafe_native:
+        # The OCI canary uses only an empty temporary mount. Freeze the real
+        # Git/context boundary only after strong isolation is available, but
+        # still before any durable attempt or budget reservation is written.
+        collaboration_contract = prepare_collaboration_contract(project, task)
+        actor["collaboration_contract"] = json.loads(
+            json.dumps(
+                collaboration_contract,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        )
+    prompt_binding = bind_actor_prompt(layout, actor)
     semantic_preview = {
         "actor": actor,
         "route_decision": decision.to_dict(),
@@ -2851,6 +3100,14 @@ def command_dispatch(args: Any) -> None:
     task["tier"] = tier
     task["profile"] = profile
     task["route_decision"] = decision.to_dict()
+    if collaboration_contract is not None:
+        task["collaboration_contract"] = json.loads(
+            json.dumps(
+                collaboration_contract,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        )
     if candidate_envelope is not None:
         if superseded_envelope is not None:
             archived_envelope = json.loads(
@@ -2865,6 +3122,49 @@ def command_dispatch(args: Any) -> None:
             )
             task.setdefault("route_budget_envelope_history", []).append(archived_envelope)
         task["route_budget_envelope"] = candidate_envelope
+    route_predecessors: list[dict[str, Any]] = []
+    if effective_envelope is not None and route_plan_step_index is not None:
+        for predecessor_index, predecessor in enumerate(
+            effective_envelope["planned_steps"][:route_plan_step_index]
+        ):
+            predecessor_attempts = [
+                row
+                for row in task.get("attempts") or []
+                if row.get("route_envelope_id") == effective_envelope.get("envelope_id")
+                and row.get("route_plan_fingerprint")
+                == effective_envelope.get("plan_fingerprint")
+                and row.get("route_plan_step_index") == predecessor_index
+            ]
+            if len(predecessor_attempts) != 1:
+                raise SystemExit(
+                    "Route continuation lacks one authoritative predecessor attempt"
+                )
+            predecessor_attempt = predecessor_attempts[0]
+            predecessor_identity = _attempt_execution_identity(predecessor_attempt)
+            if (
+                predecessor_identity is None
+                or not isinstance(predecessor_attempt.get("leader_result_id"), str)
+                or predecessor_attempt.get("accepted_by_leader") is not False
+                or predecessor_attempt.get("recorded_result_status")
+                not in {"failed", "escalate"}
+            ):
+                raise SystemExit(
+                    "Route continuation requires an explicit, profile-bound leader rejection "
+                    "for every predecessor"
+                )
+            route_predecessors.append(
+                {
+                    "provider_id": predecessor.get("provider_id"),
+                    "model": predecessor_identity["model"],
+                    "profile": predecessor_identity["profile"],
+                    "profile_sha256": predecessor_identity["profile_sha256"],
+                    "attempt_id": predecessor_attempt.get("attempt_id"),
+                    "result_id": predecessor_attempt.get("leader_result_id"),
+                }
+            )
+    execution_identity = bound_execution_identity
+    if not isinstance(execution_identity, dict):
+        raise SystemExit("Dispatch lacks an immutable provider execution identity")
     task.setdefault("attempts", []).append(
         {
             "attempt": len(task.get("attempts") or []) + 1,
@@ -2875,6 +3175,9 @@ def command_dispatch(args: Any) -> None:
             "tier": tier,
             "profile": profile,
             "model": model,
+            "execution_identity": json.loads(
+                json.dumps(execution_identity, ensure_ascii=False, allow_nan=False)
+            ),
             "profile_binding": profile_binding,
             "status": "launch_pending" if deferred_start else "running" if args.start else "dispatched",
             "started_at": None if deferred_start else now_iso() if args.start else None,
@@ -2900,6 +3203,15 @@ def command_dispatch(args: Any) -> None:
             ),
             "route_plan_step_index": route_plan_step_index,
             "route_plan_step": route_plan_step,
+            "route_predecessors": route_predecessors,
+            "collaboration_contract_sha256": (
+                collaboration_contract.get("contract_sha256")
+                if collaboration_contract is not None
+                else None
+            ),
+            "prompt_binding": json.loads(
+                json.dumps(prompt_binding, ensure_ascii=False, allow_nan=False)
+            ),
             "legacy_price_snapshot": build_legacy_price_snapshot(provider_spec),
             "isolation": isolation,
         }
@@ -3398,11 +3710,19 @@ def process_scheduler_inbox(layout: ProjectLayout, *, limit: int | None = None, 
     processed: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
-    completed_ids = {
-        row.get("message_id")
-        for row in read_jsonl(layout.events_jsonl)
-        if row.get("event_type") == "scheduler_command_executed" and row.get("message_id")
-    }
+    # A SQLite scheduler work transaction advances the inbox cursor atomically
+    # with command effects, acknowledgements, and audit rows. It therefore
+    # does not need to rescan the complete event ledger every cycle. Legacy
+    # file mode retains the historical replay check.
+    completed_ids = (
+        set()
+        if current_transaction() is not None and control_store_enabled(layout)
+        else {
+            row.get("message_id")
+            for row in read_jsonl(layout.events_jsonl)
+            if row.get("event_type") == "scheduler_command_executed" and row.get("message_id")
+        }
+    )
     for offset, message in enumerate(pending, start=start_line + 1):
         try:
             if message.get("id") in completed_ids:
@@ -3454,6 +3774,148 @@ def process_scheduler_inbox(layout: ProjectLayout, *, limit: int | None = None, 
     }
 
 
+def _scheduler_relay_actor_ids(layout: ProjectLayout) -> list[str]:
+    actor_ids: list[str] = []
+    for path in sorted(layout.actors_dir.glob("*.json")):
+        try:
+            actor = read_json(path, {})
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue
+        actor_id = actor.get("id") if isinstance(actor, dict) else None
+        if isinstance(actor_id, str) and actor_id:
+            actor_ids.append(actor_id)
+    return actor_ids
+
+
+def _scheduler_pending_work_snapshot(
+    layout: ProjectLayout,
+    *,
+    relay_limit: int | None,
+    command_limit: int | None,
+) -> dict[str, Any] | None:
+    """Hash only the bounded mailbox rows that one control transaction will consume."""
+
+    cursors = load_relay_cursors(layout)
+    relay_rows: list[dict[str, Any]] = []
+    for actor_id in _scheduler_relay_actor_ids(layout):
+        path = layout.mailboxes_dir / slugify(actor_id, "actor") / "outbox.jsonl"
+        rows = read_jsonl(path)
+        actor_cursor = (cursors.get("actors") or {}).get(actor_id) or {}
+        start_line = int(actor_cursor.get("outbox_lines") or 0)
+        if start_line > len(rows):
+            start_line = 0
+        pending = rows[start_line:]
+        if relay_limit is not None:
+            pending = pending[:relay_limit]
+        if pending:
+            relay_rows.append(
+                {
+                    "actor_id": actor_id,
+                    "start_line": start_line,
+                    "rows": [
+                        {
+                            "id": row.get("id"),
+                            "sha256": hashlib.sha256(
+                                json.dumps(
+                                    row,
+                                    ensure_ascii=False,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                    allow_nan=False,
+                                ).encode("utf-8")
+                            ).hexdigest(),
+                        }
+                        for row in pending
+                    ],
+                }
+            )
+    inbox_path = layout.mailboxes_dir / slugify(SCHEDULER_ID, "actor") / "inbox.jsonl"
+    inbox_rows = read_jsonl(inbox_path)
+    command_cursor = cursors.get("scheduler_commands") or {}
+    command_start = int(command_cursor.get("inbox_lines") or 0)
+    if command_start > len(inbox_rows):
+        command_start = 0
+    pending_commands = inbox_rows[command_start:]
+    if command_limit is not None:
+        pending_commands = pending_commands[:command_limit]
+    if not relay_rows and not pending_commands:
+        return None
+    return {
+        "schema_version": 1,
+        "relay_limit": relay_limit,
+        "command_limit": command_limit,
+        "relays": relay_rows,
+        "scheduler": {
+            "start_line": command_start,
+            "rows": [
+                {
+                    "id": row.get("id"),
+                    "sha256": hashlib.sha256(
+                        json.dumps(
+                            row,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            allow_nan=False,
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                }
+                for row in pending_commands
+            ],
+        },
+    }
+
+
+def _scheduler_work_command_id(snapshot: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        snapshot,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return "SCHED-WORK-" + hashlib.sha256(encoded).hexdigest()
+
+
+def _scheduler_heartbeat_due(state: dict[str, Any]) -> bool:
+    raw = state.get("heartbeat_at")
+    if not isinstance(raw, str) or not raw:
+        return True
+    try:
+        observed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if observed.tzinfo is None:
+        return True
+    return (datetime.now(timezone.utc) - observed.astimezone(timezone.utc)).total_seconds() >= SCHEDULER_HEARTBEAT_SECONDS
+
+
+def _update_scheduler_state_authoritative(
+    layout: ProjectLayout,
+    *,
+    force: bool = True,
+    count_cycle: bool = False,
+    **fields: Any,
+) -> dict[str, Any]:
+    if not control_store_enabled(layout) or current_transaction() is not None:
+        state = load_scheduler_state(layout)
+        if not force and not _scheduler_heartbeat_due(state):
+            return state
+        if count_cycle:
+            fields["cycle_count"] = int(state.get("cycle_count") or 0) + 1
+        return update_scheduler_state(layout, **fields)
+    state = load_scheduler_state(layout)
+    if not force and not _scheduler_heartbeat_due(state):
+        return state
+    with control_document_transaction(layout):
+        state = load_scheduler_state(layout)
+        if not force and not _scheduler_heartbeat_due(state):
+            return state
+        if count_cycle:
+            fields["cycle_count"] = int(state.get("cycle_count") or 0) + 1
+        return update_scheduler_state(layout, **fields)
+
+
 def scheduler_cycle(layout: ProjectLayout, *, relay_limit: int | None = None, command_limit: int | None = None, dry_run: bool = False) -> dict[str, Any]:
     # The canonical launcher has already passed the read-only governance gate. Repair
     # committed compatibility views before actor/outbox/inbox reads even when
@@ -3470,31 +3932,121 @@ def scheduler_cycle(layout: ProjectLayout, *, relay_limit: int | None = None, co
         _governance_prevalidated=True,
     )
     relays: list[dict[str, Any]] = []
-    for actor in actor_rows(layout):
-        payload = relay_actor_outbox(layout, actor_id=actor["id"], limit=relay_limit, dry_run=dry_run)
-        if payload["processed"] or payload["delivered"] or payload["skipped"]:
-            relays.append(payload)
-    commands = process_scheduler_inbox(layout, limit=command_limit, dry_run=dry_run)
-    changed = bool(effects["processed"] or effects["failed"] or relays or commands["processed"] or commands["failed"])
-    if not dry_run:
-        state = load_scheduler_state(layout)
-        state["status"] = "running"
-        state["pid"] = os.getpid()
-        state["heartbeat_at"] = now_iso()
-        state["last_cycle_at"] = now_iso()
-        state["cycle_count"] = int(state.get("cycle_count") or 0) + 1
-        state["processed_commands"] = int(state.get("processed_commands") or 0) + len(commands["processed"])
-        save_scheduler_state(layout, state)
-        append_event(
+    commands: dict[str, Any]
+    sqlite_mode = bool(not dry_run and control_store_enabled(layout))
+    snapshot = _scheduler_pending_work_snapshot(
+        layout,
+        relay_limit=relay_limit,
+        command_limit=command_limit,
+    )
+
+    def process_control_work() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        cycle_relays: list[dict[str, Any]] = []
+        for actor_id in _scheduler_relay_actor_ids(layout):
+            payload = relay_actor_outbox(
+                layout,
+                actor_id=actor_id,
+                limit=relay_limit,
+                dry_run=dry_run,
+            )
+            if payload["processed"] or payload["delivered"] or payload["skipped"]:
+                cycle_relays.append(payload)
+        cycle_commands = process_scheduler_inbox(
             layout,
-            "scheduler_cycle",
-            processed_effect_count=len(effects["processed"]),
-            failed_effect_count=len(effects["failed"]),
-            relayed_actor_count=len(relays),
-            processed_command_count=len(commands["processed"]),
-            failed_command_count=len(commands["failed"]),
-            changed=changed,
+            limit=command_limit,
+            dry_run=dry_run,
         )
+        return cycle_relays, cycle_commands
+
+    if sqlite_mode and snapshot is not None:
+        command_id = _scheduler_work_command_id(snapshot)
+        with control_transaction(
+            layout,
+            command_name="scheduler_mailbox_cycle",
+            command_id=command_id,
+            payload=snapshot,
+        ) as transaction:
+            if transaction.replay:
+                # Reconciliation at the start of the cycle normally makes a
+                # replay unreachable; returning a quiet cycle remains safe.
+                relays = []
+                commands = {
+                    "status": "ok",
+                    "inbox_lines": 0,
+                    "start_line": 0,
+                    "processed": [],
+                    "skipped": [],
+                    "failed": [],
+                    "dry_run": False,
+                }
+            else:
+                authoritative_snapshot = _scheduler_pending_work_snapshot(
+                    layout,
+                    relay_limit=relay_limit,
+                    command_limit=command_limit,
+                )
+                if authoritative_snapshot != snapshot:
+                    raise ControlStoreError(
+                        "scheduler mailbox snapshot changed before its authoritative transaction"
+                    )
+                relays, commands = process_control_work()
+                state = load_scheduler_state(layout)
+                update_scheduler_state(
+                    layout,
+                    status="running",
+                    pid=os.getpid(),
+                    heartbeat_at=now_iso(),
+                    last_cycle_at=now_iso(),
+                    cycle_count=int(state.get("cycle_count") or 0) + 1,
+                    processed_commands=int(state.get("processed_commands") or 0)
+                    + len(commands["processed"]),
+                )
+                append_event(
+                    layout,
+                    "scheduler_cycle",
+                    scheduler_work_command_id=command_id,
+                    processed_effect_count=len(effects["processed"]),
+                    failed_effect_count=len(effects["failed"]),
+                    relayed_actor_count=len(relays),
+                    processed_command_count=len(commands["processed"]),
+                    failed_command_count=len(commands["failed"]),
+                    changed=True,
+                )
+                transaction.set_result({"status": commands["status"]})
+    elif snapshot is not None or not sqlite_mode:
+        relays, commands = process_control_work()
+    else:
+        commands = {
+            "status": "ok",
+            "inbox_lines": 0,
+            "start_line": 0,
+            "processed": [],
+            "skipped": [],
+            "failed": [],
+            "dry_run": bool(dry_run),
+        }
+    changed = bool(effects["processed"] or effects["failed"] or relays or commands["processed"] or commands["failed"])
+    if not dry_run and (not sqlite_mode or snapshot is None):
+        _update_scheduler_state_authoritative(
+            layout,
+            force=bool(changed),
+            count_cycle=True,
+            status="running",
+            pid=os.getpid(),
+            heartbeat_at=now_iso(),
+            last_cycle_at=now_iso(),
+        )
+        if changed and not sqlite_mode:
+            append_event(
+                layout,
+                "scheduler_cycle",
+                processed_effect_count=len(effects["processed"]),
+                failed_effect_count=len(effects["failed"]),
+                relayed_actor_count=len(relays),
+                processed_command_count=len(commands["processed"]),
+                failed_command_count=len(commands["failed"]),
+                changed=True,
+            )
     return {
         "status": "ok" if commands["status"] == "ok" and effects["status"] in {"ok", "disabled"} else "degraded",
         "changed": changed,
@@ -3509,28 +4061,45 @@ def _command_run_scheduler_loop(args: Any) -> None:
     _validate_governance_preflight(layout, operation="run-scheduler")
     ensure_runtime_dirs(layout)
     ensure_mailbox(layout, SCHEDULER_ID)
+    if control_store_enabled(layout):
+        audit_project_views(layout, repair=True)
     started_at = now_iso()
     if not args.dry_run:
-        update_scheduler_state(
+        _update_scheduler_state_authoritative(
             layout,
             status="running",
             pid=os.getpid(),
             started_at=started_at,
             heartbeat_at=started_at,
             last_cycle_at=None,
+            stopped_at=None,
         )
     interval = max(float(args.interval), 0.05)
     max_cycles = 1 if args.once else int(args.max_cycles or 0)
-    cycles: list[dict[str, Any]] = []
+    cycle_count = 0
+    changed_cycles = 0
+    processed_effect_count = 0
+    failed_effect_count = 0
+    processed_command_count = 0
+    failed_command_count = 0
+    last_effects: dict[str, Any] | None = None
+    all_cycles_ok = True
     completed_status = "idle" if args.once or max_cycles else "stopped"
     governance_blocked = False
     try:
         while True:
             cycle = scheduler_cycle(layout, relay_limit=args.relay_limit, command_limit=args.command_limit, dry_run=bool(args.dry_run))
-            cycles.append(cycle)
+            cycle_count += 1
+            changed_cycles += int(bool(cycle["changed"]))
+            processed_effect_count += len(cycle["effects"]["processed"])
+            failed_effect_count += len(cycle["effects"]["failed"])
+            processed_command_count += len(cycle["commands"]["processed"])
+            failed_command_count += len(cycle["commands"]["failed"])
+            last_effects = cycle["effects"]
+            all_cycles_ok = all_cycles_ok and cycle["status"] == "ok"
             if args.once:
                 break
-            if max_cycles and len(cycles) >= max_cycles:
+            if max_cycles and cycle_count >= max_cycles:
                 break
             time.sleep(interval)
     except KeyboardInterrupt:
@@ -3540,24 +4109,24 @@ def _command_run_scheduler_loop(args: Any) -> None:
         raise
     finally:
         if not args.dry_run and not governance_blocked:
-            update_scheduler_state(
+            _update_scheduler_state_authoritative(
                 layout,
                 status=completed_status,
-                pid=os.getpid(),
+                pid=None,
                 heartbeat_at=now_iso(),
-                stopped_at=now_iso() if completed_status == "stopped" else None,
+                stopped_at=now_iso(),
             )
     print_json(
         {
-            "status": "ok" if all(cycle["status"] == "ok" for cycle in cycles) else "degraded",
+            "status": "ok" if all_cycles_ok else "degraded",
             "project": str(layout.project_dir),
-            "cycles": len(cycles),
-            "changed_cycles": sum(1 for cycle in cycles if cycle["changed"]),
-            "processed_effects": sum(len(cycle["effects"]["processed"]) for cycle in cycles),
-            "failed_effects": sum(len(cycle["effects"]["failed"]) for cycle in cycles),
-            "last_effects": cycles[-1]["effects"] if cycles else None,
-            "processed_commands": sum(len(cycle["commands"]["processed"]) for cycle in cycles),
-            "failed_commands": sum(len(cycle["commands"]["failed"]) for cycle in cycles),
+            "cycles": cycle_count,
+            "changed_cycles": changed_cycles,
+            "processed_effects": processed_effect_count,
+            "failed_effects": failed_effect_count,
+            "last_effects": last_effects,
+            "processed_commands": processed_command_count,
+            "failed_commands": failed_command_count,
             "scheduler_state": load_scheduler_state(layout),
         }
     )
@@ -3780,6 +4349,14 @@ def command_escalate(args: Any) -> None:
         raise SystemExit(f"Stale escalation attempt rejected: {expected_attempt}")
     if expected_actor and previous.get("actor_id") != expected_actor:
         raise SystemExit(f"Stale escalation actor rejected: {expected_actor}")
+    if (
+        not isinstance(previous.get("leader_result_id"), str)
+        or previous.get("accepted_by_leader") is not False
+        or previous.get("recorded_result_status") not in {"failed", "escalate"}
+    ):
+        raise SystemExit(
+            "Escalation requires an explicit leader-rejected record-result for the current attempt"
+        )
     project = load_project(layout)
     try:
         catalog = project_provider_catalog(project)
@@ -3794,7 +4371,8 @@ def command_escalate(args: Any) -> None:
                 task,
                 catalog,
                 requested_tier=str(explicit_tier),
-                history=result_rows(layout),
+                history=trusted_result_rows(layout),
+                execution_identities=_routing_execution_identities(project),
                 input_tokens=int(task.get("estimated_input_tokens") or 0),
                 cached_input_tokens=int(task.get("estimated_cached_input_tokens") or 0),
                 output_tokens=int(task.get("estimated_output_tokens") or 0),
@@ -3817,7 +4395,8 @@ def command_escalate(args: Any) -> None:
                 current_provider,
                 required_capabilities=task.get("required_capabilities") or (),
                 preferred_provider_ids=preferred_chain,
-                history=result_rows(layout),
+                history=trusted_result_rows(layout),
+                execution_identities=_routing_execution_identities(project),
                 task_type=str(task.get("task_type") or "analysis"),
                 difficulty=str(task.get("difficulty") or "normal"),
                 input_tokens=int(task.get("estimated_input_tokens") or 0),
@@ -3830,7 +4409,7 @@ def command_escalate(args: Any) -> None:
             raise SystemExit(
                 f"Escalation target {target['provider_id']} ({target['tier']}) is not stronger than {current_provider} ({current_spec['tier']})"
             )
-    except RoutingValidationError as exc:
+    except (ProfileBindingError, RoutingValidationError) as exc:
         raise SystemExit(f"Unable to escalate task: {exc}") from exc
     if incomplete_origin is not None:
         if incomplete_origin.get("escalation_reason") != args.reason:
@@ -4126,15 +4705,96 @@ def command_collect(args: Any) -> None:
     print_json({"status": "ok", "task_id": args.task, "actor_id": actor_id, "message_id": message["id"]})
 
 
+def _result_request_contract(
+    args: Any,
+    *,
+    command_id: str,
+    task_id: str,
+    attempt_id: str,
+) -> tuple[dict[str, Any], str]:
+    try:
+        estimated_cost = (
+            None
+            if args.estimated_cost_cny is None
+            else _money_text(args.estimated_cost_cny, "estimated-cost-cny")
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    contract = {
+        "schema_version": "costmarshal-record-result-request-v1",
+        "command_id": command_id,
+        "task_id": task_id,
+        "attempt_id": attempt_id,
+        "status": args.status,
+        "accepted_by_leader": bool(args.accepted_by_leader),
+        "quality_score": int(args.quality_score),
+        "actor_argument": getattr(args, "actor", None),
+        "agent_argument": getattr(args, "agent", None),
+        "model_argument": getattr(args, "model", None),
+        "input_tokens_argument": require_non_negative_int(
+            args.input_tokens,
+            "input-tokens",
+        ),
+        "cached_input_tokens_argument": require_non_negative_int(
+            getattr(args, "cached_input_tokens", 0),
+            "cached-input-tokens",
+        ),
+        "output_tokens_argument": require_non_negative_int(
+            args.output_tokens,
+            "output-tokens",
+        ),
+        "estimated_cost_cny_argument": estimated_cost,
+        "summary_argument": compact_text(args.summary) if args.summary else "",
+        "note_argument": args.note or "",
+    }
+    payload = json.dumps(
+        contract,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return contract, "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def _apply_leader_result_binding(
+    task: dict[str, Any],
+    attempt: dict[str, Any],
+    row: dict[str, Any],
+) -> None:
+    attempt["status"] = row["status"]
+    attempt["finished_at"] = attempt.get("finished_at") or row["timestamp"]
+    attempt["leader_result_id"] = row["id"]
+    attempt["accepted_by_leader"] = row["accepted_by_leader"]
+    attempt["quality_score"] = row["quality_score"]
+    attempt["recorded_result_status"] = row["status"]
+    attempt["result_request_contract_sha256"] = row["request_contract_sha256"]
+    attempt["result_estimated_cost_cny"] = row.get("estimated_cost_cny")
+    if not attempt.get("cost_settled"):
+        attempt["cost_settlement_blocked_reason"] = "actual cost is not verified"
+    attempt["estimated_cost_cny"] = row.get("estimated_cost_cny")
+    attempt["cost_source"] = row.get("cost_source")
+    task["leader_result"] = {
+        "result_id": row["id"],
+        "recorded_at": row["timestamp"],
+        "status": row["status"],
+        "accepted_by_leader": row["accepted_by_leader"],
+        "quality_score": row["quality_score"],
+        "summary": row["summary"],
+        "agent": row["agent"],
+        "model": row["model"],
+    }
+    if row["summary"]:
+        task["summary"] = row["summary"]
+
+
 def command_record_result(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
     require_task(layout, args.task)
     command_id = getattr(args, "command_id", None)
-    if command_id:
-        existing = next((row for row in result_rows(layout) if row.get("command_id") == command_id), None)
-        if existing:
-            print_json({"status": "ok", "idempotent_replay": True, "result": existing})
-            return
+    if not isinstance(command_id, str) or not command_id.strip():
+        raise SystemExit("record-result requires --command-id")
+    command_id = command_id.strip()
     if args.status not in RESULT_TASK_STATES:
         raise SystemExit(f"record-result status must be one of: {', '.join(sorted(RESULT_TASK_STATES))}")
     if args.accepted_by_leader and args.status != "done":
@@ -4157,6 +4817,103 @@ def command_record_result(args: Any) -> None:
         )
     if attempt is None:
         raise SystemExit(f"Leader result requires a bound provider attempt for task {args.task}")
+    attempt_id = str(attempt.get("attempt_id") or "")
+    execution_identity = _attempt_execution_identity(attempt)
+    if execution_identity is None:
+        raise SystemExit("Leader result requires an immutable profile-bound execution identity")
+    if args.model is not None and args.model != execution_identity["model"]:
+        raise SystemExit(
+            "record-result --model cannot override the attempt execution identity"
+        )
+    request_contract, request_contract_sha256 = _result_request_contract(
+        args,
+        command_id=command_id,
+        task_id=args.task,
+        attempt_id=attempt_id,
+    )
+    existing_results = result_rows(layout)
+    command_result = (
+        next((row for row in existing_results if row.get("command_id") == command_id), None)
+        if command_id
+        else None
+    )
+    recorded_result_id = attempt.get("leader_result_id")
+    if recorded_result_id is not None:
+        recorded = next(
+            (row for row in existing_results if row.get("id") == recorded_result_id),
+            None,
+        )
+        if recorded is None:
+            raise SystemExit("Attempt references a missing leader result; validate and recover state")
+        if (
+            recorded.get("command_id") == command_id
+            and recorded.get("task_id") == args.task
+            and recorded.get("attempt_id") == attempt_id
+            and recorded.get("request_contract_sha256") == request_contract_sha256
+            and attempt.get("result_request_contract_sha256")
+            == request_contract_sha256
+        ):
+            print_json({"status": "ok", "idempotent_replay": True, "result": recorded})
+            return
+        raise SystemExit(
+            f"Leader result is already recorded for attempt {attempt.get('attempt_id')}; "
+            "reuse its original command-id for an exact idempotent replay"
+        )
+    orphan_results = [
+        row for row in existing_results if row.get("attempt_id") == attempt_id
+    ]
+    if len(orphan_results) > 1:
+        raise SystemExit(
+            f"Multiple unbound results exist for attempt {attempt_id}; validate and recover manually"
+        )
+    if orphan_results:
+        orphan = orphan_results[0]
+        if (
+            orphan.get("evidence_schema_version") != RESULT_EVIDENCE_SCHEMA
+            or orphan.get("command_id") != command_id
+            or orphan.get("task_id") != args.task
+            or orphan.get("request_contract_sha256") != request_contract_sha256
+            or orphan.get("actor_id") != attempt.get("actor_id")
+            or orphan.get("provider") != attempt.get("provider")
+            or orphan.get("profile") != execution_identity["profile"]
+            or orphan.get("profile_sha256") != execution_identity["profile_sha256"]
+            or orphan.get("execution_model") != execution_identity["model"]
+            or orphan.get("route_envelope_id") != attempt.get("route_envelope_id")
+            or orphan.get("route_plan_fingerprint")
+            != attempt.get("route_plan_fingerprint")
+            or orphan.get("route_plan_step_index")
+            != attempt.get("route_plan_step_index")
+            or orphan.get("route_predecessors")
+            != (attempt.get("route_predecessors") or [])
+            or orphan.get("report_path") != attempt.get("report_path")
+            or orphan.get("report_sha256") != attempt.get("report_sha256")
+            or orphan.get("report_size") != attempt.get("report_size")
+        ):
+            raise SystemExit(
+                f"Unbound result for attempt {attempt_id} does not match its immutable request and receipts"
+            )
+        _apply_leader_result_binding(task, attempt, orphan)
+        set_task_state(layout, task, str(orphan["status"]))
+        append_event(
+            layout,
+            "result_recorded_recovered",
+            task_id=args.task,
+            actor_id=attempt.get("actor_id"),
+            result_id=orphan["id"],
+            status=orphan["status"],
+            accepted_by_leader=orphan["accepted_by_leader"],
+        )
+        print_json(
+            {
+                "status": "ok",
+                "idempotent_replay": True,
+                "recovered_orphan_result": True,
+                "result": orphan,
+            }
+        )
+        return
+    if command_result is not None:
+        raise SystemExit("record-result command-id is already bound to a different result")
     if attempt.get("status") not in {"waiting_leader", "failed", "escalate"}:
         raise SystemExit(
             f"Leader result rejected while latest attempt is {attempt.get('status')}; collect a finished report first"
@@ -4245,20 +5002,35 @@ def command_record_result(args: Any) -> None:
             raise SystemExit(f"Unable to price result: {exc}") from exc
     actor_id = args.actor or (attempt or {}).get("actor_id") or task.get("agent_id")
     agent_name = args.agent or task.get("agent_name") or actor_id or "unknown"
-    model = args.model or (attempt or {}).get("model") or task.get("model") or "inherit"
+    model = execution_identity["model"]
     row = {
         "id": new_id("RES"),
         "command_id": command_id,
         "event_type": "result",
+        "evidence_schema_version": RESULT_EVIDENCE_SCHEMA,
+        "request_contract": request_contract,
+        "request_contract_sha256": request_contract_sha256,
         "timestamp": now_iso(),
         "project_id": project.get("project_id"),
         "task_id": args.task,
         "attempt_id": (attempt or {}).get("attempt_id"),
+        "route_envelope_id": (attempt or {}).get("route_envelope_id"),
+        "route_plan_fingerprint": (attempt or {}).get("route_plan_fingerprint"),
+        "route_plan_step_index": (attempt or {}).get("route_plan_step_index"),
+        "route_predecessors": json.loads(
+            json.dumps(
+                (attempt or {}).get("route_predecessors") or [],
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        ),
         "actor_id": actor_id,
         "agent": agent_name,
         "provider": provider_id,
         "tier": (attempt or {}).get("tier") or task.get("tier"),
-        "profile": (attempt or {}).get("profile") or task.get("profile"),
+        "profile": execution_identity["profile"],
+        "profile_sha256": execution_identity["profile_sha256"],
+        "execution_model": execution_identity["model"],
         "model": model,
         "task_type": task.get("task_type") or "unknown",
         "difficulty": task.get("difficulty") or "normal",
@@ -4275,32 +5047,12 @@ def command_record_result(args: Any) -> None:
         "cost_source": pricing_source,
         "summary": compact_text(args.summary) if args.summary else "",
         "note": args.note or "",
-        "report_path": task.get("report_path"),
+        "report_path": attempt.get("report_path"),
+        "report_sha256": attempt.get("report_sha256"),
+        "report_size": attempt.get("report_size"),
     }
     append_jsonl(layout.results_jsonl, row)
-    if attempt is not None:
-        attempt["status"] = args.status
-        attempt["finished_at"] = attempt.get("finished_at") or row["timestamp"]
-        attempt["leader_result_id"] = row["id"]
-        attempt["accepted_by_leader"] = row["accepted_by_leader"]
-        attempt["quality_score"] = row["quality_score"]
-        attempt["result_estimated_cost_cny"] = estimated_cost_cny
-        if not attempt.get("cost_settled"):
-            attempt["cost_settlement_blocked_reason"] = "actual cost is not verified"
-        attempt["estimated_cost_cny"] = estimated_cost_cny
-        attempt["cost_source"] = pricing_source
-    task["leader_result"] = {
-        "result_id": row["id"],
-        "recorded_at": row["timestamp"],
-        "status": row["status"],
-        "accepted_by_leader": row["accepted_by_leader"],
-        "quality_score": row["quality_score"],
-        "summary": row["summary"],
-        "agent": row["agent"],
-        "model": row["model"],
-    }
-    if row["summary"]:
-        task["summary"] = row["summary"]
+    _apply_leader_result_binding(task, attempt, row)
     set_task_state(layout, task, args.status)
     append_event(layout, "result_recorded", task_id=args.task, actor_id=actor_id, result_id=row["id"], status=args.status, accepted_by_leader=bool(args.accepted_by_leader))
     send_message(
@@ -4600,6 +5352,232 @@ def result_rows(layout: ProjectLayout) -> list[dict[str, Any]]:
     return read_jsonl(layout.results_jsonl)
 
 
+RESULT_EVIDENCE_SCHEMA = "costmarshal-result-evidence-v2"
+
+
+def _attempt_execution_identity(attempt: dict[str, Any]) -> dict[str, Any] | None:
+    raw = attempt.get("execution_identity")
+    binding = attempt.get("profile_binding")
+    bound_sha = binding.get("sha256") if isinstance(binding, dict) else None
+    if isinstance(raw, dict):
+        identity = {
+            "model": raw.get("model"),
+            "profile": raw.get("profile"),
+            "profile_sha256": raw.get("profile_sha256"),
+        }
+    else:
+        identity = {
+            "model": attempt.get("model") or "inherit",
+            "profile": attempt.get("profile"),
+            "profile_sha256": bound_sha,
+        }
+    if (
+        not isinstance(identity["model"], str)
+        or not identity["model"]
+        or identity["profile"] is not None
+        and not isinstance(identity["profile"], str)
+        or not isinstance(identity["profile_sha256"], str)
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", identity["profile_sha256"])
+        or identity["profile_sha256"] != bound_sha
+    ):
+        return None
+    return identity
+
+
+def audit_result_evidence(
+    layout: ProjectLayout,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Return task-bound leader evidence and integrity issues.
+
+    Results are an audit projection, not an authority.  Every routing row must
+    round-trip through the authoritative task attempt and its immutable route,
+    profile, report, request, and predecessor-result bindings.
+    """
+
+    rows = result_rows(layout)
+    issues: list[str] = []
+    attempts: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    tasks: dict[str, dict[str, Any]] = {}
+    for task_path in sorted(layout.tasks_dir.glob("*/task.json")):
+        task = read_json(task_path, {})
+        task_id = task.get("id")
+        if not isinstance(task_id, str) or not task_id:
+            continue
+        tasks[task_id] = task
+        for attempt in task.get("attempts") or []:
+            if not isinstance(attempt, dict):
+                continue
+            attempt_id = attempt.get("attempt_id")
+            if not isinstance(attempt_id, str) or not attempt_id:
+                continue
+            if attempt_id in attempts:
+                issues.append(f"duplicate authoritative attempt_id {attempt_id}")
+            else:
+                attempts[attempt_id] = (task, attempt)
+
+    result_ids: dict[str, tuple[int, dict[str, Any]]] = {}
+    command_ids: dict[str, tuple[int, dict[str, Any]]] = {}
+    attempt_results: dict[str, tuple[int, dict[str, Any]]] = {}
+    invalid_rows: set[int] = set()
+
+    def reject(index: int, reason: str) -> None:
+        invalid_rows.add(index)
+        issues.append(f"results.jsonl line {index + 1} is not trusted routing evidence: {reason}")
+
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            reject(index, "row is not an object")
+            continue
+        result_id = row.get("id")
+        attempt_id = row.get("attempt_id")
+        command_id = row.get("command_id")
+        if row.get("evidence_schema_version") != RESULT_EVIDENCE_SCHEMA:
+            reject(index, "unsupported or missing evidence schema")
+        if not isinstance(result_id, str) or not result_id:
+            reject(index, "missing result id")
+        elif result_id in result_ids:
+            reject(index, f"duplicate result id {result_id}")
+            reject(result_ids[result_id][0], f"duplicate result id {result_id}")
+        else:
+            result_ids[result_id] = (index, row)
+        if not isinstance(command_id, str) or not command_id:
+            reject(index, "missing command id")
+        elif command_id in command_ids:
+            reject(index, f"duplicate command id {command_id}")
+            reject(command_ids[command_id][0], f"duplicate command id {command_id}")
+        else:
+            command_ids[command_id] = (index, row)
+        if not isinstance(attempt_id, str) or not attempt_id:
+            reject(index, "missing attempt id")
+            continue
+        if attempt_id in attempt_results:
+            reject(index, f"duplicate result for attempt {attempt_id}")
+            reject(
+                attempt_results[attempt_id][0],
+                f"duplicate result for attempt {attempt_id}",
+            )
+        else:
+            attempt_results[attempt_id] = (index, row)
+        binding = attempts.get(attempt_id)
+        if binding is None:
+            reject(index, f"unknown attempt {attempt_id}")
+            continue
+        task, attempt = binding
+        expected_identity = _attempt_execution_identity(attempt)
+        expected = {
+            "task_id": task.get("id"),
+            "attempt_id": attempt_id,
+            "actor_id": attempt.get("actor_id"),
+            "provider": attempt.get("provider"),
+            "tier": attempt.get("tier"),
+            "profile": (expected_identity or {}).get("profile"),
+            "profile_sha256": (expected_identity or {}).get("profile_sha256"),
+            "execution_model": (expected_identity or {}).get("model"),
+            "model": (expected_identity or {}).get("model"),
+            "route_envelope_id": attempt.get("route_envelope_id"),
+            "route_plan_fingerprint": attempt.get("route_plan_fingerprint"),
+            "route_plan_step_index": attempt.get("route_plan_step_index"),
+            "route_predecessors": attempt.get("route_predecessors") or [],
+            "report_path": attempt.get("report_path"),
+            "report_sha256": attempt.get("report_sha256"),
+            "report_size": attempt.get("report_size"),
+            "request_contract_sha256": attempt.get("result_request_contract_sha256"),
+        }
+        if expected_identity is None:
+            reject(index, "attempt lacks an immutable execution identity")
+        for field, expected_value in expected.items():
+            observed = row.get(field)
+            if field == "provider":
+                observed = row.get("provider_id", row.get("provider"))
+            if observed != expected_value:
+                reject(index, f"{field} does not match attempt binding")
+        if attempt.get("leader_result_id") != result_id:
+            reject(index, "attempt does not bind this result id")
+        if attempt.get("accepted_by_leader") != row.get("accepted_by_leader"):
+            reject(index, "leader acceptance does not match attempt")
+        if attempt.get("quality_score") != row.get("quality_score"):
+            reject(index, "quality score does not match attempt")
+        if attempt.get("recorded_result_status") != row.get("status"):
+            reject(index, "recorded status does not match attempt")
+        if (
+            not isinstance(row.get("request_contract_sha256"), str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", row["request_contract_sha256"])
+        ):
+            reject(index, "request contract digest is invalid")
+        request_contract = row.get("request_contract")
+        if not isinstance(request_contract, dict):
+            reject(index, "request contract is missing")
+        else:
+            encoded_contract = json.dumps(
+                request_contract,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            if (
+                "sha256:" + hashlib.sha256(encoded_contract).hexdigest()
+                != row.get("request_contract_sha256")
+            ):
+                reject(index, "request contract digest does not match its payload")
+
+    # Verify every conditional lineage against the exact rejected predecessor
+    # result and authoritative attempt.  A metadata-only route prefix is not
+    # sufficient evidence.
+    for index, row in enumerate(rows):
+        if index in invalid_rows or not isinstance(row, dict):
+            continue
+        predecessors = row.get("route_predecessors") or []
+        if not isinstance(predecessors, list):
+            reject(index, "route_predecessors is not a list")
+            continue
+        for predecessor_index, predecessor in enumerate(predecessors):
+            if not isinstance(predecessor, dict):
+                reject(index, "route predecessor is not an object")
+                break
+            predecessor_result_entry = result_ids.get(
+                str(predecessor.get("result_id") or "")
+            )
+            predecessor_result = (
+                predecessor_result_entry[1]
+                if predecessor_result_entry is not None
+                else None
+            )
+            predecessor_attempt_id = predecessor.get("attempt_id")
+            predecessor_binding = attempts.get(str(predecessor_attempt_id or ""))
+            if predecessor_result is None or predecessor_binding is None:
+                reject(index, "route predecessor result/attempt is missing")
+                break
+            predecessor_task, predecessor_attempt = predecessor_binding
+            predecessor_identity = _attempt_execution_identity(predecessor_attempt)
+            if (
+                predecessor_result.get("attempt_id") != predecessor_attempt_id
+                or predecessor_result.get("accepted_by_leader") is not False
+                or predecessor_attempt.get("accepted_by_leader") is not False
+                or predecessor_attempt.get("leader_result_id") != predecessor.get("result_id")
+                or predecessor_task.get("id") != row.get("task_id")
+                or predecessor_attempt.get("route_envelope_id") != row.get("route_envelope_id")
+                or predecessor_attempt.get("route_plan_fingerprint")
+                != row.get("route_plan_fingerprint")
+                or predecessor_attempt.get("route_plan_step_index") != predecessor_index
+                or predecessor.get("provider_id") != predecessor_attempt.get("provider")
+                or predecessor.get("model") != (predecessor_identity or {}).get("model")
+                or predecessor.get("profile") != (predecessor_identity or {}).get("profile")
+                or predecessor.get("profile_sha256")
+                != (predecessor_identity or {}).get("profile_sha256")
+            ):
+                reject(index, "route predecessor lineage is not an exact rejected result")
+                break
+
+    trusted = [row for index, row in enumerate(rows) if index not in invalid_rows]
+    return trusted, issues
+
+
+def trusted_result_rows(layout: ProjectLayout) -> list[dict[str, Any]]:
+    trusted, _ = audit_result_evidence(layout)
+    return trusted
+
+
 def leader_work_rows(layout: ProjectLayout) -> list[dict[str, Any]]:
     return read_jsonl(layout.leader_work_jsonl)
 
@@ -4658,8 +5636,69 @@ def _bind_route_step_profiles(
                     f"provider profile is unavailable at route admission: {profile}"
                 )
             binding = material[1]
+        expected_identity = step.get("execution_identity")
+        resolved_model = (
+            str(provider.get("model"))
+            if provider.get("model") not in {None, "", "inherit"}
+            else str(binding.get("model") or "inherit")
+        )
+        actual_identity = {
+            "model": resolved_model,
+            "profile": profile if isinstance(profile, str) else None,
+            "profile_sha256": binding.get("sha256"),
+        }
+        if expected_identity is not None and expected_identity != actual_identity:
+            raise ProfileBindingError(
+                f"provider {provider['provider_id']} profile identity changed during route admission"
+            )
+        step["execution_identity"] = actual_identity
         step["profile_binding"] = binding
     return bound_steps
+
+
+def _routing_execution_identities(
+    project: dict[str, Any],
+) -> dict[str, tuple[str, str | None, str | None]]:
+    """Resolve the exact mutable-profile identities before reading priors."""
+
+    catalog = project_provider_catalog(project)
+    identities: dict[str, tuple[str, str | None, str | None]] = {}
+    for index, provider in enumerate(catalog["providers"]):
+        provider_id = str(provider["provider_id"])
+        profile = provider.get("profile")
+        preview_path = _profile_snapshot_relpath(
+            str(project.get("project_id") or "project"),
+            "routing-evidence",
+            index,
+            profile if isinstance(profile, str) else None,
+        )
+        if profile is None:
+            _, binding = synthetic_default_profile(snapshot_relpath=preview_path)
+        else:
+            material = read_named_profile(
+                str(profile),
+                expected_env_key=provider.get("env_key"),
+                snapshot_relpath=preview_path,
+            )
+            if material is None:
+                identities[provider_id] = (
+                    str(provider.get("model") or "inherit"),
+                    str(profile),
+                    None,
+                )
+                continue
+            binding = material[1]
+        resolved_model = (
+            str(provider.get("model"))
+            if provider.get("model") not in {None, "", "inherit"}
+            else str(binding.get("model") or "inherit")
+        )
+        identities[provider_id] = (
+            resolved_model,
+            profile if isinstance(profile, str) else None,
+            str(binding["sha256"]),
+        )
+    return identities
 
 
 def _materialize_step_profile(
@@ -4761,7 +5800,13 @@ def _enforce_task_success_floor(
     task: dict[str, Any],
     candidate_steps: list[dict[str, Any]],
 ) -> float | None:
-    """Enforce the frozen SLA across prior attempts and a revised continuation."""
+    """Enforce the frozen SLA for the remaining, conditionally estimated chain.
+
+    Outcomes already observed are facts, not independent chances that can be
+    multiplied into a replacement plan.  Until cross-envelope conditional
+    evidence is modeled explicitly, replanning after any prior attempt fails
+    closed; continuing the already admitted envelope remains supported.
+    """
 
     raw_minimum = task.get("min_success_probability")
     if raw_minimum is None:
@@ -4770,32 +5815,26 @@ def _enforce_task_success_floor(
         raw_minimum,
         f"task {task.get('id') or '?'} minimum success probability",
     )
-    survival = 1.0
+    if minimum == 0:
+        return 0.0
     probability_rows: list[tuple[str, Any]] = []
-    for attempt in task.get("attempts") or []:
-        execution_state = attempt.get("provider_execution_state")
-        actor_id = attempt.get("actor_id")
-        if execution_state not in {"finished", "finished_recovered"} and actor_id and actor_exists(layout, str(actor_id)):
-            execution_state = (load_actor(layout, str(actor_id)).get("runtime") or {}).get(
-                "provider_execution_state"
-            )
-        if execution_state not in {"finished", "finished_recovered"}:
-            continue
-        bound_step = attempt.get("route_plan_step")
-        if isinstance(bound_step, dict):
-            prior = bound_step.get("acceptance_prior")
-        else:
-            route = attempt.get("route_decision")
-            prior = route.get("acceptance_prior") if isinstance(route, dict) else None
-        if not isinstance(prior, dict):
+    prior_attempts = [
+        attempt
+        for attempt in task.get("attempts") or []
+        if isinstance(attempt, dict)
+    ]
+    if prior_attempts:
+        if any(
+            not isinstance(attempt.get("leader_result_id"), str)
+            or attempt.get("accepted_by_leader") is not False
+            for attempt in prior_attempts
+        ):
             raise ValueError(
-                f"task {task.get('id') or '?'} cannot prove the success SLA because an existing attempt lacks its acceptance prior"
+                f"task {task.get('id') or '?'} cannot revise its SLA route while a prior attempt lacks an explicit leader rejection"
             )
-        probability_rows.append(
-            (
-                f"attempt {attempt.get('attempt_id') or attempt.get('attempt') or '?'} acceptance prior",
-                prior.get("conservative_probability"),
-            )
+        raise ValueError(
+            f"task {task.get('id') or '?'} revised route cannot prove its frozen success SLA "
+            "because the new envelope lacks exact cross-envelope predecessor-conditioned evidence"
         )
     for index, step in enumerate(candidate_steps):
         prior = step.get("acceptance_prior")
@@ -4809,6 +5848,7 @@ def _enforce_task_success_floor(
                 prior.get("conservative_probability"),
             )
         )
+    survival = 1.0
     for label, raw_probability in probability_rows:
         survival *= 1.0 - _acceptance_probability(raw_probability, label)
     combined = round(1.0 - survival, 9)
@@ -4886,9 +5926,33 @@ def validate_route_budget_envelope(task: dict[str, Any]) -> dict[str, Any] | Non
             raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope step {index} lacks acceptance_prior")
         if not isinstance(step.get("price_basis"), dict):
             raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope step {index} lacks price_basis")
+        execution_identity = step.get("execution_identity")
+        if not isinstance(execution_identity, dict) or set(execution_identity) != {
+            "model",
+            "profile",
+            "profile_sha256",
+        }:
+            raise ValueError(
+                f"task {task.get('id') or '?'} route_budget_envelope step {index} lacks execution_identity"
+            )
+        if (
+            not isinstance(execution_identity.get("model"), str)
+            or not execution_identity.get("model")
+            or execution_identity.get("profile") != step.get("profile")
+            or not isinstance(execution_identity.get("profile_sha256"), str)
+            or not re.fullmatch(
+                r"sha256:[0-9a-f]{64}",
+                execution_identity["profile_sha256"],
+            )
+        ):
+            raise ValueError(
+                f"task {task.get('id') or '?'} route_budget_envelope step {index} execution_identity is invalid"
+            )
         if step.get("profile_binding") is not None:
             try:
-                validate_profile_binding(step.get("profile_binding"))
+                validated_binding = validate_profile_binding(step.get("profile_binding"))
+                if validated_binding.get("sha256") != execution_identity.get("profile_sha256"):
+                    raise ValueError("profile hash does not match execution_identity")
             except ProfileBindingError as exc:
                 raise ValueError(
                     f"task {task.get('id') or '?'} route_budget_envelope step {index} profile binding is invalid"
@@ -5362,7 +6426,12 @@ def task_rows(layout: ProjectLayout) -> list[dict[str, Any]]:
                 "provider": task.get("provider"),
                 "profile": task.get("profile"),
                 "model": task.get("model"),
-                "attempts": task.get("attempts") or [],
+                "attempts": [
+                    redact_launch_token(attempt, attempt)
+                    if isinstance(attempt, dict)
+                    else attempt
+                    for attempt in task.get("attempts") or []
+                ],
                 "route_budget_envelope": task.get("route_budget_envelope"),
                 "report_path": task.get("report_path"),
                 "summary": task.get("summary"),
@@ -5820,7 +6889,10 @@ def command_recover(args: Any) -> None:
                 if args.plan_restarts:
                     command = actor_launch_command(layout, session, actor_data)
                     plan = backend.start_plan(session_name=session_name, actor_name=runtime_name, command=command, session_exists=True)
-                    planned_restarts.extend(command_to_string(argv) for argv in plan)
+                    planned_restarts.extend(
+                        redact_launch_token(command_to_string(argv), actor_data)
+                        for argv in plan
+                    )
                 if args.restart_missing and runtime.get("provider_execution_state") != "started":
                     transaction = current_transaction()
                     if transaction is not None and control_store_enabled(layout):
@@ -6167,6 +7239,18 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
                     actor_data = load_actor(layout, str(actor_id))
                     if actor_data.get("profile_binding") != attempt.get("profile_binding"):
                         issues.append(f"{task['id']} attempt {attempt_id} actor profile binding mismatch")
+            execution_identity = _attempt_execution_identity(attempt)
+            if execution_identity is None:
+                issues.append(
+                    f"{task['id']} attempt {attempt_id} is missing an immutable execution identity"
+                )
+            elif isinstance(attempt.get("route_plan_step"), dict) and (
+                attempt["route_plan_step"].get("execution_identity")
+                != execution_identity
+            ):
+                issues.append(
+                    f"{task['id']} attempt {attempt_id} route execution identity mismatch"
+                )
             if catalog is not None:
                 try:
                     spec = provider_by_id(catalog, str(attempt.get("provider") or ""))
@@ -6240,6 +7324,8 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
         validate_non_negative_integer(row.get("minutes"), f"{label} minutes", issues)
         validate_token_triplet(row, label, issues)
         validate_non_negative_number(row.get("estimated_cost_cny"), f"{label} estimated_cost_cny", issues, allow_none=True)
+    _, result_evidence_issues = audit_result_evidence(layout)
+    issues.extend(result_evidence_issues)
     usage_rows_to_validate = read_rows_for_validation(layout.usage_jsonl, "usage.jsonl", issues)
     for index, row in enumerate(usage_rows_to_validate, start=1):
         label = f"usage.jsonl line {index}"
@@ -6256,6 +7342,16 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
     store = control_store_status(layout)
     if store.get("status") == "invalid":
         issues.extend(f"control store: {issue}" for issue in store.get("issues") or [])
+    elif control_store_enabled(layout):
+        view_audit = audit_project_views(layout, repair=False)
+        issues.extend(
+            f"control store compatibility view drift: {path}"
+            for path in view_audit.get("drifted") or []
+        )
+        issues.extend(
+            f"control store ghost compatibility view: {path}"
+            for path in view_audit.get("ghosts") or []
+        )
     return issues
 
 
@@ -6409,6 +7505,7 @@ def _locked_project_command(function: Any) -> Any:
                 if not control_store_enabled(layout):
                     return function(args)
                 reconcile_project_views(layout)
+                audit_project_views(layout, repair=True)
                 external_effect = (
                     (function.__name__ == "command_send" and bool(getattr(args, "runtime_send", False)))
                     or function.__name__ == "command_start_leader"

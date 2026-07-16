@@ -88,12 +88,27 @@ def main() -> int:
         actor_id = dispatched["actor_id"]
         actor_file = project / "scheduler" / "actors" / f"{actor_id}.json"
         actor = json.loads(actor_file.read_text(encoding="utf-8"))
+        task_file = project / "tasks" / "V2-0001" / "task.json"
+        task_state = json.loads(task_file.read_text(encoding="utf-8"))
+        task_launch_token = task_state["attempts"][0]["launch_token"]
         launch_token = "-leading-url-safe-launch-token"
         actor["launch_token"] = launch_token
         actor_file.write_text(
             json.dumps(actor, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+
+        for command_name in ("status", "dashboard"):
+            public_state = cli(
+                temp,
+                command_name,
+                "--project",
+                str(project),
+                "--format",
+                "json",
+            ).stdout
+            assert task_launch_token not in public_state
+            assert launch_token not in public_state
 
         counter = temp / "provider-invocations.txt"
         ready = temp / "provider-ready"
@@ -159,6 +174,23 @@ def main() -> int:
         actor = json.loads(actor_file.read_text(encoding="utf-8"))
         registered = actor["runtime"]["registered_launch_token_sha256"]
         assert registered == hashlib.sha256(launch_token.encode("utf-8")).hexdigest()
+        actor["status"] = "running"
+        actor.setdefault("runtime", {})["pid"] = 999_999_999
+        actor["runtime"]["provider_execution_state"] = "finished"
+        actor_file.write_text(
+            json.dumps(actor, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        recovery_output = cli(
+            temp,
+            "recover",
+            "--project",
+            str(project),
+            "--plan-restarts",
+        ).stdout
+        assert launch_token not in recovery_output
+        assert task_launch_token not in recovery_output
+        assert "<launch-token-redacted>" in recovery_output
         print("actor fencing ok")
         return 0
     finally:

@@ -1654,6 +1654,12 @@ class OciWorkerExecutionAdapter:
             raise WorkerExecutionError("container_id_invalid", "managed container did not expose an immutable ID")
         if handle.container_id and not hmac.compare_digest(container_id, handle.container_id):
             raise WorkerExecutionError("container_id_mismatch", "managed container ID did not match its durable identity")
+        names = self._payload_container_names(payload)
+        if handle.container_name not in names:
+            raise WorkerExecutionError(
+                "container_name_mismatch",
+                "managed container name did not match its deterministic attempt identity",
+            )
         config = payload.get("Config") if isinstance(payload.get("Config"), dict) else {}
         actual_labels = config.get("Labels") if isinstance(config.get("Labels"), dict) else {}
         mismatched = sorted(key for key, value in handle.labels.items() if actual_labels.get(key) != value)
@@ -1664,6 +1670,19 @@ class OciWorkerExecutionAdapter:
                 details={"label_keys": mismatched},
             )
         return container_id, config
+
+    @staticmethod
+    def _payload_container_names(payload: Mapping[str, Any]) -> set[str]:
+        """Normalize Docker/Podman inspect names without trusting string casts."""
+
+        names: set[str] = set()
+        for key in ("Name", "Names", "name", "names"):
+            raw = payload.get(key)
+            values = raw if isinstance(raw, list) else [raw]
+            for value in values:
+                if isinstance(value, str) and value:
+                    names.add(value.lstrip("/"))
+        return names
 
     def _container_rows(self, *, timeout: float) -> list[Mapping[str, Any]]:
         """Return a complete no-trunc container listing or fail closed."""
@@ -1767,16 +1786,6 @@ class OciWorkerExecutionAdapter:
                     return
                 raise inspect_error
             container_id, _ = self._validate_container_identity(handle, current)
-            raw_name = str(current.get("Name") or current.get("Names") or "")
-            names = {
-                item.lstrip("/")
-                for item in ([raw_name] if isinstance(raw_name, str) else list(raw_name))
-            }
-            if handle.container_name not in names:
-                raise WorkerExecutionError(
-                    "uncertain_container_identity",
-                    "unregistered container identity could not be bound safely",
-                )
             try:
                 self._run_lifecycle(
                     self.backend._engine_argv("rm", "--force", container_id),

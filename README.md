@@ -78,7 +78,7 @@ $CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".c
 python "$CodexHome\skills\costmarshal\scripts\install_smoke_test.py"
 ```
 
-CostMarshal uses only Python's standard library at runtime. `git` is required for writable worker worktrees. `tmux` is optional; Windows defaults to the local process backend.
+CostMarshal requires Python 3.11+ and uses only its standard library at runtime. `git` is required for writable worker worktrees. `tmux` is optional; Windows defaults to the local process backend.
 
 Production worker isolation additionally requires Docker or Podman running Linux containers and a digest-pinned CostMarshal worker image. Native workers are a development compatibility mode, not a security boundary.
 
@@ -367,8 +367,10 @@ python tests/three_tier_routing_test.py
 python tests/route_oracle_test.py
 python tests/backtest_harness_test.py
 python tests/pricing_metadata_test.py
+python tests/result_evidence_integrity_test.py
 python tests/control_store_test.py
 python tests/transactional_scheduler_test.py
+python tests/scheduler_authority_test.py
 python tests/runtime_effect_store_test.py
 python tests/runtime_effect_scheduler_test.py
 python tests/worker_isolation_test.py
@@ -384,6 +386,8 @@ python tests/actor_fencing_test.py
 python tests/actor_governance_contract_test.py
 python tests/security_contract_test.py
 python tests/actor_security_contract_test.py
+python tests/context_projection_test.py
+python tests/handoff_contract_test.py
 python tests/reliability_contract_test.py
 python tests/release_gate_test.py
 python tests/budget_contract_test.py
@@ -396,6 +400,7 @@ python tests/historical_state_migration_test.py
 python tests/archmarshal_compat_test.py
 python tests/profile_config_test.py
 python tests/concurrency_contract_test.py
+python tests/ci_contract_test.py
 python scripts/install_smoke_test.py
 python tests/release/run_local_test_evidence.py
 python tests/release/run_runtime_effect_evidence.py

@@ -15,7 +15,7 @@ import hashlib
 import json
 import math
 import re
-from decimal import Decimal, InvalidOperation, ROUND_CEILING
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, localcontext
 from itertools import product
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -76,6 +76,10 @@ _PRICING_FIELDS = {
 }
 _SNAPSHOT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _SNAPSHOT_HASH = re.compile(r"sha256:[0-9a-f]{64}")
+_PROFILE_HASH = re.compile(r"sha256:[0-9a-f]{64}")
+
+ExecutionIdentity = tuple[str, str | None, str | None]
+PredecessorExecutionIdentity = tuple[str, str, str | None, str | None]
 
 
 class RoutingValidationError(ValueError):
@@ -128,15 +132,20 @@ class RouteDecision:
     estimated_cached_input_tokens: int
     estimated_output_tokens: int
     estimated_cost_cny: float | None
+    estimated_cost_cny_exact: str | None
     acceptance_prior: AcceptancePrior
     candidate_provider_ids: tuple[str, ...]
     planned_provider_ids: tuple[str, ...]
     planned_steps: tuple[dict[str, Any], ...]
     worst_case_chain_cost_cny: float | None
+    worst_case_chain_cost_cny_exact: str | None
     plan_fingerprint: str
     expected_chain_cost_cny: float | None
+    expected_chain_cost_cny_exact: str | None
     expected_success_probability: float | None
+    expected_success_probability_exact: str | None
     expected_cost_per_accepted_cny: float | None
+    expected_cost_per_accepted_cny_exact: str | None
     optimization_mode: str
     pricing_status: str
     pricing_currency: str | None
@@ -323,13 +332,23 @@ def _normalize_pricing_snapshot(
     legacy_hash = "sha256:" + hashlib.sha256(
         json.dumps(legacy_normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     ).hexdigest()
+    legacy_float_exact = all(
+        Decimal(value) == Decimal(str(float(value)))
+        for value in (input_price, output_price, fixed_request)
+    ) and (
+        cached_price is None
+        or Decimal(cached_price) == Decimal(str(float(cached_price)))
+    )
     supplied_hash = raw.get("snapshot_hash")
     if require_hash:
         if not isinstance(supplied_hash, str) or not _SNAPSHOT_HASH.fullmatch(supplied_hash):
             raise RoutingValidationError(f"{label}.snapshot_hash must be sha256:<64 lowercase hex characters>")
-        if supplied_hash not in {computed_hash, legacy_hash}:
+        accepted_hashes = {computed_hash}
+        if legacy_float_exact:
+            accepted_hashes.add(legacy_hash)
+        if supplied_hash not in accepted_hashes:
             raise RoutingValidationError(f"{label}.snapshot_hash does not match the canonical snapshot")
-        if supplied_hash == legacy_hash and supplied_hash != computed_hash:
+        if legacy_float_exact and supplied_hash == legacy_hash and supplied_hash != computed_hash:
             legacy_normalized["snapshot_hash"] = legacy_hash
             return legacy_normalized
     normalized["snapshot_hash"] = computed_hash
@@ -423,13 +442,25 @@ def _route_plan_step(
     cost: Decimal | None,
     *,
     index: int,
+    execution_identity: ExecutionIdentity | None = None,
 ) -> dict[str, Any]:
+    identity = execution_identity or (
+        str(provider.get("model") or "inherit"),
+        provider.get("profile") if isinstance(provider.get("profile"), str) else None,
+        None,
+    )
+    identity = _normalize_execution_identity(identity, "route step execution identity")
     return {
         "index": index,
         "provider_id": str(provider["provider_id"]),
         "tier": str(provider["tier"]),
         "profile": provider.get("profile"),
         "model": provider.get("model"),
+        "execution_identity": {
+            "model": identity[0],
+            "profile": identity[1],
+            "profile_sha256": identity[2],
+        },
         "estimated_cost_cny": None if cost is None else _decimal_money_text(cost),
         "acceptance_prior": prior.to_dict(),
         "price_basis": provider_price_basis(provider),
@@ -672,7 +703,12 @@ def _money_decimal(value: Any, label: str) -> Decimal:
     if not result.is_finite() or result < 0:
         raise RoutingValidationError(f"{label} must be a finite non-negative number")
     try:
-        normalized = result.quantize(_NANO_QUANTUM)
+        with localcontext() as context:
+            context.prec = max(
+                50,
+                len(result.as_tuple().digits) + abs(result.as_tuple().exponent) + 12,
+            )
+            normalized = result.quantize(_NANO_QUANTUM)
     except InvalidOperation as exc:
         raise RoutingValidationError(f"{label} is outside the supported nano-CNY range") from exc
     if normalized != result:
@@ -681,8 +717,28 @@ def _money_decimal(value: Any, label: str) -> Decimal:
 
 
 def _decimal_money_text(value: Decimal) -> str:
-    rendered = format(value.quantize(_NANO_QUANTUM), "f").rstrip("0").rstrip(".")
+    with localcontext() as context:
+        context.prec = max(
+            50,
+            len(value.as_tuple().digits) + abs(value.as_tuple().exponent) + 12,
+        )
+        normalized = value.quantize(_NANO_QUANTUM)
+    rendered = format(normalized, "f").rstrip("0").rstrip(".")
     return rendered or "0"
+
+
+def _decimal_exact_text(value: Decimal) -> str:
+    rendered = format(value, "f").rstrip("0").rstrip(".")
+    return rendered or "0"
+
+
+def _rounded_decimal_float(value: Decimal, places: int = 9) -> float:
+    """Render a Decimal for the compatibility float API without narrowing selection math."""
+
+    quantum = Decimal(1).scaleb(-places)
+    with localcontext() as context:
+        context.prec = max(50, len(value.as_tuple().digits) + places + 8)
+        return float(value.quantize(quantum))
 
 
 def estimate_cost_nano_cny(
@@ -808,17 +864,111 @@ def _row_provider_id(row: Mapping[str, Any]) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _normalize_execution_identity(value: Sequence[Any], label: str) -> ExecutionIdentity:
+    if isinstance(value, (str, bytes)) or len(value) not in {2, 3}:
+        raise RoutingValidationError(
+            f"{label} must be a (model, profile, profile_sha256) tuple"
+        )
+    model, profile = value[:2]
+    profile_sha256 = value[2] if len(value) == 3 else None
+    if not isinstance(model, str) or not model:
+        raise RoutingValidationError(f"{label} model must be a non-empty string")
+    if profile is not None and not isinstance(profile, str):
+        raise RoutingValidationError(f"{label} profile must be null or a string")
+    if profile_sha256 is not None and (
+        not isinstance(profile_sha256, str) or not _PROFILE_HASH.fullmatch(profile_sha256)
+    ):
+        raise RoutingValidationError(
+            f"{label} profile_sha256 must be null or a canonical sha256 digest"
+        )
+    return model, profile, profile_sha256
+
+
+def _row_execution_identity(row: Mapping[str, Any]) -> ExecutionIdentity | None:
+    if "model" not in row or "profile" not in row:
+        return None
+    model = row.get("execution_model") or row.get("model") or "inherit"
+    profile = row.get("profile") or None
+    profile_sha256 = row.get("profile_sha256") if "profile_sha256" in row else None
+    try:
+        return _normalize_execution_identity(
+            (model, profile, profile_sha256),
+            "result execution identity",
+        )
+    except RoutingValidationError:
+        return None
+
+
+def _deduplicated_leader_history(
+    history: Iterable[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    """Validate and globally deduplicate explicit leader evidence.
+
+    The global pass is intentionally performed before provider or conditional
+    filtering.  One attempt therefore cannot contribute to two incompatible
+    providers, routes, profiles, or predecessor lineages.
+    """
+
+    rows: list[Mapping[str, Any]] = []
+    seen_attempts: dict[str, str] = {}
+    seen_results: dict[str, str] = {}
+    seen_commands: dict[str, str] = {}
+    for row in history:
+        if not isinstance(row, Mapping) or type(row.get("accepted_by_leader")) is not bool:
+            continue
+        try:
+            canonical = json.dumps(
+                dict(row),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise RoutingValidationError("leader result evidence is not canonical JSON") from exc
+        duplicate = False
+        for field, seen in (
+            ("attempt_id", seen_attempts),
+            ("id", seen_results),
+            ("command_id", seen_commands),
+        ):
+            identity = row.get(field)
+            if not isinstance(identity, str) or not identity:
+                continue
+            previous = seen.get(identity)
+            if previous is not None:
+                if previous != canonical:
+                    raise RoutingValidationError(
+                        f"conflicting leader result evidence for {field} {identity}"
+                    )
+                duplicate = True
+            else:
+                seen[identity] = canonical
+        if not duplicate:
+            rows.append(row)
+    return rows
+
+
 def _leader_rows(
-    history: Iterable[Mapping[str, Any]], provider_id: str
+    history: Iterable[Mapping[str, Any]],
+    provider_id: str,
+    *,
+    execution_identity: ExecutionIdentity | None = None,
+    _history_is_deduplicated: bool = False,
 ) -> list[Mapping[str, Any]]:
     rows: list[Mapping[str, Any]] = []
-    for row in history:
+    source = list(history) if _history_is_deduplicated else _deduplicated_leader_history(history)
+    for row in source:
         if not isinstance(row, Mapping) or _row_provider_id(row) != provider_id:
             continue
         # Only explicit leader decisions are evidence.  Worker completion and
         # truthy strings must not train the routing prior.
-        if type(row.get("accepted_by_leader")) is bool:
-            rows.append(row)
+        if type(row.get("accepted_by_leader")) is not bool:
+            continue
+        if execution_identity is not None:
+            if _row_execution_identity(row) != execution_identity:
+                continue
+        rows.append(row)
     return rows
 
 
@@ -840,8 +990,12 @@ def leader_acceptance_prior(
     *,
     task_type: str | None = None,
     difficulty: str | None = None,
+    execution_identity: ExecutionIdentity | None = None,
     prior_alpha: float = 1.0,
     prior_beta: float = 2.0,
+    _history_is_deduplicated: bool = False,
+    require_exact_scope: bool = False,
+    minimum_observations: int = 0,
 ) -> AcceptancePrior:
     """Build a conservative Beta-style prior from leader acceptance records.
 
@@ -855,6 +1009,8 @@ def leader_acceptance_prior(
     assert alpha is not None and beta is not None
     if alpha <= 0 or beta <= 0:
         raise RoutingValidationError("prior_alpha and prior_beta must be positive")
+    if type(minimum_observations) is not int or minimum_observations < 0:
+        raise RoutingValidationError("minimum_observations must be a non-negative integer")
     if not isinstance(provider_id, str) or not _PROVIDER_ID.fullmatch(provider_id):
         raise RoutingValidationError("provider_id is invalid")
     if task_type is not None and (not isinstance(task_type, str) or not task_type.strip()):
@@ -863,9 +1019,19 @@ def leader_acceptance_prior(
         raise RoutingValidationError(
             f"difficulty must be one of: {', '.join(sorted(DIFFICULTIES))}"
         )
+    if execution_identity is not None:
+        execution_identity = _normalize_execution_identity(
+            execution_identity,
+            "execution_identity",
+        )
 
-    provider_rows = _leader_rows(history or [], provider_id)
-    scope = "provider"
+    provider_rows = _leader_rows(
+        history or [],
+        provider_id,
+        execution_identity=execution_identity,
+        _history_is_deduplicated=_history_is_deduplicated,
+    )
+    scope = "provider+execution" if execution_identity is not None else "provider"
     selected = provider_rows
     normalized_task_type = task_type.strip().lower() if task_type else None
     if normalized_task_type is not None:
@@ -877,7 +1043,11 @@ def leader_acceptance_prior(
         ]
         if type_rows:
             selected = type_rows
-            scope = "provider+task_type"
+            scope = (
+                "provider+execution+task_type"
+                if execution_identity is not None
+                else "provider+task_type"
+            )
             if difficulty is not None:
                 exact_rows = [
                     row
@@ -887,7 +1057,29 @@ def leader_acceptance_prior(
                 ]
                 if exact_rows:
                     selected = exact_rows
-                    scope = "provider+task_type+difficulty"
+                    scope = (
+                        "provider+execution+task_type+difficulty"
+                        if execution_identity is not None
+                        else "provider+task_type+difficulty"
+                    )
+                elif require_exact_scope:
+                    selected = []
+                    scope = (
+                        "provider+execution+task_type+difficulty"
+                        if execution_identity is not None
+                        else "provider+task_type+difficulty"
+                    )
+        elif require_exact_scope:
+            selected = []
+            scope = (
+                "provider+execution+task_type+difficulty"
+                if execution_identity is not None and difficulty is not None
+                else "provider+execution+task_type"
+                if execution_identity is not None
+                else "provider+task_type+difficulty"
+                if difficulty is not None
+                else "provider+task_type"
+            )
 
     accepted = sum(1 for row in selected if row["accepted_by_leader"] is True)
     observations = len(selected)
@@ -904,7 +1096,269 @@ def leader_acceptance_prior(
         prior_alpha=alpha,
         prior_beta=beta,
         posterior_mean=round(posterior_mean, 6),
-        conservative_probability=round(min(posterior_mean, conservative), 6),
+        conservative_probability=(
+            round(min(posterior_mean, conservative), 6)
+            if observations >= minimum_observations
+            else 0.0
+        ),
+    )
+
+
+def conditional_leader_acceptance_prior(
+    history: Iterable[Mapping[str, Any]] | None,
+    provider_id: str,
+    *,
+    predecessor_execution_identities: Sequence[PredecessorExecutionIdentity],
+    task_type: str | None = None,
+    difficulty: str | None = None,
+    execution_identity: ExecutionIdentity | None = None,
+    _position_index: Mapping[
+        tuple[str, str, str, int], Sequence[Mapping[str, Any]]
+    ] | None = None,
+    _history_is_deduplicated: bool = False,
+    require_exact_scope: bool = False,
+    minimum_observations: int = 0,
+    _evidence_index: Mapping[
+        tuple[str, ExecutionIdentity, tuple[PredecessorExecutionIdentity, ...]],
+        Sequence[Mapping[str, Any]],
+    ]
+    | None = None,
+) -> AcceptancePrior:
+    """Estimate acceptance after an exact, observed predecessor failure chain.
+
+    Marginal provider outcomes are not independent. A continuation receives
+    evidence only from result rows that identify the same ordered predecessor
+    provider/model/profile sequence. With no paired evidence its conservative
+    probability is zero, so an unobserved continuation cannot inflate an SLA.
+    """
+
+    expected_prefix_rows: list[PredecessorExecutionIdentity] = []
+    for index, raw_identity in enumerate(predecessor_execution_identities):
+        if isinstance(raw_identity, (str, bytes)) or len(raw_identity) != 4:
+            raise RoutingValidationError(
+                "conditional predecessor identity must be a "
+                "(provider, model, profile, profile_sha256) tuple"
+            )
+        predecessor, model, profile, profile_sha256 = raw_identity
+        if not isinstance(predecessor, str) or not _PROVIDER_ID.fullmatch(predecessor):
+            raise RoutingValidationError("conditional predecessor provider_id is invalid")
+        normalized = _normalize_execution_identity(
+            (model or "inherit", profile, profile_sha256),
+            f"conditional predecessor identity {index}",
+        )
+        expected_prefix_rows.append((predecessor, *normalized))
+    expected_prefix = tuple(expected_prefix_rows)
+    if not expected_prefix:
+        return leader_acceptance_prior(
+            history,
+            provider_id,
+            task_type=task_type,
+            difficulty=difficulty,
+            execution_identity=execution_identity,
+            require_exact_scope=require_exact_scope,
+            minimum_observations=minimum_observations,
+        )
+
+    # `_position_index` remains accepted for source compatibility, but exact
+    # lineage is now verified by predecessor result/attempt ids instead of a
+    # broad position match.
+    del _position_index
+    history_rows = (
+        list(history or [])
+        if _history_is_deduplicated
+        else _deduplicated_leader_history(history or [])
+    )
+    evidence_index = (
+        _evidence_index
+        if _evidence_index is not None
+        else _conditional_evidence_index(history_rows)
+    )
+    normalized_target = (
+        _normalize_execution_identity(execution_identity, "execution_identity")
+        if execution_identity is not None
+        else None
+    )
+    if normalized_target is None:
+        paired_rows = [
+            row
+            for (candidate_provider, _, candidate_prefix), rows in evidence_index.items()
+            if candidate_provider == provider_id and candidate_prefix == expected_prefix
+            for row in rows
+        ]
+    else:
+        paired_rows = list(
+            evidence_index.get(
+                (provider_id, normalized_target, expected_prefix),
+                (),
+            )
+        )
+
+    prior = leader_acceptance_prior(
+        paired_rows,
+        provider_id,
+        task_type=task_type,
+        difficulty=difficulty,
+        execution_identity=execution_identity,
+        _history_is_deduplicated=True,
+        require_exact_scope=require_exact_scope,
+        minimum_observations=minimum_observations,
+    )
+    return AcceptancePrior(
+        provider_id=prior.provider_id,
+        scope=f"conditional:{'->'.join(item[0] for item in expected_prefix)}:{prior.scope}",
+        observations=prior.observations,
+        accepted=prior.accepted,
+        prior_alpha=prior.prior_alpha,
+        prior_beta=prior.prior_beta,
+        posterior_mean=prior.posterior_mean,
+        conservative_probability=(
+            prior.conservative_probability if prior.observations > 0 else 0.0
+        ),
+    )
+
+
+def _conditional_position_index(
+    history: Iterable[Mapping[str, Any]],
+) -> dict[tuple[str, str, str, int], list[Mapping[str, Any]]]:
+    index: dict[tuple[str, str, str, int], list[Mapping[str, Any]]] = {}
+    for row in history:
+        if not isinstance(row, Mapping):
+            continue
+        task_id = row.get("task_id")
+        envelope_id = row.get("route_envelope_id")
+        fingerprint = row.get("route_plan_fingerprint")
+        step_index = row.get("route_plan_step_index")
+        if (
+            isinstance(task_id, str)
+            and task_id
+            and isinstance(envelope_id, str)
+            and envelope_id
+            and isinstance(fingerprint, str)
+            and fingerprint.startswith("sha256:")
+            and type(step_index) is int
+            and step_index >= 0
+        ):
+            index.setdefault(
+                (task_id, envelope_id, fingerprint, step_index),
+                [],
+            ).append(row)
+    return index
+
+
+def _conditional_evidence_index(
+    history: Sequence[Mapping[str, Any]],
+) -> dict[
+    tuple[str, ExecutionIdentity, tuple[PredecessorExecutionIdentity, ...]],
+    list[Mapping[str, Any]],
+]:
+    """Validate every conditional lineage once and index sufficient rows."""
+
+    result_index = {
+        str(row["id"]): row
+        for row in history
+        if isinstance(row.get("id"), str) and row.get("id")
+    }
+    index: dict[
+        tuple[str, ExecutionIdentity, tuple[PredecessorExecutionIdentity, ...]],
+        list[Mapping[str, Any]],
+    ] = {}
+    for row in history:
+        provider_id = _row_provider_id(row)
+        target_identity = _row_execution_identity(row)
+        task_id = row.get("task_id")
+        envelope_id = row.get("route_envelope_id")
+        fingerprint = row.get("route_plan_fingerprint")
+        step_index = row.get("route_plan_step_index")
+        raw_prefix = row.get("route_predecessors")
+        if (
+            provider_id is None
+            or target_identity is None
+            or not isinstance(row.get("id"), str)
+            or not isinstance(row.get("attempt_id"), str)
+            or not isinstance(task_id, str)
+            or not task_id
+            or not isinstance(envelope_id, str)
+            or not envelope_id
+            or not isinstance(fingerprint, str)
+            or not fingerprint.startswith("sha256:")
+            or type(step_index) is not int
+            or step_index <= 0
+            or not isinstance(raw_prefix, list)
+            or len(raw_prefix) != step_index
+        ):
+            continue
+        prefix: list[PredecessorExecutionIdentity] = []
+        valid = True
+        for predecessor_index, predecessor in enumerate(raw_prefix):
+            if not isinstance(predecessor, Mapping):
+                valid = False
+                break
+            predecessor_provider = predecessor.get("provider_id")
+            predecessor_attempt_id = predecessor.get("attempt_id")
+            predecessor_result_id = predecessor.get("result_id")
+            if (
+                not isinstance(predecessor_provider, str)
+                or not _PROVIDER_ID.fullmatch(predecessor_provider)
+                or not isinstance(predecessor_attempt_id, str)
+                or not predecessor_attempt_id
+                or not isinstance(predecessor_result_id, str)
+                or not predecessor_result_id
+            ):
+                valid = False
+                break
+            try:
+                identity = _normalize_execution_identity(
+                    (
+                        predecessor.get("model") or "inherit",
+                        predecessor.get("profile") or None,
+                        predecessor.get("profile_sha256"),
+                    ),
+                    "route predecessor execution identity",
+                )
+            except RoutingValidationError:
+                valid = False
+                break
+            predecessor_row = result_index.get(predecessor_result_id)
+            if (
+                predecessor_row is None
+                or predecessor_row.get("attempt_id") != predecessor_attempt_id
+                or predecessor_row.get("task_id") != task_id
+                or predecessor_row.get("route_envelope_id") != envelope_id
+                or predecessor_row.get("route_plan_fingerprint") != fingerprint
+                or predecessor_row.get("route_plan_step_index") != predecessor_index
+                or _row_provider_id(predecessor_row) != predecessor_provider
+                or _row_execution_identity(predecessor_row) != identity
+                or predecessor_row.get("accepted_by_leader") is not False
+            ):
+                valid = False
+                break
+            prefix.append((predecessor_provider, *identity))
+        if valid:
+            index.setdefault(
+                (provider_id, target_identity, tuple(prefix)),
+                [],
+            ).append(row)
+    return index
+
+
+def _provider_execution_identity(
+    provider: Mapping[str, Any],
+    execution_identities: Mapping[str, ExecutionIdentity] | None,
+) -> ExecutionIdentity:
+    provider_id = str(provider.get("provider_id") or "")
+    supplied = (
+        execution_identities.get(provider_id)
+        if execution_identities is not None
+        else None
+    )
+    value = supplied or (
+        str(provider.get("model") or "inherit"),
+        provider.get("profile"),
+        None,
+    )
+    return _normalize_execution_identity(
+        value,
+        f"provider {provider_id} execution identity",
     )
 
 
@@ -918,15 +1372,25 @@ def _rank_candidates(
     output_tokens: int,
     cached_input_tokens: int = 0,
     allow_costs: bool = True,
+    execution_identities: Mapping[str, ExecutionIdentity] | None = None,
+    _history_is_deduplicated: bool = False,
 ) -> list[tuple[dict[str, Any], AcceptancePrior, Decimal | None]]:
     rows: list[tuple[dict[str, Any], AcceptancePrior, Decimal | None]] = []
-    history_rows = list(history or [])
+    history_rows = (
+        list(history or [])
+        if _history_is_deduplicated
+        else _deduplicated_leader_history(history or [])
+    )
     for provider in providers:
+        provider_id = str(provider["provider_id"])
+        identity = _provider_execution_identity(provider, execution_identities)
         prior = leader_acceptance_prior(
             history_rows,
-            provider["provider_id"],
+            provider_id,
             task_type=task_type,
             difficulty=difficulty,
+            execution_identity=identity,
+            _history_is_deduplicated=True,
         )
         cost_units = (
             estimate_cost_nano_cny(
@@ -962,19 +1426,36 @@ def _auto_chain_plans(
     input_tokens: int,
     output_tokens: int,
     cached_input_tokens: int = 0,
+    execution_identities: Mapping[str, ExecutionIdentity] | None = None,
+    _history_is_deduplicated: bool = False,
+    sla_evidence: bool = False,
 ) -> list[dict[str, Any]]:
     """Enumerate start-provider chains and price expected accepted outcomes."""
 
-    history_rows = list(history or [])
+    history_rows = (
+        list(history or [])
+        if _history_is_deduplicated
+        else _deduplicated_leader_history(history or [])
+    )
+    conditional_evidence_index = _conditional_evidence_index(history_rows)
+    conditional_prior_cache: dict[
+        tuple[ExecutionIdentity, tuple[PredecessorExecutionIdentity, ...]],
+        AcceptancePrior,
+    ] = {}
     plans: list[dict[str, Any]] = []
     for start in enabled:
         if TIER_RANK[start["tier"]] < TIER_RANK[floor]:
             continue
+        start_identity = _provider_execution_identity(start, execution_identities)
         start_prior = leader_acceptance_prior(
             history_rows,
             start["provider_id"],
             task_type=task_type,
             difficulty=difficulty,
+            execution_identity=start_identity,
+            _history_is_deduplicated=True,
+            require_exact_scope=sla_evidence,
+            minimum_observations=10 if sla_evidence else 0,
         )
         start_cost_units = estimate_cost_nano_cny(
             start,
@@ -1000,25 +1481,75 @@ def _auto_chain_plans(
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
                         cached_input_tokens=cached_input_tokens,
+                        execution_identities=execution_identities,
+                        _history_is_deduplicated=True,
                     )]
                 )
         combinations = product(*stronger_groups) if stronger_groups else [()]
         for optional_continuation in combinations:
             continuation = [row for row in optional_continuation if row is not None]
-            chain = [start_row, *continuation]
+            marginal_chain = [start_row, *continuation]
+            chain: list[tuple[dict[str, Any], AcceptancePrior, Decimal | None]] = []
+            predecessor_identities: list[PredecessorExecutionIdentity] = []
+            for index, (item_provider, marginal_prior, item_cost) in enumerate(marginal_chain):
+                item_identity = _provider_execution_identity(
+                    item_provider,
+                    execution_identities,
+                )
+                item_prior = marginal_prior
+                if index:
+                    cache_key = (
+                        item_identity,
+                        tuple(predecessor_identities),
+                    )
+                    item_prior = conditional_prior_cache.get(cache_key)
+                    if item_prior is None:
+                        item_prior = conditional_leader_acceptance_prior(
+                            history_rows,
+                            item_provider["provider_id"],
+                            predecessor_execution_identities=predecessor_identities,
+                            task_type=task_type,
+                            difficulty=difficulty,
+                            execution_identity=item_identity,
+                            _history_is_deduplicated=True,
+                            require_exact_scope=sla_evidence,
+                            minimum_observations=10 if sla_evidence else 0,
+                            _evidence_index=conditional_evidence_index,
+                        )
+                        conditional_prior_cache[cache_key] = item_prior
+                chain.append((item_provider, item_prior, item_cost))
+                predecessor_identities.append(
+                    (
+                        item_provider["provider_id"],
+                        item_identity[0],
+                        item_identity[1],
+                        item_identity[2],
+                    )
+                )
             if any(cost is None for _, _, cost in chain):
                 continue
-            survival = 1.0
-            expected_cost = 0.0
+            survival = Decimal(1)
+            expected_cost = Decimal(0)
             for _, prior, cost in chain:
                 assert cost is not None
-                expected_cost += survival * float(cost)
-                survival *= 1.0 - prior.conservative_probability
-            success_probability = 1.0 - survival
+                probability = Decimal(str(prior.conservative_probability))
+                expected_cost += survival * cost
+                survival *= Decimal(1) - probability
+            success_probability = Decimal(1) - survival
             if success_probability <= 0:
                 continue
+            objective = expected_cost / success_probability
             planned_steps = tuple(
-                _route_plan_step(item_provider, item_prior, item_cost, index=index)
+                _route_plan_step(
+                    item_provider,
+                    item_prior,
+                    item_cost,
+                    index=index,
+                    execution_identity=_provider_execution_identity(
+                        item_provider,
+                        execution_identities,
+                    ),
+                )
                 for index, (item_provider, item_prior, item_cost) in enumerate(chain)
             )
             plans.append(
@@ -1031,15 +1562,22 @@ def _auto_chain_plans(
                     "worst_case_cost": float(
                         sum((item[2] for item in chain if item[2] is not None), Decimal(0))
                     ),
-                    "expected_cost": round(expected_cost, 9),
-                    "success_probability": round(success_probability, 9),
-                    "objective": round(expected_cost / success_probability, 9),
+                    "_worst_case_cost_exact": sum(
+                        (item[2] for item in chain if item[2] is not None),
+                        Decimal(0),
+                    ),
+                    "expected_cost": _rounded_decimal_float(expected_cost),
+                    "success_probability": _rounded_decimal_float(success_probability),
+                    "objective": _rounded_decimal_float(objective),
+                    "_expected_cost_exact": expected_cost,
+                    "_success_probability_exact": success_probability,
+                    "_objective_exact": objective,
                 }
             )
     plans.sort(
         key=lambda plan: (
-            plan["objective"],
-            -plan["success_probability"],
+            plan["_objective_exact"],
+            -plan["_success_probability_exact"],
             plan["provider"]["priority"],
             plan["provider"]["provider_id"],
         )
@@ -1054,6 +1592,7 @@ def decide_route(
     requested_provider_id: str | None = None,
     requested_tier: str | None = None,
     history: Iterable[Mapping[str, Any]] | None = None,
+    execution_identities: Mapping[str, ExecutionIdentity] | None = None,
     input_tokens: int = 0,
     cached_input_tokens: int = 0,
     output_tokens: int = 0,
@@ -1063,6 +1602,7 @@ def decide_route(
 
     values = validate_task_routing(task)
     normalized = validate_provider_catalog(catalog)
+    history_rows = _deduplicated_leader_history(history or [])
     floor = auto_tier_floor(values)
     _require_token_count(input_tokens, "input_tokens")
     _require_token_count(cached_input_tokens, "cached_input_tokens")
@@ -1174,22 +1714,28 @@ def decide_route(
         pricing_currency = candidate_pricing_currency
     ranked = _rank_candidates(
         candidates,
-        history=history,
+        history=history_rows,
         task_type=values["task_type"],
         difficulty=values["difficulty"],
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cached_input_tokens=cached_input_tokens,
         allow_costs=selection_pricing_ready,
+        execution_identities=execution_identities,
+        _history_is_deduplicated=True,
     )
     provider, prior, cost = ranked[0]
     candidate_ids = tuple(item[0]["provider_id"] for item in ranked)
     planned_provider_ids = (provider["provider_id"],)
     planned_steps: tuple[dict[str, Any], ...] = ()
     worst_case_chain_cost: float | None = None
+    worst_case_chain_cost_exact: Decimal | None = None
     expected_chain_cost = None
+    expected_chain_cost_exact: Decimal | None = None
     expected_success = None
+    expected_success_exact: Decimal | None = None
     expected_cost_per_accepted = None
+    expected_cost_per_accepted_exact: Decimal | None = None
     optimization_mode = "safe-tier"
     economics_ready = (
         requested_provider_id is None
@@ -1197,7 +1743,7 @@ def decide_route(
         and input_tokens + cached_input_tokens + output_tokens > 0
         and optimization_pricing_ready
     )
-    if values.get("min_success_probability") is not None and not economics_ready:
+    if (values.get("min_success_probability") or 0) > 0 and not economics_ready:
         raise RoutingValidationError(
             "minimum success probability requires auto routing, non-zero token estimates, and current compatible pricing; "
             f"pricing status is {optimization_pricing_status}"
@@ -1206,17 +1752,30 @@ def decide_route(
         plans = _auto_chain_plans(
             enabled,
             floor=floor,
-            history=history,
+            history=history_rows,
             task_type=values["task_type"],
             difficulty=values["difficulty"],
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cached_input_tokens=cached_input_tokens,
+            execution_identities=execution_identities,
+            _history_is_deduplicated=True,
+            sla_evidence=(values.get("min_success_probability") or 0) > 0,
         )
+        if not plans and (values.get("min_success_probability") or 0) > 0:
+            raise RoutingValidationError(
+                "no priced provider chain has enough exact, profile-bound evidence "
+                f"to satisfy minimum success probability {values['min_success_probability']}"
+            )
         if plans:
             minimum_success = values.get("min_success_probability")
-            if minimum_success is not None:
-                plans = [plan for plan in plans if plan["success_probability"] >= minimum_success]
+            if minimum_success is not None and minimum_success > 0:
+                minimum_success_decimal = Decimal(str(minimum_success))
+                plans = [
+                    plan
+                    for plan in plans
+                    if plan["_success_probability_exact"] >= minimum_success_decimal
+                ]
                 if not plans:
                     raise RoutingValidationError(
                         f"no priced provider chain satisfies minimum success probability {minimum_success}"
@@ -1231,9 +1790,13 @@ def decide_route(
             planned_provider_ids = best["chain"]
             planned_steps = best["steps"]
             worst_case_chain_cost = best["worst_case_cost"]
+            worst_case_chain_cost_exact = best["_worst_case_cost_exact"]
             expected_chain_cost = best["expected_cost"]
+            expected_chain_cost_exact = best["_expected_cost_exact"]
             expected_success = best["success_probability"]
+            expected_success_exact = best["_success_probability_exact"]
             expected_cost_per_accepted = best["objective"]
+            expected_cost_per_accepted_exact = best["_objective_exact"]
             optimization_mode = "expected-cost-per-accepted"
             reason = (
                 f"cost-performance optimization selected {provider['provider_id']} as the first "
@@ -1250,8 +1813,20 @@ def decide_route(
     elif not optimization_pricing_ready and requested_provider_id is None and requested_tier is None:
         reason = f"{reason}; cross-tier optimization unavailable ({optimization_pricing_status})"
     if not planned_steps:
-        planned_steps = (_route_plan_step(provider, prior, cost, index=0),)
+        planned_steps = (
+            _route_plan_step(
+                provider,
+                prior,
+                cost,
+                index=0,
+                execution_identity=_provider_execution_identity(
+                    provider,
+                    execution_identities,
+                ),
+            ),
+        )
         worst_case_chain_cost = None if cost is None else float(cost)
+        worst_case_chain_cost_exact = cost
     plan_fingerprint = route_plan_fingerprint(
         planned_steps,
         input_tokens=input_tokens,
@@ -1288,15 +1863,38 @@ def decide_route(
         estimated_cached_input_tokens=cached_input_tokens,
         estimated_output_tokens=output_tokens,
         estimated_cost_cny=cost_value,
+        estimated_cost_cny_exact=(
+            None if cost is None else _decimal_money_text(cost)
+        ),
         acceptance_prior=prior,
         candidate_provider_ids=candidate_ids,
         planned_provider_ids=planned_provider_ids,
         planned_steps=planned_steps,
         worst_case_chain_cost_cny=worst_case_chain_cost,
+        worst_case_chain_cost_cny_exact=(
+            None
+            if worst_case_chain_cost_exact is None
+            else _decimal_money_text(worst_case_chain_cost_exact)
+        ),
         plan_fingerprint=plan_fingerprint,
         expected_chain_cost_cny=expected_chain_cost,
+        expected_chain_cost_cny_exact=(
+            None
+            if expected_chain_cost_exact is None
+            else _decimal_money_text(expected_chain_cost_exact)
+        ),
         expected_success_probability=expected_success,
+        expected_success_probability_exact=(
+            None
+            if expected_success_exact is None
+            else _decimal_exact_text(expected_success_exact)
+        ),
         expected_cost_per_accepted_cny=expected_cost_per_accepted,
+        expected_cost_per_accepted_cny_exact=(
+            None
+            if expected_cost_per_accepted_exact is None
+            else _decimal_money_text(expected_cost_per_accepted_exact)
+        ),
         optimization_mode=optimization_mode,
         pricing_status=pricing_status,
         pricing_currency=pricing_currency,
@@ -1313,6 +1911,7 @@ def next_stronger_provider(
     required_capabilities: Iterable[str] = (),
     preferred_provider_ids: Sequence[str] | None = None,
     history: Iterable[Mapping[str, Any]] | None = None,
+    execution_identities: Mapping[str, ExecutionIdentity] | None = None,
     task_type: str = "analysis",
     difficulty: str = "normal",
     input_tokens: int = 0,
@@ -1368,6 +1967,7 @@ def next_stronger_provider(
             output_tokens=output_tokens,
             cached_input_tokens=cached_input_tokens,
             allow_costs=pricing_ready,
+            execution_identities=execution_identities,
         )
         chosen, prior, cost = ranked[0]
         snapshot = _snapshot_from_provider(chosen) if pricing_ready else None
@@ -1434,6 +2034,7 @@ def next_stronger_provider(
                 output_tokens=output_tokens,
                 cached_input_tokens=cached_input_tokens,
                 allow_costs=pricing_ready,
+                execution_identities=execution_identities,
             )
             provider, _, _ = ranked[0]
             return selected(

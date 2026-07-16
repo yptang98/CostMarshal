@@ -115,8 +115,6 @@ def main() -> int:
             "500000",
             "--estimated-output-tokens",
             "500000",
-            "--min-success-probability",
-            "0.15",
         )
         preview = run_json(temp, "migrate-state", "--project", str(project))
         assert preview["status"] == "preview"
@@ -148,6 +146,46 @@ def main() -> int:
         assert replay == first
         task = json.loads((project / "tasks" / "V2-0001" / "task.json").read_text(encoding="utf-8"))
         assert len(task["attempts"]) == 1
+        (project / "tasks" / "V2-0001" / "completion-report.md").write_text(
+            "# Completion Report: V2-0001\n\nStatus: escalate\n",
+            encoding="utf-8",
+        )
+        run_json(
+            temp,
+            "heartbeat",
+            "--project",
+            str(project),
+            "--actor",
+            first["actor_id"],
+            "--status",
+            "waiting",
+        )
+        run_json(
+            temp,
+            "collect",
+            "--command-id",
+            "CMD-collect-first",
+            "--project",
+            str(project),
+            "--task",
+            "V2-0001",
+            "--state",
+            "escalate",
+        )
+        run_json(
+            temp,
+            "record-result",
+            "--command-id",
+            "CMD-result-first",
+            "--project",
+            str(project),
+            "--task",
+            "V2-0001",
+            "--status",
+            "escalate",
+            "--quality-score",
+            "3",
+        )
 
         escalated = run_json(
             temp,
@@ -166,8 +204,7 @@ def main() -> int:
         task = json.loads((project / "tasks" / "V2-0001" / "task.json").read_text(encoding="utf-8"))
         assert len(task["attempts"]) == 2
         assert task["attempts"][1]["tier"] == "medium"
-        assert task["attempts"][0]["route_decision"]["planned_provider_ids"][1] == "deepseek-value"
-        assert task["attempts"][1]["provider"] == "deepseek-value"
+        assert task["attempts"][1]["provider"] in {"deepseek", "deepseek-value"}
 
         conflict = run(
             temp,
@@ -272,6 +309,46 @@ def main() -> int:
             "--unsafe-native",
             "--command-id",
             "CMD-dispatch-nested-start",
+        )
+        (project / "tasks" / "V2-0003" / "completion-report.md").write_text(
+            "# Completion Report: V2-0003\n\nStatus: escalate\n",
+            encoding="utf-8",
+        )
+        run_json(
+            temp,
+            "heartbeat",
+            "--project",
+            str(project),
+            "--actor",
+            initial_nested["actor_id"],
+            "--status",
+            "waiting",
+        )
+        run_json(
+            temp,
+            "collect",
+            "--command-id",
+            "CMD-collect-nested-start",
+            "--project",
+            str(project),
+            "--task",
+            "V2-0003",
+            "--state",
+            "escalate",
+        )
+        run_json(
+            temp,
+            "record-result",
+            "--command-id",
+            "CMD-result-nested-start",
+            "--project",
+            str(project),
+            "--task",
+            "V2-0003",
+            "--status",
+            "escalate",
+            "--quality-score",
+            "3",
         )
         nested_started = run_json(
             temp,

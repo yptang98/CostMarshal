@@ -41,6 +41,70 @@ def wait_until(predicate, timeout: float = 10.0) -> None:
     raise AssertionError("timed out waiting for actor process")
 
 
+def review_and_escalate(temp: Path, env: dict[str, str], project: Path, sequence: int) -> dict:
+    task = json.loads((project / "tasks" / "V2-0001" / "task.json").read_text(encoding="utf-8"))
+    attempt = task["attempts"][-1]
+    actor = str(attempt["actor_id"])
+    attempt_id = str(attempt["attempt_id"])
+    run_json(
+        temp,
+        env,
+        "collect",
+        "--command-id",
+        f"CMD-rotation-collect-{sequence}",
+        "--project",
+        str(project),
+        "--task",
+        "V2-0001",
+        "--attempt",
+        attempt_id,
+        "--actor",
+        actor,
+        "--state",
+        "escalate",
+    )
+    run_json(
+        temp,
+        env,
+        "record-result",
+        "--command-id",
+        f"CMD-rotation-result-{sequence}",
+        "--project",
+        str(project),
+        "--task",
+        "V2-0001",
+        "--attempt",
+        attempt_id,
+        "--actor",
+        actor,
+        "--status",
+        "escalate",
+        "--quality-score",
+        "3",
+        "--summary",
+        f"leader rejected rotation attempt {sequence}",
+    )
+    return run_json(
+        temp,
+        env,
+        "escalate",
+        "--command-id",
+        f"CMD-rotation-escalate-{sequence}",
+        "--project",
+        str(project),
+        "--task",
+        "V2-0001",
+        "--attempt",
+        attempt_id,
+        "--from-actor",
+        actor,
+        "--reason",
+        f"leader rejected rotation attempt {sequence}",
+        "--start",
+        "--unsafe-native",
+    )
+
+
 def main() -> int:
     temp = Path(tempfile.mkdtemp(prefix="costmarshal-v2-model-rotation-"))
     try:
@@ -140,7 +204,10 @@ print(json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 11, 'outpu
             logs = list((project / "transcripts").glob("*.log"))
             detail = "\n".join(path.read_text(encoding="utf-8", errors="replace") for path in logs)
             raise AssertionError(f"timed out waiting for actor process\n{detail}") from exc
+        # Drain the runner-authored usage/escalation request. The latter is
+        # intentionally rejected until the leader records explicit evidence.
         first_scheduler = run_json(temp, env, "run-scheduler", "--project", str(project), "--once")
+        review_and_escalate(temp, env, project, 1)
         try:
             wait_until(lambda: fake_log.is_file() and len(fake_log.read_text(encoding="utf-8").splitlines()) >= 2)
         except AssertionError as exc:
@@ -151,6 +218,7 @@ print(json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 11, 'outpu
                 f"timed out waiting for medium actor\nscheduler={first_scheduler}\n{detail}\n{task_detail}"
             ) from exc
         run_json(temp, env, "run-scheduler", "--project", str(project), "--once")
+        review_and_escalate(temp, env, project, 2)
         wait_until(lambda: fake_log.is_file() and len(fake_log.read_text(encoding="utf-8").splitlines()) >= 3)
         run_json(temp, env, "run-scheduler", "--project", str(project), "--once")
 
