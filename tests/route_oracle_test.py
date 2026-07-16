@@ -22,6 +22,7 @@ SEED = 20260716
 CASE_COUNT = 10_000
 TIERS = ("low", "medium", "high")
 TIER_RANK = {tier: index for index, tier in enumerate(TIERS)}
+BOOTSTRAP_MIN_CONDITIONAL_OBSERVATIONS = 10
 LOW_TYPES = {
     "analysis",
     "documentation",
@@ -180,6 +181,9 @@ def independent_oracle(
                     "first_cost": float(cost[start["provider_id"]]),
                     "_success": success_probability,
                     "_objective": objective,
+                    # Random oracle rows are intentionally unconditional.  No
+                    # continuation lineage can therefore be counted as mature.
+                    "_conditional_exact_observations": tuple(0 for _ in chain[1:]),
                 }
             )
     plans.sort(
@@ -204,6 +208,31 @@ def independent_oracle(
             )
             >= 10
         ]
+    else:
+        available_tiers = tuple(
+            tier
+            for tier in TIERS[TIER_RANK[floor] :]
+            if any(provider["tier"] == tier for provider in eligible)
+        )
+        if len(available_tiers) > 1:
+            full_plans = [
+                plan
+                for plan in plans
+                if tuple(
+                    next(
+                        provider["tier"]
+                        for provider in eligible
+                        if provider["provider_id"] == provider_id
+                    )
+                    for provider_id in plan["chain"]
+                )
+                == available_tiers
+            ]
+            if full_plans and any(
+                count < BOOTSTRAP_MIN_CONDITIONAL_OBSERVATIONS
+                for count in full_plans[0]["_conditional_exact_observations"]
+            ):
+                return full_plans[0]
     return plans[0] if plans else None
 
 

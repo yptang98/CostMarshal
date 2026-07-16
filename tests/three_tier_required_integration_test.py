@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A required-OCI low -> medium -> high route obeys the real leader state machine."""
+"""Fresh required-OCI bootstrap chains obey the real leader state machine."""
 
 from __future__ import annotations
 
@@ -34,7 +34,6 @@ from costmarshal_v2.routing import (  # noqa: E402
 from costmarshal_v2.scheduler import audit_result_evidence  # noqa: E402
 from costmarshal_v2.state import (  # noqa: E402
     load_actor,
-    load_project,
     load_task,
     save_task,
 )
@@ -43,9 +42,6 @@ from costmarshal_v2.worker_isolation import (  # noqa: E402
     OciCliBackend,
     validate_execution_spec,
 )
-from project_success_policy_test import seed_paired_route_evidence  # noqa: E402
-
-
 CLI = ROOT / "scripts" / "costmarshal.py"
 IMAGE = "ghcr.io/example/costmarshal-worker@sha256:" + "7" * 64
 
@@ -459,8 +455,6 @@ def main() -> int:
             root=(temp / "runtime").resolve(),
             project_dir=project_dir.resolve(),
         )
-        project = load_project(layout)
-        seed_paired_route_evidence(temp, project_dir)
         cli(temp, "migrate-state", "--project", str(project_dir), "--apply")
         task_id = cli(
             temp,
@@ -479,9 +473,14 @@ def main() -> int:
             "1000000",
             "--estimated-output-tokens",
             "10000",
-            "--min-success-probability",
-            "0.15",
         )["task_id"]
+        fresh_preview = load_task(layout, task_id)["route_preview"]
+        assert fresh_preview["optimization_mode"] == "conditional-evidence-bootstrap"
+        assert fresh_preview["planned_provider_ids"] == [
+            "longcat",
+            "deepseek",
+            "codex",
+        ]
         first = required_cli(
             temp,
             "dispatch",
@@ -695,10 +694,91 @@ def main() -> int:
         chain_results = [row for row in trusted if row.get("task_id") == task_id]
         assert len(chain_results) == 3
         assert [row["tier"] for row in chain_results] == ["low", "medium", "high"]
+
+        # One sample per continuation is intentionally below the bootstrap
+        # reliability threshold. A second route therefore seals the same full
+        # plan, but explicit leader acceptance at low must stop before any peer
+        # or stronger provider is called.
+        early_task_id = cli(
+            temp,
+            "new-task",
+            "--project",
+            str(project_dir),
+            "--title",
+            "leader early stop",
+            "--purpose",
+            "prove accepted bootstrap steps do not spend successors",
+            "--task-type",
+            "analysis",
+            "--difficulty",
+            "normal",
+            "--estimated-input-tokens",
+            "1000000",
+            "--estimated-output-tokens",
+            "10000",
+        )["task_id"]
+        early_preview = load_task(layout, early_task_id)["route_preview"]
+        assert early_preview["optimization_mode"] == "conditional-evidence-bootstrap"
+        assert early_preview["planned_provider_ids"] == [
+            "longcat",
+            "deepseek",
+            "codex",
+        ]
+        early_dispatch = required_cli(
+            temp,
+            "dispatch",
+            "--project",
+            str(project_dir),
+            "--task",
+            early_task_id,
+        )
+        early_actor_id = early_dispatch["actor_id"]
+        early_actor = load_actor(layout, early_actor_id)
+        with patch(
+            "costmarshal_v2.actor_runner.OciCliBackend",
+            side_effect=ThreeTierOciBackend,
+        ):
+            returncode = run_actor(
+                layout,
+                early_actor_id,
+                attempt_id=early_actor["attempt_id"],
+                launch_token=early_actor["launch_token"],
+            )
+        assert returncode == 0
+        for _ in range(6):
+            cli(temp, "run-scheduler", "--project", str(project_dir), "--once")
+            early_task = load_task(layout, early_task_id)
+            early_attempt = early_task["attempts"][-1]
+            if early_attempt["status"] != "running":
+                break
+        assert early_attempt["status"] == "waiting_leader", early_attempt
+        cli(
+            temp,
+            "record-result",
+            "--command-id",
+            "CMD-bootstrap-early-accept",
+            "--project",
+            str(project_dir),
+            "--task",
+            early_task_id,
+            "--attempt",
+            early_attempt["attempt_id"],
+            "--actor",
+            early_actor_id,
+            "--status",
+            "done",
+            "--quality-score",
+            "5",
+            "--accepted-by-leader",
+        )
+        early_task = load_task(layout, early_task_id)
+        assert early_task["status"] == "done"
+        assert [attempt["tier"] for attempt in early_task["attempts"]] == ["low"]
         assert ThreeTierOciBackend.provider_calls == [
             "LONGCAT_API_KEY",
             "DEEPSEEK_API_KEY",
             "CODEX_API_KEY",
+            "LONGCAT_API_KEY",
         ]
         assert cli(temp, "validate", "--project", str(project_dir))["status"] == "ok"
         print("three tier required integration ok")

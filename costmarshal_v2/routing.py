@@ -23,6 +23,7 @@ from typing import Any, Iterable, Mapping, Sequence
 CATALOG_SCHEMA_VERSION = 1
 ROUTE_PLAN_SCHEMA_VERSION = "costmarshal-route-plan-v1"
 MAX_ENABLED_PROVIDERS_PER_TIER = 16
+BOOTSTRAP_MIN_CONDITIONAL_OBSERVATIONS = 10
 TIERS = ("low", "medium", "high")
 TIER_RANK = {tier: index for index, tier in enumerate(TIERS)}
 RISKS = {"low", "medium", "high"}
@@ -1458,6 +1459,7 @@ def _rank_candidates(
     allow_costs: bool = True,
     execution_identities: Mapping[str, ExecutionIdentity] | None = None,
     _history_is_deduplicated: bool = False,
+    rank_by_cost_per_accepted: bool = False,
 ) -> list[tuple[dict[str, Any], AcceptancePrior, Decimal | None]]:
     rows: list[tuple[dict[str, Any], AcceptancePrior, Decimal | None]] = []
     history_rows = (
@@ -1488,15 +1490,31 @@ def _rank_candidates(
         )
         cost = None if cost_units is None else Decimal(cost_units) / _NANO_CNY
         rows.append((provider, prior, cost))
-    rows.sort(
-        key=lambda item: (
-            item[0]["priority"],
-            -item[1].conservative_probability,
-            item[2] is None,
-            item[2] if item[2] is not None else math.inf,
-            item[0]["provider_id"],
+    if rank_by_cost_per_accepted:
+        rows.sort(
+            key=lambda item: (
+                item[2] is None or item[1].conservative_probability <= 0,
+                (
+                    item[2] / Decimal(str(item[1].conservative_probability))
+                    if item[2] is not None and item[1].conservative_probability > 0
+                    else Decimal("Infinity")
+                ),
+                -item[1].conservative_probability,
+                item[2] if item[2] is not None else Decimal("Infinity"),
+                item[0]["priority"],
+                item[0]["provider_id"],
+            )
         )
-    )
+    else:
+        rows.sort(
+            key=lambda item: (
+                item[0]["priority"],
+                -item[1].conservative_probability,
+                item[2] is None,
+                item[2] if item[2] is not None else math.inf,
+                item[0]["provider_id"],
+            )
+        )
     return rows
 
 
@@ -1523,6 +1541,10 @@ def _auto_chain_plans(
     )
     conditional_evidence_index = _conditional_evidence_index(history_rows)
     conditional_prior_cache: dict[
+        tuple[str, ExecutionIdentity, tuple[PredecessorExecutionIdentity, ...]],
+        AcceptancePrior,
+    ] = {}
+    conditional_exact_prior_cache: dict[
         tuple[str, ExecutionIdentity, tuple[PredecessorExecutionIdentity, ...]],
         AcceptancePrior,
     ] = {}
@@ -1574,6 +1596,7 @@ def _auto_chain_plans(
             continuation = [row for row in optional_continuation if row is not None]
             marginal_chain = [start_row, *continuation]
             chain: list[tuple[dict[str, Any], AcceptancePrior, Decimal | None]] = []
+            conditional_exact_observations: list[int] = []
             predecessor_identities: list[PredecessorExecutionIdentity] = []
             for index, (item_provider, marginal_prior, item_cost) in enumerate(marginal_chain):
                 item_identity = _provider_execution_identity(
@@ -1602,6 +1625,21 @@ def _auto_chain_plans(
                             _evidence_index=conditional_evidence_index,
                         )
                         conditional_prior_cache[cache_key] = item_prior
+                    exact_item_prior = conditional_exact_prior_cache.get(cache_key)
+                    if exact_item_prior is None:
+                        exact_item_prior = conditional_leader_acceptance_prior(
+                            history_rows,
+                            item_provider["provider_id"],
+                            predecessor_execution_identities=predecessor_identities,
+                            task_type=task_type,
+                            difficulty=difficulty,
+                            execution_identity=item_identity,
+                            _history_is_deduplicated=True,
+                            require_exact_scope=True,
+                            _evidence_index=conditional_evidence_index,
+                        )
+                        conditional_exact_prior_cache[cache_key] = exact_item_prior
+                    conditional_exact_observations.append(exact_item_prior.observations)
                 chain.append((item_provider, item_prior, item_cost))
                 predecessor_identities.append(
                     (
@@ -1657,6 +1695,9 @@ def _auto_chain_plans(
                     "_expected_cost_exact": expected_cost,
                     "_success_probability_exact": success_probability,
                     "_objective_exact": objective,
+                    "_conditional_exact_observations": tuple(
+                        conditional_exact_observations
+                    ),
                 }
             )
     plans.sort(
@@ -1668,6 +1709,47 @@ def _auto_chain_plans(
         )
     )
     return plans
+
+
+def _conditional_bootstrap_plan(
+    plans: Sequence[dict[str, Any]],
+    enabled: Sequence[dict[str, Any]],
+    *,
+    floor: str,
+) -> dict[str, Any] | None:
+    """Return the most cost-efficient full chain until its lineage is reliable.
+
+    This is an evidence-collection policy, not an assumed-success model.  The
+    plan retains the real conservative probabilities (including zero for an
+    unseen continuation), while leader acceptance still stops the chain before
+    any unnecessary successor call.
+    """
+
+    available_tiers = tuple(
+        tier
+        for tier in TIERS[TIER_RANK[floor] :]
+        if any(provider["tier"] == tier for provider in enabled)
+    )
+    if len(available_tiers) <= 1:
+        return None
+    full_plans = [
+        plan
+        for plan in plans
+        if tuple(step["tier"] for step in plan["steps"]) == available_tiers
+    ]
+    if not full_plans:
+        return None
+    # ``plans`` is already ordered by the exhaustive economic objective, so the
+    # canonical bootstrap lineage also chooses peers economically and remains
+    # deterministic under a frozen catalog/history snapshot.
+    plan = full_plans[0]
+    observations = plan["_conditional_exact_observations"]
+    if any(
+        count < BOOTSTRAP_MIN_CONDITIONAL_OBSERVATIONS
+        for count in observations
+    ):
+        return plan
+    return None
 
 
 def decide_route(
@@ -1808,6 +1890,12 @@ def decide_route(
         allow_costs=selection_pricing_ready,
         execution_identities=execution_identities,
         _history_is_deduplicated=True,
+        rank_by_cost_per_accepted=(
+            requested_provider_id is None
+            and requested_tier is not None
+            and input_tokens + cached_input_tokens + output_tokens > 0
+            and selection_pricing_ready
+        ),
     )
     provider, prior, cost = ranked[0]
     candidate_ids = tuple(item[0]["provider_id"] for item in ranked)
@@ -1865,7 +1953,12 @@ def decide_route(
                     raise RoutingValidationError(
                         f"no priced provider chain satisfies minimum success probability {minimum_success}"
                     )
-            best = plans[0]
+            bootstrap = (
+                _conditional_bootstrap_plan(plans, enabled, floor=floor)
+                if minimum_success is None or minimum_success == 0
+                else None
+            )
+            best = bootstrap or plans[0]
             provider = best["provider"]
             prior = best["prior"]
             cost = best["cost"]
@@ -1882,12 +1975,21 @@ def decide_route(
             expected_success_exact = best["_success_probability_exact"]
             expected_cost_per_accepted = best["objective"]
             expected_cost_per_accepted_exact = best["_objective_exact"]
-            optimization_mode = "expected-cost-per-accepted"
-            reason = (
-                f"cost-performance optimization selected {provider['provider_id']} as the first "
-                f"step of chain {' -> '.join(planned_provider_ids)}"
-            )
-            if minimum_success is None:
+            if bootstrap is not None:
+                optimization_mode = "conditional-evidence-bootstrap"
+                reason = (
+                    "conditional evidence bootstrap selected the most cost-efficient complete "
+                    f"monotonic chain {' -> '.join(planned_provider_ids)}; each successor "
+                    "runs only after an explicit leader rejection, and expected success "
+                    "uses observed conservative evidence rather than an assumed SLA probability"
+                )
+            else:
+                optimization_mode = "expected-cost-per-accepted"
+                reason = (
+                    f"cost-performance optimization selected {provider['provider_id']} as the first "
+                    f"step of chain {' -> '.join(planned_provider_ids)}"
+                )
+            if minimum_success is None and bootstrap is None:
                 reason += (
                     "; no success-probability floor is configured, so multi-provider "
                     "collaboration is permitted but not required"

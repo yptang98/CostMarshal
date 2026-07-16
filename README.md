@@ -13,6 +13,8 @@ Current version: `v2.4.0-beta`
 - Applies a fail-closed safety floor from risk, difficulty, and task type.
 - Filters providers by explicit required capabilities before cost optimization.
 - Exhaustively compares every safe monotonic priced chain, including early-stop and tier-skip plans, by expected cost per leader-accepted result.
+- Bootstraps missing exact conditional evidence across every available safe tier at or above the task floor (low→medium→high for a complete low-floor catalog, medium→high for a medium floor); successors still require leader rejection, and routing returns to the exhaustive economic objective after 10 matching observations per continuation. A high-floor route remains a single high-tier step.
+- Keeps explicit provider requests pinned; an explicit tier with complete prices and token estimates chooses same-tier peers by conservative cost per accepted result before using priority as a tie-breaker.
 - Follows the admitted monotonic provider chain (including an explicitly selected tier skip) and fences stale actor attempts.
 - Uses durable actors, mailboxes, reports, claims, usage records, and recovery state.
 - Binds every planned step to a price basis and reserves the full chain estimate in a task/project admission envelope before the first dispatch.
@@ -31,7 +33,7 @@ The safety floor always wins:
 | Low-risk bounded analysis, extraction, docs, tests, verification, or small edits | low |
 | Unknown or judgment-heavy task type | medium |
 
-When all enabled providers have reviewed prices and the task includes non-zero token estimates, CostMarshal evaluates every valid monotonic escalation subchain. This includes single-step, early-stop, and safe tier-skip plans; `--min-success-probability` filters them before the objective is minimized:
+When all enabled providers have reviewed prices and the task includes non-zero token estimates, CostMarshal evaluates every valid monotonic escalation subchain. This includes single-step, early-stop, and safe tier-skip plans; `--min-success-probability` filters them before the objective is minimized. Without a positive success floor, a chain whose exact continuation lineage has fewer than 10 matching observations enters `conditional-evidence-bootstrap`: CostMarshal seals the most cost-efficient complete monotonic chain, but each successor still requires an explicit leader rejection, so an accepted earlier result stops additional spend. Bootstrap never inserts an assumed success probability. Once the lineage is mature, routing returns to the exhaustive objective:
 
 ```text
 expected_chain_cost = C1 + (1-P1)C2 + (1-P1)(1-P2)C3
@@ -41,7 +43,7 @@ objective = expected_chain_cost / success_probability
 
 `Pi` is a conservative probability derived only from explicit leader acceptance records. If pricing or token estimates are missing, routing falls back to the minimum safe tier rather than inventing a cost.
 
-Use `--min-success-probability 0..1` to impose a task SLA floor on priced chains. Routing fails closed when no chain meets it. `init --default-min-success-probability P` stores a project default that is resolved and frozen into each new auto-routed task; a task-level value, including `0`, takes precedence. Omitting both keeps the beta-compatible objective, which permits but does not require multi-provider collaboration and says so in the route explanation.
+Use `--min-success-probability 0..1` to impose a task SLA floor on priced chains. Routing fails closed when no chain meets it. `init --default-min-success-probability P` stores a project default that is resolved and frozen into each new auto-routed task; a task-level value, including `0`, takes precedence. Omitting both (or explicitly using `0`) permits the evidence-bootstrap phase above; after its exact lineages mature, the ordinary objective may economically stop early or skip a tier.
 
 Each route position needs at least 10 trusted v3 observations for the exact task
 type, difficulty, provider profile SHA-256, and conditional predecessor lineage.

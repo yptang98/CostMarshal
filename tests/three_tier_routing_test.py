@@ -401,7 +401,7 @@ class ThreeTierRoutingTest(unittest.TestCase):
         self.assertEqual(backed_off.scope, "provider")
         self.assertEqual(backed_off.observations, 3)
 
-    def test_same_tier_selection_uses_priority_then_conservative_evidence(self) -> None:
+    def test_same_tier_selection_without_economic_inputs_uses_priority_then_evidence(self) -> None:
         catalog = default_provider_catalog()
         second = deepcopy(catalog["providers"][1])
         second["provider_id"] = "deepseek-alt"
@@ -434,6 +434,40 @@ class ThreeTierRoutingTest(unittest.TestCase):
         catalog["providers"][-1]["priority"] = 101
         priority_choice = decide_route({"risk": "medium"}, catalog, history=history)
         self.assertEqual(priority_choice.provider_id, "deepseek")
+
+    def test_explicit_tier_uses_conservative_cost_per_accepted_before_priority(self) -> None:
+        catalog = default_provider_catalog()
+        expensive = catalog["providers"][1]
+        expensive.update(
+            {
+                "priority": 0,
+                "input_cny_per_1m": 100.0,
+                "output_cny_per_1m": 100.0,
+            }
+        )
+        value = deepcopy(expensive)
+        value.update(
+            {
+                "provider_id": "deepseek-value",
+                "profile": "deepseek-value",
+                "priority": 1000,
+                "input_cny_per_1m": 1.0,
+                "output_cny_per_1m": 1.0,
+            }
+        )
+        catalog["providers"].append(value)
+
+        decision = decide_route(
+            {"risk": "medium", "task_type": "analysis"},
+            catalog,
+            requested_tier="medium",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+        )
+
+        self.assertEqual(decision.provider_id, "deepseek-value")
+        self.assertEqual(decision.candidate_provider_ids[0], "deepseek-value")
+        self.assertEqual(decision.estimated_cost_cny, 2.0)
 
     def test_acceptance_evidence_is_scoped_to_model_and_profile_identity(self) -> None:
         history = [
@@ -595,6 +629,7 @@ class ThreeTierRoutingTest(unittest.TestCase):
         decision = decide_route(
             {"risk": "low", "task_type": "analysis", "difficulty": "normal"},
             catalog,
+            history=paired_chain_history(),
             input_tokens=500_000,
             output_tokens=500_000,
         )
@@ -602,6 +637,86 @@ class ThreeTierRoutingTest(unittest.TestCase):
         self.assertEqual(decision.optimization_mode, "expected-cost-per-accepted")
         self.assertEqual(decision.planned_provider_ids, ("codex",))
         self.assertIsNotNone(decision.expected_cost_per_accepted_cny)
+
+    def test_fresh_priced_route_bootstraps_exact_low_medium_high_lineage(self) -> None:
+        catalog = default_provider_catalog()
+        for index, provider in enumerate(catalog["providers"], start=1):
+            provider["input_cny_per_1m"] = float(index)
+            provider["output_cny_per_1m"] = float(index)
+
+        decision = decide_route(
+            {"risk": "low", "task_type": "analysis", "difficulty": "normal"},
+            catalog,
+            input_tokens=1_000_000,
+        )
+
+        self.assertEqual(
+            decision.planned_provider_ids,
+            ("longcat", "deepseek", "codex"),
+        )
+        self.assertEqual(decision.optimization_mode, "conditional-evidence-bootstrap")
+        self.assertEqual(
+            [step["acceptance_prior"]["observations"] for step in decision.planned_steps],
+            [0, 0, 0],
+        )
+        self.assertEqual(
+            decision.expected_success_probability,
+            decision.acceptance_prior.conservative_probability,
+        )
+        self.assertIn("explicit leader rejection", decision.reason)
+        self.assertIn("rather than an assumed SLA probability", decision.reason)
+
+        medium = decide_route(
+            {"risk": "medium", "task_type": "analysis", "difficulty": "normal"},
+            catalog,
+            input_tokens=1_000_000,
+        )
+        self.assertEqual(medium.planned_provider_ids, ("deepseek", "codex"))
+        self.assertEqual(medium.optimization_mode, "conditional-evidence-bootstrap")
+
+        high = decide_route(
+            {"risk": "high", "task_type": "analysis", "difficulty": "normal"},
+            catalog,
+            input_tokens=1_000_000,
+        )
+        self.assertEqual(high.planned_provider_ids, ("codex",))
+        self.assertEqual(high.optimization_mode, "expected-cost-per-accepted")
+
+    def test_bootstrap_requires_ten_exact_observations_then_returns_to_economics(self) -> None:
+        catalog = default_provider_catalog()
+        prices = {"longcat": 80.0, "deepseek": 20.0, "codex": 1.0}
+        for provider in catalog["providers"]:
+            price = prices[provider["provider_id"]]
+            provider["input_cny_per_1m"] = price
+            provider["output_cny_per_1m"] = price
+
+        nine = decide_route(
+            {"risk": "low", "task_type": "analysis", "difficulty": "normal"},
+            catalog,
+            history=paired_chain_history(
+                total=9,
+                low_accepts=0,
+                medium_accepts=0,
+                high_accepts=0,
+            ),
+            input_tokens=1_000_000,
+        )
+        self.assertEqual(nine.optimization_mode, "conditional-evidence-bootstrap")
+        self.assertEqual(nine.planned_provider_ids, ("longcat", "deepseek", "codex"))
+
+        ten = decide_route(
+            {"risk": "low", "task_type": "analysis", "difficulty": "normal"},
+            catalog,
+            history=paired_chain_history(
+                total=10,
+                low_accepts=0,
+                medium_accepts=0,
+                high_accepts=0,
+            ),
+            input_tokens=1_000_000,
+        )
+        self.assertEqual(ten.optimization_mode, "expected-cost-per-accepted")
+        self.assertEqual(ten.planned_provider_ids, ("codex",))
 
     def test_cross_tier_optimizer_keeps_cheap_escalation_chain(self) -> None:
         catalog = default_provider_catalog()
@@ -755,9 +870,11 @@ class ThreeTierRoutingTest(unittest.TestCase):
         unconstrained = decide_route(
             {"risk": "low", "task_type": "analysis"},
             catalog,
+            history=paired_chain_history(),
             input_tokens=1_000_000,
         )
         self.assertEqual(unconstrained.planned_provider_ids, ("longcat",))
+        self.assertEqual(unconstrained.optimization_mode, "expected-cost-per-accepted")
         skip_history = []
         for row in paired_chain_history(medium_accepts=0, high_accepts=115):
             if row["provider_id"] == "deepseek":

@@ -35,6 +35,7 @@ from costmarshal_v2.routing import (  # noqa: E402
     validate_provider_catalog,
 )
 from costmarshal_v2.scheduler import validate_token_triplet  # noqa: E402
+from three_tier_routing_test import paired_chain_history  # noqa: E402
 
 
 NOW = "2026-07-16T12:00:00Z"
@@ -491,6 +492,7 @@ class PricingMetadataTest(unittest.TestCase):
         ordinary = decide_route(
             {"risk": "low", "task_type": "analysis"},
             catalog,
+            history=paired_chain_history(),
             input_tokens=1_000_000,
             output_tokens=0,
             now=NOW,
@@ -498,6 +500,7 @@ class PricingMetadataTest(unittest.TestCase):
         cached = decide_route(
             {"risk": "low", "task_type": "analysis"},
             catalog,
+            history=paired_chain_history(),
             input_tokens=0,
             cached_input_tokens=1_000_000,
             output_tokens=0,
@@ -649,7 +652,7 @@ class PricingMetadataTest(unittest.TestCase):
             now=NOW,
         )
         self.assertEqual(decision.pricing_status, "beta-legacy")
-        self.assertEqual(decision.optimization_mode, "expected-cost-per-accepted")
+        self.assertEqual(decision.optimization_mode, "conditional-evidence-bootstrap")
         self.assertIsNone(decision.price_snapshot)
         self.assertIsNotNone(decision.estimated_cost_cny)
 
