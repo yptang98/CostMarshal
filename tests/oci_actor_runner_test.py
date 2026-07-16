@@ -456,6 +456,50 @@ class RecoveryLogsOverflowAdapter(FakeOciAdapter):
         )
 
 
+class AttachInspectionFailureAdapter(FakeOciAdapter):
+    """Fail one recovery attach while the durable container may still be live."""
+
+    attach_calls = 0
+    start_calls = 0
+
+    def start(self, spec, command, *, stdin_prompt: str):
+        self.__class__.start_calls += 1
+        raise AssertionError("outcome-unknown recovery attempted a fresh provider start")
+
+    def attach(self, spec, *, container_name: str, container_id: str | None, command):
+        self.__class__.attach_calls += 1
+        validate_execution_spec(spec)
+        assert container_name == _expected_oci_container_name(spec)
+        assert container_id == "7" * 64
+        assert tuple(command) == (
+            "costmarshal-worker",
+            "--jsonl",
+            "--model",
+            "LongCat-2.0",
+        )
+        if self.__class__.attach_calls == 1:
+            raise WorkerExecutionError(
+                "lifecycle_command_failed",
+                "transient inspect failure while the container may still be live",
+            )
+        return SimpleNamespace(
+            spec=spec,
+            container_name=container_name,
+            container_id=str(container_id),
+            command=tuple(command),
+            network_id="c" * 64,
+            recovered=True,
+            attestation=SimpleNamespace(
+                to_dict=lambda: {
+                    "schema": "costmarshal-worker-isolation-attestation-v1",
+                    "backend": "docker",
+                    "image": IMAGE,
+                    "strong_isolation": True,
+                }
+            ),
+        )
+
+
 class LegacyRecoveryOnlyAdapter(FakeOciAdapter):
     """Prove a legacy authority may attach/clean but never fresh-start OCI."""
 
@@ -1311,6 +1355,115 @@ raise SystemExit(actor_runner.run_actor(
         assert not unknown_usage_task["attempts"][-1].get("cost_settled")
         unknown_usage_commands = queued_command_args(project_dir, "V2-0005", "record_usage")
         assert unknown_usage_commands == [], unknown_usage_commands
+
+        # A transient attach/inspect failure is not proof that a durable OCI
+        # identity is absent. Preserve its credential and outcome-unknown state,
+        # then prove a later recovery attaches to the same ID without a fresh
+        # provider start.
+        cli(
+            temp,
+            "new-task",
+            "--project",
+            str(project_dir),
+            "--title",
+            "attach uncertainty",
+            "--purpose",
+            "preserve a live container across transient recovery inspection failure",
+        )
+        attach_dispatch = cli(
+            temp,
+            "dispatch",
+            "--project",
+            str(project_dir),
+            "--task",
+            "V2-0006",
+            "--unsafe-native",
+        )
+        attach_actor = load_actor(layout, attach_dispatch["actor_id"])
+        attach_actor["isolation"] = json.loads(json.dumps(actor["isolation"]))
+        attach_actor = bind_required_collaboration(layout, project, attach_actor)
+        attach_workspace = persist_projection_fixture(
+            layout,
+            project,
+            attach_actor,
+        )
+        with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
+            attach_spec, attach_command, _ = _required_worker_bundle(
+                layout,
+                project,
+                attach_actor,
+                execution_workspace=attach_workspace,
+                workspace_mode="read-only",
+            )
+        assert attach_spec.credential_path is not None
+        assert attach_spec.credential_path.is_file()
+        attach_actor = load_actor(layout, attach_actor["id"])
+        attach_actor.setdefault("runtime", {}).update(
+            {
+                "container_name": _expected_oci_container_name(attach_spec),
+                "container_id": "7" * 64,
+                "container_command": list(attach_command),
+                "container_network_id": "c" * 64,
+                "oci_lifecycle_state": "started",
+            }
+        )
+        attach_actor["runtime"]["credential_cleanup"]["status"] = "pending"
+        with control_document_transaction(layout):
+            save_actor(layout, attach_actor)
+        attach_report = (
+            project_dir
+            / "tasks"
+            / "V2-0006"
+            / "attempts"
+            / f"{attach_actor['id']}.md"
+        )
+        AttachInspectionFailureAdapter.attach_calls = 0
+        AttachInspectionFailureAdapter.start_calls = 0
+        with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False), patch(
+            "costmarshal_v2.actor_runner.OciWorkerExecutionAdapter",
+            AttachInspectionFailureAdapter,
+        ):
+            attach_uncertain_returncode = run_actor(
+                layout,
+                attach_actor["id"],
+                attempt_id=attach_actor["attempt_id"],
+                launch_token=attach_actor["launch_token"],
+            )
+        assert attach_uncertain_returncode == 125
+        attach_uncertain = load_actor(layout, attach_actor["id"])
+        assert attach_uncertain["status"] == "needs_recovery"
+        assert attach_uncertain["runtime"]["oci_lifecycle_state"] == "uncertain_cleanup"
+        assert attach_uncertain["runtime"]["container_cleanup_unconfirmed"] is True
+        assert attach_uncertain["runtime"]["credential_cleanup"]["status"] == "pending"
+        assert attach_spec.credential_path.is_file()
+        assert attach_uncertain["runtime"].get("provider_execution_state") != "finished"
+        assert not attach_report.exists()
+        attach_uncertain_task = load_task(layout, "V2-0006")
+        assert attach_uncertain_task["status"] == "needs_recovery"
+        assert attach_uncertain_task["attempts"][-1]["status"] == "needs_recovery"
+        assert queued_command_args(project_dir, "V2-0006", "collect_task") == []
+        assert AttachInspectionFailureAdapter.attach_calls == 1
+        assert AttachInspectionFailureAdapter.start_calls == 0
+
+        with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False), patch(
+            "costmarshal_v2.actor_runner.OciWorkerExecutionAdapter",
+            AttachInspectionFailureAdapter,
+        ):
+            attach_recovered_returncode = run_actor(
+                layout,
+                attach_actor["id"],
+                attempt_id=attach_actor["attempt_id"],
+                launch_token=attach_actor["launch_token"],
+            )
+        assert attach_recovered_returncode == 0
+        attach_recovered = load_actor(layout, attach_actor["id"])
+        assert attach_recovered["runtime"]["provider_execution_state"] == "finished"
+        assert attach_recovered["runtime"]["oci_lifecycle_state"] == "cleaned"
+        assert attach_recovered["runtime"]["credential_cleanup"]["status"] == "deleted"
+        assert not attach_spec.credential_path.exists()
+        assert attach_report.is_file()
+        assert AttachInspectionFailureAdapter.attach_calls == 2
+        assert AttachInspectionFailureAdapter.start_calls == 0
         print("oci actor runner ok")
         print(
             "COSTMARSHAL_RUNTIME_EVIDENCE="
@@ -1329,6 +1482,7 @@ raise SystemExit(actor_runner.run_actor(
                         "oci_prepared_before_start",
                         "deterministic_name_attach_after_hard_exit",
                         "cleanup_unconfirmed_preserves_credential",
+                        "attach_inspect_failure_preserves_live_identity",
                         "recovered_usage_unknown_preserves_budget_reservation",
                     ],
                     "provider_calls": 1,

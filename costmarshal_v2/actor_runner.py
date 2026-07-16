@@ -1770,7 +1770,15 @@ def _required_worker_bundle(
         runtime.get("container_name")
         and runtime.get("container_command")
         and (
-            runtime.get("oci_lifecycle_state") in {"prepared", "started", "finished", "cleaned"}
+            runtime.get("oci_lifecycle_state")
+            in {
+                "prepared",
+                "started",
+                "finished",
+                "cleaned",
+                "uncertain_start",
+                "uncertain_cleanup",
+            }
             or runtime.get("container_id")
             or runtime.get("provider_execution_state") == PROVIDER_COMPLETION_PENDING
         )
@@ -2631,7 +2639,8 @@ def _run_actor_once(
         recovering_existing = bool(
             prepared_identity
             and (
-                existing_lifecycle in {"started", "finished"}
+                existing_lifecycle
+                in {"started", "finished", "uncertain_start", "uncertain_cleanup"}
                 or existing_runtime.get("container_id")
             )
         )
@@ -2885,6 +2894,30 @@ def _run_actor_once(
                 )
             else:
                 failure = exc
+            if (
+                handle is None
+                and prepared_identity
+                and not failure.details.get("container_cleanup_unconfirmed")
+            ):
+                # A durable deterministic name/argv means an OCI create may
+                # already have succeeded. An attach/inspect error is not proof
+                # of absence: retain the credential and the outcome-unknown
+                # attempt so STOP or a later identity-verified recovery can
+                # inspect/clean the same container without another provider
+                # launch.
+                failure = WorkerExecutionError(
+                    "container_recovery_unconfirmed",
+                    "OCI recovery could not confirm the durable container lifecycle; "
+                    "container and credential cleanup remain pending",
+                    details={
+                        **failure.details,
+                        "container_cleanup_unconfirmed": True,
+                        "container_name": existing_container_name
+                        or expected_container_name,
+                        "container_id": existing_runtime.get("container_id"),
+                        "recovery_error": failure.code,
+                    },
+                )
             failure_details = failure.details
             if failure_details.get("container_cleanup_unconfirmed"):
 
@@ -2897,7 +2930,11 @@ def _run_actor_once(
                         allow_provider_started=True,
                     )
                     uncertain_runtime = current_actor.setdefault("runtime", {})
-                    uncertain_runtime["oci_lifecycle_state"] = "uncertain_start"
+                    uncertain_runtime["oci_lifecycle_state"] = (
+                        "uncertain_cleanup"
+                        if failure_details.get("recovery_error")
+                        else "uncertain_start"
+                    )
                     uncertain_runtime["container_name"] = failure_details.get(
                         "container_name"
                     ) or expected_container_name
