@@ -6,18 +6,22 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import costmarshal_v2.control_store as control_store_module  # noqa: E402
 from costmarshal_v2.control_store import (  # noqa: E402
     ControlStoreConflict,
     ControlStoreError,
     ControlStoreNotEnabled,
     FAULT_ENV,
+    audit_project_views,
     control_store_enabled,
     control_store_pragmas,
     control_transaction,
@@ -288,6 +292,114 @@ raise AssertionError('fault point did not exit')
             migrate_legacy_store(layout)
         self.assertFalse(database_path(layout).exists())
         self.assertFalse(marker_path(layout).exists())
+
+    def test_repair_audit_cannot_delete_concurrently_materialized_new_view(self) -> None:
+        layout = make_project(self.base, "audit-materializer-race")
+        migrate_legacy_store(layout)
+        relative = "scheduler/actors/agent-v2-new.json"
+        target = layout.project_dir / relative
+        content = json.dumps(
+            {"schema_version": 2, "id": "agent-v2-new", "status": "ready"},
+            indent=2,
+        ) + "\n"
+        audit_at_file_snapshot = threading.Event()
+        writer_committed = threading.Event()
+        writer_materialized = threading.Event()
+        audit_errors: list[BaseException] = []
+        writer_errors: list[BaseException] = []
+        audit_result: list[dict[str, object]] = []
+        original_rglob = Path.rglob
+        original_materialize = control_store_module._materialize_one
+
+        def barrier_rglob(path: Path, pattern: str):
+            if (
+                threading.current_thread().name == "repair-audit"
+                and path.resolve() == layout.project_dir.resolve()
+            ):
+                audit_at_file_snapshot.set()
+                if not writer_committed.wait(timeout=5):
+                    raise AssertionError("concurrent writer did not commit")
+                # Under the fixed locking order the writer cannot materialize
+                # until the audit releases the materializer lock.  Under the
+                # old order it reaches this point and exposes the deletion race.
+                writer_materialized.wait(timeout=0.25)
+            return original_rglob(path, pattern)
+
+        def observed_materialize(*args: object, **kwargs: object) -> None:
+            original_materialize(*args, **kwargs)
+            if threading.current_thread().name == "concurrent-materializer":
+                writer_materialized.set()
+
+        def run_audit() -> None:
+            try:
+                audit_result.append(audit_project_views(layout, repair=True))
+            except BaseException as exc:  # noqa: BLE001 - thread assertion handoff
+                audit_errors.append(exc)
+
+        def write_new_authoritative_view() -> None:
+            connection = sqlite3.connect(database_path(layout), timeout=5)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    "INSERT INTO documents(path, content, content_sha256, updated_at) VALUES(?, ?, ?, ?)",
+                    (
+                        relative,
+                        content,
+                        control_store_module._sha256_text(content),
+                        control_store_module._now(),
+                    ),
+                )
+                control_store_module._mark_dirty(connection, relative, "document")
+                connection.commit()
+                writer_committed.set()
+            except BaseException as exc:  # noqa: BLE001 - thread assertion handoff
+                writer_errors.append(exc)
+                if connection.in_transaction:
+                    connection.rollback()
+                writer_committed.set()
+                return
+            finally:
+                connection.close()
+            try:
+                reconcile_project_views(layout)
+            except BaseException as exc:  # noqa: BLE001 - thread assertion handoff
+                writer_errors.append(exc)
+
+        with (
+            patch("pathlib.Path.rglob", barrier_rglob),
+            patch("costmarshal_v2.control_store._materialize_one", observed_materialize),
+        ):
+            audit_thread = threading.Thread(target=run_audit, name="repair-audit", daemon=True)
+            audit_thread.start()
+            self.assertTrue(audit_at_file_snapshot.wait(timeout=5))
+            writer_thread = threading.Thread(
+                target=write_new_authoritative_view,
+                name="concurrent-materializer",
+                daemon=True,
+            )
+            writer_thread.start()
+            audit_thread.join(timeout=10)
+            writer_thread.join(timeout=10)
+
+        self.assertFalse(audit_thread.is_alive(), "repair audit deadlocked")
+        self.assertFalse(writer_thread.is_alive(), "concurrent materializer deadlocked")
+        self.assertEqual(audit_errors, [])
+        self.assertEqual(writer_errors, [])
+        self.assertTrue(writer_materialized.is_set())
+        self.assertEqual(len(audit_result), 1)
+        self.assertNotIn(relative, audit_result[0]["ghosts"])
+        self.assertNotIn(relative, audit_result[0]["repaired"])
+        self.assertEqual(target.read_text(encoding="utf-8"), content)
+        connection = sqlite3.connect(database_path(layout))
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM dirty_views WHERE path=?", (relative,)
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
 
 
 if __name__ == "__main__":

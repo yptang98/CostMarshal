@@ -841,69 +841,78 @@ def audit_project_views(
 
     upgrade_control_store(layout)
     reconcile_project_views(layout)
-    connection = _connect(layout)
-    expected: dict[str, str] = {}
-    try:
-        _schema(connection)
-        for row in connection.execute("SELECT path, content FROM documents").fetchall():
-            expected[str(row["path"])] = str(row["content"])
-        ledger_paths = [
-            str(row["path"])
-            for row in connection.execute(
-                "SELECT DISTINCT path FROM ledger_entries ORDER BY path"
-            ).fetchall()
-        ]
-        for relative in ledger_paths:
-            rows = connection.execute(
-                "SELECT content FROM ledger_entries WHERE path=? ORDER BY sequence",
-                (relative,),
-            ).fetchall()
-            expected[relative] = "".join(f"{row['content']}\n" for row in rows)
-    finally:
-        connection.close()
-
-    actual_paths = {
-        _relative(layout, path): path
-        for path in sorted(layout.project_dir.rglob("*"))
-        if path.is_file() and _controlled_file(layout, path)
-    }
-    drifted: list[str] = []
-    for relative, content in expected.items():
-        path = layout.project_dir / Path(relative)
+    # Hold the cross-process materializer fence while taking both sides of the
+    # comparison.  Without this fence, a writer can commit and materialize a
+    # new compatibility view after ``expected`` is read; a repairing startup
+    # audit then mistakes that valid new view for a ghost and deletes it.  The
+    # explicit read transaction pins one WAL snapshot even if another writer
+    # commits while the materializer fence is held.
+    with materializer_lock(layout):
+        connection = _connect(layout)
+        expected: dict[str, str] = {}
         try:
-            actual = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            actual = None
-        if actual != content:
-            drifted.append(relative)
-    ghosts = sorted(
-        relative
-        for relative in set(actual_paths) - set(expected)
-        if not (
-            actual_paths[relative].suffix.casefold() == ".jsonl"
-            and actual_paths[relative].read_bytes() == b""
-        )
-    )
+            _schema(connection)
+            connection.execute("BEGIN")
+            for row in connection.execute("SELECT path, content FROM documents").fetchall():
+                expected[str(row["path"])] = str(row["content"])
+            ledger_paths = [
+                str(row["path"])
+                for row in connection.execute(
+                    "SELECT DISTINCT path FROM ledger_entries ORDER BY path"
+                ).fetchall()
+            ]
+            for relative in ledger_paths:
+                rows = connection.execute(
+                    "SELECT content FROM ledger_entries WHERE path=? ORDER BY sequence",
+                    (relative,),
+                ).fetchall()
+                expected[relative] = "".join(f"{row['content']}\n" for row in rows)
 
-    repaired: list[str] = []
-    if repair and (drifted or ghosts):
-        with materializer_lock(layout):
-            for relative in sorted(drifted):
-                path = (layout.project_dir / Path(relative)).resolve()
-                if not _controlled_file(layout, path):
-                    raise ControlStoreError(
-                        f"refusing to repair an unsafe compatibility path: {relative}"
-                    )
-                _write_atomic(path, expected[relative])
-                repaired.append(relative)
-            for relative in ghosts:
-                path = actual_paths[relative].resolve()
-                if not _controlled_file(layout, path):
-                    raise ControlStoreError(
-                        f"refusing to remove an unsafe ghost compatibility path: {relative}"
-                    )
-                path.unlink(missing_ok=True)
-                repaired.append(relative)
+            actual_paths = {
+                _relative(layout, path): path
+                for path in sorted(layout.project_dir.rglob("*"))
+                if path.is_file() and _controlled_file(layout, path)
+            }
+            drifted: list[str] = []
+            for relative, content in expected.items():
+                path = layout.project_dir / Path(relative)
+                try:
+                    actual = path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    actual = None
+                if actual != content:
+                    drifted.append(relative)
+            ghosts = sorted(
+                relative
+                for relative in set(actual_paths) - set(expected)
+                if not (
+                    actual_paths[relative].suffix.casefold() == ".jsonl"
+                    and actual_paths[relative].read_bytes() == b""
+                )
+            )
+
+            repaired: list[str] = []
+            if repair and (drifted or ghosts):
+                for relative in sorted(drifted):
+                    path = (layout.project_dir / Path(relative)).resolve()
+                    if not _controlled_file(layout, path):
+                        raise ControlStoreError(
+                            f"refusing to repair an unsafe compatibility path: {relative}"
+                        )
+                    _write_atomic(path, expected[relative])
+                    repaired.append(relative)
+                for relative in ghosts:
+                    path = actual_paths[relative].resolve()
+                    if not _controlled_file(layout, path):
+                        raise ControlStoreError(
+                            f"refusing to remove an unsafe ghost compatibility path: {relative}"
+                        )
+                    path.unlink(missing_ok=True)
+                    repaired.append(relative)
+        finally:
+            if connection.in_transaction:
+                connection.rollback()
+            connection.close()
     return {
         "status": "ok" if not drifted and not ghosts else "repaired" if repair else "drifted",
         "drifted": sorted(drifted),
