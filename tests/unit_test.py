@@ -82,6 +82,8 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="costmarshal-v2-unit-") as tmp:
         project = Path(tmp) / "project"
         layout = ProjectLayout(root=Path(tmp), project_dir=project)
+        assert_true(layout.root == Path(tmp).resolve(), "project layout root should be canonical")
+        assert_true(layout.project_dir == project.resolve(), "project directory should be canonical")
         actor = {
             "id": "agent-v2-0001",
             "task_id": "V2-0001",

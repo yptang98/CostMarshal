@@ -12,6 +12,17 @@ class ProjectLayout:
     root: Path
     project_dir: Path
 
+    def __post_init__(self) -> None:
+        # Every authority/CAS path is compared lexically after this boundary.
+        # Canonicalize once so Windows 8.3 aliases and relative callers cannot
+        # create two spellings for the same trusted root.
+        object.__setattr__(self, "root", Path(self.root).expanduser().resolve())
+        object.__setattr__(
+            self,
+            "project_dir",
+            Path(self.project_dir).expanduser().resolve(),
+        )
+
     @property
     def project_json(self) -> Path:
         return self.project_dir / "project.json"
