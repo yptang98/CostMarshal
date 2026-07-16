@@ -200,7 +200,7 @@ def ensure_workspace_containment(
     root = Path(workspace).expanduser().resolve(strict=True)
     candidate_text = os.fspath(candidate)
     windows_candidate = PureWindowsPath(candidate_text)
-    if os.name != "nt" and (windows_candidate.drive or windows_candidate.root):
+    if os.name != "nt" and (windows_candidate.drive or candidate_text.startswith("\\")):
         raise SecurityValidationError("candidate uses an absolute Windows path outside this workspace")
     raw_candidate = Path(candidate_text).expanduser()
     joined = raw_candidate if raw_candidate.is_absolute() else root / raw_candidate

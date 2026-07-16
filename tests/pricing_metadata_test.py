@@ -682,6 +682,9 @@ class PricingMetadataTest(unittest.TestCase):
             workspace.mkdir()
             catalog_path = temp / "catalog.json"
             catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+            profile_home = temp / "codex-home"
+            env = dict(os.environ)
+            env["CODEX_HOME"] = str(profile_home)
 
             def run(*args: str) -> dict:
                 completed = subprocess.run(
@@ -692,10 +695,16 @@ class PricingMetadataTest(unittest.TestCase):
                     errors="replace",
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    check=True,
+                    env=env,
+                    check=False,
                 )
+                if completed.returncode != 0:
+                    raise AssertionError(
+                        f"command failed: {args}\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+                    )
                 return json.loads(completed.stdout)
 
+            run("configure-profiles", "--codex-home", str(profile_home))
             created = run(
                 "init",
                 "--name",
