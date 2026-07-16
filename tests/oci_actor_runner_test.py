@@ -51,6 +51,7 @@ IMAGE = "ghcr.io/example/costmarshal-worker@sha256:" + ("a" * 64)
 def cli(temp: Path, *args: str) -> dict:
     environment = os.environ.copy()
     environment["COSTMARSHAL_V2_HOME"] = str(temp / "runtime")
+    environment["CODEX_HOME"] = str(temp / "codex-home")
     completed = subprocess.run(
         [sys.executable, str(CLI), "--root", str(temp / "runtime"), *args],
         text=True,
