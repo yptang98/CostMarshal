@@ -111,6 +111,14 @@ class ChangeApplyTests(unittest.TestCase):
             change_artifact_root=persisted.artifact_root,
             preview_root=preview_root,
         )
+        # The durable project/preview authority stores canonical absolute paths.
+        # On Windows, tempfile may expose an 8.3 alias that ``resolve()`` expands
+        # during preview creation; passing that alias to the I/O-free parser
+        # would correctly fail its exact binding check.  Reuse the already
+        # frozen canonical receipts so this test exercises only the no-I/O
+        # parsing boundary on every platform.
+        frozen_repository = preview.repository
+        frozen_preview_root = preview.patch_path.parents[2]
         with mock.patch(
             "costmarshal_v2.change_apply._run_git",
             side_effect=AssertionError("intent parser must not invoke Git"),
@@ -129,11 +137,11 @@ class ChangeApplyTests(unittest.TestCase):
         ):
             frozen = prepared_change_preview_intent_from_dict(
                 preview.to_dict(),
-                expected_repository=self.repository,
+                expected_repository=frozen_repository,
                 expected_base_sha=self.base_sha,
                 expected_write_scope=["src"],
                 expected_change_manifest_sha256=prepared.manifest_sha256,
-                expected_preview_root=preview_root,
+                expected_preview_root=frozen_preview_root,
             )
         self.assertEqual(frozen.to_dict(), preview.to_dict())
 
