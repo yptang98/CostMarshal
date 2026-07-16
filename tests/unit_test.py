@@ -21,6 +21,7 @@ from costmarshal_v2.scheduler import (  # noqa: E402
     _validate_spawn_observation,
     _validate_stop_effect,
     STOP_EFFECT_TYPE,
+    default_backend_session_name,
     normalize_claim_path,
     paths_conflict,
     summarize_leader_self_work,
@@ -55,6 +56,13 @@ def main() -> int:
     assert_true(actor_target("cmv2-demo", "agent:V2 0001") == "cmv2-demo:agent-v2-0001", "runtime targets should combine session/actor")
     assert_true(select_backend_kind("local") == "local", "backend selection should allow explicit local")
     assert_true(select_backend_kind("tmux") == "tmux", "backend selection should allow explicit tmux")
+    truncated_session = default_backend_session_name(
+        "20260716-212345-leader-change-preview-and-apply"
+    )
+    assert_true(
+        validate_tmux_name(truncated_session, label="default session") == truncated_session,
+        "default session truncation must not leave a trailing separator",
+    )
     required_direct_actor = {
         "role": "agent",
         "isolation": {"mode": "required"},

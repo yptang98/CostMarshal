@@ -1144,6 +1144,12 @@ def protocol_text() -> str:
     )
 
 
+def default_backend_session_name(project_id: str) -> str:
+    safe_slug = re.sub(r"[^a-z0-9_-]+", "-", slugify(project_id)).strip("-_")
+    component = safe_slug[:42].rstrip("-_") or "project"
+    return f"cmv2-{component}"
+
+
 def command_init(args: Any) -> None:
     root = args.root.resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -1228,8 +1234,7 @@ def command_init(args: Any) -> None:
         )
     except GovernanceError as exc:
         raise SystemExit(f"ArchMarshal governance check failed [{exc.code}]: {exc}") from exc
-    default_session_slug = re.sub(r"[^a-z0-9_-]+", "-", slugify(project_id)).strip("-_")
-    session_name = args.session_name or f"cmv2-{default_session_slug[:42]}"
+    session_name = args.session_name or default_backend_session_name(project_id)
     requested_backend = getattr(args, "backend", None) or "auto"
     backend_kind = select_backend_kind(requested_backend)
     if backend_kind == "tmux":
