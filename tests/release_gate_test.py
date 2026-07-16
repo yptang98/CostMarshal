@@ -207,6 +207,29 @@ class ReleaseGateTest(unittest.TestCase):
                 str(result["commands"][0].get("artifact_error")),
             )
 
+    def test_cli_replaces_stale_default_machine_report(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="costmarshal-release-report-") as raw:
+            fake_root = Path(raw)
+            report_path = fake_root / "artifacts" / "release-gates.json"
+            report_path.parent.mkdir()
+            report_path.write_text('{"git_sha":"stale"}\n', encoding="utf-8")
+            expected = {
+                "schema_version": 1,
+                "git_sha": "a" * 40,
+                "status": "blocked",
+                "exit_code": 2,
+                "counts": {"pass": 1, "fail": 0, "blocked": 1},
+                "gates": [],
+            }
+            with mock.patch.object(release_gates, "ROOT", fake_root), mock.patch.object(
+                release_gates, "build_report", return_value=expected
+            ), mock.patch("builtins.print"):
+                self.assertEqual(release_gates.main([]), 2)
+            self.assertEqual(
+                json.loads(report_path.read_text(encoding="utf-8")),
+                expected,
+            )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

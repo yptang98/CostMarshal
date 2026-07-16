@@ -490,7 +490,10 @@ python tests/release/run_runtime_effect_evidence.py
 These commands require the preregistered real-provider dataset/signature policy and
 the reviewed live OCI/proxy topology. Without those external inputs, exit status 2
 and a machine-readable `blocked` artifact are the expected safe result, not a local
-test failure.
+test failure. Every release-gate invocation atomically replaces
+`artifacts/release-gates.json`, so the report cannot silently retain evidence from
+an older commit. Use `--report <path>` only when a separate report destination is
+required.
 
 ```powershell
 python tests/oci_live_evidence.py

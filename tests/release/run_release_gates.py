@@ -28,6 +28,7 @@ sys.path.insert(0, str(ROOT))
 
 from costmarshal_v2 import __version__  # noqa: E402
 from costmarshal_v2.cli import build_parser  # noqa: E402
+from costmarshal_v2.state import atomic_write_text  # noqa: E402
 from runtime_evidence_contract import (  # noqa: E402
     REQUIRED_RUNTIME_CRASH_POINTS,
     REQUIRED_RUNTIME_RECOVERY_SCENARIOS,
@@ -967,19 +968,24 @@ def build_report(reproduction: dict[str, Any] | None = None) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Aggregate CostMarshal non-beta release gates")
-    parser.add_argument("--report", type=Path, help="Optional JSON report output path")
+    parser.add_argument(
+        "--report",
+        type=Path,
+        default=ROOT / "artifacts" / "release-gates.json",
+        help="JSON report output path (default: artifacts/release-gates.json)",
+    )
     parser.add_argument(
         "--reproduce-evidence",
         action="store_true",
         help="Run local, runtime-effect, offline backtest, and live OCI evidence generators before evaluating gates",
     )
     args = parser.parse_args(argv)
+    args.report.parent.mkdir(parents=True, exist_ok=True)
+    args.report.unlink(missing_ok=True)
     reproduction = reproduce_evidence() if args.reproduce_evidence else None
     report = build_report(reproduction)
     encoded = json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False)
-    if args.report:
-        args.report.parent.mkdir(parents=True, exist_ok=True)
-        args.report.write_text(encoded + "\n", encoding="utf-8")
+    atomic_write_text(args.report, encoded + "\n")
     print(encoded)
     return int(report["exit_code"])
 
