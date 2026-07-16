@@ -457,7 +457,118 @@ def make_fake_tmux(temp: Path) -> tuple[Path, Path]:
     return fake_cmd, fake_py.with_suffix(".state.json")
 
 
+def run_tmux_inspection_failure_contract() -> None:
+    class ScriptedTmuxBackend(TmuxBackend):
+        def __init__(self, results: list[subprocess.CompletedProcess[str]]) -> None:
+            super().__init__("tmux-scripted")
+            self.results = list(results)
+
+        def available(self) -> bool:
+            return True
+
+        def _run(
+            self,
+            argv: list[str],
+            *,
+            check: bool = True,
+        ) -> subprocess.CompletedProcess[str]:
+            if not self.results:
+                raise AssertionError(f"unexpected tmux call: {argv}")
+            return self.results.pop(0)
+
+    absent = ScriptedTmuxBackend(
+        [
+            subprocess.CompletedProcess(
+                ["tmux-scripted", "list-sessions"],
+                1,
+                "",
+                "no server running on /tmp/tmux-test/default\n",
+            )
+        ]
+    )
+    assert_true(
+        not absent.session_exists("cmv2-test"),
+        "an explicit tmux no-server result should mean the session is absent",
+    )
+
+    failed_sessions = ScriptedTmuxBackend(
+        [
+            subprocess.CompletedProcess(
+                ["tmux-scripted", "list-sessions"],
+                1,
+                "",
+                "permission denied while opening the tmux socket\n",
+            )
+        ]
+    )
+    try:
+        failed_sessions.session_exists("cmv2-test")
+    except RuntimeError as exc:
+        assert_true(
+            "session inspection failed" in str(exc),
+            "unexpected list-sessions failures should retain an inspection error",
+        )
+    else:
+        raise AssertionError("an arbitrary tmux list-sessions failure was treated as absence")
+
+    failed_windows = ScriptedTmuxBackend(
+        [
+            subprocess.CompletedProcess(
+                ["tmux-scripted", "list-sessions"],
+                0,
+                "$7\tcmv2-test\n",
+                "",
+            ),
+            subprocess.CompletedProcess(
+                ["tmux-scripted", "list-windows"],
+                1,
+                "",
+                "server lost while listing windows\n",
+            ),
+        ]
+    )
+    try:
+        failed_windows.actor_alive(
+            session_name="cmv2-test",
+            actor_name="leader",
+            target="cmv2-test:leader",
+        )
+    except RuntimeError as exc:
+        assert_true(
+            "actor inspection failed" in str(exc),
+            "unexpected list-windows failures should retain an inspection error",
+        )
+    else:
+        raise AssertionError("an arbitrary tmux list-windows failure was treated as a stopped actor")
+
+    vanished_session = ScriptedTmuxBackend(
+        [
+            subprocess.CompletedProcess(
+                ["tmux-scripted", "list-sessions"],
+                0,
+                "$7\tcmv2-test\n",
+                "",
+            ),
+            subprocess.CompletedProcess(
+                ["tmux-scripted", "list-windows"],
+                1,
+                "",
+                "can't find session: $7\n",
+            ),
+        ]
+    )
+    assert_true(
+        not vanished_session.actor_alive(
+            session_name="cmv2-test",
+            actor_name="leader",
+            target="cmv2-test:leader",
+        ),
+        "an exact vanished-session response should confirm that the actor is absent",
+    )
+
+
 def main() -> int:
+    run_tmux_inspection_failure_contract()
     temp = Path(tempfile.mkdtemp(prefix="costmarshal-v2-tmux#{session_name}-"))
     previous_codex_home = os.environ.get("CODEX_HOME")
     try:

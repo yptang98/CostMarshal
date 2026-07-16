@@ -507,6 +507,11 @@ def _verified_local_process_group(
             for member_marker in members.values()
         )
         if not leader_matches and not token_member_exists:
+            if members:
+                raise RuntimeError(
+                    "local process identity changed and the recorded process group is still live; "
+                    "refusing to treat an unverified group as stopped"
+                )
             return None
         return process_group, session_id, members
 
@@ -527,37 +532,67 @@ def _verified_local_process_group(
     return process_group, session_id, members
 
 
-def _owned_group_members(
+def _verified_group_anchor(
     *,
     leader_pid: int,
     leader_marker: str,
     process_group: int,
     session_id: int,
     bound_members: dict[int, str],
-) -> dict[int, str]:
-    """Return current members only while a durable original identity survives."""
+) -> tuple[int, str]:
+    """Bind the member that must survive until every other group member is gone."""
 
-    current = _linux_process_group_members(process_group, session_id=session_id)
-    known_member_survives = any(
-        current.get(member_pid) == member_marker
-        for member_pid, member_marker in bound_members.items()
-    )
     durable = _linux_marker_identity(leader_marker)
-    token_member_survives = bool(
-        durable is not None
-        and any(
-            _marker_has_process_token(
-                member_marker,
+    if durable is not None:
+        anchor_pid = process_group
+        anchor_record = _linux_process_record(anchor_pid)
+        if (
+            anchor_record is not None
+            and anchor_record["process_group"] == process_group
+            and anchor_record["session_id"] == session_id
+            and _marker_has_process_token(
+                str(anchor_record["marker"]),
                 str(durable["token"]),
                 boot_id=str(durable["boot_id"]),
             )
-            for member_marker in current.values()
+        ):
+            return anchor_pid, str(anchor_record["marker"])
+        raise RuntimeError(
+            "local durable process-group supervisor identity disappeared; "
+            "refusing to signal an unanchored process group"
         )
+
+    if bound_members.get(leader_pid) == leader_marker:
+        return leader_pid, leader_marker
+    raise RuntimeError(
+        "local process-group leader identity disappeared; refusing to signal an unanchored process group"
     )
-    leader_survives = current.get(leader_pid) == leader_marker
-    if not (known_member_survives or token_member_survives or leader_survives):
+
+
+def _anchored_group_members(
+    *,
+    anchor_pid: int,
+    anchor_marker: str,
+    process_group: int,
+    session_id: int,
+) -> dict[int, str]:
+    """Return a complete current snapshot or fail if a live group lost its anchor."""
+
+    current = _linux_process_group_members(process_group, session_id=session_id)
+    if _linux_member_identity_matches(
+        anchor_pid,
+        anchor_marker,
+        process_group=process_group,
+        session_id=session_id,
+    ):
+        current[anchor_pid] = anchor_marker
+        return current
+    if not current:
         return {}
-    return current
+    raise RuntimeError(
+        "local process-group supervisor identity disappeared while group members remain live; "
+        "refusing to report STOP success"
+    )
 
 
 def _signal_verified_members(
@@ -613,6 +648,32 @@ class TmuxBackend:
     def _run(self, argv: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
         return subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check)
 
+    @staticmethod
+    def _session_listing_confirms_absence(result: subprocess.CompletedProcess[str]) -> bool:
+        """Recognize only tmux's explicit empty-server results as absence."""
+
+        if result.returncode != 1 or result.stdout.strip():
+            return False
+        detail = result.stderr.strip()
+        return detail == "no sessions" or re.fullmatch(r"no server running on [^\r\n]+", detail) is not None
+
+    @classmethod
+    def _window_listing_confirms_absence(
+        cls,
+        result: subprocess.CompletedProcess[str],
+        *,
+        session_target: str,
+    ) -> bool:
+        """Recognize only an exact vanished-session result as actor absence."""
+
+        if cls._session_listing_confirms_absence(result):
+            return True
+        return bool(
+            result.returncode == 1
+            and not result.stdout.strip()
+            and result.stderr.strip() == f"can't find session: {session_target}"
+        )
+
     def _resolve_session_target(self, session_name_value: str) -> str | None:
         """Resolve one logical persisted name to an unambiguous stable session ID."""
 
@@ -629,7 +690,10 @@ class TmuxBackend:
             check=False,
         )
         if result.returncode != 0:
-            return None
+            if self._session_listing_confirms_absence(result):
+                return None
+            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            raise RuntimeError(f"tmux session inspection failed: {detail}")
         runtime_name = tmux_runtime_session_name(session_name_value)
         accepted_names = {session_name_value, runtime_name}
         matches: list[str] = []
@@ -686,7 +750,10 @@ class TmuxBackend:
             return []
         result = self._run([self.executable, "list-windows", "-t", target, "-F", "#{window_name}"], check=False)
         if result.returncode != 0:
-            return []
+            if self._window_listing_confirms_absence(result, session_target=target):
+                return []
+            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            raise RuntimeError(f"tmux actor inspection failed: {detail}")
         return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
     def start_plan(
@@ -941,65 +1008,121 @@ class LocalProcessBackend:
                 "refusing to stop a reused PID or PGID"
             )
         process_group, session_id, bound_group_members = verified_group
-        term_commands = _signal_verified_members(
-            bound_group_members,
-            process_group=process_group,
-            session_id=session_id,
-            signal_number=signal.SIGTERM,
-        )
-        commands = [command_to_string(argv) for argv in term_commands]
-        deadline = time.monotonic() + 2.0
-        current_group_members = _owned_group_members(
+        anchor_pid, anchor_marker = _verified_group_anchor(
             leader_pid=pid,
             leader_marker=process_start_marker,
             process_group=process_group,
             session_id=session_id,
             bound_members=bound_group_members,
         )
-        while current_group_members and time.monotonic() < deadline:
-            bound_group_members.update(current_group_members)
-            time.sleep(0.05)
-            current_group_members = _owned_group_members(
-                leader_pid=pid,
-                leader_marker=process_start_marker,
+        commands: list[str] = []
+
+        def current_members() -> dict[int, str]:
+            return _anchored_group_members(
+                anchor_pid=anchor_pid,
+                anchor_marker=anchor_marker,
                 process_group=process_group,
                 session_id=session_id,
-                bound_members=bound_group_members,
             )
-        if current_group_members:
-            bound_group_members.update(current_group_members)
-            kill_commands = _signal_verified_members(
-                current_group_members,
-                process_group=process_group,
-                session_id=session_id,
-                signal_number=signal.SIGKILL,
-            )
-            commands.extend(command_to_string(argv) for argv in kill_commands)
-            kill_deadline = time.monotonic() + 1.0
-            current_group_members = _owned_group_members(
-                leader_pid=pid,
-                leader_marker=process_start_marker,
-                process_group=process_group,
-                session_id=session_id,
-                bound_members=bound_group_members,
-            )
-            while current_group_members and time.monotonic() < kill_deadline:
+
+        def sweep_non_anchor(signal_number: int, *, deadline: float) -> dict[int, str]:
+            signalled: set[tuple[int, str]] = set()
+            while True:
+                current = current_members()
+                non_anchor = {
+                    member_pid: member_marker
+                    for member_pid, member_marker in current.items()
+                    if member_pid != anchor_pid
+                }
+                if not non_anchor:
+                    return current
+                pending = {
+                    member_pid: member_marker
+                    for member_pid, member_marker in non_anchor.items()
+                    if (member_pid, member_marker) not in signalled
+                }
+                if pending:
+                    signalled.update(pending.items())
+                    signal_commands = _signal_verified_members(
+                        pending,
+                        process_group=process_group,
+                        session_id=session_id,
+                        signal_number=signal_number,
+                    )
+                    commands.extend(command_to_string(argv) for argv in signal_commands)
+                if time.monotonic() >= deadline:
+                    return current
                 time.sleep(0.05)
-                current_group_members = _owned_group_members(
-                    leader_pid=pid,
-                    leader_marker=process_start_marker,
+
+        current_group_members = sweep_non_anchor(
+            signal.SIGTERM,
+            deadline=time.monotonic() + 2.0,
+        )
+        non_anchor_members = {
+            member_pid: member_marker
+            for member_pid, member_marker in current_group_members.items()
+            if member_pid != anchor_pid
+        }
+        if non_anchor_members:
+            current_group_members = sweep_non_anchor(
+                signal.SIGKILL,
+                deadline=time.monotonic() + 1.0,
+            )
+            non_anchor_members = {
+                member_pid: member_marker
+                for member_pid, member_marker in current_group_members.items()
+                if member_pid != anchor_pid
+            }
+            if non_anchor_members:
+                raise RuntimeError(
+                    "local actor process group retained non-supervisor members after "
+                    "identity-verified SIGKILL escalation"
+                )
+
+        current_group_members = current_members()
+        if anchor_pid in current_group_members:
+            anchor_commands = _signal_verified_members(
+                {anchor_pid: anchor_marker},
+                process_group=process_group,
+                session_id=session_id,
+                signal_number=signal.SIGTERM,
+            )
+            commands.extend(command_to_string(argv) for argv in anchor_commands)
+            anchor_deadline = time.monotonic() + 1.0
+            current_group_members = current_members()
+            while current_group_members and time.monotonic() < anchor_deadline:
+                time.sleep(0.05)
+                current_group_members = current_members()
+            if current_group_members:
+                if set(current_group_members) != {anchor_pid}:
+                    raise RuntimeError(
+                        "local actor process group created new members while its supervisor was stopping"
+                    )
+                kill_commands = _signal_verified_members(
+                    {anchor_pid: anchor_marker},
                     process_group=process_group,
                     session_id=session_id,
-                    bound_members=bound_group_members,
+                    signal_number=signal.SIGKILL,
                 )
+                commands.extend(command_to_string(argv) for argv in kill_commands)
+                kill_deadline = time.monotonic() + 1.0
+                current_group_members = current_members()
+                while current_group_members and time.monotonic() < kill_deadline:
+                    time.sleep(0.05)
+                    current_group_members = current_members()
             if current_group_members:
                 raise RuntimeError(
-                    "local actor process group remained live after identity-verified SIGKILL escalation"
+                    "local actor process-group supervisor remained live after identity-verified SIGKILL escalation"
                 )
+
+        remaining = _linux_process_group_members(process_group, session_id=session_id)
+        if remaining:
+            raise RuntimeError(
+                "local actor process group remained live after its verified supervisor exited"
+            )
         if not commands:
             commands = [
-                command_to_string(["kill", "-TERM", "--", str(member_pid)])
-                for member_pid in sorted(bound_group_members)
+                command_to_string([self.executable, "verified-stop", "--pid", str(pid)])
             ]
         return {"command": commands[-1], "commands": commands}
 

@@ -15,6 +15,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import costmarshal_v2.session_backend as session_backend_module  # noqa: E402
 from costmarshal_v2.session_backend import (  # noqa: E402
     LocalProcessBackend,
     _windows_tasklist_contains_pid,
@@ -183,7 +184,7 @@ class PidIdentityTest(unittest.TestCase):
                 forged_marker = command_leader_marker[:-1] + (
                     "0" if command_leader_marker[-1] != "0" else "1"
                 )
-                self.assertFalse(
+                with self.assertRaisesRegex(RuntimeError, "identity changed"):
                     backend.actor_alive(
                         session_name="test",
                         actor_name="orphan-child",
@@ -191,7 +192,6 @@ class PidIdentityTest(unittest.TestCase):
                         pid=command_leader_pid,
                         process_start_marker=forged_marker,
                     )
-                )
                 with self.assertRaisesRegex(RuntimeError, "identity changed"):
                     backend.stop_actor(
                         target=f"pid:{command_leader_pid}",
@@ -236,6 +236,152 @@ class PidIdentityTest(unittest.TestCase):
                     and pid_identity_matches(child_pid, child_marker)
                 ):
                     os.kill(child_pid, signal.SIGKILL)
+
+    @unittest.skipUnless(
+        os.name != "nt"
+        and platform.system() == "Linux"
+        and Path("/proc").is_dir()
+        and hasattr(os, "memfd_create")
+        and hasattr(os, "pidfd_open")
+        and hasattr(signal, "pidfd_send_signal"),
+        "durable process-group identity requires Linux procfs, memfd, and pidfd",
+    )
+    def test_local_stop_keeps_supervisor_anchor_while_term_handler_spawns_child(self) -> None:
+        backend = LocalProcessBackend()
+        supervisor_pid: int | None = None
+        supervisor_marker: str | None = None
+        leader_pid: int | None = None
+        leader_marker: str | None = None
+        child_pid: int | None = None
+        child_marker: str | None = None
+        with tempfile.TemporaryDirectory(prefix="costmarshal-local-term-race-") as raw:
+            temp = Path(raw)
+            ready_file = temp / "leader.pid"
+            child_file = temp / "spawned-child.pid"
+            leader_code = "\n".join(
+                [
+                    "import os, pathlib, signal, subprocess, sys, time",
+                    "ready = pathlib.Path(sys.argv[1])",
+                    "spawned = pathlib.Path(sys.argv[2])",
+                    "def on_term(signum, frame):",
+                    "    signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+                    "    child = subprocess.Popen(",
+                    "        [sys.executable, '-c', 'import time; time.sleep(60)'],",
+                    "        stdin=subprocess.DEVNULL,",
+                    "        stdout=subprocess.DEVNULL,",
+                    "        stderr=subprocess.DEVNULL,",
+                    "        close_fds=True,",
+                    "    )",
+                    "    spawned.write_text(str(child.pid), encoding='ascii')",
+                    "    os._exit(0)",
+                    "signal.signal(signal.SIGTERM, on_term)",
+                    "ready.write_text(str(os.getpid()), encoding='ascii')",
+                    "while True:",
+                    "    time.sleep(1)",
+                ]
+            )
+            launch = backend.start_actor(
+                session_name="test",
+                actor_name="term-race",
+                command=[
+                    sys.executable,
+                    "-c",
+                    leader_code,
+                    str(ready_file),
+                    str(child_file),
+                ],
+                cwd=temp,
+                log_path=temp / "actor.log",
+            )
+            supervisor_pid = int(launch["pid"])
+            original_signal_verified_members = session_backend_module._signal_verified_members
+            coordinated = False
+
+            def signal_with_spawn_barrier(
+                members: dict[int, str],
+                *,
+                process_group: int,
+                session_id: int,
+                signal_number: int,
+            ) -> list[list[str]]:
+                nonlocal coordinated, child_pid, child_marker
+                commands = original_signal_verified_members(
+                    members,
+                    process_group=process_group,
+                    session_id=session_id,
+                    signal_number=signal_number,
+                )
+                if (
+                    not coordinated
+                    and signal_number == signal.SIGTERM
+                    and leader_pid is not None
+                    and leader_pid in members
+                ):
+                    coordinated = True
+                    deadline = time.monotonic() + 5
+                    while not child_file.is_file() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(child_file.is_file(), "TERM handler did not spawn its child")
+                    child_pid = int(child_file.read_text(encoding="ascii"))
+                    while child_marker is None and time.monotonic() < deadline:
+                        child_marker = pid_start_marker(child_pid)
+                        time.sleep(0.01)
+                    self.assertIsNotNone(child_marker, "spawned child had no durable start marker")
+                    while pid_is_alive(leader_pid) and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertFalse(pid_is_alive(leader_pid), "TERM handler leader did not exit")
+                    if supervisor_pid in members:
+                        while pid_is_alive(supervisor_pid) and time.monotonic() < deadline:
+                            time.sleep(0.01)
+                        self.assertFalse(
+                            pid_is_alive(supervisor_pid),
+                            "legacy all-member signaling did not release the supervisor anchor",
+                        )
+                return commands
+
+            try:
+                deadline = time.monotonic() + 10
+                while not ready_file.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready_file.is_file(), "leader did not publish its pid")
+                leader_pid = int(ready_file.read_text(encoding="ascii"))
+                leader_marker = pid_start_marker(leader_pid)
+                supervisor_marker = pid_start_marker(supervisor_pid)
+                self.assertIsNotNone(leader_marker)
+                self.assertIsNotNone(supervisor_marker)
+                assert leader_marker is not None
+                with patch.object(
+                    session_backend_module,
+                    "_signal_verified_members",
+                    side_effect=signal_with_spawn_barrier,
+                ):
+                    backend.stop_actor(
+                        target=f"pid:{leader_pid}",
+                        pid=leader_pid,
+                        process_start_marker=leader_marker,
+                    )
+                self.assertTrue(coordinated, "STOP did not exercise the TERM-handler spawn barrier")
+                self.assertIsNotNone(child_pid)
+                self.assertIsNotNone(child_marker)
+                assert child_pid is not None
+                assert child_marker is not None
+                self.assertFalse(
+                    pid_identity_matches(child_pid, child_marker),
+                    "a child spawned during STOP survived the anchored sweep",
+                )
+                self.assertFalse(pid_is_alive(supervisor_pid), "verified supervisor survived STOP")
+            finally:
+                for candidate_pid, candidate_marker in (
+                    (child_pid, child_marker),
+                    (leader_pid, leader_marker),
+                    (supervisor_pid, supervisor_marker),
+                ):
+                    if (
+                        candidate_pid is not None
+                        and candidate_marker is not None
+                        and pid_identity_matches(candidate_pid, candidate_marker)
+                    ):
+                        os.kill(candidate_pid, signal.SIGKILL)
 
 
 if __name__ == "__main__":
