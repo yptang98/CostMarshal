@@ -136,8 +136,12 @@ def test_workspace_containment() -> None:
                 must_exist=True,
             ) == existing.resolve()
             rejects(ensure_workspace_containment, workspace, r"C:\\outside.txt")
+            rejects(ensure_workspace_containment, workspace, "C:/outside.txt")
+            rejects(ensure_workspace_containment, workspace, "C:relative.txt")
             rejects(ensure_workspace_containment, workspace, r"\outside.txt")
             rejects(ensure_workspace_containment, workspace, r"\\server\share\outside.txt")
+            rejects(ensure_workspace_containment, workspace, "//server/share/outside.txt")
+            rejects(ensure_workspace_containment, workspace, r"\\?\C:\outside.txt")
         rejects(resolve_workspace_path, workspace, "../outside.txt")
         rejects(resolve_workspace_path, workspace, ".git/config")
 

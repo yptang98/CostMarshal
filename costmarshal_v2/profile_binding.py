@@ -350,12 +350,21 @@ def _verify_payload(payload: bytes, binding: dict[str, Any]) -> None:
 
 
 def _stat_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    # Python deprecates st_ctime_ns on Windows because its meaning is changing
+    # from creation time to metadata-change time.  Path-based stat and handle
+    # fstat can expose different transition semantics, while st_birthtime_ns is
+    # the stable creation identity recommended by the Windows API contract.
+    stable_creation_or_change_ns = (
+        int(getattr(info, "st_birthtime_ns", 0))
+        if os.name == "nt" and hasattr(info, "st_birthtime_ns")
+        else int(getattr(info, "st_ctime_ns", 0))
+    )
     return (
         int(info.st_dev),
         int(info.st_ino),
         int(info.st_size),
         int(info.st_mtime_ns),
-        int(getattr(info, "st_ctime_ns", 0)),
+        stable_creation_or_change_ns,
     )
 
 

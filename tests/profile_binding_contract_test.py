@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -17,7 +18,7 @@ sys.path.insert(0, str(ROOT))
 
 from costmarshal_v2.actor_runner import _validate_worker_fence  # noqa: E402
 from costmarshal_v2.paths import ProjectLayout  # noqa: E402
-from costmarshal_v2.profile_binding import read_named_profile  # noqa: E402
+from costmarshal_v2.profile_binding import _stat_identity, read_named_profile  # noqa: E402
 from costmarshal_v2.profiles import provider_profile_text  # noqa: E402
 from costmarshal_v2.routing import default_provider_catalog  # noqa: E402
 from project_success_policy_test import seed_paired_route_evidence  # noqa: E402
@@ -127,6 +128,18 @@ def main() -> int:
     temp = Path(tempfile.mkdtemp(prefix="costmarshal-profile-binding-"))
     previous_codex_home = os.environ.get("CODEX_HOME")
     try:
+        if os.name == "nt":
+            common_stat = {
+                "st_dev": 1,
+                "st_ino": 2,
+                "st_size": 3,
+                "st_mtime_ns": 4,
+                "st_birthtime_ns": 5,
+            }
+            path_stat = SimpleNamespace(**common_stat, st_ctime_ns=6)
+            descriptor_stat = SimpleNamespace(**common_stat, st_ctime_ns=7)
+            assert _stat_identity(path_stat) == _stat_identity(descriptor_stat)
+
         workspace = temp / "workspace"
         workspace.mkdir()
         codex_home = temp / "codex-home"

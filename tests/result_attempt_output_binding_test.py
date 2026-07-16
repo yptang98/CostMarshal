@@ -29,7 +29,7 @@ from costmarshal_v2.handoff_contract import (  # noqa: E402
     build_prompt_binding,
 )
 from costmarshal_v2.actor_runner import _prepare_semantic_attempt  # noqa: E402
-from costmarshal_v2.paths import ProjectLayout  # noqa: E402
+from costmarshal_v2.paths import ProjectLayout, slugify  # noqa: E402
 from costmarshal_v2.routing import (  # noqa: E402
     acceptance_evidence_provenance,
     provider_price_basis,
@@ -176,7 +176,12 @@ class ResultAttemptOutputBindingTest(unittest.TestCase):
             attempt_input=attempt_input,
             prompt_bytes=prompt,
         )
-        prompt_dir = self.layout.root / "semantic-prompts" / "binding" / "ATT-low-001"
+        prompt_dir = (
+            self.layout.root
+            / "semantic-prompts"
+            / "binding"
+            / slugify("ATT-low-001", "attempt")
+        )
         prompt_dir.mkdir(parents=True)
         prompt_path = prompt_dir / prompt_binding["prompt_sha256"].removeprefix("sha256:")
         prompt_path.write_bytes(prompt)
@@ -214,7 +219,12 @@ class ResultAttemptOutputBindingTest(unittest.TestCase):
         execution_sha256 = "sha256:" + hashlib.sha256(
             canonical_bytes(execution_body)
         ).hexdigest()
-        receipt_dir = self.layout.root / "execution-receipts" / "binding" / "ATT-low-001"
+        receipt_dir = (
+            self.layout.root
+            / "execution-receipts"
+            / "binding"
+            / slugify("ATT-low-001", "attempt")
+        )
         receipt_dir.mkdir(parents=True)
         receipt_path = receipt_dir / execution_sha256.removeprefix("sha256:")
         receipt_path.write_bytes(canonical_bytes(execution_body))
