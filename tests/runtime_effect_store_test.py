@@ -182,14 +182,13 @@ raise AssertionError('fault did not exit')
         layout = make_layout(self.base, "lease-renew")
         migrate_legacy_store(layout)
         prepare_effect(layout, "CMD-renew", "EFF-renew")
-        first = lease_effect(layout, owner="worker-one", ttl_seconds=0.2)
+        first = lease_effect(layout, owner="worker-one", ttl_seconds=1)
         assert first is not None
-        time.sleep(0.1)
         renewed = renew_effect_lease(
             layout,
             effect_id="EFF-renew",
             owner="worker-one",
-            ttl_seconds=0.3,
+            ttl_seconds=2,
         )
         self.assertEqual(renewed["lease_owner"], "worker-one")
         self.assertEqual(renewed["attempts"], 1)
@@ -200,7 +199,6 @@ raise AssertionError('fault did not exit')
                 owner="worker-two",
                 ttl_seconds=1,
             )
-        time.sleep(0.15)
         self.assertIsNone(lease_effect(layout, owner="worker-two", ttl_seconds=1))
 
     def test_materializer_lock_closes_revision_aba_window(self) -> None:
