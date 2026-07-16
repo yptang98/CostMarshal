@@ -48,7 +48,22 @@ def assert_true(condition: bool, message: str) -> None:
 
 def main() -> int:
     temp = Path(tempfile.mkdtemp(prefix="costmarshal-v2-smoke-"))
+    previous_codex_home = os.environ.get("CODEX_HOME")
     try:
+        # Keep the smoke test independent from the developer's user-level Codex
+        # configuration. Route admission intentionally fails closed when a named
+        # provider profile is missing, so a clean runner must create its fixture.
+        codex_home = temp / "codex-home"
+        os.environ["CODEX_HOME"] = str(codex_home)
+        configured = run_json(
+            temp,
+            "configure-profiles",
+            "--codex-home",
+            str(codex_home),
+        )
+        assert_true(configured["profile"] == "longcat", "smoke fixture should create the low-tier profile")
+        assert_true(Path(configured["path"]).is_file(), "smoke fixture profile should exist")
+
         source = temp / "legacy-source"
         source.mkdir()
         (source / "project.json").write_text('{"schema_version": 1, "id": "legacy-source"}\n', encoding="utf-8")
@@ -460,6 +475,10 @@ def main() -> int:
         print(json.dumps({"status": "ok", "temporary_state": "cleaned"}, indent=2))
         return 0
     finally:
+        if previous_codex_home is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = previous_codex_home
         resolved = temp.resolve()
         temp_root = Path(tempfile.gettempdir()).resolve()
         if resolved == temp_root or temp_root not in resolved.parents:
