@@ -140,7 +140,13 @@ def assert_true(condition: bool, message: str) -> None:
 
 def make_fake_tmux(temp: Path) -> tuple[Path, Path]:
     fake_py = temp / "fake_tmux.py"
-    fake_py.write_text(FAKE_TMUX, encoding="utf-8")
+    payload = FAKE_TMUX
+    if os.name != "nt":
+        payload = "#!/usr/bin/env python3\n" + FAKE_TMUX.lstrip()
+    fake_py.write_text(payload, encoding="utf-8")
+    if os.name != "nt":
+        fake_py.chmod(0o700)
+        return fake_py, fake_py.with_suffix(".state.json")
     fake_cmd = temp / "fake_tmux.cmd"
     fake_cmd.write_text(f'@echo off\r\n"{sys.executable}" "{fake_py}" %*\r\n', encoding="utf-8")
     return fake_cmd, fake_py.with_suffix(".state.json")
@@ -148,7 +154,18 @@ def make_fake_tmux(temp: Path) -> tuple[Path, Path]:
 
 def main() -> int:
     temp = Path(tempfile.mkdtemp(prefix="costmarshal-v2-tmux-contract-"))
+    previous_codex_home = os.environ.get("CODEX_HOME")
     try:
+        codex_home = temp / "codex-home"
+        os.environ["CODEX_HOME"] = str(codex_home)
+        configured = run_json(
+            temp,
+            "configure-profiles",
+            "--codex-home",
+            str(codex_home),
+        )
+        assert_true(Path(configured["path"]).is_file(), "tmux fixture profile should exist")
+
         fake_tmux, fake_state = make_fake_tmux(temp)
         init = run_json(
             temp,
@@ -212,6 +229,10 @@ def main() -> int:
         print(json.dumps({"status": "ok", "temporary_state": "cleaned"}, indent=2))
         return 0
     finally:
+        if previous_codex_home is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = previous_codex_home
         resolved = temp.resolve()
         temp_root = Path(tempfile.gettempdir()).resolve()
         if resolved == temp_root or temp_root not in resolved.parents:
