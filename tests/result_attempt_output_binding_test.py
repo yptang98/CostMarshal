@@ -67,11 +67,13 @@ def canonical_bytes(value: object) -> bytes:
 class ResultAttemptOutputBindingTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = Path(tempfile.mkdtemp(prefix="costmarshal-output-binding-"))
+        runtime = self.temp / "runtime"
+        project_dir = runtime / "projects" / "binding"
+        project_dir.mkdir(parents=True)
         self.layout = ProjectLayout(
-            root=self.temp / "runtime",
-            project_dir=self.temp / "runtime" / "projects" / "binding",
+            root=runtime.resolve(),
+            project_dir=project_dir.resolve(),
         )
-        self.layout.project_dir.mkdir(parents=True)
         self.layout.project_json.write_text(
             json.dumps({"schema_version": 2, "project_id": "binding"}) + "\n",
             encoding="utf-8",

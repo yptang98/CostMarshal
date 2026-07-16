@@ -26,6 +26,7 @@ from costmarshal_v2.scheduler import default_actor_argv  # noqa: E402
 def cli(temp: Path, *args: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["COSTMARSHAL_V2_HOME"] = str(temp / "runtime")
+    env["CODEX_HOME"] = str(temp / "codex-home")
     result = subprocess.run(
         [sys.executable, str(CLI), "--root", str(temp / "runtime"), *args],
         text=True,
@@ -47,7 +48,19 @@ def cli_json(temp: Path, *args: str) -> dict:
 
 def main() -> int:
     temp = Path(tempfile.mkdtemp(prefix="costmarshal-v2-actor-fence-"))
+    previous_codex_home = os.environ.get("CODEX_HOME")
     try:
+        codex_home = temp / "codex-home"
+        os.environ["CODEX_HOME"] = str(codex_home)
+        configured = cli_json(
+            temp,
+            "configure-profiles",
+            "--codex-home",
+            str(codex_home),
+        )
+        assert configured["profile"] == "longcat"
+        assert Path(configured["path"]).is_file()
+
         workspace = temp / "workspace"
         workspace.mkdir()
         project = Path(
@@ -138,6 +151,7 @@ def main() -> int:
         assert "--launch-token" not in command
         env = os.environ.copy()
         env["COSTMARSHAL_V2_HOME"] = str(temp / "runtime")
+        env["CODEX_HOME"] = str(codex_home)
         env["COSTMARSHAL_CODEX_COMMAND_JSON"] = json.dumps([sys.executable, str(fake)])
 
         wrong = subprocess.run(
@@ -194,6 +208,10 @@ def main() -> int:
         print("actor fencing ok")
         return 0
     finally:
+        if previous_codex_home is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = previous_codex_home
         shutil.rmtree(temp, ignore_errors=True)
 
 

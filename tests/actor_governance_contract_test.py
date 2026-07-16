@@ -27,6 +27,7 @@ IMAGE = "ghcr.io/example/costmarshal-worker@sha256:" + ("c" * 64)
 def cli(temp: Path, *args: str) -> dict:
     env = os.environ.copy()
     env["COSTMARSHAL_V2_HOME"] = str(temp / "runtime")
+    env["CODEX_HOME"] = str(temp / "codex-home")
     completed = subprocess.run(
         [sys.executable, str(CLI), "--root", str(temp / "runtime"), *args],
         text=True,
@@ -145,7 +146,19 @@ def wait_for_file(path: Path, process: subprocess.Popen[str], timeout: float = 1
 
 def main() -> int:
     temp = Path(tempfile.mkdtemp(prefix="costmarshal-v2-actor-governance-"))
+    previous_codex_home = os.environ.get("CODEX_HOME")
     try:
+        codex_home = temp / "codex-home"
+        os.environ["CODEX_HOME"] = str(codex_home)
+        configured = cli(
+            temp,
+            "configure-profiles",
+            "--codex-home",
+            str(codex_home),
+        )
+        assert configured["profile"] == "longcat"
+        assert Path(configured["path"]).is_file()
+
         workspace = temp / "workspace"
         marker = workspace / ".agent" / "ownership.json"
         head = workspace / ".agent" / "skill-overlays" / ".archmarshal" / "HEAD"
@@ -194,6 +207,7 @@ def main() -> int:
         before_auto_ready_dispatch = tree_digest(project)
         dispatch_environment = os.environ.copy()
         dispatch_environment["COSTMARSHAL_V2_HOME"] = str(temp / "runtime")
+        dispatch_environment["CODEX_HOME"] = str(codex_home)
         rejected_auto_ready = subprocess.run(
             [
                 sys.executable,
@@ -288,6 +302,7 @@ def main() -> int:
         ]
         env = os.environ.copy()
         env["COSTMARSHAL_V2_HOME"] = str(temp / "runtime")
+        env["CODEX_HOME"] = str(codex_home)
         env["COSTMARSHAL_CODEX_COMMAND_JSON"] = json.dumps([sys.executable, str(fake_provider)])
 
         marker.write_bytes(ownership_bytes("workspace-drifted"))
@@ -373,6 +388,8 @@ def main() -> int:
         barrier_ready = temp / "native-launch.ready"
         barrier_release = temp / "native-launch.release"
         barrier_env = dict(env)
+        # The launch path must consume only the immutable admitted snapshot;
+        # it must not re-resolve the named source profile.
         barrier_env.pop("CODEX_HOME", None)
         barrier_env.update(
             {
@@ -436,6 +453,10 @@ def main() -> int:
         print("actor governance contract ok")
         return 0
     finally:
+        if previous_codex_home is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = previous_codex_home
         shutil.rmtree(temp, ignore_errors=True)
 
 

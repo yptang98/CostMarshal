@@ -28,6 +28,7 @@ def run(
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["COSTMARSHAL_V2_HOME"] = str(temp / "runtime")
+    env["CODEX_HOME"] = str(temp / "codex-home")
     env.update(env_extra or {})
     result = subprocess.run(
         [sys.executable, str(CLI), "--root", str(temp / "runtime"), *args],
@@ -48,7 +49,19 @@ def run_json(temp: Path, *args: str, env_extra: dict[str, str] | None = None) ->
 
 def main() -> int:
     temp = Path(tempfile.mkdtemp(prefix="costmarshal-v2-actor-crash-recovery-"))
+    previous_codex_home = os.environ.get("CODEX_HOME")
     try:
+        codex_home = temp / "codex-home"
+        os.environ["CODEX_HOME"] = str(codex_home)
+        configured = run_json(
+            temp,
+            "configure-profiles",
+            "--codex-home",
+            str(codex_home),
+        )
+        assert configured["profile"] == "longcat"
+        assert Path(configured["path"]).is_file()
+
         workspace = temp / "workspace"
         workspace.mkdir()
         counter = temp / "provider-count.txt"
@@ -147,6 +160,10 @@ def main() -> int:
         )
         return 0
     finally:
+        if previous_codex_home is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = previous_codex_home
         shutil.rmtree(temp, ignore_errors=True)
 
 

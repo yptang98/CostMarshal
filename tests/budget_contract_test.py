@@ -21,6 +21,7 @@ CLI = ROOT / "scripts" / "costmarshal.py"
 def run(temp: Path, *args: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env["COSTMARSHAL_V2_HOME"] = str(temp / "runtime")
+    env["CODEX_HOME"] = str(temp / "codex-home")
     result = subprocess.run([sys.executable, str(CLI), *args], env=env, text=True, capture_output=True)
     if ok and result.returncode:
         raise AssertionError(f"command failed {args}\n{result.stdout}\n{result.stderr}")
@@ -34,6 +35,14 @@ def data(temp: Path, *args: str) -> dict:
 def main() -> int:
     temp = Path(tempfile.mkdtemp(prefix="costmarshal-v2-budget-"))
     try:
+        configured = data(
+            temp,
+            "configure-profiles",
+            "--codex-home",
+            str(temp / "codex-home"),
+        )
+        assert Path(configured["path"]).is_file()
+
         workspace = temp / "workspace"
         workspace.mkdir()
         catalog = default_provider_catalog()

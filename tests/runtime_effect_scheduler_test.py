@@ -157,7 +157,18 @@ def wait_for_actor_started(project: Path, actor_id: str, timeout: float = 15.0) 
 
 def main() -> int:
     temp = Path(tempfile.mkdtemp(prefix="costmarshal-v2-runtime-effect-scheduler-"))
+    previous_codex_home = os.environ.get("CODEX_HOME")
     try:
+        codex_home = temp / "codex-home"
+        os.environ["CODEX_HOME"] = str(codex_home)
+        configured = run_json(
+            temp,
+            "configure-profiles",
+            "--codex-home",
+            str(codex_home),
+        )
+        assert Path(configured["path"]).is_file()
+
         workspace = temp / "workspace"
         workspace.mkdir()
         counter = temp / "provider-count.txt"
@@ -916,6 +927,10 @@ def main() -> int:
         )
         return 0
     finally:
+        if previous_codex_home is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = previous_codex_home
         shutil.rmtree(temp, ignore_errors=True)
 
 

@@ -42,6 +42,7 @@ CLI = ROOT / "scripts" / "costmarshal.py"
 def cli(temp: Path, *args: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env["COSTMARSHAL_V2_HOME"] = str(temp / "runtime")
+    env["CODEX_HOME"] = str(temp / "codex-home")
     result = subprocess.run([sys.executable, str(CLI), *args], env=env, text=True, capture_output=True)
     if ok and result.returncode:
         raise AssertionError(f"command failed {args}\n{result.stdout}\n{result.stderr}")
@@ -51,6 +52,16 @@ def cli(temp: Path, *args: str, ok: bool = True) -> subprocess.CompletedProcess[
 def main() -> int:
     temp = Path(tempfile.mkdtemp(prefix="costmarshal-v2-actor-security-"))
     try:
+        configured = json.loads(
+            cli(
+                temp,
+                "configure-profiles",
+                "--codex-home",
+                str(temp / "codex-home"),
+            ).stdout
+        )
+        assert Path(configured["path"]).is_file()
+
         workspace = temp / "workspace"
         workspace.mkdir()
         subprocess.run(["git", "init", "-q", str(workspace)], check=True)
@@ -209,10 +220,10 @@ def main() -> int:
             encoding="utf-8"
         ) == "print('dirty host')\n"
 
-        codex_home = temp / "codex-home"
-        codex_home.mkdir()
-        (codex_home / "longcat.config.toml").write_text("model = 'test'\n", encoding="utf-8")
-        (codex_home / "auth.json").write_text("secret-auth\n", encoding="utf-8")
+        credential_codex_home = temp / "credential-codex-home"
+        credential_codex_home.mkdir()
+        (credential_codex_home / "longcat.config.toml").write_text("model = 'test'\n", encoding="utf-8")
+        (credential_codex_home / "auth.json").write_text("secret-auth\n", encoding="utf-8")
         secrets = temp / "providers.env"
         secrets.write_text("LONGCAT_API_KEY=longcat-secret\nDEEPSEEK_API_KEY=deepseek-secret\n", encoding="utf-8")
         project["secrets_file"] = str(secrets)
@@ -223,7 +234,7 @@ def main() -> int:
         with patch.dict(
             os.environ,
             {
-                "CODEX_HOME": str(codex_home),
+                "CODEX_HOME": str(credential_codex_home),
                 "OPENAI_API_KEY": "must-not-leak",
                 "GH_TOKEN": "must-not-leak",
                 "AWS_SECRET_ACCESS_KEY": "must-not-leak",
@@ -238,14 +249,14 @@ def main() -> int:
         for key in ("OPENAI_API_KEY", "GH_TOKEN", "AWS_SECRET_ACCESS_KEY", "DEEPSEEK_API_KEY", "COSTMARSHAL_SECRETS_FILE"):
             assert key not in env
         isolated_home = Path(env["CODEX_HOME"])
-        assert isolated_home != codex_home
+        assert isolated_home != credential_codex_home
         assert (isolated_home / "longcat.config.toml").is_file()
         assert not (isolated_home / "auth.json").exists()
         assert "longcat-secret" in redactions and "deepseek-secret" in redactions and "inherited-selected" in redactions
 
         high_actor = dict(actor)
         high_actor.update({"id": "agent-high-test", "tier": "high", "provider": "codex", "env_key": None, "profile": None})
-        with patch.dict(os.environ, {"CODEX_HOME": str(codex_home), "GH_TOKEN": "must-not-leak", "AWS_SECRET_ACCESS_KEY": "must-not-leak"}, clear=False):
+        with patch.dict(os.environ, {"CODEX_HOME": str(credential_codex_home), "GH_TOKEN": "must-not-leak", "AWS_SECRET_ACCESS_KEY": "must-not-leak"}, clear=False):
             high_env, _ = isolated_actor_env(project, high_actor, layout=layout)
         assert "GH_TOKEN" not in high_env and "AWS_SECRET_ACCESS_KEY" not in high_env
         assert (Path(high_env["CODEX_HOME"]) / "auth.json").is_file()

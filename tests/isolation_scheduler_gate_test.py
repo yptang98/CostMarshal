@@ -19,6 +19,7 @@ CLI = ROOT / "scripts" / "costmarshal.py"
 def run(temp: Path, *args: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["COSTMARSHAL_V2_HOME"] = str(temp / "runtime")
+    env["CODEX_HOME"] = str(temp / "codex-home")
     result = subprocess.run(
         [sys.executable, str(CLI), "--root", str(temp / "runtime"), *args],
         text=True,
@@ -75,7 +76,21 @@ def assert_no_attempt(project: Path) -> None:
 
 def main() -> int:
     temp = Path(tempfile.mkdtemp(prefix="costmarshal-v2-isolation-gate-"))
+    previous_codex_home = os.environ.get("CODEX_HOME")
     try:
+        codex_home = temp / "codex-home"
+        os.environ["CODEX_HOME"] = str(codex_home)
+        configured = json.loads(
+            run(
+                temp,
+                "configure-profiles",
+                "--codex-home",
+                str(codex_home),
+            ).stdout
+        )
+        assert configured["profile"] == "longcat"
+        assert Path(configured["path"]).is_file()
+
         required = create_project(temp, "required", allow_unsafe=False)
         rejected = run(temp, "dispatch", "--project", str(required), "--task", "V2-0001", ok=False)
         assert "native fallback is forbidden" in (rejected.stdout + rejected.stderr)
@@ -121,6 +136,10 @@ def main() -> int:
         print("scheduler isolation gate ok")
         return 0
     finally:
+        if previous_codex_home is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = previous_codex_home
         shutil.rmtree(temp, ignore_errors=True)
 
 

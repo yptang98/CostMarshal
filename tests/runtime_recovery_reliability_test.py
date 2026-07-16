@@ -50,6 +50,7 @@ def run(
 ) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment["COSTMARSHAL_V2_HOME"] = str(temp / "runtime")
+    environment["CODEX_HOME"] = str(temp / "codex-home")
     environment.update(env_extra or {})
     result = subprocess.run(
         [sys.executable, str(CLI), "--root", str(temp / "runtime"), *args],
@@ -94,6 +95,14 @@ def wait_for_counter(counter: Path, expected: int, timeout: float = 15.0) -> Non
 def main() -> int:
     temp = Path(tempfile.mkdtemp(prefix="costmarshal-runtime-reliability-"))
     try:
+        configured = run_json(
+            temp,
+            "configure-profiles",
+            "--codex-home",
+            str(temp / "codex-home"),
+        )
+        assert Path(configured["path"]).is_file()
+
         workspace = temp / "workspace"
         workspace.mkdir()
         project = Path(
