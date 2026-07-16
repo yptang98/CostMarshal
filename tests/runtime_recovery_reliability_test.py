@@ -280,6 +280,12 @@ def main() -> int:
         }
         oci_actor.setdefault("runtime", {}).update(
             {
+                # OCI emergency cleanup is fenced by container identity and must
+                # remain available even if an unrelated native runtime binding
+                # was corrupted.
+                "backend": "tmux",
+                "session_name": "corrupt-session",
+                "actor_name": "corrupt-actor",
                 "provider_execution_state": "started",
                 "execution_workspace": str(workspace),
                 "target": "container:durable-container",
@@ -383,6 +389,86 @@ def main() -> int:
         run_json(temp, "run-scheduler", "--project", str(project), "--once")
         assert effect_status(layout, effect_id)["status"] == "dead"
         assert load_actor(layout, dead_atomic["actor_id"])["status"] == "needs_recovery"
+
+        # A queued spawn freezes its native runtime identity. Recovery must not
+        # accept a syntactically valid actor whose backend/target drifted after
+        # the effect commit, even through the registered/observed shortcuts.
+        run_json(temp, "new-task", "--project", str(project), "--title", "spawn-binding", "--purpose", "fence runtime identity")
+        bound_spawn = run_json(
+            temp,
+            "dispatch",
+            "--project",
+            str(project),
+            "--task",
+            "V2-0005",
+            "--start",
+            "--unsafe-native",
+            "--command-id",
+            "CMD-SPAWN-BINDING",
+        )
+        bound_effect_id = bound_spawn["start"]["effect_id"]
+        bound_actor = load_actor(layout, bound_spawn["actor_id"])
+        bound_actor["runtime"]["backend"] = "tmux"
+        bound_actor["runtime"]["session_name"] = "victim"
+        bound_actor["runtime"]["actor_name"] = "leader"
+        bound_actor["runtime"]["target"] = "victim:leader"
+        with control_transaction(
+            layout,
+            command_name="test_corrupt_spawn_binding",
+            command_id="CMD-TEST-CORRUPT-SPAWN-BINDING",
+            payload={"actor_id": bound_actor["id"]},
+        ):
+            save_actor(layout, bound_actor)
+        run_json(temp, "run-scheduler", "--project", str(project), "--once")
+        assert effect_status(layout, bound_effect_id)["status"] == "dead"
+        assert load_actor(layout, bound_actor["id"])["status"] == "needs_recovery"
+
+        # Pre-runtime-fence beta effects retain launch/profile/attempt fences.
+        # Accept the all-or-none legacy shape so an upgrade can safely drain an
+        # already committed spawn instead of stranding it permanently.
+        run_json(temp, "new-task", "--project", str(project), "--title", "legacy-spawn", "--purpose", "recover legacy effect")
+        legacy_spawn = run_json(
+            temp,
+            "dispatch",
+            "--project",
+            str(project),
+            "--task",
+            "V2-0006",
+            "--start",
+            "--unsafe-native",
+            "--command-id",
+            "CMD-LEGACY-SPAWN-FENCE",
+        )
+        legacy_effect_id = legacy_spawn["start"]["effect_id"]
+        with sqlite3.connect(project / "scheduler" / "state.db") as connection:
+            raw_payload = connection.execute(
+                "SELECT payload_json FROM effects WHERE effect_id=?",
+                (legacy_effect_id,),
+            ).fetchone()[0]
+            legacy_payload = json.loads(raw_payload)
+            for key in (
+                "runtime_backend",
+                "runtime_session_name",
+                "runtime_actor_name",
+                "runtime_target",
+            ):
+                legacy_payload.pop(key)
+            canonical = json.dumps(legacy_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            connection.execute(
+                "UPDATE effects SET payload_json=?, payload_sha256=? WHERE effect_id=?",
+                (canonical, hashlib.sha256(canonical.encode("utf-8")).hexdigest(), legacy_effect_id),
+            )
+            connection.commit()
+        run_json(
+            temp,
+            "run-scheduler",
+            "--project",
+            str(project),
+            "--once",
+            env_extra=provider_env,
+        )
+        wait_for_counter(counter, 2)
+        assert effect_status(layout, legacy_effect_id)["status"] == "applied"
         with sqlite3.connect(project / "scheduler" / "state.db") as connection:
             assert connection.execute(
                 "SELECT status FROM commands WHERE command_id='CMD-DEAD-ATOMIC'"
@@ -393,7 +479,7 @@ def main() -> int:
                 ).fetchone()[0]
             )
         provider_calls = len(counter.read_text(encoding="utf-8").splitlines())
-        assert provider_calls == 1
+        assert provider_calls == 2
         assert orphan_effects == 0
         print("runtime recovery reliability ok")
         print(
@@ -406,9 +492,12 @@ def main() -> int:
                     "recovery_scenarios": [
                         "runner_exit_before_provider_start",
                         "oci_stop_after_rm_before_observe",
+                        "oci_cleanup_ignores_corrupt_native_binding",
+                        "spawn_runtime_identity_drift_rejected",
+                        "legacy_spawn_runtime_fence_migration",
                     ],
                     "provider_calls": provider_calls,
-                    "expected_provider_calls": 1,
+                    "expected_provider_calls": 2,
                     "orphan_effects": orphan_effects,
                 },
                 sort_keys=True,

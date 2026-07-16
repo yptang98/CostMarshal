@@ -136,7 +136,7 @@ class NoProviderAdapter:
 def prepare_fixture(
     temp: Path,
     *,
-    sqlite_authority: bool = False,
+    sqlite_authority: bool = True,
 ) -> tuple[ProjectLayout, Path, dict, Path]:
     workspace = temp / "workspace"
     workspace.mkdir(parents=True)

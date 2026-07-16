@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -24,6 +25,10 @@ from costmarshal_v2.actor_runner import (  # noqa: E402
     _required_worker_bundle,
     actor_execution_workspace,
     run_actor,
+)
+from costmarshal_v2.control_store import (  # noqa: E402
+    control_document_transaction,
+    control_store_enabled,
 )
 from costmarshal_v2.governance import GovernanceError  # noqa: E402
 from costmarshal_v2.paths import ProjectLayout  # noqa: E402
@@ -70,19 +75,25 @@ def bind_required_collaboration(
     project: dict,
     actor: dict,
 ) -> dict:
-    task = load_task(layout, str(actor["task_id"]))
-    collaboration_contract = prepare_collaboration_contract(project, task)
-    task["collaboration_contract"] = collaboration_contract
-    save_task(layout, task)
-    actor["collaboration_contract"] = collaboration_contract
-    prompt_binding = bind_actor_prompt(layout, actor)
-    task = load_task(layout, str(actor["task_id"]))
-    task["attempts"][-1]["collaboration_contract_sha256"] = collaboration_contract[
-        "contract_sha256"
-    ]
-    task["attempts"][-1]["prompt_binding"] = prompt_binding
-    save_task(layout, task)
-    save_actor(layout, actor)
+    transaction = (
+        control_document_transaction(layout)
+        if control_store_enabled(layout)
+        else nullcontext()
+    )
+    with transaction:
+        task = load_task(layout, str(actor["task_id"]))
+        collaboration_contract = prepare_collaboration_contract(project, task)
+        task["collaboration_contract"] = collaboration_contract
+        save_task(layout, task)
+        actor["collaboration_contract"] = collaboration_contract
+        prompt_binding = bind_actor_prompt(layout, actor)
+        task = load_task(layout, str(actor["task_id"]))
+        task["attempts"][-1]["collaboration_contract_sha256"] = collaboration_contract[
+            "contract_sha256"
+        ]
+        task["attempts"][-1]["prompt_binding"] = prompt_binding
+        save_task(layout, task)
+        save_actor(layout, actor)
     return actor
 
 
@@ -96,11 +107,17 @@ def persist_projection_fixture(
         execution_workspace.parent,
         actor["collaboration_contract"],
     )
-    actor.setdefault("runtime", {})["context_projection"] = receipt
-    save_actor(layout, actor)
-    task = load_task(layout, str(actor["task_id"]))
-    task["attempts"][-1]["context_projection"] = receipt
-    save_task(layout, task)
+    transaction = (
+        control_document_transaction(layout)
+        if control_store_enabled(layout)
+        else nullcontext()
+    )
+    with transaction:
+        actor.setdefault("runtime", {})["context_projection"] = receipt
+        save_actor(layout, actor)
+        task = load_task(layout, str(actor["task_id"]))
+        task["attempts"][-1]["context_projection"] = receipt
+        save_task(layout, task)
     return execution_workspace
 
 
@@ -439,6 +456,197 @@ class RecoveryLogsOverflowAdapter(FakeOciAdapter):
         )
 
 
+class LegacyRecoveryOnlyAdapter(FakeOciAdapter):
+    """Prove a legacy authority may attach/clean but never fresh-start OCI."""
+
+    attach_calls = 0
+    start_calls = 0
+    recover_or_start_calls = 0
+
+    def start(self, spec, command, *, stdin_prompt: str):
+        self.__class__.start_calls += 1
+        raise AssertionError("legacy recovery-only runner attempted a fresh OCI start")
+
+    def recover_or_start(
+        self,
+        spec,
+        command,
+        *,
+        container_name: str,
+        container_id: str | None = None,
+        stdin_prompt: str,
+    ):
+        self.__class__.recover_or_start_calls += 1
+        raise AssertionError("legacy recovery-only runner attempted recover_or_start")
+
+    def attach(self, spec, *, container_name: str, container_id: str | None, command):
+        self.__class__.attach_calls += 1
+        validate_execution_spec(spec)
+        assert container_name == _expected_oci_container_name(spec)
+        assert container_id == "f" * 64
+        assert tuple(command) == (
+            "costmarshal-worker",
+            "--jsonl",
+            "--model",
+            "LongCat-2.0",
+        )
+        return SimpleNamespace(
+            spec=spec,
+            container_name=container_name,
+            container_id=str(container_id),
+            command=tuple(command),
+            network_id="c" * 64,
+            recovered=True,
+            attestation=SimpleNamespace(to_dict=lambda: {}),
+        )
+
+
+def exercise_legacy_required_recovery(
+    temp: Path,
+    *,
+    workspace: Path,
+    codex_home: Path,
+    secrets_file: Path,
+    required_isolation: dict,
+) -> None:
+    """End-to-end legacy JSON recovery is attach-only; fresh launch is blocked."""
+
+    project_dir = Path(
+        cli(
+            temp,
+            "init",
+            "--name",
+            "legacy-required-recovery",
+            "--objective",
+            "attach and clean an existing required OCI container",
+            "--workspace",
+            str(workspace),
+            "--backend",
+            "local",
+            "--governance",
+            "off",
+            "--allow-unsafe-native-workers",
+            "--secrets-file",
+            str(secrets_file),
+        )["project"]
+    )
+    cli(
+        temp,
+        "new-task",
+        "--project",
+        str(project_dir),
+        "--title",
+        "legacy attach",
+        "--purpose",
+        "recover an already-created OCI identity",
+        "--estimated-input-tokens",
+        "50000",
+        "--estimated-output-tokens",
+        "10000",
+    )
+    with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
+        dispatched = cli(
+            temp,
+            "dispatch",
+            "--project",
+            str(project_dir),
+            "--task",
+            "V2-0001",
+            "--unsafe-native",
+        )
+    layout = ProjectLayout(root=temp / "runtime", project_dir=project_dir)
+    project = load_project(layout)
+    actor = load_actor(layout, dispatched["actor_id"])
+    actor["isolation"] = json.loads(json.dumps(required_isolation))
+    actor = bind_required_collaboration(layout, project, actor)
+    execution_workspace = persist_projection_fixture(layout, project, actor)
+    with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
+        spec, command, _ = _required_worker_bundle(
+            layout,
+            project,
+            actor,
+            execution_workspace=execution_workspace,
+            workspace_mode="read-only",
+        )
+    assert spec.credential_path is not None and spec.credential_path.is_file()
+    actor = load_actor(layout, actor["id"])
+    actor.setdefault("runtime", {}).update(
+        {
+            "container_name": _expected_oci_container_name(spec),
+            "container_id": "f" * 64,
+            "container_command": list(command),
+            "container_network_id": "c" * 64,
+            "oci_lifecycle_state": "started",
+        }
+    )
+    actor["runtime"]["credential_cleanup"]["status"] = "pending"
+    save_actor(layout, actor)
+    assert control_store_enabled(layout) is False
+
+    LegacyRecoveryOnlyAdapter.attach_calls = 0
+    LegacyRecoveryOnlyAdapter.start_calls = 0
+    LegacyRecoveryOnlyAdapter.recover_or_start_calls = 0
+    with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False), patch(
+        "costmarshal_v2.actor_runner.OciWorkerExecutionAdapter",
+        LegacyRecoveryOnlyAdapter,
+    ):
+        assert run_actor(
+            layout,
+            actor["id"],
+            attempt_id=actor["attempt_id"],
+            launch_token=actor["launch_token"],
+        ) == 0
+    assert LegacyRecoveryOnlyAdapter.attach_calls == 1
+    assert LegacyRecoveryOnlyAdapter.start_calls == 0
+    assert LegacyRecoveryOnlyAdapter.recover_or_start_calls == 0
+    recovered_actor = load_actor(layout, actor["id"])
+    assert recovered_actor["runtime"]["oci_lifecycle_state"] == "cleaned"
+    assert recovered_actor["runtime"]["credential_cleanup"]["status"] == "deleted"
+    assert not spec.credential_path.exists()
+
+    cli(
+        temp,
+        "new-task",
+        "--project",
+        str(project_dir),
+        "--title",
+        "legacy fresh blocked",
+        "--purpose",
+        "reject a fresh required OCI start without recoverable authority",
+    )
+    with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
+        fresh_dispatch = cli(
+            temp,
+            "dispatch",
+            "--project",
+            str(project_dir),
+            "--task",
+            "V2-0002",
+            "--unsafe-native",
+        )
+    fresh_actor = load_actor(layout, fresh_dispatch["actor_id"])
+    fresh_actor["isolation"] = json.loads(json.dumps(required_isolation))
+    save_actor(layout, fresh_actor)
+    with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False), patch(
+        "costmarshal_v2.actor_runner.OciWorkerExecutionAdapter",
+        LegacyRecoveryOnlyAdapter,
+    ):
+        try:
+            run_actor(
+                layout,
+                fresh_actor["id"],
+                attempt_id=fresh_actor["attempt_id"],
+                launch_token=fresh_actor["launch_token"],
+            )
+        except SystemExit as exc:
+            assert "Required OCI start needs the recoverable control store" in str(exc)
+        else:
+            raise AssertionError("fresh legacy required actor bypassed the control-store gate")
+    assert LegacyRecoveryOnlyAdapter.attach_calls == 1
+    assert LegacyRecoveryOnlyAdapter.start_calls == 0
+    assert LegacyRecoveryOnlyAdapter.recover_or_start_calls == 0
+
+
 def main() -> int:
     temp = Path(tempfile.mkdtemp(prefix="costmarshal-v2-oci-actor-runner-"))
     try:
@@ -683,6 +891,19 @@ def main() -> int:
             assert resumed_spec.credential_path == prepared_spec.credential_path
         cleanup_temporary_credential(prepared_spec)
 
+        exercise_legacy_required_recovery(
+            temp,
+            workspace=workspace,
+            codex_home=codex_home,
+            secrets_file=secrets_file,
+            required_isolation=actor["isolation"],
+        )
+
+        # Required OCI launches are production runtime effects. Exercise the
+        # runner only after the fixture has the same recoverable authority that
+        # scheduler-driven starts require.
+        cli(temp, "migrate-state", "--project", str(project_dir), "--apply")
+
         child = """
 import sys
 from pathlib import Path
@@ -728,7 +949,8 @@ raise SystemExit(run_actor(
         assert after_credential["runtime"]["credential_cleanup"]["status"] == "creating"
         assert Path(after_credential["runtime"]["credential_cleanup"]["path"]).is_file()
         after_credential["status"] = "starting"
-        save_actor(layout, after_credential)
+        with control_document_transaction(layout):
+            save_actor(layout, after_credential)
         recovery = cli(temp, "recover", "--project", str(project_dir))
         assert any(actor["id"] in issue for issue in recovery["issues"]), recovery
         after_cleanup = load_actor(layout, actor["id"])
@@ -823,7 +1045,8 @@ raise SystemExit(run_actor(
             }
         )
         recovered_actor["runtime"]["credential_cleanup"]["status"] = "pending"
-        save_actor(layout, recovered_actor)
+        with control_document_transaction(layout):
+            save_actor(layout, recovered_actor)
         FakeOciAdapter.attached = False
         started_governed_project = load_project(layout)
         started_original_governance = json.loads(
@@ -1066,7 +1289,8 @@ raise SystemExit(actor_runner.run_actor(
                 "oci_lifecycle_state": "started",
             }
         )
-        save_actor(layout, usage_actor)
+        with control_document_transaction(layout):
+            save_actor(layout, usage_actor)
         with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False), patch(
             "costmarshal_v2.actor_runner.OciWorkerExecutionAdapter",
             RecoveryLogsOverflowAdapter,
@@ -1100,6 +1324,7 @@ raise SystemExit(actor_runner.run_actor(
                         "after_external_create_before_durable_identity",
                     ],
                     "recovery_scenarios": [
+                        "legacy_json_required_attach_cleanup_only",
                         "credential_after_create_before_oci_prepare",
                         "oci_prepared_before_start",
                         "deterministic_name_attach_after_hard_exit",

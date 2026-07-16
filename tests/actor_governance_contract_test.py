@@ -364,6 +364,41 @@ def main() -> int:
         assert not list((temp / "runtime" / "worker-bundles").rglob("provider.secret"))
         assert not provider_counter.exists(), "required governance reached a provider"
 
+        # A direct actor invocation must not bypass the recoverable-effect
+        # requirement imposed on scheduler starts. With governance off and no
+        # SQLite cutover, fail before bundle, credential, OCI, or provider I/O.
+        project_payload["governance"] = {
+            "mode": "off",
+            "ready": False,
+            "status": "off",
+            "binding": None,
+        }
+        (project / "project.json").write_text(
+            json.dumps(project_payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        marker.write_bytes(ownership_bytes("workspace-original"))
+        pre_cutover_before = tree_digest(project)
+        pre_cutover_blocked = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+        assert pre_cutover_blocked.returncode != 0, (
+            "direct required OCI actor started before control-store cutover"
+        )
+        pre_cutover_error = pre_cutover_blocked.stdout + pre_cutover_blocked.stderr
+        assert "Required OCI start needs the recoverable control store" in pre_cutover_error, (
+            pre_cutover_error
+        )
+        assert tree_digest(project) == pre_cutover_before, (
+            "pre-cutover required actor rejection mutated the project"
+        )
+        assert not list((temp / "runtime" / "worker-bundles").rglob("provider.secret"))
+        assert not provider_counter.exists(), "pre-cutover required actor reached a provider"
+
         # Native execution is permitted only while governance is off. Pause
         # after Popen but before post-spawn authorization, then make the
         # project governed and drift ownership. The child counts a provider

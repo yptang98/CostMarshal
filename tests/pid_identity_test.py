@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -44,6 +45,7 @@ class PidIdentityTest(unittest.TestCase):
             [sys.executable, "-c", "import time; time.sleep(60)"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            start_new_session=os.name != "nt",
         )
         try:
             marker = None
@@ -70,6 +72,11 @@ class PidIdentityTest(unittest.TestCase):
                     process_start_marker=f"{marker}-forged",
                 )
             self.assertTrue(pid_is_alive(process.pid))
+            if os.name != "nt":
+                self.assertEqual(
+                    backend.stop_plan(target=f"pid:{process.pid}", pid=process.pid),
+                    [["kill", "-TERM", "--", f"-{process.pid}"]],
+                )
             backend.stop_actor(
                 target=f"pid:{process.pid}",
                 pid=process.pid,

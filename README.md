@@ -90,6 +90,18 @@ python "$CodexHome\skills\costmarshal\scripts\install_smoke_test.py"
 
 CostMarshal requires Python 3.11+ and uses only its standard library at runtime. `git` is required for writable worker worktrees. `tmux` is optional; Windows defaults to the local process backend.
 
+The tmux backend uses exact session/window targets and launches each actor in
+the project directory. Session and actor runtime names are restricted to 1-64
+ASCII letters, numbers, hyphens, and underscores, with a letter or number at
+both ends; ambiguous tmux target/format characters are rejected before launch.
+Pane output is not treated as a durable transcript. Completion reports, bound
+artifacts, and CAS evidence remain the authoritative result record.
+New admissions reject dotted runtime names. For upgrade safety, an already
+persisted dotted session remains addressable through exact session targets, and
+a dotted actor window can still be inspected, messaged, and stopped by resolving
+its unique tmux window ID. A missing dotted actor is not restarted under its
+legacy name; dispatch a replacement with a new safe runtime identity.
+
 Production worker isolation additionally requires Docker or Podman running Linux containers and a digest-pinned CostMarshal worker image. Native workers are a development compatibility mode, not a security boundary.
 
 ## Provider setup
@@ -379,6 +391,11 @@ python scripts/costmarshal.py state-store --project <project-dir> --repair-views
 ```
 
 After cutover, scheduler mutations use SQLite WAL transactions and stable `--command-id` values. A reused ID with a different payload is rejected. JSON/JSONL files are compatibility views rebuilt after a commit-time crash, including cycles with no pending runtime effect; a dedicated materializer lock prevents concurrent revision ABA, and bounded atomic-replace retries tolerate transient Windows reader sharing conflicts without hiding persistent permission failures. `dispatch --start`, escalation starts, and `stop-actor --stop-runtime` commit a fenced effect intent first; the scheduler leases the effect, renews that owner-bound lease during slow OS/OCI I/O, persists its observation, and atomically marks the effect and command complete. A crashed owner stops renewing, so the expired leased or observed effect becomes recoverable. Launch tokens plus the attempt lifetime lock prevent a duplicate runner from calling the provider when a start observation is uncertain.
+
+Required OCI actors must cut over with `migrate-state --apply` before
+`dispatch --start`. This guarantees that every production container start has
+a recoverable STOP effect path; legacy JSON authority cannot start a required
+container that it cannot durably stop.
 
 ## Offline blind backtest
 

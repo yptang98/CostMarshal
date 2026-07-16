@@ -461,6 +461,7 @@ def main() -> int:
         )
         project = load_project(layout)
         seed_paired_route_evidence(temp, project_dir)
+        cli(temp, "migrate-state", "--project", str(project_dir), "--apply")
         task_id = cli(
             temp,
             "new-task",

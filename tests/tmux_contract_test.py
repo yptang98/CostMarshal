@@ -7,17 +7,23 @@ requiring tmux to be installed on the development machine.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "scripts" / "costmarshal.py"
+sys.path.insert(0, str(ROOT))
+
+from costmarshal_v2.session_backend import TmuxBackend, command_to_string, tmux_format_literal  # noqa: E402
 
 
 FAKE_TMUX = r'''
@@ -48,12 +54,22 @@ def option(args: list[str], name: str) -> str:
         raise SystemExit(f"missing {name}")
 
 
-def command_tail(args: list[str], name: str) -> str:
-    try:
-        index = args.index(name) + 2
-    except ValueError:
-        return ""
-    return " ".join(args[index + 1 :])
+def session_target(value: str, sessions: dict) -> str:
+    exact = value.startswith("=")
+    name = value[1:] if exact else value
+    if name.endswith(":"):
+        name = name[:-1]
+    if exact or name in sessions:
+        return name
+    matches = sorted(candidate for candidate in sessions if candidate.startswith(name))
+    return matches[0] if len(matches) == 1 else name
+
+
+def actor_target(value: str) -> tuple[str, str]:
+    raw = value[1:] if value.startswith("=") else value
+    if ":=" in raw:
+        return tuple(raw.split(":=", 1))
+    return tuple(raw.split(":", 1))
 
 
 def main() -> int:
@@ -62,41 +78,71 @@ def main() -> int:
         return 2
     state = load()
     cmd = args[0]
+    state.setdefault("calls", []).append(args)
     if cmd == "has-session":
-        session = option(args, "-t")
-        return 0 if session in state["sessions"] else 1
+        target = option(args, "-t")
+        session = session_target(target, state["sessions"])
+        save(state)
+        if target.startswith("="):
+            return 0 if session in state["sessions"] else 1
+        matches = [candidate for candidate in state["sessions"] if candidate.startswith(session)]
+        return 0 if session in state["sessions"] or len(matches) == 1 else 1
     if cmd == "new-session":
         session = option(args, "-s")
         window = option(args, "-n")
+        cwd = option(args, "-c")
         command = args[-1]
-        state["sessions"].setdefault(session, {"windows": {}})["windows"][window] = {"command": command}
+        state["sessions"].setdefault(session, {"windows": {}})["windows"][window] = {
+            "command": command,
+            "cwd": cwd,
+            "window_id": f"@{sum(len(row['windows']) for row in state['sessions'].values()) + 1}",
+        }
         save(state)
         return 0
     if cmd == "new-window":
-        session = option(args, "-t")
+        target = option(args, "-t")
+        session = session_target(target, state["sessions"])
         window = option(args, "-n")
+        cwd = option(args, "-c")
         command = args[-1]
         if session not in state["sessions"]:
             print(f"missing session {session}", file=sys.stderr)
             return 1
-        state["sessions"][session]["windows"][window] = {"command": command}
+        state["sessions"][session]["windows"][window] = {
+            "command": command,
+            "cwd": cwd,
+            "create_target": target,
+            "window_id": f"@{sum(len(row['windows']) for row in state['sessions'].values()) + 1}",
+        }
         save(state)
         return 0
     if cmd == "list-windows":
-        session = option(args, "-t")
-        for window in sorted(state["sessions"].get(session, {}).get("windows", {})):
-            print(window)
+        session = session_target(option(args, "-t"), state["sessions"])
+        windows = state["sessions"].get(session, {}).get("windows", {})
+        include_id = "#{window_id}" in option(args, "-F")
+        for window in sorted(windows):
+            if include_id:
+                print(f"{windows[window].get('window_id', '@0')}\t{window}")
+            else:
+                print(window)
+        save(state)
         return 0
     if cmd == "send-keys":
         target = option(args, "-t")
-        text = args[-2] if len(args) >= 2 else ""
-        state.setdefault("send_keys", []).append({"target": target, "text": text})
+        text = args[-1] if args else ""
+        state.setdefault("send_keys", []).append({"target": target, "text": text, "literal": "-l" in args})
         save(state)
         return 0
     if cmd == "kill-window":
         target = option(args, "-t")
-        session, _, window = target.partition(":")
-        state["sessions"].get(session, {}).get("windows", {}).pop(window, None)
+        if target.startswith("@"):
+            for session_row in state["sessions"].values():
+                for window, window_row in list(session_row.get("windows", {}).items()):
+                    if window_row.get("window_id") == target:
+                        session_row["windows"].pop(window, None)
+        else:
+            session, window = actor_target(target)
+            state["sessions"].get(session, {}).get("windows", {}).pop(window, None)
         save(state)
         return 0
     print(f"unsupported fake tmux command: {cmd}", file=sys.stderr)
@@ -138,6 +184,181 @@ def assert_true(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
+def tree_snapshot(root: Path) -> dict[str, str]:
+    return {
+        path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def wait_for_file(path: Path, *, timeout_seconds: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if path.is_file():
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"timed out waiting for native tmux output: {path}")
+
+
+def run_native_tmux_contract(temp: Path) -> bool:
+    if os.name == "nt":
+        return False
+    executable = shutil.which("tmux")
+    if not executable:
+        if os.environ.get("CI", "").lower() == "true":
+            raise AssertionError("CI must provide tmux for the native backend contract")
+        return False
+    backend = TmuxBackend(executable)
+    # Deliberately exercise the pre-hardening dotted-session compatibility
+    # contract against native tmux, not only the fake backend.
+    session = f"cmv2.legacy-{os.getpid()}-{secrets.token_hex(4)}"
+    prefix_session = f"{session}-prefix"
+    cwd = temp / "native space #{session_name}"
+    cwd.mkdir(parents=True)
+    input_output = temp / "native-input.txt"
+    cwd_output = temp / "native-cwd.txt"
+    second_cwd_output = temp / "native-second-cwd.txt"
+    legacy_input_output = temp / "native-legacy-input.txt"
+    socket_root = temp / "native-tmux-socket"
+    socket_root.mkdir(mode=0o700)
+    socket_root.chmod(0o700)
+    isolated_home = temp / "native-tmux-home"
+    isolated_home.mkdir(mode=0o700)
+    isolated_home.chmod(0o700)
+    sleeper = command_to_string([sys.executable, "-c", "import time; time.sleep(30)"])
+    reader = command_to_string(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os,pathlib,time; "
+                f"pathlib.Path({str(cwd_output)!r}).write_text(os.getcwd(), encoding='utf-8'); "
+                "value=input(); "
+                f"pathlib.Path({str(input_output)!r}).write_text(value, encoding='utf-8'); "
+                "time.sleep(30)"
+            ),
+        ]
+    )
+    second = command_to_string(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os,pathlib,time; "
+                f"pathlib.Path({str(second_cwd_output)!r}).write_text(os.getcwd(), encoding='utf-8'); "
+                "time.sleep(30)"
+            ),
+        ]
+    )
+    legacy_reader = command_to_string(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import pathlib,time; value=input(); "
+                f"pathlib.Path({str(legacy_input_output)!r}).write_text(value, encoding='utf-8'); "
+                "time.sleep(30)"
+            ),
+        ]
+    )
+    isolated_environment = {
+        "TMUX_TMPDIR": str(socket_root),
+        "HOME": str(isolated_home),
+        "XDG_CONFIG_HOME": str(isolated_home / ".config"),
+    }
+    previous_environment = {
+        key: os.environ.get(key)
+        for key in (*isolated_environment, "TMUX")
+    }
+    os.environ.update(isolated_environment)
+    os.environ.pop("TMUX", None)
+    try:
+        created_prefix = subprocess.run(
+            [executable, "new-session", "-d", "-s", prefix_session, "-n", "sentinel", "--", sleeper],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        assert_true(created_prefix.returncode == 0, f"native tmux prefix setup failed: {created_prefix.stderr}")
+        assert_true(not backend.session_exists(session), "native exact lookup should not match a prefix session")
+        first_launch = backend.start_actor(
+            session_name=session,
+            actor_name="reader",
+            command=reader,
+            cwd=cwd,
+            log_path=temp / "ignored-reader.log",
+        )
+        assert_true(first_launch["target"] == f"{session}:reader", "native tmux should persist a stable logical target")
+        wait_for_file(cwd_output)
+        backend.send_text(target=f"{session}:reader", text="C-c")
+        wait_for_file(input_output)
+        assert_true(input_output.read_text(encoding="utf-8") == "C-c", "native tmux should inject C-c as literal text")
+        assert_true(cwd_output.read_text(encoding="utf-8") == str(cwd.resolve()), "native tmux should preserve the literal cwd")
+        backend.start_actor(
+            session_name=session,
+            actor_name="second",
+            command=second,
+            cwd=cwd,
+            log_path=temp / "ignored-second.log",
+        )
+        wait_for_file(second_cwd_output)
+        assert_true(
+            second_cwd_output.read_text(encoding="utf-8") == str(cwd.resolve()),
+            "native tmux new-window should preserve the literal cwd",
+        )
+        assert_true("sentinel" in backend.list_actors(prefix_session), "native exact targets should preserve the prefix session")
+        backend.stop_actor(target=f"{session}:second")
+        assert_true("second" not in backend.list_actors(session), "native exact stop should remove only the selected actor")
+        legacy_created = subprocess.run(
+            [
+                executable,
+                "new-window",
+                "-d",
+                "-t",
+                f"={session}:",
+                "-n",
+                "legacy.reader",
+                "-c",
+                tmux_format_literal(str(cwd.resolve())),
+                "--",
+                legacy_reader,
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        assert_true(legacy_created.returncode == 0, f"native legacy window setup failed: {legacy_created.stderr}")
+        backend.send_text(target=f"{session}:legacy.reader", text="legacy")
+        wait_for_file(legacy_input_output)
+        assert_true(
+            legacy_input_output.read_text(encoding="utf-8") == "legacy",
+            "native legacy dotted actor send should use its resolved window ID",
+        )
+        backend.stop_actor(target=f"{session}:legacy.reader")
+        assert_true(
+            "legacy.reader" not in backend.list_actors(session),
+            "native legacy dotted actor stop should remove the resolved window",
+        )
+    finally:
+        for target in (session, prefix_session):
+            subprocess.run(
+                [executable, "kill-session", "-t", f"={target}"],
+                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        for key, previous in previous_environment.items():
+            if previous is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous
+    return True
+
+
 def make_fake_tmux(temp: Path) -> tuple[Path, Path]:
     fake_py = temp / "fake_tmux.py"
     payload = FAKE_TMUX
@@ -153,7 +374,7 @@ def make_fake_tmux(temp: Path) -> tuple[Path, Path]:
 
 
 def main() -> int:
-    temp = Path(tempfile.mkdtemp(prefix="costmarshal-v2-tmux-contract-"))
+    temp = Path(tempfile.mkdtemp(prefix="costmarshal-v2-tmux#{session_name}-"))
     previous_codex_home = os.environ.get("CODEX_HOME")
     try:
         codex_home = temp / "codex-home"
@@ -167,6 +388,118 @@ def main() -> int:
         assert_true(Path(configured["path"]).is_file(), "tmux fixture profile should exist")
 
         fake_tmux, fake_state = make_fake_tmux(temp)
+        fake_state.write_text(
+            json.dumps(
+                {
+                    "sessions": {"cmv2-fake-prefix": {"windows": {"sentinel": {"command": "keep"}}}},
+                    "send_keys": [],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        for invalid_name in ("bad:name", "bad.name", "bad*name", "bad#name"):
+            invalid_session = run(
+                temp,
+                "init",
+                "--name",
+                f"invalid-tmux-session-{invalid_name.encode().hex()}",
+                "--objective",
+                "Reject an ambiguous tmux target",
+                "--session-name",
+                invalid_name,
+                "--backend",
+                "tmux",
+                "--backend-command",
+                str(fake_tmux),
+                "--allow-unsafe-custom-worker-commands",
+                "--allow-unsafe-native-workers",
+                expect_ok=False,
+            )
+            assert_true(
+                "tmux session name" in (invalid_session.stdout + invalid_session.stderr),
+                f"tmux session target syntax should reject {invalid_name!r}",
+            )
+        default_session = run_json(
+            temp,
+            "init",
+            "--name",
+            "default.session",
+            "--objective",
+            "Normalize an automatically generated tmux session",
+            "--backend",
+            "tmux",
+            "--backend-command",
+            str(fake_tmux),
+            "--allow-unsafe-custom-worker-commands",
+            "--allow-unsafe-native-workers",
+        )
+        assert_true(
+            "." not in default_session["session_name"],
+            "automatically generated tmux session names should not retain dots",
+        )
+        collision_project = Path(default_session["project"])
+        run_json(
+            temp,
+            "new-task",
+            "--project",
+            str(collision_project),
+            "--title",
+            "First runtime name",
+            "--purpose",
+            "Reserve a truncated tmux runtime name",
+        )
+        collision_prefix = "actor-" + "a" * 50
+        run_json(
+            temp,
+            "dispatch",
+            "--project",
+            str(collision_project),
+            "--task",
+            "V2-0001",
+            "--actor-id",
+            collision_prefix + "-one",
+            "--unsafe-native",
+        )
+        run_json(
+            temp,
+            "new-task",
+            "--project",
+            str(collision_project),
+            "--title",
+            "Second runtime name",
+            "--purpose",
+            "Reject a truncated tmux runtime collision",
+        )
+        collision_task = collision_project / "tasks" / "V2-0002" / "task.json"
+        collision_task_before = collision_task.read_bytes()
+        collision_project_before = tree_snapshot(collision_project)
+        collision_dispatch = run(
+            temp,
+            "dispatch",
+            "--project",
+            str(collision_project),
+            "--task",
+            "V2-0002",
+            "--actor-id",
+            collision_prefix + "-two",
+            "--unsafe-native",
+            expect_ok=False,
+        )
+        assert_true(
+            "runtime actor name" in (collision_dispatch.stdout + collision_dispatch.stderr),
+            "dispatch should reject actor IDs that truncate to the same tmux runtime name",
+        )
+        assert_true(
+            collision_task.read_bytes() == collision_task_before,
+            "a truncated tmux runtime collision should not persist an attempt or budget reservation",
+        )
+        assert_true(
+            tree_snapshot(collision_project) == collision_project_before,
+            "a truncated tmux runtime collision should have zero project-tree side effects",
+        )
         init = run_json(
             temp,
             "init",
@@ -185,11 +518,61 @@ def main() -> int:
         )
         project = Path(init["project"])
         assert_true(init["backend"] == "tmux", "tmux contract should explicitly select the tmux backend")
+        dry_run = run_json(
+            temp,
+            "start-leader",
+            "--project",
+            str(project),
+            "--command",
+            "leader {prompt_file}",
+            "--dry-run",
+        )
+        assert_true(dry_run["dry_run"], "tmux start dry-run should not launch a runtime")
+        escaped_project = str(project).replace("#", "##")
+        assert_true(
+            escaped_project in dry_run["planned_commands"][0],
+            "tmux dry-run should format-escape the actor working directory",
+        )
         leader = run_json(temp, "start-leader", "--project", str(project), "--command", "leader {prompt_file}")
         assert_true(not leader["dry_run"], "start-leader should run through fake tmux")
         assert_true(leader["backend"] == "tmux", "start-leader should report the tmux backend")
 
         run_json(temp, "new-task", "--project", str(project), "--title", "Fake tmux task", "--purpose", "Exercise tmux backend")
+        task_path = project / "tasks" / "V2-0001" / "task.json"
+        task_before_invalid_actor = task_path.read_bytes()
+        project_before_invalid_actor = tree_snapshot(project)
+        invalid_actor = run(
+            temp,
+            "dispatch",
+            "--project",
+            str(project),
+            "--task",
+            "V2-0001",
+            "--actor-id",
+            "bad.name",
+            "--unsafe-native",
+            expect_ok=False,
+        )
+        assert_true(
+            "Invalid tmux dispatch identity" in (invalid_actor.stdout + invalid_actor.stderr),
+            "dispatch should reject an actor name that cannot be represented safely in tmux",
+        )
+        assert_true(
+            task_path.read_bytes() == task_before_invalid_actor,
+            "invalid tmux actor identity should not persist an attempt or budget reservation",
+        )
+        assert_true(
+            not (project / "scheduler" / "actors" / "bad.name.json").exists(),
+            "invalid tmux actor identity should not persist an actor",
+        )
+        assert_true(
+            not (project / "scheduler" / "mailboxes" / "bad.name").exists(),
+            "invalid tmux actor identity should not persist a mailbox",
+        )
+        assert_true(
+            tree_snapshot(project) == project_before_invalid_actor,
+            "invalid tmux actor identity should have zero project-tree side effects",
+        )
         dispatch = run_json(
             temp,
             "dispatch",
@@ -205,28 +588,126 @@ def main() -> int:
             "--unsafe-native",
         )
         assert_true(dispatch["started"], "dispatch --start should run through fake tmux")
-        run_json(temp, "send", "--project", str(project), "--to", "agent-v2-0001", "--message", "hello agent", "--runtime-send")
+        run_json(temp, "send", "--project", str(project), "--to", "agent-v2-0001", "--message", "C-c", "--runtime-send")
 
         state = json.loads(fake_state.read_text(encoding="utf-8"))
         windows = state["sessions"]["cmv2-fake"]["windows"]
         assert_true("leader" in windows, "leader window should exist in fake tmux")
         assert_true("agent-v2-0001" in windows, "agent window should exist in fake tmux")
+        assert_true(windows["leader"]["cwd"] == escaped_project, "leader should start in the escaped project directory")
+        assert_true(windows["agent-v2-0001"]["cwd"] == escaped_project, "agent should start in the escaped project directory")
         assert_true("leader.prompt.md" in windows["leader"]["command"], "leader command should include prompt path")
         assert_true("agent-v2-0001.prompt.md" in windows["agent-v2-0001"]["command"], "agent command should include prompt path")
-        assert_true(state["send_keys"][-1]["target"] == "cmv2-fake:agent-v2-0001", "send --runtime-send should target the tmux adapter")
+        assert_true(
+            windows["agent-v2-0001"]["create_target"] == "=cmv2-fake:",
+            "new actors should use an exact session target",
+        )
+        assert_true(
+            "leader" not in state["sessions"]["cmv2-fake-prefix"]["windows"],
+            "an exact session lookup must not attach to a prefix collision",
+        )
+        assert_true(
+            state["sessions"]["cmv2-fake-prefix"]["windows"]["sentinel"]["command"] == "keep",
+            "an exact session lookup must leave the prefix-collision session unchanged",
+        )
+        assert_true(
+            any(call[:3] == ["has-session", "-t", "=cmv2-fake"] for call in state["calls"]),
+            "session existence checks should use an exact target",
+        )
+        runtime_send = state["send_keys"][-1]
+        assert_true(len(state["send_keys"]) == 1, "runtime send should be one tmux external call")
+        assert_true(
+            runtime_send["target"] == "=cmv2-fake:=agent-v2-0001"
+            and runtime_send["literal"] is True
+            and runtime_send["text"].rstrip("\r") == "C-c",
+            "runtime text and submission should use one literal exact-target call",
+        )
+        if os.name != "nt":
+            assert_true(
+                runtime_send["text"] == "C-c\r",
+                "POSIX fake tmux should receive the literal carriage-return submission",
+            )
 
         stop = run_json(temp, "stop-actor", "--project", str(project), "--actor", "agent-v2-0001", "--stop-runtime", "--reason", "contract done")
         assert_true(stop["actor_status"] == "stopped", "stop-actor should update state after fake runtime stop")
         state = json.loads(fake_state.read_text(encoding="utf-8"))
         assert_true("agent-v2-0001" not in state["sessions"]["cmv2-fake"]["windows"], "kill-window should remove the agent window")
+        assert_true(
+            any(
+                call[:3] == ["kill-window", "-t", "=cmv2-fake:=agent-v2-0001"]
+                for call in state["calls"]
+            ),
+            "runtime stop should use an exact actor target",
+        )
+
+        # Older beta projects could persist dotted window names. Resolve the
+        # exact matching window ID so those actors can still be messaged and
+        # stopped without reintroducing ambiguous target parsing.
+        state["sessions"]["cmv2-fake"]["windows"]["legacy.actor"] = {
+            "command": "legacy",
+            "cwd": escaped_project,
+            "window_id": "@77",
+        }
+        fake_state.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        legacy_backend = TmuxBackend(str(fake_tmux))
+        legacy_backend.send_text(target="cmv2-fake:legacy.actor", text="legacy")
+        legacy_backend.stop_actor(target="cmv2-fake:legacy.actor")
+        state = json.loads(fake_state.read_text(encoding="utf-8"))
+        assert_true(
+            state["send_keys"][-1]["target"] == "@77",
+            "legacy dotted actor send should resolve to one exact tmux window ID",
+        )
+        assert_true(
+            any(call[:3] == ["kill-window", "-t", "@77"] for call in state["calls"]),
+            "legacy dotted actor stop should resolve to one exact tmux window ID",
+        )
+        assert_true(
+            "legacy.actor" not in state["sessions"]["cmv2-fake"]["windows"],
+            "legacy dotted actor stop should remove only the resolved window",
+        )
+        state["sessions"]["cmv2.legacy"] = {
+            "windows": {
+                "legacy.actor": {
+                    "command": "legacy-session",
+                    "cwd": escaped_project,
+                    "window_id": "@78",
+                }
+            }
+        }
+        fake_state.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        assert_true(
+            legacy_backend.session_exists("cmv2.legacy"),
+            "persisted dotted sessions should use an exact compatible lookup",
+        )
+        legacy_backend.stop_actor(target="cmv2.legacy:legacy.actor")
+        state = json.loads(fake_state.read_text(encoding="utf-8"))
+        assert_true(
+            "legacy.actor" not in state["sessions"]["cmv2.legacy"]["windows"],
+            "persisted dotted session stop should resolve its exact window ID",
+        )
 
         state["sessions"]["cmv2-fake"]["windows"].pop("leader", None)
         fake_state.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         recovery = run_json(temp, "recover", "--project", str(project), "--plan-restarts")
         assert_true(recovery["status"] == "degraded", "recover should notice a missing running leader runtime")
         assert_true(recovery["planned_restarts"], "recover should plan a restart for missing running actors")
+        assert_true(
+            escaped_project in recovery["planned_restarts"][0],
+            "recovery restart plans should preserve the escaped actor working directory",
+        )
 
-        print(json.dumps({"status": "ok", "temporary_state": "cleaned"}, indent=2))
+        native_tmux = run_native_tmux_contract(temp)
+
+        print(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "native_tmux": "passed" if native_tmux else "not_available",
+                    "temporary_state": "cleaned",
+                },
+                indent=2,
+            )
+        )
         return 0
     finally:
         if previous_codex_home is None:

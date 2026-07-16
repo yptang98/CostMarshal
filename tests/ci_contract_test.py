@@ -22,6 +22,8 @@ class CiContractTest(unittest.TestCase):
         self.assertIn('          - "3.13"', text)
         self.assertNotIn('          - "3.10"', text)
         self.assertIn("python tests/release/run_local_test_evidence.py", text)
+        self.assertIn("sudo apt-get install --yes --no-install-recommends tmux", text)
+        self.assertIn("if: runner.os == 'Linux'", text)
         self.assertIn("artifacts/local-test-report.json", text)
         self.assertIn("if-no-files-found: error", text)
 

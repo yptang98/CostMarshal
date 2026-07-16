@@ -30,6 +30,7 @@ from .control_store import (
     control_document_transaction,
     control_transaction,
     current_transaction,
+    dead_effect,
     effect_status,
     fail_effect,
     lease_effect,
@@ -60,6 +61,10 @@ from .session_backend import (
     session_backend_config,
     session_backend_kind,
     session_name as backend_session_name,
+    validate_persisted_tmux_actor_name,
+    validate_persisted_tmux_session_name,
+    validate_persisted_tmux_target,
+    validate_tmux_name,
 )
 from .security import (
     SecurityValidationError,
@@ -180,6 +185,12 @@ SPAWN_EFFECT_TYPE = "spawn_actor"
 STOP_EFFECT_TYPE = "stop_actor"
 SPAWN_EFFECT_LEASE_SECONDS = 2.0
 SPAWN_EFFECT_MAX_ATTEMPTS = 5
+SPAWN_RUNTIME_FENCE_KEYS = (
+    "runtime_backend",
+    "runtime_session_name",
+    "runtime_actor_name",
+    "runtime_target",
+)
 SCHEDULER_HEARTBEAT_SECONDS = 10.0
 GOVERNANCE_PREFLIGHT_COMMANDS = frozenset(
     {
@@ -937,6 +948,59 @@ def make_actor(
     return actor
 
 
+def validate_actor_runtime_binding(session: dict[str, Any], actor: dict[str, Any]) -> None:
+    """Fail closed when persisted runtime identity diverges from its actor/session."""
+    runtime = actor_runtime(actor)
+    backend_config = session_backend_config(session)
+    expected_backend = backend_config.get("kind")
+    if expected_backend not in {"local", "tmux"}:
+        raise RuntimeError(f"session backend kind is invalid: {expected_backend!r}")
+    if runtime.get("backend") != expected_backend:
+        raise RuntimeError(
+            f"runtime backend {runtime.get('backend')!r} does not match session backend {expected_backend!r}"
+        )
+    if expected_backend != "tmux":
+        return
+    expected_session = backend_config.get("session_name")
+    actor_id = actor.get("id")
+    if not isinstance(actor_id, str) or not actor_id:
+        raise RuntimeError("actor id must be a non-empty string")
+    expected_actor = actor_runtime_name(actor_id)
+    expected_target = f"{expected_session}:{expected_actor}"
+    validate_persisted_tmux_session_name(expected_session)
+    validate_persisted_tmux_actor_name(expected_actor)
+    validate_persisted_tmux_session_name(runtime.get("session_name"))
+    validate_persisted_tmux_actor_name(runtime.get("actor_name"))
+    validate_persisted_tmux_target(runtime.get("target"))
+    if runtime.get("session_name") != expected_session:
+        raise RuntimeError("tmux runtime session name does not match the session authority")
+    if runtime.get("actor_name") != expected_actor:
+        raise RuntimeError("tmux runtime actor name does not match the actor identity")
+    if runtime.get("target") != expected_target:
+        raise RuntimeError("tmux runtime target does not match the session and actor identity")
+
+
+def validate_actor_runtime_authority(
+    layout: ProjectLayout,
+    session: dict[str, Any],
+    actor: dict[str, Any],
+) -> None:
+    """Validate one actor's binding and uniqueness within the tmux session."""
+    validate_actor_runtime_binding(session, actor)
+    if session_backend_kind(session) != "tmux":
+        return
+    actor_id = actor.get("id")
+    runtime_name = (actor.get("runtime") or {}).get("actor_name")
+    for other in actor_rows(layout):
+        if other.get("id") == actor_id:
+            continue
+        other_runtime = other.get("runtime") or {}
+        if other_runtime.get("backend") == "tmux" and other_runtime.get("actor_name") == runtime_name:
+            raise RuntimeError(
+                f"tmux runtime actor name {runtime_name!r} is shared by {actor_id!r} and {other.get('id')!r}"
+            )
+
+
 def preflight_worker_isolation(
     layout: ProjectLayout,
     project: dict[str, Any],
@@ -1164,10 +1228,16 @@ def command_init(args: Any) -> None:
         )
     except GovernanceError as exc:
         raise SystemExit(f"ArchMarshal governance check failed [{exc.code}]: {exc}") from exc
-    ensure_runtime_dirs(layout)
-    session_name = args.session_name or f"cmv2-{slugify(project_id)[:42]}"
+    default_session_slug = re.sub(r"[^a-z0-9_-]+", "-", slugify(project_id)).strip("-_")
+    session_name = args.session_name or f"cmv2-{default_session_slug[:42]}"
     requested_backend = getattr(args, "backend", None) or "auto"
     backend_kind = select_backend_kind(requested_backend)
+    if backend_kind == "tmux":
+        try:
+            validate_tmux_name(session_name, label="session name")
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+    ensure_runtime_dirs(layout)
     backend_command = getattr(args, "backend_command", None) or getattr(args, "tmux_command", None)
     if backend_kind == "tmux":
         backend_command = backend_command or "tmux"
@@ -1280,6 +1350,14 @@ def start_actor(
     persist_runtime_state: bool = True,
 ) -> dict[str, Any]:
     project = load_project(layout)
+    if (
+        not dry_run
+        and (actor.get("isolation") or {}).get("mode") == "required"
+        and not control_store_enabled(layout)
+    ):
+        raise SystemExit(
+            "Required OCI start needs the recoverable control store; run migrate-state --apply first"
+        )
     governance = project.get("governance") or {"mode": "off"}
     try:
         enforce_governance_contract(
@@ -1299,6 +1377,10 @@ def start_actor(
     session_name = backend_session_name(session)
     if not session_name:
         raise SystemExit("v2 session is missing backend.session_name")
+    try:
+        validate_actor_runtime_authority(layout, session, actor)
+    except RuntimeError as exc:
+        raise SystemExit(f"Invalid actor runtime binding: {exc}") from exc
     prompt_path = actor_prompt_file(layout, actor["id"])
     command = actor_launch_command(layout, session, actor)
     runtime = actor_runtime(actor)
@@ -1308,7 +1390,13 @@ def start_actor(
     runtime["session_name"] = session_name
     if dry_run:
         session_exists = backend.session_exists(session_name) if backend.available() else False
-        plan = backend.start_plan(session_name=session_name, actor_name=runtime_name, command=command, session_exists=session_exists)
+        plan = backend.start_plan(
+            session_name=session_name,
+            actor_name=runtime_name,
+            command=command,
+            session_exists=session_exists,
+            cwd=layout.project_dir,
+        )
         return {
             "actor": actor["id"],
             "dry_run": True,
@@ -1381,40 +1469,68 @@ def _spawn_effect_id(attempt_id: str) -> str:
 
 
 def _spawn_effect_payload(actor: dict[str, Any]) -> dict[str, Any]:
+    actor_id = actor.get("id")
+    if not isinstance(actor_id, str) or not actor_id:
+        raise ValueError("spawn actor id must be a non-empty string")
+    task_id = actor.get("task_id")
+    attempt_id = actor.get("attempt_id")
+    if not isinstance(task_id, str) or not task_id or not isinstance(attempt_id, str) or not attempt_id:
+        raise ValueError("spawn task and attempt ids must be non-empty strings")
     launch_token = str(actor.get("launch_token") or "")
     profile_binding = actor.get("profile_binding") or {}
+    runtime = actor.get("runtime") or {}
+    runtime_backend = runtime.get("backend")
     return {
-        "actor_id": str(actor["id"]),
-        "task_id": str(actor.get("task_id") or ""),
-        "attempt_id": str(actor.get("attempt_id") or ""),
+        "actor_id": actor_id,
+        "task_id": task_id,
+        "attempt_id": attempt_id,
         "launch_token_sha256": hashlib.sha256(launch_token.encode("utf-8")).hexdigest(),
         "profile_sha256": str(profile_binding.get("sha256") or "").removeprefix("sha256:"),
+        "runtime_backend": str(runtime_backend or ""),
+        "runtime_session_name": str(runtime.get("session_name") or ""),
+        "runtime_actor_name": str(runtime.get("actor_name") or ""),
+        "runtime_target": str(runtime.get("target") or "") if runtime_backend == "tmux" else "",
     }
 
 
 def _stop_effect_payload(actor: dict[str, Any], *, reason: str | None) -> dict[str, Any]:
     runtime = actor.get("runtime") or {}
+    actor_id = actor.get("id")
+    if not isinstance(actor_id, str) or not actor_id:
+        raise ValueError("stop actor id must be a non-empty string")
     return {
-        "actor_id": str(actor["id"]),
+        "actor_id": actor_id,
         "attempt_id": str(actor.get("attempt_id") or ""),
         "process_start_marker": str(runtime.get("process_start_marker") or ""),
         "container_name": str(runtime.get("container_name") or ""),
+        "container_id": str(runtime.get("container_id") or ""),
         "reason": str(reason or ""),
     }
 
 
 def _validate_stop_effect(layout: ProjectLayout, effect: dict[str, Any]) -> dict[str, Any]:
     payload = effect.get("payload") or {}
-    actor_id = str(payload.get("actor_id") or "")
+    actor_id = payload.get("actor_id")
+    if not isinstance(actor_id, str):
+        raise ValueError("stop effect actor id must be a string")
     if effect.get("effect_type") != STOP_EFFECT_TYPE or not actor_id or not actor_exists(layout, actor_id):
         raise ValueError("stop effect references a missing actor")
     actor = load_actor(layout, actor_id)
+    if actor.get("id") != actor_id:
+        raise ValueError("stop effect actor identity does not match its authority path")
     if str(payload.get("attempt_id") or "") != str(actor.get("attempt_id") or ""):
         raise ValueError("stop effect attempt fence does not match the actor")
     expected_marker = str(payload.get("process_start_marker") or "")
     current_marker = str((actor.get("runtime") or {}).get("process_start_marker") or "")
-    if expected_marker and current_marker and expected_marker != current_marker:
+    if expected_marker and expected_marker != current_marker:
         raise ValueError("stop effect process marker is stale")
+    runtime = actor.get("runtime") or {}
+    expected_container_name = str(payload.get("container_name") or "")
+    if expected_container_name and expected_container_name != str(runtime.get("container_name") or ""):
+        raise ValueError("stop effect container name fence does not match the actor")
+    expected_container_id = str(payload.get("container_id") or "")
+    if expected_container_id and expected_container_id != str(runtime.get("container_id") or ""):
+        raise ValueError("stop effect container id fence does not match the actor")
     return actor
 
 
@@ -1572,17 +1688,30 @@ def _registered_spawn_observation(actor: dict[str, Any]) -> dict[str, Any] | Non
 
 def _validate_spawn_effect(layout: ProjectLayout, effect: dict[str, Any]) -> dict[str, Any]:
     payload = effect.get("payload") or {}
-    actor_id = str(payload.get("actor_id") or "")
-    task_id = str(payload.get("task_id") or "")
-    attempt_id = str(payload.get("attempt_id") or "")
+    actor_id = payload.get("actor_id")
+    task_id = payload.get("task_id")
+    attempt_id = payload.get("attempt_id")
+    if not all(isinstance(value, str) for value in (actor_id, task_id, attempt_id)):
+        raise ValueError("spawn effect identity fields must be strings")
     if effect.get("effect_type") != SPAWN_EFFECT_TYPE or not actor_id or not task_id or not attempt_id:
         raise ValueError("spawn effect payload is incomplete")
     if not actor_exists(layout, actor_id) or not task_exists(layout, task_id):
         raise ValueError("spawn effect references missing actor or task")
     actor = load_actor(layout, actor_id)
+    if actor.get("id") != actor_id:
+        raise ValueError("spawn effect actor identity does not match its authority path")
     expected = _spawn_effect_payload(actor)
-    if any(str(payload.get(key) or "") != str(expected[key]) for key in expected):
+    runtime_fence_keys = set(SPAWN_RUNTIME_FENCE_KEYS)
+    present_runtime_fences = runtime_fence_keys.intersection(payload)
+    if present_runtime_fences and present_runtime_fences != runtime_fence_keys:
+        raise ValueError("spawn effect has a partial runtime identity fence")
+    compared_keys = set(expected) if present_runtime_fences else set(expected) - runtime_fence_keys
+    if any(payload.get(key) != expected[key] for key in compared_keys):
         raise ValueError("spawn effect fence or payload hash does not match the actor")
+    try:
+        validate_actor_runtime_authority(layout, load_session(layout), actor)
+    except RuntimeError as exc:
+        raise ValueError(f"spawn effect actor runtime binding is invalid: {exc}") from exc
     task = load_task(layout, task_id)
     attempt = next(
         (row for row in task.get("attempts") or [] if row.get("attempt_id") == attempt_id),
@@ -1593,6 +1722,19 @@ def _validate_spawn_effect(layout: ProjectLayout, effect: dict[str, Any]) -> dic
     if (task.get("attempts") or [])[-1].get("attempt_id") != attempt_id:
         raise ValueError("spawn effect attempt is stale")
     return actor
+
+
+def _validate_spawn_observation(effect: dict[str, Any], observation: dict[str, Any]) -> None:
+    payload = effect.get("payload") or {}
+    for key in ("actor_id", "task_id", "attempt_id"):
+        if observation.get(key) != payload.get(key):
+            raise ValueError(f"spawn observation {key} does not match the effect fence")
+    if "runtime_backend" in payload and observation.get("backend") != payload.get("runtime_backend"):
+        raise ValueError("spawn observation backend does not match the effect fence")
+    if observation.get("launch_token_sha256") != payload.get("launch_token_sha256"):
+        raise ValueError("spawn observation launch token does not match the effect fence")
+    if payload.get("runtime_backend") == "tmux" and observation.get("runtime_target") != payload.get("runtime_target"):
+        raise ValueError("spawn observation tmux target does not match the effect fence")
 
 
 def _record_spawn_observation(
@@ -1615,7 +1757,8 @@ def _record_spawn_observation(
             return
         actor = _validate_spawn_effect(layout, effect)
         runtime = actor.setdefault("runtime", {})
-        if runtime.get("provider_execution_state") not in {
+        stop_requested = bool(actor.get("stop_requested_at") or actor.get("status") == "stopped")
+        if not stop_requested and runtime.get("provider_execution_state") not in {
             "started",
             "finished_pending_finalize",
             "finished",
@@ -1634,12 +1777,12 @@ def _record_spawn_observation(
         task = load_task(layout, str(payload["task_id"]))
         for attempt in task.get("attempts") or []:
             if attempt.get("attempt_id") == payload["attempt_id"]:
-                if attempt.get("status") in {"preparing", "dispatched", "starting", "launch_pending"}:
+                if not stop_requested and attempt.get("status") in {"preparing", "dispatched", "starting", "launch_pending"}:
                     attempt["status"] = "running"
                 attempt["started_at"] = attempt.get("started_at") or now_iso()
                 attempt["spawn_effect_id"] = effect_id
                 break
-        if task.get("status") == "dispatched":
+        if not stop_requested and task.get("status") == "dispatched":
             set_task_state(layout, task, "running")
         else:
             save_task(layout, task)
@@ -1688,6 +1831,20 @@ def _record_stop_observation(
                 )
         save_actor(layout, actor)
         sync_actor_summary(layout, actor)
+        task_id = actor.get("task_id")
+        attempt_id = actor.get("attempt_id")
+        if task_id and attempt_id and task_exists(layout, str(task_id)):
+            task = load_task(layout, str(task_id))
+            for attempt in task.get("attempts") or []:
+                if (
+                    attempt.get("attempt_id") == attempt_id
+                    and attempt.get("status")
+                    in {"preparing", "dispatched", "launch_pending", "starting", "running", "needs_recovery"}
+                ):
+                    attempt["status"] = "cancelled"
+                    attempt["stopped_at"] = actor["stopped_at"]
+                    break
+            save_task(layout, task)
         if actor.get("role") == "agent":
             send_message(
                 layout,
@@ -1733,12 +1890,17 @@ def _record_terminal_effect_failure(
         if not actor_id or not actor_exists(layout, actor_id):
             return
         actor = load_actor(layout, actor_id)
+        if actor.get("id") != actor_id:
+            return
         runtime = actor.setdefault("runtime", {})
         runtime["effect_failure_id"] = effect_id
         runtime["effect_failure_error"] = error
         runtime["effect_failure_at"] = now_iso()
         task_id = actor.get("task_id")
         attempt_id = actor.get("attempt_id")
+        stop_requested = bool(actor.get("stop_requested_at") or actor.get("status") == "stopped")
+        cancelled_spawn = bool(stop_requested and effect.get("effect_type") == SPAWN_EFFECT_TYPE)
+        failed_stop = effect.get("effect_type") == STOP_EFFECT_TYPE
         stale_attempt = False
         if task_id and attempt_id and task_exists(layout, str(task_id)):
             task = load_task(layout, str(task_id))
@@ -1750,22 +1912,41 @@ def _record_terminal_effect_failure(
                 if attempt.get("attempt_id") != attempt_id:
                     continue
                 attempt["effect_failure_id"] = effect_id
-                attempt["launch_error"] = error
-                if not stale_attempt:
-                    attempt["status"] = "needs_recovery"
+                if failed_stop:
+                    attempt["stop_error"] = error
+                else:
+                    attempt["launch_error"] = error
+                if failed_stop or not stale_attempt:
+                    attempt["status"] = "cancelled" if cancelled_spawn else "needs_recovery"
+                if failed_stop:
+                    attempt.pop("stopped_at", None)
                 break
             save_task(layout, task)
-        if stale_attempt:
+        if failed_stop:
+            actor["status"] = "needs_recovery"
+            actor.pop("stopped_at", None)
+            runtime["effect_failure_disposition"] = "stop_failed_runtime_may_be_live"
+        elif stale_attempt or cancelled_spawn:
             actor["status"] = "stopped"
             actor["stopped_at"] = actor.get("stopped_at") or now_iso()
-            runtime["effect_failure_disposition"] = "stale_attempt_ignored"
+            runtime["effect_failure_disposition"] = (
+                "stale_attempt_ignored" if stale_attempt else "cancelled_by_stop_request"
+            )
         else:
             actor["status"] = "needs_recovery"
         save_actor(layout, actor)
         sync_actor_summary(layout, actor)
         append_event(
             layout,
-            "runtime_effect_stale_ignored" if stale_attempt else "runtime_effect_failed_permanently",
+            (
+                "runtime_stop_failed_permanently"
+                if failed_stop
+                else "runtime_effect_stale_ignored"
+                if stale_attempt
+                else "runtime_effect_cancelled_by_stop"
+                if cancelled_spawn
+                else "runtime_effect_failed_permanently"
+            ),
             effect_id=effect_id,
             effect_type=effect.get("effect_type"),
             actor_id=actor_id,
@@ -1775,6 +1956,66 @@ def _record_terminal_effect_failure(
         )
 
 
+def _cancel_pending_spawn_for_stop(
+    layout: ProjectLayout,
+    actor: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Cancel a not-yet-applied sibling spawn and return any durable runtime observation."""
+    attempt_id = actor.get("attempt_id")
+    actor_id = actor.get("id")
+    if not isinstance(attempt_id, str) or not attempt_id or not isinstance(actor_id, str):
+        return None
+    try:
+        spawn_effect = effect_status(layout, _spawn_effect_id(attempt_id))
+    except ControlStoreError:
+        return None
+    if spawn_effect.get("effect_type") != SPAWN_EFFECT_TYPE:
+        return None
+    payload = spawn_effect.get("payload") or {}
+    if payload.get("actor_id") != actor_id or payload.get("attempt_id") != attempt_id:
+        raise ValueError("stop effect sibling spawn identity is inconsistent")
+    status = spawn_effect.get("status")
+    if status in {"applied", "dead"}:
+        return spawn_effect.get("observation") if isinstance(spawn_effect.get("observation"), dict) else None
+    observation = spawn_effect.get("observation")
+    if not isinstance(observation, dict):
+        observation = _registered_spawn_observation(actor)
+    if observation is not None:
+        _validate_spawn_observation(spawn_effect, observation)
+    if status == "leased" and observation is None:
+        lease_expires_at = spawn_effect.get("lease_expires_at")
+        lease_expired = False
+        if isinstance(lease_expires_at, str):
+            try:
+                lease_expired = datetime.fromisoformat(
+                    lease_expires_at.replace("Z", "+00:00")
+                ) <= datetime.now(timezone.utc)
+            except ValueError:
+                lease_expired = False
+        if not lease_expired:
+            raise RuntimeError("spawn is leased with no durable runtime identity; retry stop after its lease expires")
+    if status == "observed" and observation is None:
+        raise RuntimeError("spawn is observed without a usable runtime identity")
+    cancellation_error = "spawn cancelled by an explicit stop request"
+    if observation is None:
+        _record_terminal_effect_failure(
+            layout,
+            effect=spawn_effect,
+            error=cancellation_error,
+            owner=None,
+        )
+    else:
+        # The runtime may already exist. End the SPAWN command, but keep the
+        # actor/attempt truthfully stop_requested until STOP itself is observed.
+        dead_effect(
+            layout,
+            effect_id=str(spawn_effect["effect_id"]),
+            owner=None,
+            error=cancellation_error,
+        )
+    return observation
+
+
 def _execute_stop_effect(
     layout: ProjectLayout,
     *,
@@ -1782,7 +2023,22 @@ def _execute_stop_effect(
     owner: str,
 ) -> dict[str, Any]:
     actor = _validate_stop_effect(layout, effect)
-    runtime = actor.get("runtime") or {}
+    spawn_observation = _cancel_pending_spawn_for_stop(layout, actor)
+    actor = load_actor(layout, str(actor["id"]))
+    runtime = dict(actor.get("runtime") or {})
+    if spawn_observation is not None:
+        for observation_key, runtime_key in (
+            ("runtime_target", "target"),
+            ("pid", "pid"),
+            ("process_start_marker", "process_start_marker"),
+            ("container_name", "container_name"),
+            ("container_id", "container_id"),
+            ("container_command", "container_command"),
+            ("container_network_id", "container_network_id"),
+        ):
+            if spawn_observation.get(observation_key) is not None:
+                runtime[runtime_key] = spawn_observation[observation_key]
+        actor = {**actor, "runtime": runtime}
     payload = effect.get("payload") or {}
     if effect.get("status") == "observed" or effect.get("observation"):
         observation = effect.get("observation") or {}
@@ -1790,24 +2046,32 @@ def _execute_stop_effect(
             observe_effect(layout, effect_id=str(effect["effect_id"]), owner=owner, observation=observation)
     else:
         session = load_session(layout)
-        backend = backend_from_session(session)
-        backend_alive = backend.available() and backend.actor_alive(
-            session_name=backend_session_name(session),
-            actor_name=runtime.get("actor_name") or actor_runtime_name(actor["id"]),
-            target=runtime.get("target"),
-            pid=runtime.get("pid"),
-            process_start_marker=runtime.get("process_start_marker"),
-        )
         provider_finished = runtime.get("provider_execution_state") == "finished"
-        source = "already_stopped" if provider_finished or not backend_alive else "backend_stop"
-        container_status = None
-        cleanup = None
-        if (
+        required_oci = bool(
             (actor.get("isolation") or {}).get("mode") == "required"
             and runtime.get("container_name")
             and runtime.get("container_command")
             and not provider_finished
-        ):
+        )
+        backend_alive = False
+        backend = None
+        if not provider_finished and not required_oci:
+            try:
+                validate_actor_runtime_authority(layout, session, actor)
+            except RuntimeError as exc:
+                raise ValueError(f"stop effect actor runtime binding is invalid: {exc}") from exc
+            backend = backend_from_session(session)
+            backend_alive = backend.available() and backend.actor_alive(
+                session_name=backend_session_name(session),
+                actor_name=runtime.get("actor_name") or actor_runtime_name(actor["id"]),
+                target=runtime.get("target"),
+                pid=runtime.get("pid"),
+                process_start_marker=runtime.get("process_start_marker"),
+            )
+        source = "already_stopped" if provider_finished or not backend_alive else "backend_stop"
+        container_status = None
+        cleanup = None
+        if required_oci:
             spec = _required_stop_spec(layout, actor)
             adapter = OciWorkerExecutionAdapter(OciCliBackend(spec.engine))
             durable_container_id = str(runtime.get("container_id") or "")
@@ -1850,6 +2114,7 @@ def _execute_stop_effect(
                 container_status = "absent"
                 source = "oci_already_absent"
         elif backend_alive:
+            assert backend is not None
             backend.stop_actor(
                 target=str(runtime.get("target") or ""),
                 pid=runtime.get("pid"),
@@ -1939,6 +2204,9 @@ def _process_runtime_effects_under_instance_lock(
                     else:
                         observation = effect.get("observation") or _registered_spawn_observation(actor)
                         if observation is None:
+                            actor = _validate_spawn_effect(layout, effect)
+                            if actor.get("stop_requested_at") or actor.get("status") == "stopped":
+                                raise ValueError("spawn cancelled by an explicit stop request")
                             launch = start_actor(layout, actor, dry_run=False, persist_runtime_state=False)
                             observation = {
                                 "source": "backend_start",
@@ -1956,6 +2224,8 @@ def _process_runtime_effects_under_instance_lock(
                                 ),
                             }
                             _scheduler_fault("effect.after_spawn_before_observe")
+                    _validate_spawn_observation(effect, observation)
+                    if effect.get("status") != "observed":
                         observe_effect(layout, effect_id=effect_id, owner=owner, observation=observation)
                     _record_spawn_observation(layout, effect=effect, observation=observation)
                     applied = apply_effect(
@@ -2748,6 +3018,15 @@ def command_dispatch(args: Any) -> None:
     unsafe_native = bool(getattr(args, "unsafe_native", False))
     if unsafe_native and governance_contract.get("governed"):
         raise SystemExit("ArchMarshal active governance forbids unsafe-native workers")
+    if (
+        bool(getattr(args, "start", False))
+        and not bool(getattr(args, "dry_run", False))
+        and not unsafe_native
+        and not control_store_enabled(layout)
+    ):
+        raise SystemExit(
+            "Required OCI start needs the recoverable control store; run migrate-state --apply first"
+        )
     collaboration_contract: dict[str, Any] | None = None
     try:
         catalog = project_provider_catalog(project)
@@ -3000,6 +3279,40 @@ def command_dispatch(args: Any) -> None:
                 f"max={project_budget}"
             )
     session = load_session(layout)
+    default_actor_id = (
+        f"agent-{args.task.lower()}"
+        if not task.get("attempts")
+        else f"agent-{args.task.lower()}-{decision.provider_id}-{len(task.get('attempts') or []) + 1}"
+    )
+    actor_id = args.actor_id or default_actor_id
+    dispatch_backend_config = session_backend_config(session)
+    dispatch_backend_kind = dispatch_backend_config.get("kind")
+    if dispatch_backend_kind not in {"local", "tmux"}:
+        raise SystemExit(f"Invalid session backend: {dispatch_backend_kind!r}")
+    if dispatch_backend_kind == "tmux":
+        try:
+            validate_persisted_tmux_session_name(
+                dispatch_backend_config.get("session_name"),
+            )
+            candidate_runtime_name = validate_tmux_name(
+                actor_runtime_name(actor_id),
+                label="actor name",
+            )
+        except RuntimeError as exc:
+            raise SystemExit(f"Invalid tmux dispatch identity: {exc}") from exc
+        for existing_actor in actor_rows(layout):
+            existing_runtime = existing_actor.get("runtime") or {}
+            if (
+                existing_actor.get("id") != actor_id
+                and existing_runtime.get("backend") == "tmux"
+                and existing_runtime.get("actor_name") == candidate_runtime_name
+            ):
+                raise SystemExit(
+                    "Invalid tmux dispatch identity: runtime actor name "
+                    f"{candidate_runtime_name!r} is already bound to {existing_actor.get('id')!r}"
+                )
+    if (layout.actors_dir / f"{slugify(actor_id, 'actor')}.json").exists() and not force:
+        raise SystemExit(f"Actor already exists: {actor_id}")
     attempt_id = new_id("ATT")
     launch_token = secrets.token_urlsafe(32)
     direct_step: dict[str, Any] | None = None
@@ -3026,14 +3339,6 @@ def command_dispatch(args: Any) -> None:
             validate_profile_binding(profile_binding, require_available=True)
     except (ProfileBindingError, RoutingValidationError) as exc:
         raise SystemExit(f"Provider profile binding failed closed: {exc}") from exc
-    default_actor_id = (
-        f"agent-{args.task.lower()}"
-        if not task.get("attempts")
-        else f"agent-{args.task.lower()}-{decision.provider_id}-{len(task.get('attempts') or []) + 1}"
-    )
-    actor_id = args.actor_id or default_actor_id
-    if (layout.actors_dir / f"{slugify(actor_id, 'actor')}.json").exists() and not force:
-        raise SystemExit(f"Actor already exists: {actor_id}")
     provider = decision.provider_id
     tier = decision.tier
     requested_model = getattr(args, "model", None)
@@ -3407,6 +3712,20 @@ def command_send(args: Any) -> None:
         require_actor(layout, args.to)
     if args.sender not in {SCHEDULER_ID} and not actor_exists(layout, args.sender):
         raise SystemExit(f"Sender actor not found: {args.sender}")
+    runtime_actor: dict[str, Any] | None = None
+    runtime_backend: Any = None
+    runtime_target: str | None = None
+    if getattr(args, "runtime_send", False) or getattr(args, "tmux_send", False):
+        runtime_actor = load_actor(layout, args.to)
+        runtime_session = load_session(layout)
+        try:
+            validate_actor_runtime_authority(layout, runtime_session, runtime_actor)
+        except RuntimeError as exc:
+            raise SystemExit(f"Invalid actor runtime binding: {exc}") from exc
+        runtime_backend = backend_from_session(runtime_session)
+        runtime_target = actor_runtime(runtime_actor).get("target")
+        if not runtime_target:
+            raise SystemExit(f"Actor has no runtime target: {args.to}")
     message = send_message(
         layout,
         sender=args.sender,
@@ -3417,14 +3736,10 @@ def command_send(args: Any) -> None:
     )
     runtime_payload: dict[str, Any] | None = None
     if getattr(args, "runtime_send", False) or getattr(args, "tmux_send", False):
-        actor = load_actor(layout, args.to)
-        session = load_session(layout)
-        backend = backend_from_session(session)
-        runtime = actor_runtime(actor)
-        target = runtime.get("target")
-        if not target:
-            raise SystemExit(f"Actor has no runtime target: {args.to}")
-        runtime_payload = {"backend": backend.kind, **backend.send_text(target=target, text=args.message)}
+        runtime_payload = {
+            "backend": runtime_backend.kind,
+            **runtime_backend.send_text(target=runtime_target, text=args.message),
+        }
     print_json({"status": "ok", "message": message, "runtime": runtime_payload})
 
 
@@ -4649,16 +4964,38 @@ def command_stop_actor(args: Any) -> None:
     stop_runtime = getattr(args, "stop_runtime", False) or getattr(args, "kill_window", False)
     if stop_runtime:
         runtime = actor_runtime(actor)
+        required_oci_stop = bool(
+            (actor.get("isolation") or {}).get("mode") == "required"
+            and runtime.get("container_name")
+            and runtime.get("container_command")
+        )
         target = runtime.get("target")
-        if not target:
-            raise SystemExit(f"Actor has no runtime target: {args.actor}")
-        backend = backend_from_session(session)
+        recoverable_stop = current_transaction() is not None and control_store_enabled(layout)
+        if not required_oci_stop:
+            try:
+                validate_actor_runtime_authority(layout, session, actor)
+            except RuntimeError as exc:
+                raise SystemExit(f"Invalid actor runtime binding: {exc}") from exc
+            if not target and (args.dry_run or not recoverable_stop):
+                raise SystemExit(f"Actor has no runtime target: {args.actor}")
+        backend = None if required_oci_stop else backend_from_session(session)
+        backend_kind = str(runtime.get("backend") or session_backend_kind(session))
         pid = runtime.get("pid")
         if args.dry_run:
-            runtime_payload = {
-                "backend": backend.kind,
-                "planned_commands": [command_to_string(argv) for argv in backend.stop_plan(target=target, pid=pid)],
-            }
+            if required_oci_stop:
+                runtime_payload = {
+                    "backend": backend_kind,
+                    "operation": "oci-stop",
+                    "container_name": runtime.get("container_name"),
+                    "container_id": runtime.get("container_id"),
+                    "planned_commands": [],
+                }
+            else:
+                assert backend is not None
+                runtime_payload = {
+                    "backend": backend.kind,
+                    "planned_commands": [command_to_string(argv) for argv in backend.stop_plan(target=target, pid=pid)],
+                }
         elif current_transaction() is not None and control_store_enabled(layout):
             transaction = current_transaction()
             assert transaction is not None
@@ -4680,8 +5017,11 @@ def command_stop_actor(args: Any) -> None:
                 reason=args.reason,
                 effect_id=effect_id,
             )
-            runtime_payload = {"status": "queued", "effect_id": effect_id, "backend": backend.kind}
+            runtime_payload = {"status": "queued", "effect_id": effect_id, "backend": backend_kind}
         else:
+            if required_oci_stop:
+                raise SystemExit("Required OCI stop needs the recoverable control store")
+            assert backend is not None
             runtime_payload = {
                 "backend": backend.kind,
                 **backend.stop_actor(
@@ -8449,6 +8789,11 @@ def command_recover(args: Any) -> None:
     else:
         for actor in actor_rows(layout):
             runtime = actor_runtime(actor)
+            try:
+                validate_actor_runtime_authority(layout, session, actor)
+            except RuntimeError as exc:
+                issues.append(f"invalid runtime binding for {actor['id']}: {exc}")
+                continue
             runtime_name = runtime.get("actor_name") or actor_runtime_name(actor["id"])
             is_alive = backend.actor_alive(
                 session_name=session_name,
@@ -8589,7 +8934,17 @@ def command_recover(args: Any) -> None:
                 sync_actor_summary(layout, actor_data)
                 if args.plan_restarts:
                     command = actor_launch_command(layout, session, actor_data)
-                    plan = backend.start_plan(session_name=session_name, actor_name=runtime_name, command=command, session_exists=True)
+                    try:
+                        plan = backend.start_plan(
+                            session_name=session_name,
+                            actor_name=runtime_name,
+                            command=command,
+                            session_exists=True,
+                            cwd=layout.project_dir,
+                        )
+                    except RuntimeError as exc:
+                        issues.append(f"cannot plan restart for {actor_data['id']}: {exc}")
+                        continue
                     planned_restarts.extend(
                         redact_launch_token(command_to_string(argv), actor_data)
                         for argv in plan
@@ -8757,6 +9112,11 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
         issues.append(f"invalid session backend: {backend_kind}")
     if not backend_config.get("session_name"):
         issues.append("backend session_name is required")
+    elif backend_kind == "tmux":
+        try:
+            validate_persisted_tmux_session_name(backend_config["session_name"])
+        except RuntimeError as exc:
+            issues.append(str(exc))
     leader_id = session.get("leader_actor_id") or LEADER_ID
     if not (layout.actors_dir / f"{slugify(leader_id, 'actor')}.json").is_file():
         issues.append("missing leader actor file")
@@ -8767,6 +9127,10 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
             issues.append(f"{actor['id']} has invalid runtime backend: {runtime_backend}")
         if runtime_backend != backend_kind:
             issues.append(f"{actor['id']} runtime backend {runtime_backend} does not match session backend {backend_kind}")
+        try:
+            validate_actor_runtime_authority(layout, session, actor)
+        except RuntimeError as exc:
+            issues.append(f"{actor['id']} invalid runtime binding: {exc}")
         if not actor.get("prompt_path"):
             issues.append(f"{actor['id']} missing prompt_path")
         elif not (layout.project_dir / actor["prompt_path"]).is_file():

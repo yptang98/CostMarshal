@@ -2130,13 +2130,20 @@ def _validate_actor_governance_before_side_effect(
     try:
         # Validate an explicit SQLite marker read-only before trusting the
         # project.json governance authority retained across cutover.
-        control_store_enabled(layout)
+        recoverable_control_store = control_store_enabled(layout)
         project = load_stable_governance_project(layout.project_json)
     except (ControlStoreError, GovernanceError) as exc:
         code = getattr(exc, "code", "governance_project_unavailable")
         raise SystemExit(
             f"ArchMarshal governance gate blocked actor launch [{code}]: {exc}"
         ) from exc
+    required_worker = bool(
+        actor.get("role") == "agent"
+        and (actor.get("isolation") or {}).get("mode") == "required"
+    )
+    recovery_only = bool(
+        required_worker and not recoverable_control_store and recovery_possible
+    )
     governance = project.get("governance") or {"mode": "off", "ready": False}
     if not isinstance(governance, dict):
         raise SystemExit(
@@ -2167,7 +2174,12 @@ def _validate_actor_governance_before_side_effect(
             "ArchMarshal governance gate blocked actor launch: governed projects "
             "forbid unsafe-native provider launch; use required OCI isolation"
         )
-    return False
+    if required_worker and not recoverable_control_store and not recovery_possible:
+        raise SystemExit(
+            "Required OCI start needs the recoverable control store; "
+            "run migrate-state --apply first"
+        )
+    return recovery_only
 
 
 def _run_actor_once(
