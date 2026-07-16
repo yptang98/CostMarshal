@@ -10,13 +10,21 @@ from urllib.parse import urlsplit
 from .state import atomic_write_text
 
 
-PROFILE_NAME_RE = re.compile(r"[A-Za-z0-9_-]+")
+PROFILE_NAME_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,62}[A-Za-z0-9])?\Z")
+WINDOWS_RESERVED_PROFILE_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
 PROVIDER_ID_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*")
 ENV_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 RESERVED_PROVIDER_IDS = {"openai", "ollama", "lmstudio"}
 
 
-def codex_home(path: str | None = None) -> Path:
+def codex_home(path: str | os.PathLike[str] | None = None) -> Path:
     if path:
         return Path(path).expanduser().resolve()
     configured = os.environ.get("CODEX_HOME")
@@ -43,9 +51,21 @@ def _toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def is_valid_profile_name(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and PROFILE_NAME_RE.fullmatch(value) is not None
+        and value.split(".", 1)[0].upper() not in WINDOWS_RESERVED_PROFILE_NAMES
+    )
+
+
 def validate_profile_name(value: str) -> str:
-    if not PROFILE_NAME_RE.fullmatch(value):
-        raise SystemExit("profile name may contain only letters, numbers, hyphens, and underscores")
+    if not is_valid_profile_name(value):
+        raise SystemExit(
+            "profile name must be 1-64 characters, start and end with a letter or number, "
+            "contain only letters, numbers, dots, hyphens, and underscores, and not be a "
+            "reserved Windows device name"
+        )
     return value
 
 

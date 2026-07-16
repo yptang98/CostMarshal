@@ -121,6 +121,11 @@ python scripts/costmarshal.py configure-provider `
   --env-key DEEPSEEK_API_KEY
 ```
 
+Profile configuration and route admission use the same home resolution order:
+an explicit `--codex-home`, then non-empty `CODEX_HOME`, then the current OS
+user's `~/.codex`. Service and container launches should set an absolute
+`CODEX_HOME` so the authority does not change with the launcher account.
+
 Provide credentials through the process environment or a secrets file outside the actor workspace. At route admission CostMarshal captures and verifies each planned profile's exact bytes, binds the parsed provider identity, endpoint, environment-key identity, size, and SHA-256 into the plan, then writes an immutable runtime snapshot. Native and OCI runners use only that snapshot; changing the same-named source profile cannot change an admitted attempt, and a missing/corrupt snapshot fails before provider execution. Required OCI recovery also verifies the managed `Config.Env` contract, and the worker requires the bound profile hash before launching Codex. CostMarshal injects only the selected provider key into that actor and creates a credential-free actor-specific `CODEX_HOME` containing only its bound profile. New required-mode projects use `CODEX_API_KEY` for the high tier; persisted host login state such as `auth.json` is never mounted into the OCI worker.
 
 ## Reviewed provider catalog

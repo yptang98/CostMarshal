@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +17,7 @@ sys.path.insert(0, str(ROOT))
 
 from costmarshal_v2.actor_runner import _validate_worker_fence  # noqa: E402
 from costmarshal_v2.paths import ProjectLayout  # noqa: E402
+from costmarshal_v2.profile_binding import read_named_profile  # noqa: E402
 from costmarshal_v2.profiles import provider_profile_text  # noqa: E402
 from costmarshal_v2.routing import default_provider_catalog  # noqa: E402
 from project_success_policy_test import seed_paired_route_evidence  # noqa: E402
@@ -148,9 +150,44 @@ def main() -> int:
         (codex_home / "longcat.config.toml").write_text(low_text, encoding="utf-8")
         medium_source = codex_home / "deepseek.config.toml"
         medium_source.write_text(medium_text, encoding="utf-8")
+
+        # Profile generation and route admission must agree on Codex's default
+        # home when CODEX_HOME is unset.
+        os.environ.pop("CODEX_HOME", None)
+        fallback_user_home = temp / "fallback-user"
+        fallback_codex_home = fallback_user_home / ".codex"
+        fallback_codex_home.mkdir(parents=True)
+        fallback_profile = fallback_codex_home / "longcat.config.toml"
+        fallback_profile.write_text(
+            low_text.replace("https://low.example/v1", "https://fallback.example/v1"),
+            encoding="utf-8",
+        )
+        with patch("costmarshal_v2.profiles.Path.home", return_value=fallback_user_home):
+            fallback_material = read_named_profile(
+                "longcat",
+                expected_env_key="LONGCAT_API_KEY",
+                snapshot_relpath="profile-snapshots/fallback/longcat.config.toml",
+            )
+        assert fallback_material is not None
+        assert fallback_material[0] == fallback_profile.read_bytes()
+
         env = dict(os.environ)
         env["CODEX_HOME"] = str(codex_home)
         os.environ["CODEX_HOME"] = str(codex_home)
+        env_material = read_named_profile(
+            "longcat",
+            expected_env_key="LONGCAT_API_KEY",
+            snapshot_relpath="profile-snapshots/env/longcat.config.toml",
+        )
+        explicit_material = read_named_profile(
+            "longcat",
+            expected_env_key="LONGCAT_API_KEY",
+            snapshot_relpath="profile-snapshots/explicit/longcat.config.toml",
+            codex_home=fallback_codex_home,
+        )
+        assert env_material is not None and explicit_material is not None
+        assert env_material[0] == (codex_home / "longcat.config.toml").read_bytes()
+        assert explicit_material[0] == fallback_profile.read_bytes()
 
         catalog = default_provider_catalog()
         for provider, price in zip(catalog["providers"], (1.0, 2.0, 3.0), strict=True):

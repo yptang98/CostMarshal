@@ -17,10 +17,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from .profiles import codex_home as resolve_codex_home, is_valid_profile_name
+
 
 PROFILE_BINDING_SCHEMA = "costmarshal-profile-binding-v1"
 MAX_PROFILE_BYTES = 256 * 1024
-_SAFE_PROFILE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,62}[A-Za-z0-9])?\Z")
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
@@ -76,10 +77,7 @@ def read_named_profile(
     """Read one stable regular file and return its exact bytes plus identity."""
 
     _validate_profile_name(profile)
-    raw_home = codex_home if codex_home is not None else os.environ.get("CODEX_HOME")
-    if not raw_home:
-        return None
-    home = Path(raw_home).expanduser().resolve()
+    home = resolve_codex_home(codex_home)
     source = home / f"{profile}.config.toml"
     try:
         before = source.lstat()
@@ -362,7 +360,7 @@ def _stat_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
 
 
 def _validate_profile_name(profile: str) -> str:
-    if not isinstance(profile, str) or not _SAFE_PROFILE.fullmatch(profile) or profile in {".", ".."}:
+    if not is_valid_profile_name(profile):
         raise ProfileBindingError("provider profile name must be a safe identifier")
     return profile
 
@@ -374,4 +372,3 @@ def _validate_snapshot_relpath(value: Any) -> str:
     if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
         raise ProfileBindingError("profile snapshot path is invalid")
     return path.as_posix()
-

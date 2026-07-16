@@ -4,14 +4,19 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "scripts" / "costmarshal.py"
+sys.path.insert(0, str(ROOT))
+
+from costmarshal_v2.profile_binding import read_named_profile  # noqa: E402
 
 
 def run(*args: str, expect: int = 0) -> subprocess.CompletedProcess[str]:
@@ -130,6 +135,104 @@ def main() -> int:
             expect=1,
         )
         assert "credentials" in credential_url.stderr
+
+        dotted = run(
+            "configure-provider",
+            "--codex-home",
+            str(home),
+            "--profile",
+            "medium.v2",
+            "--provider-id",
+            "custom",
+            "--base-url",
+            "https://example.test/v1",
+            "--model",
+            "model",
+            "--env-key",
+            "API_KEY",
+            "--dry-run",
+        )
+        assert json.loads(dotted.stdout)["profile"] == "medium.v2"
+
+        boundary = run(
+            "configure-provider",
+            "--codex-home",
+            str(home),
+            f"--profile={'x' * 64}",
+            "--provider-id",
+            "custom",
+            "--base-url",
+            "https://example.test/v1",
+            "--model",
+            "model",
+            "--env-key",
+            "API_KEY",
+            "--dry-run",
+        )
+        assert json.loads(boundary.stdout)["profile"] == "x" * 64
+
+        for invalid_profile in (
+            "-bad",
+            "bad_",
+            "x" * 65,
+            "CON",
+            "nul",
+            "Com1",
+            "LPT9",
+            "CON.v2",
+            "nul.backup",
+            "Com1.prod",
+        ):
+            invalid = run(
+                "configure-provider",
+                "--codex-home",
+                str(home),
+                f"--profile={invalid_profile}",
+                "--provider-id",
+                "custom",
+                "--base-url",
+                "https://example.test/v1",
+                "--model",
+                "model",
+                "--env-key",
+                "API_KEY",
+                "--dry-run",
+                expect=1,
+            )
+            assert "profile name must be 1-64 characters" in invalid.stderr
+
+        default_user_home = home / "default-user"
+        default_user_home.mkdir()
+        with patch.dict(
+            os.environ,
+            {
+                "CODEX_HOME": "",
+                "HOME": str(default_user_home),
+                "USERPROFILE": str(default_user_home),
+            },
+            clear=False,
+        ):
+            configured = run(
+                "configure-provider",
+                "--profile",
+                "roundtrip",
+                "--provider-id",
+                "custom",
+                "--base-url",
+                "https://example.test/v1",
+                "--model",
+                "model",
+                "--env-key",
+                "API_KEY",
+            )
+            configured_path = Path(json.loads(configured.stdout)["path"])
+            material = read_named_profile(
+                "roundtrip",
+                expected_env_key="API_KEY",
+                snapshot_relpath="profile-snapshots/roundtrip/config.toml",
+            )
+        assert configured_path == (default_user_home / ".codex" / "roundtrip.config.toml").resolve()
+        assert material is not None and material[0] == configured_path.read_bytes()
     print("provider profile contract ok")
     return 0
 
