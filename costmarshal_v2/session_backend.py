@@ -18,6 +18,7 @@ from .paths import ProjectLayout
 ActorCommand = str | list[str]
 _TMUX_COMPONENT_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9])?\Z")
 _TMUX_LEGACY_ACTOR_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,62}[A-Za-z0-9])?\Z")
+_TMUX_SESSION_ID_RE = re.compile(r"\$[0-9]+\Z")
 _TMUX_WINDOW_ID_RE = re.compile(r"@[0-9]+\Z")
 
 
@@ -57,6 +58,13 @@ def validate_persisted_tmux_session_name(value: str) -> str:
             "persisted tmux session name must be 1-64 safe legacy characters"
         )
     return value
+
+
+def tmux_runtime_session_name(value: str) -> str:
+    """Mirror tmux 3.4 session_check_name for accepted persisted names."""
+
+    validate_persisted_tmux_session_name(value)
+    return value.replace(".", "_").replace(":", "_")
 
 
 def validate_persisted_tmux_target(value: str) -> str:
@@ -333,51 +341,76 @@ class TmuxBackend:
     def _run(self, argv: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
         return subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check)
 
+    def _resolve_session_target(self, session_name_value: str) -> str | None:
+        """Resolve one logical persisted name to an unambiguous stable session ID."""
+
+        validate_persisted_tmux_session_name(session_name_value)
+        if not self.available():
+            return None
+        result = self._run(
+            [
+                self.executable,
+                "list-sessions",
+                "-F",
+                "#{session_id}\t#{session_name}",
+            ],
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        runtime_name = tmux_runtime_session_name(session_name_value)
+        accepted_names = {session_name_value, runtime_name}
+        matches: list[str] = []
+        for line in result.stdout.splitlines():
+            session_id, separator, observed_name = line.partition("\t")
+            if not separator or observed_name not in accepted_names:
+                continue
+            if not _TMUX_SESSION_ID_RE.fullmatch(session_id):
+                raise RuntimeError("tmux returned an invalid session ID for a persisted session")
+            matches.append(session_id)
+        if len(matches) > 1:
+            raise RuntimeError(
+                "persisted tmux session name is ambiguous between its logical and sanitized forms"
+            )
+        return matches[0] if matches else None
+
     def _resolve_actor_target(self, target: str) -> str:
         validate_persisted_tmux_target(target)
         session_value, actor_value = target.split(":", 1)
-        try:
-            validate_tmux_name(actor_value, label="actor name")
-        except RuntimeError:
-            if not self.available():
-                raise RuntimeError(
-                    "tmux is required to resolve a legacy dotted actor window"
-                )
-            result = self._run(
-                [
-                    self.executable,
-                    "list-windows",
-                    "-t",
-                    tmux_persisted_session_target(session_value),
-                    "-F",
-                    "#{window_id}\t#{window_name}",
-                ],
-                check=False,
+        validate_persisted_tmux_actor_name(actor_value)
+        session_target = self._resolve_session_target(session_value)
+        if session_target is None:
+            raise RuntimeError("tmux actor lookup could not resolve its persisted session")
+        result = self._run(
+            [
+                self.executable,
+                "list-windows",
+                "-t",
+                session_target,
+                "-F",
+                "#{window_id}\t#{window_name}",
+            ],
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"tmux actor lookup failed: {result.stderr.strip()}")
+        matches: list[str] = []
+        for line in result.stdout.splitlines():
+            window_id, separator, window_name = line.partition("\t")
+            if separator and window_name == actor_value and _TMUX_WINDOW_ID_RE.fullmatch(window_id):
+                matches.append(window_id)
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"tmux actor lookup requires one exact window, found {len(matches)}"
             )
-            if result.returncode != 0:
-                raise RuntimeError(f"tmux legacy actor lookup failed: {result.stderr.strip()}")
-            matches: list[str] = []
-            for line in result.stdout.splitlines():
-                window_id, separator, window_name = line.partition("\t")
-                if separator and window_name == actor_value and _TMUX_WINDOW_ID_RE.fullmatch(window_id):
-                    matches.append(window_id)
-            if len(matches) != 1:
-                raise RuntimeError(
-                    f"tmux legacy actor lookup requires one exact window, found {len(matches)}"
-                )
-            return matches[0]
-        return f"={session_value}:={actor_value}"
+        return matches[0]
 
     def session_exists(self, session_name_value: str) -> bool:
-        target = tmux_persisted_session_target(session_name_value)
-        if not self.available():
-            return False
-        result = self._run([self.executable, "has-session", "-t", target], check=False)
-        return result.returncode == 0
+        return self._resolve_session_target(session_name_value) is not None
 
     def list_actors(self, session_name_value: str) -> list[str]:
-        target = tmux_persisted_session_target(session_name_value)
-        if not self.available() or not self.session_exists(session_name_value):
+        target = self._resolve_session_target(session_name_value)
+        if target is None:
             return []
         result = self._run([self.executable, "list-windows", "-t", target, "-F", "#{window_name}"], check=False)
         if result.returncode != 0:
@@ -396,15 +429,18 @@ class TmuxBackend:
         validate_persisted_tmux_session_name(session_name)
         validate_tmux_name(actor_name, label="actor name")
         command_text = command_display(command)
-        exists = self.session_exists(session_name) if session_exists is None else session_exists
+        resolved_session = self._resolve_session_target(session_name)
+        exists = resolved_session is not None if session_exists is None else session_exists
         cwd_args = ["-c", tmux_format_literal(str(Path(cwd).resolve()))] if cwd is not None else []
         if exists:
+            if resolved_session is None:
+                raise RuntimeError("tmux session was expected to exist but could not be resolved uniquely")
             create = [
                 self.executable,
                 "new-window",
                 "-d",
                 "-t",
-                tmux_persisted_new_window_target(session_name),
+                f"{resolved_session}:",
                 "-n",
                 actor_name,
                 *cwd_args,
@@ -443,6 +479,9 @@ class TmuxBackend:
             result = self._run(argv, check=False)
             if result.returncode != 0:
                 raise RuntimeError(f"tmux command failed: {command_to_string(argv)}\n{result.stderr.strip()}")
+        if self._resolve_session_target(session_name) is None:
+            raise RuntimeError("tmux started an actor but its persisted session could not be resolved")
+        self._resolve_actor_target(target)
         return {
             "commands": [command_to_string(argv) for argv in commands],
             "target": target,

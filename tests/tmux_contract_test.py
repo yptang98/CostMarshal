@@ -47,6 +47,21 @@ def save(state: dict) -> None:
     STATE.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def ensure_session_ids(state: dict) -> None:
+    used = {
+        int(str(row.get("session_id", "$-1"))[1:])
+        for row in state.get("sessions", {}).values()
+        if str(row.get("session_id", "")).startswith("$")
+        and str(row.get("session_id", ""))[1:].isdigit()
+    }
+    next_id = max(used, default=-1) + 1
+    for name in sorted(state.get("sessions", {})):
+        row = state["sessions"][name]
+        if not str(row.get("session_id", "")).startswith("$"):
+            row["session_id"] = f"${next_id}"
+            next_id += 1
+
+
 def option(args: list[str], name: str) -> str:
     try:
         return args[args.index(name) + 1]
@@ -59,6 +74,11 @@ def session_target(value: str, sessions: dict) -> str:
     name = value[1:] if exact else value
     if name.endswith(":"):
         name = name[:-1]
+    if name.startswith("$"):
+        for candidate, row in sessions.items():
+            if row.get("session_id") == name:
+                return candidate
+        return name
     if exact or name in sessions:
         return name
     matches = sorted(candidate for candidate in sessions if candidate.startswith(name))
@@ -77,8 +97,15 @@ def main() -> int:
     if not args:
         return 2
     state = load()
+    ensure_session_ids(state)
     cmd = args[0]
     state.setdefault("calls", []).append(args)
+    if cmd == "list-sessions":
+        for session in sorted(state["sessions"]):
+            row = state["sessions"][session]
+            print(f"{row['session_id']}\t{session}")
+        save(state)
+        return 0
     if cmd == "has-session":
         target = option(args, "-t")
         session = session_target(target, state["sessions"])
@@ -88,11 +115,18 @@ def main() -> int:
         matches = [candidate for candidate in state["sessions"] if candidate.startswith(session)]
         return 0 if session in state["sessions"] or len(matches) == 1 else 1
     if cmd == "new-session":
-        session = option(args, "-s")
+        session = option(args, "-s").replace(".", "_").replace(":", "_")
         window = option(args, "-n")
         cwd = option(args, "-c")
         command = args[-1]
-        state["sessions"].setdefault(session, {"windows": {}})["windows"][window] = {
+        next_session_id = max(
+            (int(str(row["session_id"])[1:]) for row in state["sessions"].values()),
+            default=-1,
+        ) + 1
+        state["sessions"].setdefault(
+            session,
+            {"session_id": f"${next_session_id}", "windows": {}},
+        )["windows"][window] = {
             "command": command,
             "cwd": cwd,
             "window_id": f"@{sum(len(row['windows']) for row in state['sessions'].values()) + 1}",
@@ -291,7 +325,38 @@ def run_native_tmux_contract(temp: Path) -> bool:
             log_path=temp / "ignored-reader.log",
         )
         assert_true(first_launch["target"] == f"{session}:reader", "native tmux should persist a stable logical target")
+        listed_sessions = subprocess.run(
+            [executable, "list-sessions", "-F", "#{session_id}\t#{session_name}"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        assert_true(listed_sessions.returncode == 0, f"native tmux session listing failed: {listed_sessions.stderr}")
+        assert_true(
+            any(
+                line.endswith(f"\t{session.replace('.', '_')}")
+                for line in listed_sessions.stdout.splitlines()
+            ),
+            "tmux 3.4 should sanitize the dotted persisted session name at runtime",
+        )
+        assert_true(
+            backend._resolve_session_target(session) is not None,
+            "native dotted logical session should resolve to a stable session ID",
+        )
         wait_for_file(cwd_output)
+        reader_window_id = backend._resolve_actor_target(f"{session}:reader")
+        reader_status = subprocess.run(
+            [executable, "list-panes", "-t", reader_window_id, "-F", "#{pane_dead}"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        assert_true(
+            reader_status.returncode == 0 and reader_status.stdout.splitlines() == ["0"],
+            f"native tmux reader pane exited before send: {reader_status.stderr}",
+        )
         backend.send_text(target=f"{session}:reader", text="C-c")
         wait_for_file(input_output)
         assert_true(input_output.read_text(encoding="utf-8") == "C-c", "native tmux should inject C-c as literal text")
@@ -317,7 +382,7 @@ def run_native_tmux_contract(temp: Path) -> bool:
                 "new-window",
                 "-d",
                 "-t",
-                f"={session}:",
+                f"{backend._resolve_session_target(session)}:",
                 "-n",
                 "legacy.reader",
                 "-c",
@@ -343,14 +408,33 @@ def run_native_tmux_contract(temp: Path) -> bool:
             "native legacy dotted actor stop should remove the resolved window",
         )
     finally:
-        for target in (session, prefix_session):
+        cleanup_targets: list[str] = []
+        for logical_name in (session, prefix_session):
+            try:
+                resolved_target = backend._resolve_session_target(logical_name)
+            except RuntimeError:
+                resolved_target = None
+            if resolved_target is not None:
+                cleanup_targets.append(resolved_target)
+        for target in cleanup_targets:
             subprocess.run(
-                [executable, "kill-session", "-t", f"={target}"],
+                [executable, "kill-session", "-t", target],
                 text=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
             )
+        remaining_sessions = subprocess.run(
+            [executable, "list-sessions", "-F", "#{session_id}\t#{session_name}"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        assert_true(
+            not remaining_sessions.stdout.strip(),
+            f"native tmux cleanup left sessions behind: {remaining_sessions.stdout}",
+        )
         for key, previous in previous_environment.items():
             if previous is None:
                 os.environ.pop(key, None)
@@ -599,8 +683,9 @@ def main() -> int:
         assert_true("leader.prompt.md" in windows["leader"]["command"], "leader command should include prompt path")
         assert_true("agent-v2-0001.prompt.md" in windows["agent-v2-0001"]["command"], "agent command should include prompt path")
         assert_true(
-            windows["agent-v2-0001"]["create_target"] == "=cmv2-fake:",
-            "new actors should use an exact session target",
+            windows["agent-v2-0001"]["create_target"]
+            == f"{state['sessions']['cmv2-fake']['session_id']}:",
+            "new actors should use the resolved stable session ID",
         )
         assert_true(
             "leader" not in state["sessions"]["cmv2-fake-prefix"]["windows"],
@@ -611,13 +696,13 @@ def main() -> int:
             "an exact session lookup must leave the prefix-collision session unchanged",
         )
         assert_true(
-            any(call[:3] == ["has-session", "-t", "=cmv2-fake"] for call in state["calls"]),
-            "session existence checks should use an exact target",
+            any(call[0] == "list-sessions" for call in state["calls"]),
+            "session existence checks should resolve a stable session ID",
         )
         runtime_send = state["send_keys"][-1]
         assert_true(len(state["send_keys"]) == 1, "runtime send should be one tmux external call")
         assert_true(
-            runtime_send["target"] == "=cmv2-fake:=agent-v2-0001"
+            runtime_send["target"] == windows["agent-v2-0001"]["window_id"]
             and runtime_send["literal"] is True
             and runtime_send["text"].rstrip("\r") == "C-c",
             "runtime text and submission should use one literal exact-target call",
@@ -634,10 +719,10 @@ def main() -> int:
         assert_true("agent-v2-0001" not in state["sessions"]["cmv2-fake"]["windows"], "kill-window should remove the agent window")
         assert_true(
             any(
-                call[:3] == ["kill-window", "-t", "=cmv2-fake:=agent-v2-0001"]
+                call[:3] == ["kill-window", "-t", windows["agent-v2-0001"]["window_id"]]
                 for call in state["calls"]
             ),
-            "runtime stop should use an exact actor target",
+            "runtime stop should use the stable actor window ID",
         )
 
         # Older beta projects could persist dotted window names. Resolve the
@@ -665,7 +750,7 @@ def main() -> int:
             "legacy.actor" not in state["sessions"]["cmv2-fake"]["windows"],
             "legacy dotted actor stop should remove only the resolved window",
         )
-        state["sessions"]["cmv2.legacy"] = {
+        state["sessions"]["cmv2_legacy"] = {
             "windows": {
                 "legacy.actor": {
                     "command": "legacy-session",
@@ -682,10 +767,52 @@ def main() -> int:
         legacy_backend.stop_actor(target="cmv2.legacy:legacy.actor")
         state = json.loads(fake_state.read_text(encoding="utf-8"))
         assert_true(
-            "legacy.actor" not in state["sessions"]["cmv2.legacy"]["windows"],
+            "legacy.actor" not in state["sessions"]["cmv2_legacy"]["windows"],
             "persisted dotted session stop should resolve its exact window ID",
         )
 
+        state["sessions"]["cmv2.legacy"] = {
+            "session_id": "$901",
+            "windows": {"collision": {"window_id": "@901"}},
+        }
+        state["sessions"]["cmv2_legacy"]["session_id"] = "$902"
+        fake_state.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        try:
+            legacy_backend.session_exists("cmv2.legacy")
+        except RuntimeError as exc:
+            assert_true("ambiguous" in str(exc), "logical/sanitized collision should fail closed")
+        else:
+            raise AssertionError("logical/sanitized tmux session collision was accepted")
+        state["sessions"].pop("cmv2.legacy", None)
+        fake_state.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+        created_legacy = legacy_backend.start_actor(
+            session_name="cmv2.created.legacy",
+            actor_name="created-reader",
+            command="legacy-created-session",
+            cwd=project,
+            log_path=temp / "ignored-created-legacy.log",
+        )
+        assert_true(
+            created_legacy["target"] == "cmv2.created.legacy:created-reader",
+            "new dotted sessions should retain their logical persisted target",
+        )
+        state = json.loads(fake_state.read_text(encoding="utf-8"))
+        assert_true(
+            "cmv2_created_legacy" in state["sessions"]
+            and "cmv2.created.legacy" not in state["sessions"],
+            "fake tmux should mirror tmux 3.4 dotted session sanitation",
+        )
+        legacy_backend.send_text(target=created_legacy["target"], text="created")
+        state = json.loads(fake_state.read_text(encoding="utf-8"))
+        assert_true(
+            state["send_keys"][-1]["target"]
+            == state["sessions"]["cmv2_created_legacy"]["windows"]["created-reader"]["window_id"],
+            "new sanitized sessions should send through their stable window ID",
+        )
+        legacy_backend.stop_actor(target=created_legacy["target"])
+
+        state = json.loads(fake_state.read_text(encoding="utf-8"))
         state["sessions"]["cmv2-fake"]["windows"].pop("leader", None)
         fake_state.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         recovery = run_json(temp, "recover", "--project", str(project), "--plan-restarts")
