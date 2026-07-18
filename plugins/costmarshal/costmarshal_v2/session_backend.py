@@ -500,7 +500,9 @@ def _linux_process_group_members(
     members: dict[int, str] = {}
     proc_root = Path("/proc")
     if not proc_root.is_dir():
-        return members
+        raise RuntimeError(
+            "Linux process-group inspection unavailable because procfs is not mounted"
+        )
     boot_id_path = Path("/proc/sys/kernel/random/boot_id")
     try:
         boot_id = boot_id_path.read_text(encoding="ascii").strip()
@@ -523,8 +525,8 @@ def _linux_process_group_members(
                 and (session_id is None or record["session_id"] == session_id)
             ):
                 members[member_pid] = str(record["marker"])
-    except OSError:
-        return {}
+    except OSError as exc:
+        raise RuntimeError("Linux process-group inspection failed") from exc
     return members
 
 
@@ -562,7 +564,9 @@ def _verified_local_process_group(
     """Resolve a launch to members without trusting a reusable PGID alone."""
 
     if not Path("/proc").is_dir():
-        return None
+        raise RuntimeError(
+            "Linux process identity inspection unavailable because procfs is not mounted"
+        )
     durable = _linux_marker_identity(marker)
     leader_matches = pid_identity_matches(pid, marker)
     if durable is not None:

@@ -55,6 +55,9 @@ jobs:
         run: python scripts/sync_plugin_package.py
       - name: Run the complete SHA-bound local evidence suite
         run: python tests/release/run_local_test_evidence.py
+      - name: Stress Linux supervisor teardown race
+        if: runner.os == 'Linux'
+        run: python tests/release/run_linux_process_race_stress.py --iterations 50
       - name: Retain the machine-readable evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

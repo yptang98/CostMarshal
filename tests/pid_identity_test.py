@@ -36,6 +36,49 @@ from costmarshal_v2.windows_job import (  # noqa: E402
 
 
 class PidIdentityTest(unittest.TestCase):
+    def test_linux_group_inspection_error_is_not_treated_as_empty(self) -> None:
+        with patch.object(
+            session_backend_module.Path,
+            "is_dir",
+            return_value=True,
+        ), patch.object(
+            session_backend_module.Path,
+            "read_text",
+            return_value="test-boot-id",
+        ), patch.object(
+            session_backend_module.Path,
+            "glob",
+            side_effect=OSError("procfs enumeration denied"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Linux process-group inspection failed",
+            ):
+                session_backend_module._linux_process_group_members(
+                    11,
+                    session_id=11,
+                )
+
+    def test_actor_liveness_fails_closed_without_procfs(self) -> None:
+        backend = LocalProcessBackend()
+        with patch.object(
+            session_backend_module.os,
+            "name",
+            "posix",
+        ), patch.object(session_backend_module, "Path") as path_class:
+            path_class.return_value.is_dir.return_value = False
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Linux process identity inspection unavailable",
+            ):
+                backend.actor_alive(
+                    session_name="test",
+                    actor_name="actor",
+                    target="pid:11",
+                    pid=11,
+                    process_start_marker="linux-proc:test-boot-id:1",
+                )
+
     def test_anchored_group_rechecks_stale_nonempty_teardown_snapshot(self) -> None:
         snapshots = iter(({22: "child-marker"}, {}))
         with patch.object(
