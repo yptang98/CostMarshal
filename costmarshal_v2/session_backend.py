@@ -655,19 +655,26 @@ def _anchored_group_members(
     process_group: int,
     session_id: int,
 ) -> dict[int, str]:
-    """Return a complete current snapshot or fail if a live group lost its anchor."""
+    """Return a fresh anchored snapshot without trusting a teardown race."""
 
-    current = _linux_process_group_members(process_group, session_id=session_id)
-    if _linux_member_identity_matches(
-        anchor_pid,
-        anchor_marker,
-        process_group=process_group,
-        session_id=session_id,
-    ):
-        current[anchor_pid] = anchor_marker
-        return current
-    if not current:
-        return {}
+    # procfs group enumeration and the anchor identity read are not atomic. A
+    # final child and then its supervisor can exit between them, yielding one
+    # stale non-empty snapshot with an already-absent anchor. Confirm that
+    # uncertainty with fresh reads only; never authorize a signal from it.
+    for attempt in range(3):
+        current = _linux_process_group_members(process_group, session_id=session_id)
+        if _linux_member_identity_matches(
+            anchor_pid,
+            anchor_marker,
+            process_group=process_group,
+            session_id=session_id,
+        ):
+            current[anchor_pid] = anchor_marker
+            return current
+        if not current:
+            return {}
+        if attempt < 2:
+            time.sleep(0.02)
     raise RuntimeError(
         "local process-group supervisor identity disappeared while group members remain live; "
         "refusing to report STOP success"

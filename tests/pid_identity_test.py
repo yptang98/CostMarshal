@@ -36,6 +36,66 @@ from costmarshal_v2.windows_job import (  # noqa: E402
 
 
 class PidIdentityTest(unittest.TestCase):
+    def test_anchored_group_rechecks_stale_nonempty_teardown_snapshot(self) -> None:
+        snapshots = iter(({22: "child-marker"}, {}))
+        with patch.object(
+            session_backend_module,
+            "_linux_process_group_members",
+            side_effect=lambda *args, **kwargs: dict(next(snapshots)),
+        ), patch.object(
+            session_backend_module,
+            "_linux_member_identity_matches",
+            return_value=False,
+        ), patch.object(session_backend_module.time, "sleep"):
+            self.assertEqual(
+                session_backend_module._anchored_group_members(
+                    anchor_pid=11,
+                    anchor_marker="anchor-marker",
+                    process_group=11,
+                    session_id=11,
+                ),
+                {},
+            )
+
+    def test_anchored_group_retries_transient_anchor_identity_read(self) -> None:
+        with patch.object(
+            session_backend_module,
+            "_linux_process_group_members",
+            return_value={22: "child-marker"},
+        ), patch.object(
+            session_backend_module,
+            "_linux_member_identity_matches",
+            side_effect=(False, True),
+        ), patch.object(session_backend_module.time, "sleep"):
+            self.assertEqual(
+                session_backend_module._anchored_group_members(
+                    anchor_pid=11,
+                    anchor_marker="anchor-marker",
+                    process_group=11,
+                    session_id=11,
+                ),
+                {11: "anchor-marker", 22: "child-marker"},
+            )
+
+    def test_anchored_group_still_rejects_confirmed_live_unanchored_members(self) -> None:
+        with patch.object(
+            session_backend_module,
+            "_linux_process_group_members",
+            return_value={22: "unbound-marker"},
+        ) as snapshots, patch.object(
+            session_backend_module,
+            "_linux_member_identity_matches",
+            return_value=False,
+        ), patch.object(session_backend_module.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "supervisor identity disappeared"):
+                session_backend_module._anchored_group_members(
+                    anchor_pid=11,
+                    anchor_marker="anchor-marker",
+                    process_group=11,
+                    session_id=11,
+                )
+        self.assertEqual(snapshots.call_count, 3)
+
     def test_windows_job_receipt_read_is_bounded(self) -> None:
         release = threading.Event()
 
