@@ -1,0 +1,7 @@
+interface:
+  display_name: "CostMarshal Orchestrator"
+  short_description: "Route Codex work across low, medium, and high APIs"
+  default_prompt: "Use $orchestrate-cost-aware-agents to complete this task with the best cost-quality tradeoff."
+
+policy:
+  allow_implicit_invocation: true

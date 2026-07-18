@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -17,28 +18,7 @@ SOURCE = Path(__file__).resolve().parents[1]
 MINIMUM_PYTHON = (3, 11)
 MINIMUM_CODEX = (0, 144, 1)
 PLUGIN_ID = "costmarshal@costmarshal"
-IGNORED_DIRS = {
-    ".git",
-    ".github",
-    "__pycache__",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    "artifacts",
-}
-
-
-def ignore_package_artifacts(directory: str, names: list[str]) -> set[str]:
-    ignored: set[str] = set()
-    for name in names:
-        path = Path(directory) / name
-        if name in IGNORED_DIRS:
-            ignored.add(name)
-        elif name.endswith((".pyc", ".pyo", ".env")):
-            ignored.add(name)
-        elif path.is_file() and name.lower() in {".env", "secrets.json"}:
-            ignored.add(name)
-    return ignored
+COMMAND_TIMEOUT_SECONDS = 180
 
 
 def assert_true(condition: bool, message: str) -> None:
@@ -59,6 +39,7 @@ def run(
         stderr=subprocess.PIPE,
         env=env,
         check=False,
+        timeout=COMMAND_TIMEOUT_SECONDS,
     )
     if result.returncode != 0:
         raise AssertionError(
@@ -107,18 +88,67 @@ def require_installed_files(installed: Path) -> None:
         "SKILL.md",
         "skills/orchestrate-cost-aware-agents/SKILL.md",
         "scripts/costmarshal.py",
+        "scripts/costmarshal_actor.py",
         "costmarshal_v2/cli.py",
+        "costmarshal_v2/windows_job_supervisor.py",
         "references/protocol.md",
+        "container/worker/.dockerignore",
         "container/worker/Dockerfile",
-        "release/evidence-policy.json",
-        "tests/release/run_release_gates.py",
+        "container/worker/costmarshal-escape-probe.js",
+        "container/worker/costmarshal-isolation-canary.js",
+        "container/worker/costmarshal-worker.js",
     )
     for relative in required:
         assert_true((installed / relative).is_file(), f"installed plugin lost {relative}")
-    assert_true(not (installed / ".git").exists(), "plugin cache must not include .git")
-    assert_true(not (installed / ".github").exists(), "plugin cache must not include CI metadata")
-    assert_true(not (installed / "artifacts").exists(), "plugin cache must not include generated evidence")
-    assert_true(not any(installed.rglob("*.env")), "plugin cache must not include .env files")
+    forbidden_names = {
+        ".agents",
+        ".env",
+        ".git",
+        ".github",
+        "__pycache__",
+        "artifacts",
+        "plugins",
+        "secrets.json",
+        "tests",
+        "release",
+    }
+    forbidden_suffixes = {".pyc", ".pyo"}
+    for path in installed.rglob("*"):
+        relative = path.relative_to(installed)
+        metadata = path.lstat()
+        attributes = getattr(metadata, "st_file_attributes", 0)
+        is_reparse = bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+        assert_true(
+            not path.is_symlink() and not is_reparse,
+            f"plugin cache contains a linked or redirected entry: {relative}",
+        )
+        assert_true(
+            stat.S_ISDIR(metadata.st_mode)
+            or (stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1),
+            f"plugin cache contains a non-regular or hard-linked entry: {relative}",
+        )
+        lowered_parts = {part.casefold() for part in relative.parts}
+        assert_true(
+            not lowered_parts.intersection(forbidden_names),
+            f"plugin cache contains forbidden path: {relative}",
+        )
+        assert_true(
+            path.suffix.casefold() not in forbidden_suffixes,
+            f"plugin cache contains bytecode: {relative}",
+        )
+    assert_true(
+        not (installed / "scripts" / "mc.py").exists(),
+        "plugin cache must not include legacy CLI",
+    )
+
+
+def remove_tree_strict(path: Path) -> None:
+    def remove_readonly(action, entry: str, _error) -> None:
+        os.chmod(entry, 0o700)
+        action(entry)
+
+    shutil.rmtree(path, onerror=remove_readonly)
+    assert_true(not path.exists(), f"temporary smoke root survived cleanup: {path}")
 
 
 def main() -> int:
@@ -134,8 +164,37 @@ def main() -> int:
         codex_home = temp / "codex-home"
         runtime_root = codex_home / "costmarshal-v2"
         legacy_runtime_root = codex_home / "costmarshal"
-        shutil.copytree(SOURCE, package_root, ignore=ignore_package_artifacts)
-        shutil.copytree(package_root, legacy_package_root)
+        package_root.mkdir()
+        shutil.copytree(SOURCE / ".agents", package_root / ".agents")
+        shutil.copytree(SOURCE / "plugins", package_root / "plugins")
+        for repository_only in (".git", ".github", "artifacts"):
+            sentinel = package_root / repository_only
+            sentinel.mkdir()
+            (sentinel / "must-not-install.txt").write_text(
+                "marketplace transport metadata\n", encoding="utf-8"
+            )
+        legacy_package_root.mkdir()
+        shutil.copytree(SOURCE / ".agents", legacy_package_root / ".agents")
+        for source in sorted((SOURCE / "plugins" / "costmarshal").iterdir()):
+            destination = legacy_package_root / source.name
+            if source.is_dir():
+                shutil.copytree(source, destination)
+            else:
+                shutil.copy2(source, destination)
+        legacy_marketplace_path = (
+            legacy_package_root / ".agents" / "plugins" / "marketplace.json"
+        )
+        legacy_marketplace = json.loads(
+            legacy_marketplace_path.read_text(encoding="utf-8")
+        )
+        legacy_marketplace["plugins"][0]["source"] = {
+            "source": "local",
+            "path": "./",
+        }
+        legacy_marketplace_path.write_text(
+            json.dumps(legacy_marketplace, indent=2) + "\n",
+            encoding="utf-8",
+        )
         legacy_manifest_path = legacy_package_root / ".codex-plugin" / "plugin.json"
         legacy_manifest = json.loads(legacy_manifest_path.read_text(encoding="utf-8"))
         legacy_manifest["version"] = "2.4.0-beta"
@@ -175,6 +234,15 @@ def main() -> int:
         )
         assert isinstance(legacy_install, dict)
         legacy_installed = Path(str(legacy_install.get("installedPath", ""))).resolve()
+        assert_true(
+            (legacy_installed / ".codex-plugin" / "plugin.json").is_file(),
+            "legacy root-layout plugin was not installed",
+        )
+        assert_true(
+            (legacy_installed / ".agents").is_dir()
+            and not (legacy_installed / "plugins").exists(),
+            "legacy fixture did not exercise the root-layout package",
+        )
         legacy_listed = run([codex, "plugin", "list", "--json"], env, parse_json=True)
         assert isinstance(legacy_listed, dict)
         legacy_rows = legacy_listed.get("installed", [])
@@ -312,7 +380,7 @@ def main() -> int:
             "plugin removal changed legacy runtime state",
         )
 
-        install_prompt = (package_root / "INSTALL_PROMPT.md").read_text(encoding="utf-8")
+        install_prompt = (SOURCE / "INSTALL_PROMPT.md").read_text(encoding="utf-8")
         assert_true("codex plugin marketplace add" in install_prompt, "install prompt bypasses marketplace")
         assert_true("codex plugin marketplace remove costmarshal" in install_prompt, "install prompt lacks pinned update flow")
         assert_true(f"codex plugin add {PLUGIN_ID}" in install_prompt, "install prompt bypasses plugin add")
@@ -328,7 +396,7 @@ def main() -> int:
         temp_root = Path(tempfile.gettempdir()).resolve()
         if resolved == temp_root or temp_root not in resolved.parents:
             raise RuntimeError(f"Refusing to delete unexpected path: {resolved}")
-        shutil.rmtree(resolved, ignore_errors=True)
+        remove_tree_strict(resolved)
 
 
 if __name__ == "__main__":

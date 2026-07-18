@@ -108,6 +108,12 @@ install or update. It registers the repository marketplace, installs
 package, and leaves both current and legacy runtime roots untouched. Start a new
 Codex task after installation so the plugin Skill is discovered.
 
+The marketplace points at the committed `plugins/costmarshal` runtime snapshot,
+not the repository root. The snapshot is generated from an explicit allowlist,
+byte-checked against the canonical sources, and excludes Git/CI metadata,
+development tests, release-only evidence policy, generated artifacts, and the
+legacy `mc.py` interface.
+
 ```powershell
 # First install
 codex plugin marketplace add yptang98/CostMarshal --ref <reviewed-40-character-commit>

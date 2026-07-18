@@ -8,15 +8,20 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+GITATTRIBUTES = ROOT / ".gitattributes"
 WORKER = ROOT / "container" / "worker" / "costmarshal-worker.js"
 CANARY = ROOT / "container" / "worker" / "costmarshal-isolation-canary.js"
 PROBE = ROOT / "container" / "worker" / "costmarshal-escape-probe.js"
 DOCKERFILE = ROOT / "container" / "worker" / "Dockerfile"
+DOCKERIGNORE = ROOT / "container" / "worker" / ".dockerignore"
 LIVE_HARNESS = ROOT / "tests" / "oci_live_evidence.py"
 
 
 def main() -> int:
     for script in (WORKER, CANARY, PROBE):
+        raw = script.read_bytes()
+        assert raw.startswith(b"#!/usr/bin/env node\n")
+        assert b"\r" not in raw
         completed = subprocess.run(
             ["node", "--check", str(script)],
             text=True,
@@ -28,6 +33,26 @@ def main() -> int:
     worker = WORKER.read_text(encoding="utf-8")
     canary = CANARY.read_text(encoding="utf-8")
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    dockerignore = DOCKERIGNORE.read_text(encoding="utf-8")
+    attributes = GITATTRIBUTES.read_text(encoding="utf-8")
+    assert b"\r" not in DOCKERFILE.read_bytes()
+    assert b"\r" not in DOCKERIGNORE.read_bytes()
+    assert dockerignore.splitlines() == [
+        "*",
+        "!Dockerfile",
+        "!costmarshal-worker.js",
+        "!costmarshal-isolation-canary.js",
+        "!costmarshal-escape-probe.js",
+    ]
+    for required in (
+        "container/worker/*.js text eol=lf",
+        "container/worker/Dockerfile text eol=lf",
+        "container/worker/.dockerignore text eol=lf",
+        "plugins/costmarshal/container/worker/*.js text eol=lf",
+        "plugins/costmarshal/container/worker/Dockerfile text eol=lf",
+        "plugins/costmarshal/container/worker/.dockerignore text eol=lf",
+    ):
+        assert required in attributes
     for required in (
         'path.resolve(value) !== expected',
         '"--ask-for-approval"',
@@ -51,6 +76,7 @@ def main() -> int:
     ):
         assert required in canary
     assert "ARG NODE_BASE_IMAGE" in dockerfile
+    assert "# syntax=" not in dockerfile
     assert "FROM ${NODE_BASE_IMAGE}" in dockerfile
     assert "ARG CODEX_NPM_VERSION" in dockerfile
     assert "COPY costmarshal-escape-probe.js" in dockerfile

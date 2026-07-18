@@ -19,8 +19,8 @@ Requirements:
 - If any update step fails, stop and report it; do not delete or rewrite runtime state and do not silently install a moving source.
 - Verify the marketplace with `codex plugin marketplace list` and confirm its name is `costmarshal`.
 - On a first install, run `codex plugin add costmarshal@costmarshal`; after either install path, verify `codex plugin list` reports the expected source and version as installed and enabled. Do not add it a second time after the update sequence already succeeded.
-- Verify the cached plugin is self-contained: `.codex-plugin/plugin.json`, root `SKILL.md`, `skills/orchestrate-cost-aware-agents/SKILL.md`, `scripts/`, `costmarshal_v2/`, `references/`, `container/`, and `release/` must all exist under the installed plugin root.
-- Verify repository-only or secret-bearing material is absent from the plugin cache: no `.git`, `.github`, `artifacts`, `.env`, `secrets.json`, `*.pyc`, or `__pycache__` entry may be copied.
+- Verify the cached plugin is the curated runtime snapshot: `.codex-plugin/plugin.json`, root `SKILL.md`, `skills/orchestrate-cost-aware-agents/SKILL.md`, `scripts/costmarshal.py`, `scripts/costmarshal_actor.py`, `costmarshal_v2/`, `references/`, and `container/worker/` must all exist under the installed plugin root.
+- Verify repository-only, legacy, or secret-bearing material is absent from the plugin cache: no `.agents`, `.git`, `.github`, `plugins`, `tests`, `release`, `artifacts`, `scripts/mc.py`, `.env`, `secrets.json`, `*.pyc`, or `__pycache__` entry may be copied.
 - Verify Python 3.11+ is available for the hidden runtime with `python --version`; on Windows, run `py -3.11 --version` when `python` is unavailable or older.
 - Run the repository's plugin validator, Skill validator, contract test, and isolated install smoke against that exact commit.
 - In a new Codex task, verify explicit `$orchestrate-cost-aware-agents` discovery and natural-language invocation. Run only read-only `route`, `dashboard`, and `recover` smoke operations in temporary CostMarshal state.

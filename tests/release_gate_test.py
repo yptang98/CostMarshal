@@ -187,7 +187,15 @@ class ReleaseGateTest(unittest.TestCase):
             for path in (ROOT / "tests").glob("*_test.py")
         }
         required = set(REQUIRED_LOCAL_TESTS)
-        self.assertEqual(discovered, required - {"scripts/install_smoke_test.py"})
+        maintenance_smokes = {path for path in required if path.startswith("scripts/")}
+        self.assertEqual(
+            maintenance_smokes,
+            {
+                "scripts/codex_plugin_install_smoke_test.py",
+                "scripts/install_smoke_test.py",
+            },
+        )
+        self.assertEqual(discovered, required - maintenance_smokes)
 
     def test_reproduction_deletes_stale_artifact_and_requires_fresh_output(self) -> None:
         with tempfile.TemporaryDirectory(prefix="costmarshal-release-stale-") as raw:

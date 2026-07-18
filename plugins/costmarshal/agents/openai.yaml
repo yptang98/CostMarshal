@@ -1,0 +1,7 @@
+interface:
+  display_name: "CostMarshal"
+  short_description: "Route work across costly and cheap coding agents."
+  default_prompt: "Use $costmarshal to split this task across strong, medium, and low-cost agents with structured reports and budget controls."
+
+policy:
+  allow_implicit_invocation: false

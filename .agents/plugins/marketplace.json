@@ -8,7 +8,7 @@
       "name": "costmarshal",
       "source": {
         "source": "local",
-        "path": "./"
+        "path": "./plugins/costmarshal"
       },
       "policy": {
         "installation": "AVAILABLE",

@@ -5,9 +5,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from scripts.sync_plugin_package import PACKAGE, package_differences  # noqa: E402
+
 PLUGIN_MANIFEST = ROOT / ".codex-plugin" / "plugin.json"
 MARKETPLACE = ROOT / ".agents" / "plugins" / "marketplace.json"
 PLUGIN_SKILL = ROOT / "skills" / "orchestrate-cost-aware-agents" / "SKILL.md"
@@ -51,14 +56,23 @@ def main() -> int:
     entry = entries[0]
     require(entry.get("name") == "costmarshal", "marketplace plugin id drifted")
     require(
-        entry.get("source") == {"source": "local", "path": "./"},
-        "marketplace must install the self-contained repository root",
+        entry.get("source")
+        == {"source": "local", "path": "./plugins/costmarshal"},
+        "marketplace must install the curated plugin distribution",
     )
     require(
         entry.get("policy")
         == {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
         "marketplace policy drifted",
     )
+    differences = package_differences()
+    require(not differences, f"committed plugin package drifted: {differences[:8]}")
+    packaged_manifest = json.loads(
+        (PACKAGE / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
+    )
+    require(packaged_manifest == manifest, "packaged plugin manifest drifted")
+    for forbidden in (".agents", ".git", ".github", "artifacts", "release", "tests"):
+        require(not (PACKAGE / forbidden).exists(), f"plugin package includes {forbidden}")
 
     skill = PLUGIN_SKILL.read_text(encoding="utf-8")
     require(

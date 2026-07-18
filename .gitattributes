@@ -1,0 +1,8 @@
+# Linux-executed worker sources must retain LF after Windows checkouts.
+container/worker/*.js text eol=lf
+container/worker/Dockerfile text eol=lf
+container/worker/.dockerignore text eol=lf
+plugins/costmarshal/container/worker/*.js text eol=lf
+plugins/costmarshal/container/worker/Dockerfile text eol=lf
+plugins/costmarshal/container/worker/.dockerignore text eol=lf
+scripts/*.sh text eol=lf

@@ -40,6 +40,8 @@ REQUIRED_LOCAL_TESTS = (
     "tests/unit_test.py",
     "tests/smoke_test.py",
     "tests/codex_plugin_contract_test.py",
+    "tests/plugin_package_security_test.py",
+    "scripts/codex_plugin_install_smoke_test.py",
     "tests/local_backend_contract_test.py",
     "tests/tmux_contract_test.py",
     "tests/model_rotation_contract_test.py",
