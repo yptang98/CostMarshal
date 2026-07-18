@@ -58,6 +58,8 @@ LINUX_RUNNER_PROCESS_TOKEN = "costmarshal-process-" + ("e" * 64)
 def run_actor_fixture(*args, **kwargs) -> int:
     """Isolate OCI behavior from the separately tested local-launch identity."""
 
+    if not sys.platform.startswith("linux"):
+        return run_actor(*args, **kwargs)
     with patch(
         "costmarshal_v2.actor_runner._runner_process_start_marker",
         return_value=LINUX_RUNNER_FIXTURE_MARKER,
@@ -68,6 +70,8 @@ def run_actor_fixture(*args, **kwargs) -> int:
 def run_linux_token_bound_child(command: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
     """Launch a runner fixture with the same inherited memfd authority as LocalBackend."""
 
+    if not sys.platform.startswith("linux"):
+        return subprocess.run(command, **kwargs)
     token_fd = os.memfd_create(LINUX_RUNNER_PROCESS_TOKEN, flags=0)
     try:
         return subprocess.run(command, stdin=token_fd, **kwargs)

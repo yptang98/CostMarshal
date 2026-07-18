@@ -31,7 +31,12 @@ from costmarshal_v2.state import (  # noqa: E402
     save_task,
 )
 from costmarshal_v2.worker_isolation import cleanup_temporary_credential  # noqa: E402
-from oci_actor_runner_test import IMAGE, cli  # noqa: E402
+from oci_actor_runner_test import (  # noqa: E402
+    IMAGE,
+    cli,
+    run_actor_fixture,
+    run_linux_token_bound_child,
+)
 
 
 class CrashAfterCleanup(RuntimeError):
@@ -322,7 +327,7 @@ def crash_after_cleanup(layout: ProjectLayout, codex_home: Path, actor: dict) ->
         CompletionAdapter,
     ), patch("costmarshal_v2.actor_runner._actor_fault", side_effect=fault):
         try:
-            actor_runner.run_actor(
+            run_actor_fixture(
                 layout,
                 actor["id"],
                 attempt_id=actor["attempt_id"],
@@ -368,7 +373,7 @@ def main() -> int:
             "costmarshal_v2.actor_runner.OciWorkerExecutionAdapter",
             NoProviderAdapter,
         ):
-            assert actor_runner.run_actor(
+            assert run_actor_fixture(
                 layout,
                 actor["id"],
                 attempt_id=actor["attempt_id"],
@@ -409,7 +414,7 @@ raise SystemExit(runner.run_actor(
                 "COSTMARSHAL_PROVIDER_CALLS_FILE": str(calls),
             }
         )
-        crashed = subprocess.run(
+        crashed = run_linux_token_bound_child(
             [
                 sys.executable,
                 "-c",
@@ -439,7 +444,7 @@ raise SystemExit(runner.run_actor(
             "costmarshal_v2.actor_runner.OciWorkerExecutionAdapter",
             CompletionAdapter,
         ):
-            assert actor_runner.run_actor(
+            assert run_actor_fixture(
                 layout3,
                 actor3["id"],
                 attempt_id=actor3["attempt_id"],
@@ -465,7 +470,7 @@ raise SystemExit(runner.run_actor(
             NoProviderAdapter,
         ):
             try:
-                actor_runner.run_actor(
+                run_actor_fixture(
                     layout2,
                     actor2["id"],
                     attempt_id=actor2["attempt_id"],
@@ -492,7 +497,7 @@ raise SystemExit(runner.run_actor(
             NoProviderAdapter,
         ):
             try:
-                actor_runner.run_actor(
+                run_actor_fixture(
                     layout4,
                     actor4["id"],
                     attempt_id=actor4["attempt_id"],

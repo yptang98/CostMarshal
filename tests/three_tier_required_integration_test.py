@@ -22,9 +22,10 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+if str(ROOT / "tests") not in sys.path:
+    sys.path.insert(0, str(ROOT / "tests"))
 
 import costmarshal_v2.actor_runner as actor_runner  # noqa: E402
-from costmarshal_v2.actor_runner import run_actor  # noqa: E402
 from costmarshal_v2.cli import build_parser  # noqa: E402
 from costmarshal_v2.paths import ProjectLayout  # noqa: E402
 from costmarshal_v2.profiles import provider_profile_text  # noqa: E402
@@ -43,6 +44,7 @@ from costmarshal_v2.worker_isolation import (  # noqa: E402
     OciCliBackend,
     validate_execution_spec,
 )
+from oci_actor_runner_test import run_actor_fixture  # noqa: E402
 CLI = ROOT / "scripts" / "costmarshal.py"
 IMAGE = "ghcr.io/example/costmarshal-worker@sha256:" + "7" * 64
 
@@ -547,7 +549,7 @@ def main() -> int:
                 "costmarshal_v2.actor_runner.OciCliBackend",
                 side_effect=ThreeTierOciBackend,
             ):
-                returncode = run_actor(
+                returncode = run_actor_fixture(
                     layout,
                     actor_id,
                     attempt_id=actor["attempt_id"],
@@ -773,7 +775,7 @@ def main() -> int:
             "costmarshal_v2.actor_runner.OciCliBackend",
             side_effect=ThreeTierOciBackend,
         ):
-            returncode = run_actor(
+            returncode = run_actor_fixture(
                 layout,
                 early_actor_id,
                 attempt_id=early_actor["attempt_id"],
