@@ -600,11 +600,12 @@ def main() -> int:
             )
         assert orphan_effects == 0
 
-        # Exercise the harder ordering: SPAWN owns its durable lease and is
-        # already inside backend.start_actor when a public stop-actor process
-        # commits STOP.  The runtime-effect mutex must let that one start finish,
-        # then give STOP the observed PID/marker without ever resurrecting the
-        # stopped actor or launching a second provider.
+        # Exercise the harder platform-specific linearization: SPAWN owns its
+        # durable lease inside backend.start_actor when a public stop-actor
+        # commits STOP. Windows must cancel the prepared child before resume;
+        # POSIX must let its already-entered unsuspended start finish exactly
+        # once, then let STOP consume that PID/marker. Neither platform may
+        # resurrect the actor, duplicate the provider, or retain an orphan.
         run_json(
             temp,
             "new-task",
@@ -800,20 +801,32 @@ def main() -> int:
         assert race_errors == [], repr(race_errors)
         assert race_runner_alive_after_stop is False, "STOP left the externally started runner alive"
         assert race_provider_alive_after_stop is False, "STOP left the provider child alive"
-        # STOP committed before the Windows prepared callback authorized
-        # ResumeThread. The child must remain suspended and be contained; a
-        # provider call is no longer an acceptable outcome for this race.
-        assert race_start_calls == []
         assert len(race_scheduler_results) == 1
-        assert race_scheduler_results[0]["processed"] == []
-        assert len(race_scheduler_results[0]["failed"]) == 1
-        assert (
-            race_scheduler_results[0]["failed"][0]["effect_id"]
-            == racing_spawn["start"]["effect_id"]
-        )
-        assert "stopped before Windows Job resume authorization" in str(
-            race_scheduler_results[0]["failed"][0]["error"]
-        )
+        if os.name == "nt":
+            # STOP committed before the Windows prepared callback authorized
+            # ResumeThread. The child must remain suspended and be contained;
+            # a provider call is no longer an acceptable outcome.
+            assert race_start_calls == []
+            assert race_scheduler_results[0]["processed"] == []
+            assert len(race_scheduler_results[0]["failed"]) == 1
+            assert (
+                race_scheduler_results[0]["failed"][0]["effect_id"]
+                == racing_spawn["start"]["effect_id"]
+            )
+            assert "stopped before Windows Job resume authorization" in str(
+                race_scheduler_results[0]["failed"][0]["error"]
+            )
+        else:
+            # POSIX local launch has no suspended-child preparation primitive.
+            # The already-entered start therefore linearizes first, and STOP
+            # must consume its one exact receipt without a duplicate launch.
+            assert len(race_start_calls) == 1
+            assert race_scheduler_results[0]["failed"] == []
+            assert len(race_scheduler_results[0]["processed"]) == 1
+            assert (
+                race_scheduler_results[0]["processed"][0]["effect_id"]
+                == racing_spawn["start"]["effect_id"]
+            )
         assert len(race_stop_results) == 1
         racing_stop = race_stop_results[0]
         assert racing_stop["runtime"]["status"] == "applied"
@@ -835,8 +848,13 @@ def main() -> int:
             else 0
         )
         race_provider_pid = read_pid_file(race_provider_pid_file)
-        assert race_provider_pid is None, "provider started after STOP won resume authorization"
-        assert race_provider_calls == 0
+        if os.name == "nt":
+            assert race_provider_pid is None, "provider started after STOP won resume authorization"
+            assert race_provider_calls == 0
+        else:
+            assert race_provider_pid is not None, "POSIX start did not reach its provider"
+            assert wait_for_pid_exit(race_provider_pid), "STOP left the POSIX provider alive"
+            assert race_provider_calls == 1
         run_json(
             temp,
             "run-scheduler",
@@ -851,7 +869,7 @@ def main() -> int:
             if race_provider_counter.is_file()
             else 0
         ) == race_provider_calls
-        assert race_start_calls == []
+        assert len(race_start_calls) == (0 if os.name == "nt" else 1)
         assert load_actor(project_layout, racing_spawn["actor_id"])["status"] == "stopped"
         assert load_task(project_layout, "V2-0006")["attempts"][-1]["status"] == "cancelled"
         with sqlite3.connect(project / "scheduler" / "state.db") as connection:
@@ -1543,7 +1561,8 @@ def main() -> int:
             + len(emergency_counter.read_text(encoding="utf-8").splitlines())
             + race_provider_calls
         )
-        assert provider_calls == 6
+        expected_provider_calls = 6 if os.name == "nt" else 7
+        assert provider_calls == expected_provider_calls
         print("runtime effect scheduler ok")
         print(
             "COSTMARSHAL_RUNTIME_EVIDENCE="
@@ -1564,12 +1583,12 @@ def main() -> int:
                         "daemon_sleep_does_not_block_emergency_stop",
                         "no_effect_commit_view_reconciled_by_scheduler",
                         "stop_cancels_pending_spawn_before_provider",
-                        "stop_prevents_inflight_spawn_before_resume_authorization",
+                        "stop_linearizes_against_inflight_spawn",
                         "explicit_recovery_rejects_stale_runner_registration",
                         "stop_permanent_failure_remains_recoverable",
                     ],
                     "provider_calls": provider_calls,
-                    "expected_provider_calls": 6,
+                    "expected_provider_calls": expected_provider_calls,
                     "orphan_effects": orphan_effects,
                 },
                 sort_keys=True,

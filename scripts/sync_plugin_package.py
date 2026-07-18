@@ -345,7 +345,21 @@ def _assert_safe_package_location() -> None:
     root = ROOT.resolve(strict=True)
     expected_parent = root / "plugins"
     expected_package = expected_parent / "costmarshal"
-    if PACKAGE_PARENT != expected_parent or PACKAGE != expected_package:
+    parent_matches_root = False
+    try:
+        parent_matches_root = os.path.samefile(PACKAGE_PARENT.parent, root)
+    except OSError:
+        pass
+    package_parent_matches = (
+        os.path.normcase(os.path.abspath(PACKAGE.parent))
+        == os.path.normcase(os.path.abspath(PACKAGE_PARENT))
+    )
+    if (
+        not parent_matches_root
+        or PACKAGE_PARENT.name.casefold() != "plugins"
+        or not package_parent_matches
+        or PACKAGE.name.casefold() != "costmarshal"
+    ):
         raise RuntimeError(
             f"refusing package path outside the canonical repository location: {PACKAGE}"
         )
