@@ -7,6 +7,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -67,7 +68,14 @@ def main() -> int:
         shim.write_text("@echo off\n", encoding="utf-8")
         javascript.write_text("// fixture\n", encoding="utf-8")
         node.write_bytes(b"fixture")
-        with patch("costmarshal_v2.actor_runner.os.name", "nt"):
+        # Patch the actor runner's OS dependency, not ``os.name`` on the shared
+        # stdlib module.  Mutating the latter makes ``pathlib.Path`` try to
+        # instantiate ``WindowsPath`` on Linux before the shim contract can be
+        # exercised.
+        with patch(
+            "costmarshal_v2.actor_runner.os",
+            SimpleNamespace(name="nt"),
+        ):
             resolved = _resolve_windows_codex_shim(
                 [str(shim), "--model", "gpt-safe", "-"]
             )
