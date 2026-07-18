@@ -497,6 +497,95 @@ def main() -> int:
         remove_seed_evidence(escalation_project)
         assert run_json(temp, "validate", "--project", str(escalation_project))["status"] == "ok"
 
+        cached_project = make_project(temp, "per-step-cache", 12.0)
+        cached_project_json = cached_project / "project.json"
+        cached_state = json.loads(cached_project_json.read_text(encoding="utf-8"))
+        ordinary_prices = {"longcat": 1.0, "deepseek": 2.0, "codex": 3.0}
+        cached_prices = {"longcat": 0.1, "deepseek": 0.2, "codex": 0.3}
+        for provider in cached_state["provider_catalog"]["providers"]:
+            previous = provider["pricing"]
+            provider["pricing"] = build_pricing_snapshot(
+                currency="CNY",
+                source=f"https://pricing.example/per-step-{provider['provider_id']}",
+                reviewed_at=previous["reviewed_at"],
+                effective_at=previous["effective_at"],
+                expires_at=previous["expires_at"],
+                snapshot_id=f"per-step-{provider['provider_id']}",
+                input_per_1m=ordinary_prices[provider["provider_id"]],
+                cached_input_per_1m=cached_prices[provider["provider_id"]],
+                output_per_1m=0.0,
+                fixed_attempt=0.0,
+            )
+        cached_project_json.write_text(
+            json.dumps(cached_state, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        cached_task = run_json(
+            temp,
+            "new-task",
+            "--project",
+            str(cached_project),
+            "--title",
+            "per-step cached reserve",
+            "--purpose",
+            "prove cached input is not portable across providers",
+            "--estimated-input-tokens",
+            "1000000",
+            "--estimated-cached-input-tokens",
+            "1000000",
+            "--min-success-probability",
+            "0.15",
+        )["task_id"]
+        run_json(
+            temp,
+            "dispatch",
+            "--project",
+            str(cached_project),
+            "--task",
+            cached_task,
+            "--unsafe-native",
+        )
+        cached_payload = task_payload(cached_project, cached_task)
+        cached_envelope = cached_payload["route_budget_envelope"]
+        assert cached_envelope["schema_version"] == "costmarshal-route-budget-envelope-v3"
+        cached_forecasts = [
+            step["token_forecast"] for step in cached_envelope["planned_steps"]
+        ]
+        assert [
+            (
+                row["estimated_input_tokens"],
+                row["estimated_cached_input_tokens"],
+                row["cache_mode"],
+            )
+            for row in cached_forecasts
+        ] == [
+            (2000000, 0, "reclassified-as-ordinary"),
+            (2000000, 0, "reclassified-as-ordinary"),
+            (2000000, 0, "reclassified-as-ordinary"),
+        ]
+        assert [
+            step["estimated_cost_cny"] for step in cached_envelope["planned_steps"]
+        ] == ["2", "4", "6"]
+        assert cached_envelope["reserved_cost_cny"] == "12"
+        reject_latest_attempt(temp, cached_project, cached_task, "cached-low")
+        run_json(
+            temp,
+            "escalate",
+            "--project",
+            str(cached_project),
+            "--task",
+            cached_task,
+            "--reason",
+            "continue with ordinary-input successor pricing",
+            "--unsafe-native",
+        )
+        cached_continuation = task_payload(cached_project, cached_task)["attempts"][-1]
+        assert cached_continuation["provider"] == "deepseek"
+        assert cached_continuation["route_decision"]["estimated_input_tokens"] == 2000000
+        assert cached_continuation["route_decision"]["estimated_cached_input_tokens"] == 0
+        assert cached_continuation["reserved_cost_cny"] == "4"
+        assert run_json(temp, "budget", "--project", str(cached_project))["commitment_cny"] == 12.0
+
         revision_project = make_project(temp, "envelope-revision", 10.0)
         override_task = new_chain_task(temp, revision_project, "reject model override")
         override = run(

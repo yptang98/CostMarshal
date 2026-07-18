@@ -648,6 +648,38 @@ def main() -> int:
         project = Path(init["project"])
         seed_paired_route_evidence(temp, project)
 
+        project_file = project / "project.json"
+        initialized_state = json.loads(project_file.read_text(encoding="utf-8"))
+        assert initialized_state["routing_policy"]["routing_objective"] == "completion-first"
+        legacy_state = json.loads(json.dumps(initialized_state))
+        legacy_state["routing_policy"].pop("routing_objective")
+        project_file.write_text(
+            json.dumps(legacy_state, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        legacy_task_result = run_json(
+            temp,
+            "new-task",
+            "--project",
+            str(project),
+            "--title",
+            "legacy objective",
+            "--purpose",
+            "missing project field preserves cost-only behavior",
+            "--estimated-input-tokens",
+            "1000000",
+        )
+        legacy_task = json.loads(
+            (Path(legacy_task_result["task"]) / "task.json").read_text(encoding="utf-8")
+        )
+        assert legacy_task["routing_objective"] == "cost-only"
+        assert legacy_task["routing_objective_source"] == "legacy-cost-only"
+        assert len(legacy_task["route_preview"]["planned_provider_ids"]) == 2
+        project_file.write_text(
+            json.dumps(initialized_state, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
         inherited = run_json(
             temp,
             "new-task",
@@ -663,7 +695,9 @@ def main() -> int:
         inherited_task = json.loads((Path(inherited["task"]) / "task.json").read_text(encoding="utf-8"))
         assert inherited_task["min_success_probability"] == 0.1
         assert inherited_task["min_success_probability_source"] == "project-default"
-        assert len(inherited_task["route_preview"]["planned_provider_ids"]) == 2
+        assert inherited_task["routing_objective"] == "completion-first"
+        assert inherited_task["routing_objective_source"] == "project-default"
+        assert inherited_task["route_preview"]["planned_provider_ids"][-1] == "codex"
 
         explicit = run_json(
             temp,
@@ -702,10 +736,28 @@ def main() -> int:
         assert zero_task["min_success_probability"] == 0.0
         # Medium/high observations in this fixture are conditional continuation
         # evidence and must not inflate their standalone start priors.
-        assert zero_task["route_preview"]["planned_provider_ids"] == [
-            "longcat",
-            "deepseek",
-        ]
+        assert zero_task["route_preview"]["planned_provider_ids"][-1] == "codex"
+
+        cost_only = run_json(
+            temp,
+            "new-task",
+            "--project",
+            str(project),
+            "--title",
+            "cost only",
+            "--purpose",
+            "explicitly opt out of strongest-tier terminal fallback",
+            "--routing-objective",
+            "cost-only",
+            "--estimated-input-tokens",
+            "1000000",
+        )
+        cost_only_task = json.loads(
+            (Path(cost_only["task"]) / "task.json").read_text(encoding="utf-8")
+        )
+        assert cost_only_task["routing_objective"] == "cost-only"
+        assert cost_only_task["routing_objective_source"] == "task-explicit"
+        assert len(cost_only_task["route_preview"]["planned_provider_ids"]) == 2
 
         pinned = run_json(
             temp,
@@ -761,7 +813,6 @@ def main() -> int:
         )
         assert "frozen tier routing mode" in (tier_override.stdout + tier_override.stderr)
 
-        project_file = project / "project.json"
         project_state = json.loads(project_file.read_text(encoding="utf-8"))
         project_state["routing_policy"]["default_min_success_probability"] = 0.15
         project_file.write_text(json.dumps(project_state, ensure_ascii=False, indent=2), encoding="utf-8")

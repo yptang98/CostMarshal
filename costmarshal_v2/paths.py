@@ -136,7 +136,7 @@ def resolve_project(root: Path, project_arg: str) -> ProjectLayout:
     if candidate.exists() and candidate.is_dir():
         project_dir = candidate.resolve()
         if not (project_dir / "project.json").is_file():
-            raise SystemExit(f"Not a CostMarshal v2 project: {project_dir}")
+            raise SystemExit(f"Not a CostMarshal project: {project_dir}")
         return ProjectLayout(root=root, project_dir=project_dir)
 
     matches = sorted((root / "projects").glob(f"*{project_arg}*"))

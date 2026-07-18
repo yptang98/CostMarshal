@@ -16,18 +16,20 @@ import json
 import math
 import re
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, localcontext
-from itertools import product
 from typing import Any, Iterable, Mapping, Sequence
 
 
 CATALOG_SCHEMA_VERSION = 1
-ROUTE_PLAN_SCHEMA_VERSION = "costmarshal-route-plan-v1"
+ROUTE_PLAN_SCHEMA_V1 = "costmarshal-route-plan-v1"
+ROUTE_PLAN_SCHEMA_V2 = "costmarshal-route-plan-v2"
+ROUTE_PLAN_SCHEMA_VERSION = ROUTE_PLAN_SCHEMA_V2
 MAX_ENABLED_PROVIDERS_PER_TIER = 16
 BOOTSTRAP_MIN_CONDITIONAL_OBSERVATIONS = 10
 TIERS = ("low", "medium", "high")
 TIER_RANK = {tier: index for index, tier in enumerate(TIERS)}
 RISKS = {"low", "medium", "high"}
 DIFFICULTIES = {"simple", "normal", "hard"}
+ROUTING_OBJECTIVES = {"completion-first", "cost-only"}
 
 # Low tier is an allowlist.  Unknown or judgment-heavy work starts at medium.
 LOW_TIER_TASK_TYPES = {
@@ -48,6 +50,7 @@ MEDIUM_TIER_TASK_TYPES = {
 
 _PROVIDER_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _PROFILE_ID = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,62}[A-Za-z0-9])?")
+_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}")
 _PROVIDER_FIELDS = {
     "provider_id",
     "tier",
@@ -82,6 +85,26 @@ _PROFILE_HASH = re.compile(r"sha256:[0-9a-f]{64}")
 
 ExecutionIdentity = tuple[str, str | None, str | None]
 PredecessorExecutionIdentity = tuple[str, str, str | None, str | None]
+
+_TOKEN_FORECAST_FIELDS = {
+    "estimated_input_tokens",
+    "estimated_cached_input_tokens",
+    "estimated_output_tokens",
+    "cache_mode",
+    "cache_binding",
+}
+_CACHE_BINDING_FIELDS = {
+    "provider_id",
+    "model",
+    "profile",
+    "profile_sha256",
+}
+_CACHE_MODES = {
+    "none",
+    "bound-origin",
+    "exact-identity-reuse",
+    "reclassified-as-ordinary",
+}
 
 
 class RoutingValidationError(ValueError):
@@ -137,6 +160,7 @@ class RouteDecision:
     tier_floor: str
     requested_provider_id: str | None
     requested_tier: str | None
+    routing_objective: str
     estimated_input_tokens: int
     estimated_cached_input_tokens: int
     estimated_output_tokens: int
@@ -428,25 +452,234 @@ def provider_price_basis(provider: Mapping[str, Any]) -> dict[str, Any]:
     return {"kind": "unpriced"}
 
 
+def _cache_binding(
+    provider: Mapping[str, Any],
+    execution_identity: ExecutionIdentity,
+) -> dict[str, Any]:
+    identity = _normalize_execution_identity(
+        execution_identity,
+        f"provider {provider.get('provider_id') or '?'} cache identity",
+    )
+    return {
+        "provider_id": str(provider.get("provider_id") or ""),
+        "model": identity[0],
+        "profile": identity[1],
+        "profile_sha256": identity[2],
+    }
+
+
+def derive_step_token_forecast(
+    *,
+    input_tokens: int,
+    cached_input_tokens: int,
+    output_tokens: int,
+    target_provider: Mapping[str, Any],
+    target_execution_identity: ExecutionIdentity,
+    step_index: int,
+    cache_origin: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Derive one immutable route-step forecast from the task forecast.
+
+    Cached input is never assumed portable across provider/model/profile bytes.
+    The first step binds the source cache to its exact execution identity.  A
+    successor may retain the cached dimension only when that complete identity
+    is byte-equivalent; otherwise the same tokens are conservatively repriced as
+    ordinary input.  Current route chains prohibit provider repetition, so every
+    admitted successor is reclassified in practice.
+    """
+
+    ordinary = _require_token_count(input_tokens, "input_tokens")
+    cached = _require_token_count(cached_input_tokens, "cached_input_tokens")
+    output = _require_token_count(output_tokens, "output_tokens")
+    if type(step_index) is not int or step_index < 0:
+        raise RoutingValidationError("step_index must be a non-negative integer")
+    target_binding = _cache_binding(target_provider, target_execution_identity)
+    if not target_binding["provider_id"]:
+        raise RoutingValidationError("route step cache identity lacks provider_id")
+    if cached == 0:
+        return {
+            "estimated_input_tokens": ordinary,
+            "estimated_cached_input_tokens": 0,
+            "estimated_output_tokens": output,
+            "cache_mode": "none",
+            "cache_binding": None,
+        }
+    if step_index == 0:
+        if cache_origin is None:
+            return {
+                "estimated_input_tokens": ordinary + cached,
+                "estimated_cached_input_tokens": 0,
+                "estimated_output_tokens": output,
+                "cache_mode": "reclassified-as-ordinary",
+                "cache_binding": None,
+            }
+        if dict(cache_origin) != target_binding:
+            raise RoutingValidationError("first route step cache origin is inconsistent")
+        return {
+            "estimated_input_tokens": ordinary,
+            "estimated_cached_input_tokens": cached,
+            "estimated_output_tokens": output,
+            "cache_mode": "bound-origin",
+            "cache_binding": target_binding,
+        }
+    if cache_origin is None:
+        return {
+            "estimated_input_tokens": ordinary + cached,
+            "estimated_cached_input_tokens": 0,
+            "estimated_output_tokens": output,
+            "cache_mode": "reclassified-as-ordinary",
+            "cache_binding": None,
+        }
+    if dict(cache_origin) == target_binding:
+        return {
+            "estimated_input_tokens": ordinary,
+            "estimated_cached_input_tokens": cached,
+            "estimated_output_tokens": output,
+            "cache_mode": "exact-identity-reuse",
+            "cache_binding": target_binding,
+        }
+    return {
+        "estimated_input_tokens": ordinary + cached,
+        "estimated_cached_input_tokens": 0,
+        "estimated_output_tokens": output,
+        "cache_mode": "reclassified-as-ordinary",
+        "cache_binding": None,
+    }
+
+
+def _validated_step_token_forecast(
+    value: Any,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != _TOKEN_FORECAST_FIELDS:
+        raise RoutingValidationError(f"{label} has unknown or missing fields")
+    forecast = deepcopy(dict(value))
+    for field in (
+        "estimated_input_tokens",
+        "estimated_cached_input_tokens",
+        "estimated_output_tokens",
+    ):
+        _require_token_count(forecast.get(field), f"{label}.{field}")
+    if forecast.get("cache_mode") not in _CACHE_MODES:
+        raise RoutingValidationError(f"{label}.cache_mode is invalid")
+    binding = forecast.get("cache_binding")
+    if binding is not None:
+        if not isinstance(binding, Mapping) or set(binding) != _CACHE_BINDING_FIELDS:
+            raise RoutingValidationError(f"{label}.cache_binding is invalid")
+        if not isinstance(binding.get("provider_id"), str) or not binding["provider_id"]:
+            raise RoutingValidationError(f"{label}.cache_binding.provider_id is invalid")
+        if not isinstance(binding.get("model"), str) or not binding["model"]:
+            raise RoutingValidationError(f"{label}.cache_binding.model is invalid")
+        if binding.get("profile") is not None and (
+            not isinstance(binding.get("profile"), str) or not binding["profile"]
+        ):
+            raise RoutingValidationError(f"{label}.cache_binding.profile is invalid")
+        profile_sha256 = binding.get("profile_sha256")
+        if profile_sha256 is not None and (
+            not isinstance(profile_sha256, str) or not _PROFILE_HASH.fullmatch(profile_sha256)
+        ):
+            raise RoutingValidationError(
+                f"{label}.cache_binding.profile_sha256 is invalid"
+            )
+        forecast["cache_binding"] = deepcopy(dict(binding))
+    return forecast
+
+
+def _validate_plan_token_forecasts(
+    planned_steps: Sequence[Mapping[str, Any]],
+    *,
+    input_tokens: int,
+    cached_input_tokens: int,
+    output_tokens: int,
+) -> None:
+    cache_origin: dict[str, Any] | None = None
+    for index, step in enumerate(planned_steps):
+        if not isinstance(step, Mapping):
+            raise RoutingValidationError(f"planned_steps[{index}] must be an object")
+        identity = step.get("execution_identity")
+        if not isinstance(identity, Mapping) or set(identity) != {
+            "model",
+            "profile",
+            "profile_sha256",
+        }:
+            raise RoutingValidationError(
+                f"planned_steps[{index}].execution_identity is invalid"
+            )
+        target_identity = _normalize_execution_identity(
+            (
+                identity.get("model"),
+                identity.get("profile"),
+                identity.get("profile_sha256"),
+            ),
+            f"planned_steps[{index}].execution_identity",
+        )
+        expected = derive_step_token_forecast(
+            input_tokens=input_tokens,
+            cached_input_tokens=cached_input_tokens,
+            output_tokens=output_tokens,
+            target_provider=step,
+            target_execution_identity=target_identity,
+            step_index=index,
+            cache_origin=cache_origin,
+        )
+        observed = _validated_step_token_forecast(
+            step.get("token_forecast"),
+            label=f"planned_steps[{index}].token_forecast",
+        )
+        if observed != expected:
+            raise RoutingValidationError(
+                f"planned_steps[{index}].token_forecast is inconsistent with its cache identity"
+            )
+        if index == 0:
+            cache_origin = expected.get("cache_binding")
+
+
 def route_plan_fingerprint(
     planned_steps: Sequence[Mapping[str, Any]],
     *,
     input_tokens: int,
     cached_input_tokens: int,
     output_tokens: int,
+    routing_objective: str = "cost-only",
 ) -> str:
-    """Hash the complete route plan and its three-dimensional token forecast."""
+    """Hash a legacy or per-step route plan without rewriting old envelopes.
+
+    Plans whose steps all omit ``token_forecast`` retain the exact v1 payload.
+    New plans require the field on every step and use v2.  Mixed schemas fail
+    closed instead of silently downgrading the fingerprint.
+    """
 
     _require_token_count(input_tokens, "input_tokens")
     _require_token_count(cached_input_tokens, "cached_input_tokens")
     _require_token_count(output_tokens, "output_tokens")
+    steps = deepcopy(list(planned_steps))
+    forecast_presence = [
+        isinstance(step, Mapping) and "token_forecast" in step
+        for step in steps
+    ]
+    if any(forecast_presence) and not all(forecast_presence):
+        raise RoutingValidationError(
+            "route plan cannot mix v1 and v2 token-forecast steps"
+        )
+    schema_version = ROUTE_PLAN_SCHEMA_V2 if forecast_presence and all(forecast_presence) else ROUTE_PLAN_SCHEMA_V1
+    if schema_version == ROUTE_PLAN_SCHEMA_V2:
+        objective = _validate_routing_objective(routing_objective)
+        _validate_plan_token_forecasts(
+            steps,
+            input_tokens=input_tokens,
+            cached_input_tokens=cached_input_tokens,
+            output_tokens=output_tokens,
+        )
     payload = {
-        "schema_version": ROUTE_PLAN_SCHEMA_VERSION,
+        "schema_version": schema_version,
         "estimated_input_tokens": input_tokens,
         "estimated_cached_input_tokens": cached_input_tokens,
         "estimated_output_tokens": output_tokens,
-        "planned_steps": deepcopy(list(planned_steps)),
+        "planned_steps": steps,
     }
+    if schema_version == ROUTE_PLAN_SCHEMA_V2:
+        payload["routing_objective"] = objective
     encoded = json.dumps(
         payload,
         ensure_ascii=False,
@@ -463,6 +696,7 @@ def _route_plan_step(
     cost: Decimal | None,
     *,
     index: int,
+    token_forecast: Mapping[str, Any],
     execution_identity: ExecutionIdentity | None = None,
 ) -> dict[str, Any]:
     identity = execution_identity or (
@@ -483,6 +717,10 @@ def _route_plan_step(
             "profile_sha256": identity[2],
         },
         "estimated_cost_cny": None if cost is None else _decimal_money_text(cost),
+        "token_forecast": _validated_step_token_forecast(
+            token_forecast,
+            label=f"route step {index} token_forecast",
+        ),
         "acceptance_prior": prior.to_dict(),
         "price_basis": provider_price_basis(provider),
     }
@@ -567,8 +805,12 @@ def validate_provider_catalog(catalog: Mapping[str, Any]) -> dict[str, Any]:
             not isinstance(profile, str) or not _PROFILE_ID.fullmatch(profile)
         ):
             raise RoutingValidationError(f"{label}.profile must be null or a safe identifier")
-        if model is not None and (not isinstance(model, str) or not model.strip()):
-            raise RoutingValidationError(f"{label}.model must be null or a non-empty string")
+        if model is not None and (
+            not isinstance(model, str) or not _MODEL_ID.fullmatch(model)
+        ):
+            raise RoutingValidationError(
+                f"{label}.model must be null or match {_MODEL_ID.pattern!r}"
+            )
         if env_key is not None and (
             not isinstance(env_key, str) or not re.fullmatch(r"[A-Z_][A-Z0-9_]{0,127}", env_key)
         ):
@@ -655,6 +897,14 @@ def _normalized_task_value(task: Mapping[str, Any], key: str, default: str) -> s
     return value.strip().lower()
 
 
+def _validate_routing_objective(value: Any) -> str:
+    if not isinstance(value, str) or value.strip().lower() not in ROUTING_OBJECTIVES:
+        raise RoutingValidationError(
+            "routing_objective must be one of: completion-first, cost-only"
+        )
+    return value.strip().lower()
+
+
 def validate_task_routing(task: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(task, Mapping):
         raise RoutingValidationError("task must be an object")
@@ -680,12 +930,16 @@ def validate_task_routing(task: Mapping[str, Any]) -> dict[str, Any]:
     )
     if minimum_success is not None and minimum_success > 1:
         raise RoutingValidationError("task.min_success_probability must be between 0 and 1")
+    routing_objective = _validate_routing_objective(
+        task.get("routing_objective", "cost-only")
+    )
     return {
         "risk": risk,
         "difficulty": difficulty,
         "task_type": task_type,
         "required_capabilities": normalized_capabilities,
         "min_success_probability": minimum_success,
+        "routing_objective": routing_objective,
     }
 
 
@@ -1532,7 +1786,13 @@ def _auto_chain_plans(
     _history_is_deduplicated: bool = False,
     sla_evidence: bool = False,
 ) -> list[dict[str, Any]]:
-    """Enumerate start-provider chains and price expected accepted outcomes."""
+    """Enumerate bounded monotonic provider chains and price accepted outcomes.
+
+    Mature economic routing may continue to a different provider in the same
+    tier, but it may never repeat a provider, downgrade a tier, or admit more
+    than three total attempts.  The cold-start bootstrap selector below applies
+    a stricter one-provider-per-tier filter to these plans.
+    """
 
     history_rows = (
         list(history or [])
@@ -1544,15 +1804,105 @@ def _auto_chain_plans(
         tuple[str, ExecutionIdentity, tuple[PredecessorExecutionIdentity, ...]],
         AcceptancePrior,
     ] = {}
-    conditional_exact_prior_cache: dict[
-        tuple[str, ExecutionIdentity, tuple[PredecessorExecutionIdentity, ...]],
-        AcceptancePrior,
+    empty_conditional_base_cache: dict[
+        tuple[str, ExecutionIdentity, bool], AcceptancePrior
     ] = {}
+    marginal_rows = {
+        str(row[0]["provider_id"]): row
+        for row in _rank_candidates(
+            [
+                provider
+                for provider in enabled
+                if TIER_RANK[provider["tier"]] >= TIER_RANK[floor]
+            ],
+            history=history_rows,
+            task_type=task_type,
+            difficulty=difficulty,
+            input_tokens=input_tokens + cached_input_tokens,
+            output_tokens=output_tokens,
+            cached_input_tokens=0,
+            execution_identities=execution_identities,
+            _history_is_deduplicated=True,
+        )
+    }
+    ordered_rows = tuple(
+        sorted(
+            marginal_rows.values(),
+            key=lambda row: (
+                TIER_RANK[row[0]["tier"]],
+                row[0]["priority"],
+                row[0]["provider_id"],
+            ),
+        )
+    )
+    # With no caller-proven cache origin, a provider's execution identity,
+    # per-step forecast, and immutable price are invariant across every chain
+    # position.  Precompute them once instead of repeating Decimal parsing and
+    # identity normalization for O(n^3) candidate chains.
+    static_steps: dict[
+        str,
+        tuple[ExecutionIdentity, dict[str, Any], Decimal | None],
+    ] = {}
+    for static_provider in enabled:
+        static_identity = _provider_execution_identity(
+            static_provider,
+            execution_identities,
+        )
+        static_forecast = derive_step_token_forecast(
+            input_tokens=input_tokens,
+            cached_input_tokens=cached_input_tokens,
+            output_tokens=output_tokens,
+            target_provider=static_provider,
+            target_execution_identity=static_identity,
+            step_index=0,
+            cache_origin=None,
+        )
+        static_cost_units = estimate_cost_nano_cny(
+            static_provider,
+            input_tokens=static_forecast["estimated_input_tokens"],
+            cached_input_tokens=static_forecast[
+                "estimated_cached_input_tokens"
+            ],
+            output_tokens=static_forecast["estimated_output_tokens"],
+        )
+        static_steps[str(static_provider["provider_id"])] = (
+            static_identity,
+            static_forecast,
+            (
+                None
+                if static_cost_units is None
+                else Decimal(static_cost_units) / _NANO_CNY
+            ),
+        )
+
+    def continuation_sequences(
+        prefix: tuple[tuple[dict[str, Any], AcceptancePrior, Decimal | None], ...],
+        *,
+        last_rank: int,
+        seen_provider_ids: frozenset[str],
+    ) -> Iterable[tuple[tuple[dict[str, Any], AcceptancePrior, Decimal | None], ...]]:
+        """Yield every legal continuation, including an immediate early stop."""
+
+        yield prefix
+        if len(prefix) >= 2:
+            return
+        for row in ordered_rows:
+            candidate = row[0]
+            provider_id = str(candidate["provider_id"])
+            candidate_rank = TIER_RANK[candidate["tier"]]
+            if provider_id in seen_provider_ids or candidate_rank < last_rank:
+                continue
+            yield from continuation_sequences(
+                (*prefix, row),
+                last_rank=candidate_rank,
+                seen_provider_ids=seen_provider_ids | {provider_id},
+            )
+
     plans: list[dict[str, Any]] = []
     for start in enabled:
         if TIER_RANK[start["tier"]] < TIER_RANK[floor]:
             continue
-        start_identity = _provider_execution_identity(start, execution_identities)
+        start_identity = static_steps[str(start["provider_id"])][0]
         start_prior = leader_acceptance_prior(
             history_rows,
             start["provider_id"],
@@ -1563,46 +1913,32 @@ def _auto_chain_plans(
             require_exact_scope=sla_evidence,
             minimum_observations=10 if sla_evidence else 0,
         )
-        start_cost_units = estimate_cost_nano_cny(
-            start,
-            input_tokens=input_tokens,
-            cached_input_tokens=cached_input_tokens,
-            output_tokens=output_tokens,
-        )
         start_row = (
             start,
             start_prior,
-            None if start_cost_units is None else Decimal(start_cost_units) / _NANO_CNY,
+            None,
         )
-        stronger_groups: list[list[tuple[dict[str, Any], AcceptancePrior, Decimal | None] | None]] = []
-        for tier in TIERS[TIER_RANK[start["tier"]] + 1 :]:
-            peers = [provider for provider in enabled if provider["tier"] == tier]
-            if peers:
-                stronger_groups.append(
-                    [None, *_rank_candidates(
-                        peers,
-                        history=history_rows,
-                        task_type=task_type,
-                        difficulty=difficulty,
-                        input_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                        cached_input_tokens=cached_input_tokens,
-                        execution_identities=execution_identities,
-                        _history_is_deduplicated=True,
-                    )]
-                )
-        combinations = product(*stronger_groups) if stronger_groups else [()]
-        for optional_continuation in combinations:
-            continuation = [row for row in optional_continuation if row is not None]
+        combinations = continuation_sequences(
+            (),
+            last_rank=TIER_RANK[start["tier"]],
+            seen_provider_ids=frozenset({str(start["provider_id"])}),
+        )
+        for continuation in combinations:
             marginal_chain = [start_row, *continuation]
-            chain: list[tuple[dict[str, Any], AcceptancePrior, Decimal | None]] = []
+            chain: list[
+                tuple[
+                    dict[str, Any],
+                    AcceptancePrior,
+                    Decimal | None,
+                    dict[str, Any],
+                ]
+            ] = []
             conditional_exact_observations: list[int] = []
             predecessor_identities: list[PredecessorExecutionIdentity] = []
-            for index, (item_provider, marginal_prior, item_cost) in enumerate(marginal_chain):
-                item_identity = _provider_execution_identity(
-                    item_provider,
-                    execution_identities,
-                )
+            for index, (item_provider, marginal_prior, _) in enumerate(marginal_chain):
+                item_identity, item_forecast, item_cost = static_steps[
+                    str(item_provider["provider_id"])
+                ]
                 item_prior = marginal_prior
                 if index:
                     cache_key = (
@@ -1612,35 +1948,74 @@ def _auto_chain_plans(
                     )
                     item_prior = conditional_prior_cache.get(cache_key)
                     if item_prior is None:
-                        item_prior = conditional_leader_acceptance_prior(
-                            history_rows,
-                            item_provider["provider_id"],
-                            predecessor_execution_identities=predecessor_identities,
-                            task_type=task_type,
-                            difficulty=difficulty,
-                            execution_identity=item_identity,
-                            _history_is_deduplicated=True,
-                            require_exact_scope=sla_evidence,
-                            minimum_observations=10 if sla_evidence else 0,
-                            _evidence_index=conditional_evidence_index,
-                        )
+                        if cache_key not in conditional_evidence_index:
+                            # Most bounded-catalog combinations have no exact
+                            # predecessor-conditioned rows.  Their cold prior
+                            # differs only by provider/execution scope and the
+                            # rendered predecessor prefix, so build the common
+                            # empty base once instead of running the full
+                            # evidence pipeline for every O(n^3) chain.
+                            empty_key = (
+                                str(item_provider["provider_id"]),
+                                item_identity,
+                                sla_evidence,
+                            )
+                            empty_base = empty_conditional_base_cache.get(empty_key)
+                            if empty_base is None:
+                                empty_base = leader_acceptance_prior(
+                                    (),
+                                    item_provider["provider_id"],
+                                    task_type=task_type,
+                                    difficulty=difficulty,
+                                    execution_identity=item_identity,
+                                    _history_is_deduplicated=True,
+                                    require_exact_scope=sla_evidence,
+                                    minimum_observations=10 if sla_evidence else 0,
+                                )
+                                empty_conditional_base_cache[empty_key] = empty_base
+                            item_prior = AcceptancePrior(
+                                provider_id=empty_base.provider_id,
+                                scope=(
+                                    "conditional:"
+                                    + "->".join(
+                                        identity[0]
+                                        for identity in predecessor_identities
+                                    )
+                                    + f":{empty_base.scope}"
+                                ),
+                                observations=0,
+                                accepted=0,
+                                prior_alpha=empty_base.prior_alpha,
+                                prior_beta=empty_base.prior_beta,
+                                posterior_mean=empty_base.posterior_mean,
+                                conservative_probability=0.0,
+                                evidence_result_ids=empty_base.evidence_result_ids,
+                                evidence_sha256=empty_base.evidence_sha256,
+                            )
+                        else:
+                            item_prior = conditional_leader_acceptance_prior(
+                                history_rows,
+                                item_provider["provider_id"],
+                                predecessor_execution_identities=predecessor_identities,
+                                task_type=task_type,
+                                difficulty=difficulty,
+                                execution_identity=item_identity,
+                                _history_is_deduplicated=True,
+                                require_exact_scope=sla_evidence,
+                                minimum_observations=10 if sla_evidence else 0,
+                                _evidence_index=conditional_evidence_index,
+                            )
                         conditional_prior_cache[cache_key] = item_prior
-                    exact_item_prior = conditional_exact_prior_cache.get(cache_key)
-                    if exact_item_prior is None:
-                        exact_item_prior = conditional_leader_acceptance_prior(
-                            history_rows,
-                            item_provider["provider_id"],
-                            predecessor_execution_identities=predecessor_identities,
-                            task_type=task_type,
-                            difficulty=difficulty,
-                            execution_identity=item_identity,
-                            _history_is_deduplicated=True,
-                            require_exact_scope=True,
-                            _evidence_index=conditional_evidence_index,
-                        )
-                        conditional_exact_prior_cache[cache_key] = exact_item_prior
-                    conditional_exact_observations.append(exact_item_prior.observations)
-                chain.append((item_provider, item_prior, item_cost))
+                    # A positive success floor already requires exact scoped
+                    # evidence, so the admitted prior carries the observation
+                    # count needed by that path.  Without a success floor only
+                    # the economically best complete bootstrap chain needs its
+                    # exact observation count; compute that one lazily after
+                    # exhaustive ranking instead of duplicating this lookup for
+                    # every O(n^3) candidate chain.
+                    if sla_evidence:
+                        conditional_exact_observations.append(item_prior.observations)
+                chain.append((item_provider, item_prior, item_cost, item_forecast))
                 predecessor_identities.append(
                     (
                         item_provider["provider_id"],
@@ -1649,11 +2024,11 @@ def _auto_chain_plans(
                         item_identity[2],
                     )
                 )
-            if any(cost is None for _, _, cost in chain):
+            if any(cost is None for _, _, cost, _ in chain):
                 continue
             survival = Decimal(1)
             expected_cost = Decimal(0)
-            for _, prior, cost in chain:
+            for _, prior, cost, _ in chain:
                 assert cost is not None
                 probability = Decimal(str(prior.conservative_probability))
                 expected_cost += survival * cost
@@ -1662,18 +2037,9 @@ def _auto_chain_plans(
             if success_probability <= 0:
                 continue
             objective = expected_cost / success_probability
-            planned_steps = tuple(
-                _route_plan_step(
-                    item_provider,
-                    item_prior,
-                    item_cost,
-                    index=index,
-                    execution_identity=_provider_execution_identity(
-                        item_provider,
-                        execution_identities,
-                    ),
-                )
-                for index, (item_provider, item_prior, item_cost) in enumerate(chain)
+            worst_case_cost_exact = sum(
+                (item[2] for item in chain if item[2] is not None),
+                Decimal(0),
             )
             plans.append(
                 {
@@ -1681,17 +2047,13 @@ def _auto_chain_plans(
                     "prior": start_prior,
                     "cost": chain[0][2],
                     "chain": tuple(item[0]["provider_id"] for item in chain),
-                    "steps": planned_steps,
-                    "worst_case_cost": float(
-                        sum((item[2] for item in chain if item[2] is not None), Decimal(0))
-                    ),
-                    "_worst_case_cost_exact": sum(
-                        (item[2] for item in chain if item[2] is not None),
-                        Decimal(0),
-                    ),
-                    "expected_cost": _rounded_decimal_float(expected_cost),
-                    "success_probability": _rounded_decimal_float(success_probability),
-                    "objective": _rounded_decimal_float(objective),
+                    "tiers": tuple(item[0]["tier"] for item in chain),
+                    # Route-step serialization includes profile/evidence
+                    # bindings and is comparatively expensive.  Preserve the
+                    # evaluated rows here and materialize only the selected
+                    # plan after exhaustive ranking.
+                    "_chain_rows": tuple(chain),
+                    "_worst_case_cost_exact": worst_case_cost_exact,
                     "_expected_cost_exact": expected_cost,
                     "_success_probability_exact": success_probability,
                     "_objective_exact": objective,
@@ -1706,8 +2068,53 @@ def _auto_chain_plans(
             -plan["_success_probability_exact"],
             plan["provider"]["priority"],
             plan["provider"]["provider_id"],
+            plan["chain"],
         )
     )
+    if not sla_evidence:
+        available_tiers = tuple(
+            tier
+            for tier in TIERS[TIER_RANK[floor] :]
+            if any(provider["tier"] == tier for provider in enabled)
+        )
+        bootstrap_candidate = next(
+            (plan for plan in plans if plan["tiers"] == available_tiers),
+            None,
+        )
+        if bootstrap_candidate is not None:
+            exact_observations: list[int] = []
+            predecessor_identities: list[PredecessorExecutionIdentity] = []
+            for index, (item_provider, _, _, _) in enumerate(
+                bootstrap_candidate["_chain_rows"]
+            ):
+                item_identity = _provider_execution_identity(
+                    item_provider,
+                    execution_identities,
+                )
+                if index:
+                    exact_prior = conditional_leader_acceptance_prior(
+                        history_rows,
+                        item_provider["provider_id"],
+                        predecessor_execution_identities=predecessor_identities,
+                        task_type=task_type,
+                        difficulty=difficulty,
+                        execution_identity=item_identity,
+                        _history_is_deduplicated=True,
+                        require_exact_scope=True,
+                        _evidence_index=conditional_evidence_index,
+                    )
+                    exact_observations.append(exact_prior.observations)
+                predecessor_identities.append(
+                    (
+                        item_provider["provider_id"],
+                        item_identity[0],
+                        item_identity[1],
+                        item_identity[2],
+                    )
+                )
+            bootstrap_candidate["_conditional_exact_observations"] = tuple(
+                exact_observations
+            )
     return plans
 
 
@@ -1735,7 +2142,7 @@ def _conditional_bootstrap_plan(
     full_plans = [
         plan
         for plan in plans
-        if tuple(step["tier"] for step in plan["steps"]) == available_tiers
+        if plan["tiers"] == available_tiers
     ]
     if not full_plans:
         return None
@@ -1788,22 +2195,6 @@ def decide_route(
     if not enabled:
         detail = f" with capabilities {sorted(required_capabilities)}" if required_capabilities else ""
         raise RoutingValidationError(f"provider_catalog has no enabled providers{detail}")
-    enabled_counts = {
-        tier: sum(provider["tier"] == tier for provider in enabled)
-        for tier in TIERS
-    }
-    oversized_tiers = {
-        tier: count
-        for tier, count in enabled_counts.items()
-        if count > MAX_ENABLED_PROVIDERS_PER_TIER
-    }
-    if oversized_tiers:
-        detail = ", ".join(f"{tier}={count}" for tier, count in sorted(oversized_tiers.items()))
-        raise RoutingValidationError(
-            f"too many enabled capability-compatible providers for bounded route optimization ({detail}); "
-            f"maximum per tier is {MAX_ENABLED_PROVIDERS_PER_TIER}"
-        )
-
     if requested_provider_id is not None:
         matches = [row for row in enabled if row["provider_id"] == requested_provider_id]
         if not matches:
@@ -1851,6 +2242,36 @@ def decide_route(
             base = requested_tier or floor
             reason = f"no enabled provider at tier {base}; selected next available stronger tier {selected_tier}"
 
+    # The peer limit bounds the combinatorial auto-chain planner.  Explicit
+    # provider selection is a single lookup and explicit-tier selection only
+    # ranks that tier, so unrelated catalog breadth must not make either mode
+    # unavailable.  Likewise, providers below the task's effective safety
+    # floor can never enter an auto plan and therefore do not consume its
+    # bounded peer budget.
+    if requested_provider_id is None and requested_tier is None:
+        planning_enabled = [
+            provider
+            for provider in enabled
+            if TIER_RANK[provider["tier"]] >= TIER_RANK[floor]
+        ]
+        planning_counts = {
+            tier: sum(provider["tier"] == tier for provider in planning_enabled)
+            for tier in TIERS[TIER_RANK[floor] :]
+        }
+        oversized_tiers = {
+            tier: count
+            for tier, count in planning_counts.items()
+            if count > MAX_ENABLED_PROVIDERS_PER_TIER
+        }
+        if oversized_tiers:
+            detail = ", ".join(
+                f"{tier}={count}" for tier, count in sorted(oversized_tiers.items())
+            )
+            raise RoutingValidationError(
+                "too many enabled capability-compatible providers for bounded auto route optimization "
+                f"({detail}); maximum per tier is {MAX_ENABLED_PROVIDERS_PER_TIER}"
+            )
+
     pricing_scope = (
         candidates
         if requested_provider_id is not None or requested_tier is not None
@@ -1859,12 +2280,19 @@ def decide_route(
     optimization_pricing_ready, optimization_pricing_status, optimization_pricing_currency = _economic_pricing_gate(
         pricing_scope,
         now=now,
-        require_cached_input=cached_input_tokens > 0,
+        # Canonical providers are priced per concrete route step below.  A
+        # provider without a cached-input rate may still be a fully priced
+        # cross-provider successor after cached input is reclassified as
+        # ordinary.  Beta legacy prices have no cached dimension at all and
+        # retain their fail-closed compatibility gate.
+        # The task entry contract does not prove a cache origin, so first-step
+        # cached estimates are conservatively repriced as ordinary input.
+        require_cached_input=False,
     )
     candidate_pricing_ready, candidate_pricing_status, candidate_pricing_currency = _economic_pricing_gate(
         candidates,
         now=now,
-        require_cached_input=cached_input_tokens > 0,
+        require_cached_input=False,
     )
     uses_canonical_pricing = any(provider.get("pricing") is not None for provider in pricing_scope)
     selection_pricing_ready = (
@@ -1884,9 +2312,9 @@ def decide_route(
         history=history_rows,
         task_type=values["task_type"],
         difficulty=values["difficulty"],
-        input_tokens=input_tokens,
+        input_tokens=input_tokens + cached_input_tokens,
         output_tokens=output_tokens,
-        cached_input_tokens=cached_input_tokens,
+        cached_input_tokens=0,
         allow_costs=selection_pricing_ready,
         execution_identities=execution_identities,
         _history_is_deduplicated=True,
@@ -1953,6 +2381,22 @@ def decide_route(
                     raise RoutingValidationError(
                         f"no priced provider chain satisfies minimum success probability {minimum_success}"
                     )
+            if values["routing_objective"] == "completion-first":
+                strongest_compatible_rank = max(
+                    TIER_RANK[item["tier"]]
+                    for item in enabled
+                    if TIER_RANK[item["tier"]] >= TIER_RANK[floor]
+                )
+                plans = [
+                    plan
+                    for plan in plans
+                    if TIER_RANK[plan["tiers"][-1]] == strongest_compatible_rank
+                ]
+                if not plans:
+                    raise RoutingValidationError(
+                        "no priced provider chain reaches the strongest compatible tier "
+                        "required by completion-first routing"
+                    )
             bootstrap = (
                 _conditional_bootstrap_plan(plans, enabled, floor=floor)
                 if minimum_success is None or minimum_success == 0
@@ -1966,15 +2410,37 @@ def decide_route(
                 dict.fromkeys(plan["provider"]["provider_id"] for plan in plans)
             )
             planned_provider_ids = best["chain"]
-            planned_steps = best["steps"]
-            worst_case_chain_cost = best["worst_case_cost"]
+            planned_steps = tuple(
+                _route_plan_step(
+                    item_provider,
+                    item_prior,
+                    item_cost,
+                    index=index,
+                    token_forecast=item_forecast,
+                    execution_identity=_provider_execution_identity(
+                        item_provider,
+                        execution_identities,
+                    ),
+                )
+                for index, (
+                    item_provider,
+                    item_prior,
+                    item_cost,
+                    item_forecast,
+                ) in enumerate(
+                    best["_chain_rows"]
+                )
+            )
             worst_case_chain_cost_exact = best["_worst_case_cost_exact"]
-            expected_chain_cost = best["expected_cost"]
+            worst_case_chain_cost = float(worst_case_chain_cost_exact)
             expected_chain_cost_exact = best["_expected_cost_exact"]
-            expected_success = best["success_probability"]
+            expected_chain_cost = _rounded_decimal_float(expected_chain_cost_exact)
             expected_success_exact = best["_success_probability_exact"]
-            expected_cost_per_accepted = best["objective"]
+            expected_success = _rounded_decimal_float(expected_success_exact)
             expected_cost_per_accepted_exact = best["_objective_exact"]
+            expected_cost_per_accepted = _rounded_decimal_float(
+                expected_cost_per_accepted_exact
+            )
             if bootstrap is not None:
                 optimization_mode = "conditional-evidence-bootstrap"
                 reason = (
@@ -1986,7 +2452,7 @@ def decide_route(
             else:
                 optimization_mode = "expected-cost-per-accepted"
                 reason = (
-                    f"cost-performance optimization selected {provider['provider_id']} as the first "
+                    f"{values['routing_objective']} optimization selected {provider['provider_id']} as the first "
                     f"step of chain {' -> '.join(planned_provider_ids)}"
                 )
             if minimum_success is None and bootstrap is None:
@@ -2000,16 +2466,26 @@ def decide_route(
     elif not optimization_pricing_ready and requested_provider_id is None and requested_tier is None:
         reason = f"{reason}; cross-tier optimization unavailable ({optimization_pricing_status})"
     if not planned_steps:
+        direct_identity = _provider_execution_identity(
+            provider,
+            execution_identities,
+        )
+        direct_forecast = derive_step_token_forecast(
+            input_tokens=input_tokens,
+            cached_input_tokens=cached_input_tokens,
+            output_tokens=output_tokens,
+            target_provider=provider,
+            target_execution_identity=direct_identity,
+            step_index=0,
+        )
         planned_steps = (
             _route_plan_step(
                 provider,
                 prior,
                 cost,
                 index=0,
-                execution_identity=_provider_execution_identity(
-                    provider,
-                    execution_identities,
-                ),
+                token_forecast=direct_forecast,
+                execution_identity=direct_identity,
             ),
         )
         worst_case_chain_cost = None if cost is None else float(cost)
@@ -2019,6 +2495,7 @@ def decide_route(
         input_tokens=input_tokens,
         cached_input_tokens=cached_input_tokens,
         output_tokens=output_tokens,
+        routing_objective=values["routing_objective"],
     )
     selected_snapshot = _snapshot_from_provider(provider) if selection_pricing_ready else None
     cost_value = None if cost is None else float(cost)
@@ -2046,6 +2523,7 @@ def decide_route(
         tier_floor=floor,
         requested_provider_id=requested_provider_id,
         requested_tier=requested_tier,
+        routing_objective=values["routing_objective"],
         estimated_input_tokens=input_tokens,
         estimated_cached_input_tokens=cached_input_tokens,
         estimated_output_tokens=output_tokens,
@@ -2097,6 +2575,7 @@ def next_stronger_provider(
     *,
     required_capabilities: Iterable[str] = (),
     preferred_provider_ids: Sequence[str] | None = None,
+    allow_same_tier_preferred: bool = False,
     history: Iterable[Mapping[str, Any]] | None = None,
     execution_identities: Mapping[str, ExecutionIdentity] | None = None,
     task_type: str = "analysis",
@@ -2106,11 +2585,14 @@ def next_stronger_provider(
     output_tokens: int = 0,
     now: datetime | str | None = None,
 ) -> dict[str, Any] | None:
-    """Return the best provider at the next available stronger tier.
+    """Return the next provider in a sealed plan or a stronger fallback.
 
     The function skips missing tiers (legacy low/high catalogs) and returns
     ``None`` when the current provider is already at the strongest available
-    tier.  It never retries or chooses a peer in the current tier.
+    tier.  A same-tier peer is eligible only when it is the exact next provider
+    in a structurally valid preferred chain and the caller explicitly confirms
+    that this chain came from a sealed admission envelope.  Ad-hoc selection
+    remains strictly stronger-tier only.
     """
 
     normalized = validate_provider_catalog(catalog)
@@ -2138,21 +2620,62 @@ def next_stronger_provider(
         for provider in normalized["providers"]
         if provider["enabled"] and capabilities.issubset(set(provider["capabilities"]))
     ]
+    current_identity = _provider_execution_identity(current, execution_identities)
+    cache_origin = _cache_binding(current, current_identity)
+
+    def successor_forecast(provider: Mapping[str, Any]) -> dict[str, Any]:
+        return derive_step_token_forecast(
+            input_tokens=input_tokens,
+            cached_input_tokens=cached_input_tokens,
+            output_tokens=output_tokens,
+            target_provider=provider,
+            target_execution_identity=_provider_execution_identity(
+                provider,
+                execution_identities,
+            ),
+            step_index=1,
+            cache_origin=cache_origin,
+        )
+
+    if type(allow_same_tier_preferred) is not bool:
+        raise RoutingValidationError("allow_same_tier_preferred must be boolean")
+    preferred: list[str] = []
+    if preferred_provider_ids:
+        if isinstance(preferred_provider_ids, (str, bytes)):
+            raise RoutingValidationError("preferred provider chain must be a sequence of provider IDs")
+        preferred = [str(provider_id) for provider_id in preferred_provider_ids]
+        if not 1 <= len(preferred) <= 3 or len(preferred) != len(set(preferred)):
+            raise RoutingValidationError(
+                "preferred provider chain must contain one to three unique provider IDs"
+            )
+        catalog_by_id = {
+            str(provider["provider_id"]): provider
+            for provider in normalized["providers"]
+        }
+        if any(provider_id not in catalog_by_id for provider_id in preferred):
+            raise RoutingValidationError("preferred provider chain contains an unknown provider")
+        preferred_ranks = [
+            TIER_RANK[catalog_by_id[provider_id]["tier"]]
+            for provider_id in preferred
+        ]
+        if preferred_ranks != sorted(preferred_ranks):
+            raise RoutingValidationError("preferred provider chain contains a tier downgrade")
 
     def selected(provider: dict[str, Any], reason: str) -> dict[str, Any]:
+        forecast = successor_forecast(provider)
         pricing_ready, pricing_status, pricing_currency = _economic_pricing_gate(
             [provider],
             now=now,
-            require_cached_input=cached_input_tokens > 0,
+            require_cached_input=forecast["estimated_cached_input_tokens"] > 0,
         )
         ranked = _rank_candidates(
             [provider],
             history=history,
             task_type=task_type.strip().lower(),
             difficulty=difficulty,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cached_input_tokens=cached_input_tokens,
+            input_tokens=forecast["estimated_input_tokens"],
+            output_tokens=forecast["estimated_output_tokens"],
+            cached_input_tokens=forecast["estimated_cached_input_tokens"],
             allow_costs=pricing_ready,
             execution_identities=execution_identities,
         )
@@ -2165,11 +2688,11 @@ def next_stronger_provider(
             "pricing_status": pricing_status,
             "pricing_currency": pricing_currency,
             "price_snapshot": snapshot.to_dict() if snapshot else None,
+            "token_forecast": forecast,
             "reason": reason,
         }
 
-    if preferred_provider_ids:
-        preferred = [str(provider_id) for provider_id in preferred_provider_ids]
+    if preferred:
         try:
             current_index = preferred.index(current_provider_id)
         except ValueError:
@@ -2182,7 +2705,14 @@ def next_stronger_provider(
             )
             if (
                 planned_next is not None
-                and TIER_RANK[planned_next["tier"]] > TIER_RANK[current["tier"]]
+                and (
+                    TIER_RANK[planned_next["tier"]] > TIER_RANK[current["tier"]]
+                    or (
+                        allow_same_tier_preferred
+                        and TIER_RANK[planned_next["tier"]]
+                        == TIER_RANK[current["tier"]]
+                    )
+                )
             ):
                 return selected(
                     planned_next,
@@ -2193,7 +2723,6 @@ def next_stronger_provider(
         candidates = [provider for provider in enabled if provider["tier"] == tier]
         if candidates:
             if preferred_provider_ids:
-                preferred = [str(provider_id) for provider_id in preferred_provider_ids]
                 try:
                     current_index = preferred.index(current_provider_id)
                 except ValueError:
@@ -2210,18 +2739,34 @@ def next_stronger_provider(
             pricing_ready, pricing_status, pricing_currency = _economic_pricing_gate(
                 candidates,
                 now=now,
-                require_cached_input=cached_input_tokens > 0,
+                require_cached_input=False,
             )
-            ranked = _rank_candidates(
-                candidates,
-                history=history,
-                task_type=task_type.strip().lower(),
-                difficulty=difficulty,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cached_input_tokens=cached_input_tokens,
-                allow_costs=pricing_ready,
-                execution_identities=execution_identities,
+            ranked = []
+            for candidate in candidates:
+                forecast = successor_forecast(candidate)
+                ranked.extend(
+                    _rank_candidates(
+                        [candidate],
+                        history=history,
+                        task_type=task_type.strip().lower(),
+                        difficulty=difficulty,
+                        input_tokens=forecast["estimated_input_tokens"],
+                        output_tokens=forecast["estimated_output_tokens"],
+                        cached_input_tokens=forecast[
+                            "estimated_cached_input_tokens"
+                        ],
+                        allow_costs=pricing_ready,
+                        execution_identities=execution_identities,
+                    )
+                )
+            ranked.sort(
+                key=lambda item: (
+                    item[0]["priority"],
+                    -item[1].conservative_probability,
+                    item[2] is None,
+                    item[2] if item[2] is not None else math.inf,
+                    item[0]["provider_id"],
+                )
             )
             provider, _, _ = ranked[0]
             return selected(

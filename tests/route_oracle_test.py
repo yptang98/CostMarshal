@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 from decimal import Decimal, ROUND_CEILING
-from itertools import product
 import math
 import random
 import sys
@@ -15,7 +14,12 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from costmarshal_v2.routing import RoutingValidationError, decide_route  # noqa: E402
+from costmarshal_v2.routing import (  # noqa: E402
+    RoutingValidationError,
+    build_pricing_snapshot,
+    decide_route,
+    default_provider_catalog,
+)
 
 
 SEED = 20260716
@@ -95,14 +99,40 @@ def independent_sla_observations(history: list[dict], provider: dict, task: dict
     )
 
 
-def independent_cost(provider: dict, input_tokens: int, output_tokens: int) -> Decimal:
-    input_nano = int(Decimal(str(provider["input_cny_per_1m"])) * 1_000_000_000)
-    output_nano = int(Decimal(str(provider["output_cny_per_1m"])) * 1_000_000_000)
+def independent_cost(
+    provider: dict,
+    input_tokens: int,
+    cached_input_tokens: int,
+    output_tokens: int,
+) -> Decimal | None:
+    pricing = provider.get("pricing")
+    if isinstance(pricing, dict):
+        cached_rate = pricing.get("cached_input_per_1m")
+        if cached_input_tokens and cached_rate is None:
+            return None
+        input_rate = pricing["input_per_1m"]
+        output_rate = pricing["output_per_1m"]
+        fixed_attempt = pricing.get("fixed_attempt", pricing.get("fixed_request", "0"))
+    else:
+        if cached_input_tokens:
+            return None
+        cached_rate = 0
+        input_rate = provider["input_cny_per_1m"]
+        output_rate = provider["output_cny_per_1m"]
+        fixed_attempt = 0
+    input_nano = int(Decimal(str(input_rate)) * 1_000_000_000)
+    cached_nano = int(Decimal(str(cached_rate or 0)) * 1_000_000_000)
+    output_nano = int(Decimal(str(output_rate)) * 1_000_000_000)
     nano_cny = (
-        Decimal(input_tokens * input_nano + output_tokens * output_nano)
+        Decimal(
+            input_tokens * input_nano
+            + cached_input_tokens * cached_nano
+            + output_tokens * output_nano
+        )
         / Decimal(1_000_000)
     ).to_integral_value(rounding=ROUND_CEILING)
-    return nano_cny / Decimal(1_000_000_000)
+    fixed_nano = int(Decimal(str(fixed_attempt)) * 1_000_000_000)
+    return (nano_cny + fixed_nano) / Decimal(1_000_000_000)
 
 
 def display(value: Decimal) -> float:
@@ -117,6 +147,7 @@ def independent_oracle(
     history: list[dict],
     input_tokens: int,
     output_tokens: int,
+    cached_input_tokens: int = 0,
 ) -> dict | None:
     floor = independent_floor(task)
     required = set(task.get("required_capabilities") or [])
@@ -132,43 +163,74 @@ def independent_oracle(
         provider["provider_id"]: independent_probability(history, provider, task)
         for provider in eligible
     }
-    cost = {
-        provider["provider_id"]: independent_cost(provider, input_tokens, output_tokens)
-        for provider in eligible
-    }
-
-    def peer_key(provider: dict) -> tuple:
-        return (
-            provider["priority"],
-            -probability[provider["provider_id"]],
-            cost[provider["provider_id"]],
-            provider["provider_id"],
-        )
-
     plans: list[dict] = []
+    ordered_eligible = tuple(
+        sorted(
+            eligible,
+            key=lambda provider: (
+                TIER_RANK[provider["tier"]],
+                provider["priority"],
+                provider["provider_id"],
+            ),
+        )
+    )
+
+    def continuations(
+        prefix: tuple[dict, ...],
+        *,
+        last_rank: int,
+        seen: frozenset[str],
+    ):
+        yield prefix
+        if len(prefix) >= 2:
+            return
+        for provider in ordered_eligible:
+            provider_id = provider["provider_id"]
+            rank = TIER_RANK[provider["tier"]]
+            if provider_id in seen or rank < last_rank:
+                continue
+            yield from continuations(
+                (*prefix, provider),
+                last_rank=rank,
+                seen=seen | {provider_id},
+            )
+
     for start in eligible:
         if TIER_RANK[start["tier"]] < TIER_RANK[floor]:
             continue
-        stronger_groups: list[list[dict | None]] = []
-        for tier in TIERS[TIER_RANK[start["tier"]] + 1 :]:
-            peers = sorted((row for row in eligible if row["tier"] == tier), key=peer_key)
-            if peers:
-                stronger_groups.append([None, *peers])
-        continuations = product(*stronger_groups) if stronger_groups else [()]
-        for optional_continuation in continuations:
-            continuation = tuple(row for row in optional_continuation if row is not None)
+        for continuation in continuations(
+            (),
+            last_rank=TIER_RANK[start["tier"]],
+            seen=frozenset({start["provider_id"]}),
+        ):
             chain = (start, *continuation)
             survival = Decimal(1)
             expected_cost = Decimal(0)
+            step_costs: list[Decimal] = []
+            step_forecasts: list[tuple[int, int, int]] = []
             for step_index, provider in enumerate(chain):
                 provider_id = provider["provider_id"]
-                expected_cost += survival * cost[provider_id]
+                step_input = input_tokens if step_index == 0 else input_tokens + cached_input_tokens
+                step_cached = cached_input_tokens if step_index == 0 else 0
+                step_cost = independent_cost(
+                    provider,
+                    step_input,
+                    step_cached,
+                    output_tokens,
+                )
+                if step_cost is None:
+                    break
+                step_costs.append(step_cost)
+                step_forecasts.append((step_input, step_cached, output_tokens))
+                expected_cost += survival * step_cost
                 # Random oracle rows deliberately have no task-linked route
                 # lineage. Only the first marginal can prove success; a later
                 # hop has zero conditional lower bound until paired history
                 # exists. Dedicated contract tests cover paired chains.
                 step_probability = probability[provider_id] if step_index == 0 else 0.0
                 survival *= Decimal(1) - Decimal(str(step_probability))
+            if len(step_costs) != len(chain):
+                continue
             success_probability = Decimal(1) - survival
             objective = expected_cost / success_probability
             plans.append(
@@ -178,7 +240,10 @@ def independent_oracle(
                     "expected_cost": display(expected_cost),
                     "success_probability": display(success_probability),
                     "objective": display(objective),
-                    "first_cost": float(cost[start["provider_id"]]),
+                    "first_cost": float(step_costs[0]),
+                    "worst_cost": display(sum(step_costs, Decimal(0))),
+                    "step_costs": tuple(display(value) for value in step_costs),
+                    "step_forecasts": tuple(step_forecasts),
                     "_success": success_probability,
                     "_objective": objective,
                     # Random oracle rows are intentionally unconditional.  No
@@ -192,6 +257,7 @@ def independent_oracle(
             -plan["_success"],
             plan["provider"]["priority"],
             plan["provider"]["provider_id"],
+            plan["chain"],
         )
     )
     minimum_success = task.get("min_success_probability")

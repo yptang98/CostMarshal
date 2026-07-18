@@ -183,9 +183,11 @@ floor that differs. The manifest `locked_at` must equal every
 task's `policy_locked_at` and precede blind-review completion.
 
 Each task records the resulting pre-unblinding candidate and baseline provider
-chains. Their tiers must be strictly increasing, cannot start below the safety
-floor, and the provider IDs must exactly match the recomputed hash-bound policy
-manifest. Outcomes are provider-ID keyed only in the signed post-unblinding
+chains. A chain contains at most three unique provider IDs, its tiers are
+non-decreasing, it cannot start below the safety floor, and its provider IDs
+must exactly match the recomputed hash-bound policy manifest. This admits an
+economically selected same-tier peer but rejects repeats and downgrades.
+Outcomes are provider-ID keyed only in the signed post-unblinding
 dataset; the separate map proves which blind record and provider-call hash were
 assigned to each frozen provider:
 

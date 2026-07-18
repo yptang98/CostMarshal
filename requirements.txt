@@ -1,2 +1,2 @@
-# CostMarshal v2.4 uses only the Python standard library.
+# CostMarshal v3.0 uses only the Python standard library.
 # Python 3.11+ is required. No third-party packages are needed.

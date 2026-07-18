@@ -18,8 +18,10 @@ HARNESS = ROOT / "scripts" / "backtest_shadow_matrix.py"
 TIERS = ("low", "medium", "high")
 ATTESTATION_NAMESPACE = "costmarshal-backtest-v2"
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "scripts"))
 
 from costmarshal_v2.routing import decide_route, default_provider_catalog  # noqa: E402
+from backtest_shadow_matrix import valid_provider_chain  # noqa: E402
 from three_tier_routing_test import paired_chain_history  # noqa: E402
 
 
@@ -302,6 +304,30 @@ def sign_dataset(temp: Path, dataset: Path) -> tuple[Path, Path, str]:
 
 
 class BacktestHarnessTest(unittest.TestCase):
+    def test_provider_chain_validator_allows_bounded_same_tier_peer_only(self) -> None:
+        providers = {
+            "low-a": {"provider_id": "low-a", "tier": "low", "enabled": True},
+            "low-b": {"provider_id": "low-b", "tier": "low", "enabled": True},
+            "medium": {"provider_id": "medium", "tier": "medium", "enabled": True},
+            "high": {"provider_id": "high", "tier": "high", "enabled": True},
+        }
+        self.assertTrue(
+            valid_provider_chain(["low-a", "low-b", "high"], "low", providers)
+        )
+        self.assertFalse(
+            valid_provider_chain(["low-a", "low-a", "high"], "low", providers)
+        )
+        self.assertFalse(
+            valid_provider_chain(["medium", "low-a"], "low", providers)
+        )
+        self.assertFalse(
+            valid_provider_chain(
+                ["low-a", "low-b", "medium", "high"],
+                "low",
+                providers,
+            )
+        )
+
     def test_missing_dataset_is_honestly_blocked_without_provider_calls(self) -> None:
         with tempfile.TemporaryDirectory(prefix="costmarshal-backtest-blocked-") as raw:
             completed, report = invoke(Path(raw))

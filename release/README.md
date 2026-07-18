@@ -1,7 +1,7 @@
 # Release evidence policy
 
-`evidence-policy.json` is the reviewed trust root for non-beta gates. The beta
-keeps every value unset, so tests can exercise the machinery without allowing a
+`evidence-policy.json` is the reviewed trust root for production-certification
+gates. The v3.0 prerelease keeps every value unset, so tests can exercise the machinery without allowing a
 caller-provided key or image to become release evidence.
 
 Backtest preregistration is two-step:

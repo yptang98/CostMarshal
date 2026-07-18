@@ -1,4 +1,4 @@
-# CostMarshal v2.4 Storage
+# CostMarshal v3.0 Storage
 
 The runtime root defaults to `$COSTMARSHAL_V2_HOME`, then `$CODEX_HOME/costmarshal-v2`, then `~/.codex/costmarshal-v2`.
 

@@ -259,7 +259,23 @@ def main() -> int:
         with patch.dict(os.environ, {"CODEX_HOME": str(credential_codex_home), "GH_TOKEN": "must-not-leak", "AWS_SECRET_ACCESS_KEY": "must-not-leak"}, clear=False):
             high_env, _ = isolated_actor_env(project, high_actor, layout=layout)
         assert "GH_TOKEN" not in high_env and "AWS_SECRET_ACCESS_KEY" not in high_env
-        assert (Path(high_env["CODEX_HOME"]) / "auth.json").is_file()
+        isolated_auth = Path(high_env["CODEX_HOME"]) / "auth.json"
+        assert isolated_auth.is_file()
+        assert isolated_auth.read_text(encoding="utf-8") == "secret-auth\n"
+        (credential_codex_home / "auth.json").write_text(
+            "drifted-auth\n", encoding="utf-8"
+        )
+        with patch.dict(
+            os.environ,
+            {"CODEX_HOME": str(credential_codex_home)},
+            clear=False,
+        ):
+            try:
+                isolated_actor_env(project, high_actor, layout=layout)
+            except SystemExit as exc:
+                assert "unsafe or drifted" in str(exc)
+            else:
+                raise AssertionError("actor-private auth.json drift was silently accepted")
 
         report = project_dir / "reports" / "worker.md"
         argv = build_codex_argv(layout, actor, project, report, execution_workspace=execution, sandbox="workspace-write")

@@ -65,6 +65,11 @@ from .security import (
 )
 from .routing import RoutingValidationError, project_provider_catalog
 from .session_backend import pid_start_marker
+from .windows_job import (
+    WindowsJobError,
+    validate_windows_job_receipt,
+    verify_current_process_in_windows_job,
+)
 from .worker_isolation import (
     CredentialCleanupReceipt,
     ExecutionCleanupReceipt,
@@ -125,6 +130,68 @@ def _native_launch_barrier(stage: str) -> None:
         if time.monotonic() >= deadline:
             raise SystemExit(f"native launch barrier timed out at {stage}")
         time.sleep(0.01)
+
+
+def _runner_process_start_marker(runtime_backend: object) -> str:
+    """Bind a local Linux runner to the inherited v2 group/token authority."""
+
+    marker = pid_start_marker(os.getpid())
+    if (
+        runtime_backend == "local"
+        and sys.platform.startswith("linux")
+        and (
+            not isinstance(marker, str)
+            or re.fullmatch(
+                r"linux-proc-v2:[^:]+:[0-9]+:[0-9]+:[0-9]+:[0-9a-f]{64}",
+                marker,
+            )
+            is None
+        )
+    ):
+        raise SystemExit(
+            "Linux local actor registration lacks a linux-proc-v2 group/token identity; "
+            "refusing provider execution"
+        )
+    return marker or f"unverified:{os.getpid()}:{time.time_ns()}"
+
+
+def _inherited_windows_job_runtime(
+    *,
+    expected_child_pid: object = None,
+    expected_child_start_marker: object = None,
+) -> dict[str, Any]:
+    if os.name != "nt":
+        return {}
+    try:
+        receipt = validate_windows_job_receipt(
+            supervisor_pid=os.environ.get("COSTMARSHAL_WINDOWS_JOB_SUPERVISOR_PID"),
+            supervisor_start_marker=os.environ.get(
+                "COSTMARSHAL_WINDOWS_JOB_SUPERVISOR_MARKER"
+            ),
+            job_name=os.environ.get("COSTMARSHAL_WINDOWS_JOB_NAME"),
+            job_identity=os.environ.get("COSTMARSHAL_WINDOWS_JOB_IDENTITY"),
+            child_pid=expected_child_pid,
+            child_start_marker=expected_child_start_marker,
+        )
+    except WindowsJobError as exc:
+        raise SystemExit(
+            "Windows local actor registration lacks a complete inherited Job Object receipt"
+        ) from exc
+    try:
+        verify_current_process_in_windows_job(receipt)
+    except WindowsJobError as exc:
+        raise SystemExit(
+            "Windows local actor is not a member of its inherited Job Object"
+        ) from exc
+    return {
+        "pid": receipt.supervisor_pid,
+        "process_start_marker": receipt.supervisor_start_marker,
+        "target": f"job:{receipt.job_name}",
+        "windows_job_name": receipt.job_name,
+        "windows_job_identity": receipt.job_identity,
+        "windows_job_child_pid": receipt.child_pid,
+        "windows_job_child_start_marker": receipt.child_start_marker,
+    }
 
 
 def _terminate_unreleased_native_child(process: subprocess.Popen[str]) -> bool:
@@ -208,6 +275,138 @@ _WORKER_ENV_ALLOWLIST = {
     "COSTMARSHAL_CODEX_COMMAND_JSON",
 }
 
+_MAX_PRIVATE_CODEX_FILE_BYTES = 1024 * 1024
+
+
+def _private_codex_file_bytes(source_home: str, name: str) -> bytes | None:
+    """Read one stable non-link private Codex file from an exact home."""
+
+    home = Path(source_home).expanduser()
+    try:
+        home_info = home.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise SystemExit("private Codex home cannot be inspected safely") from exc
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if (
+        not stat.S_ISDIR(home_info.st_mode)
+        or stat.S_ISLNK(home_info.st_mode)
+        or bool(getattr(home_info, "st_file_attributes", 0) & reparse_flag)
+    ):
+        raise SystemExit("private Codex home must be a non-link directory")
+    source = home / name
+    try:
+        before = source.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise SystemExit(f"private Codex file cannot be inspected safely: {name}") from exc
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or stat.S_ISLNK(before.st_mode)
+        or bool(getattr(before, "st_file_attributes", 0) & reparse_flag)
+    ):
+        raise SystemExit(f"private Codex file must be a non-link regular file: {name}")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(source, flags)
+    except OSError as exc:
+        raise SystemExit(f"private Codex file cannot be opened safely: {name}") from exc
+    try:
+        opened_before = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_before.st_mode):
+            raise SystemExit(f"private Codex file must remain regular: {name}")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, _MAX_PRIVATE_CODEX_FILE_BYTES + 1 - total),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > _MAX_PRIVATE_CODEX_FILE_BYTES:
+                raise SystemExit(f"private Codex file exceeds 1 MiB: {name}")
+        opened_after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        after = source.lstat()
+    except OSError as exc:
+        raise SystemExit(f"private Codex file changed while being read: {name}") from exc
+    identity = lambda info: (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        getattr(info, "st_mtime_ns", int(info.st_mtime * 1_000_000_000)),
+    )
+    if (
+        identity(before) != identity(opened_before)
+        or identity(opened_before) != identity(opened_after)
+        or identity(opened_after) != identity(after)
+        or stat.S_ISLNK(after.st_mode)
+        or bool(getattr(after, "st_file_attributes", 0) & reparse_flag)
+    ):
+        raise SystemExit(f"private Codex file changed while being read: {name}")
+    return b"".join(chunks)
+
+
+def _install_private_codex_file(target: Path, name: str, payload: bytes) -> None:
+    """Install immutable actor-private bytes with restrictive permissions."""
+
+    try:
+        target_info = target.lstat()
+    except OSError as exc:
+        raise SystemExit("actor-private Codex home cannot be inspected") from exc
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if (
+        not stat.S_ISDIR(target_info.st_mode)
+        or stat.S_ISLNK(target_info.st_mode)
+        or bool(getattr(target_info, "st_file_attributes", 0) & reparse_flag)
+    ):
+        raise SystemExit("actor-private Codex home must be a non-link directory")
+    with contextlib.suppress(OSError):
+        target.chmod(0o700)
+    destination = target / name
+    if destination.exists():
+        try:
+            info = destination.lstat()
+            existing = destination.read_bytes()
+        except OSError as exc:
+            raise SystemExit(f"actor-private Codex file cannot be verified: {name}") from exc
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or bool(getattr(info, "st_file_attributes", 0) & reparse_flag)
+            or existing != payload
+        ):
+            raise SystemExit(f"actor-private Codex file is unsafe or drifted: {name}")
+        with contextlib.suppress(OSError):
+            destination.chmod(0o600)
+        return
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    created = False
+    try:
+        descriptor = os.open(destination, flags, 0o600)
+        created = True
+        try:
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(descriptor, payload[offset:])
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        if created:
+            with contextlib.suppress(OSError):
+                destination.unlink()
+        raise SystemExit(f"actor-private Codex file could not be installed: {name}") from exc
+    with contextlib.suppress(OSError):
+        destination.chmod(0o600)
+
 
 def _isolated_codex_home(layout: ProjectLayout, actor: dict[str, Any], inherited: dict[str, str]) -> Path:
     """Create a credential-free Codex home containing only this actor's profile."""
@@ -231,10 +430,9 @@ def _isolated_codex_home(layout: ProjectLayout, actor: dict[str, Any], inherited
         # profile snapshot.
         source_home = inherited.get("CODEX_HOME")
         if actor.get("tier") == "high" and source_home:
-            source = Path(source_home).expanduser() / "auth.json"
-            destination = target / "auth.json"
-            if source.is_file() and not source.is_symlink() and not destination.exists():
-                shutil.copyfile(source, destination)
+            auth_payload = _private_codex_file_bytes(source_home, "auth.json")
+            if auth_payload is not None:
+                _install_private_codex_file(target, "auth.json", auth_payload)
         return target.resolve()
     source_home = inherited.get("CODEX_HOME")
     if profile and source_home:
@@ -246,7 +444,11 @@ def _isolated_codex_home(layout: ProjectLayout, actor: dict[str, Any], inherited
         for name in ("config.toml", "auth.json"):
             source = Path(source_home).expanduser() / name
             destination = target / name
-            if source.is_file() and not destination.exists():
+            if name == "auth.json":
+                auth_payload = _private_codex_file_bytes(source_home, name)
+                if auth_payload is not None:
+                    _install_private_codex_file(target, name, auth_payload)
+            elif source.is_file() and not destination.exists():
                 shutil.copyfile(source, destination)
     return target.resolve()
 
@@ -334,6 +536,36 @@ def default_secrets_file(project: dict[str, Any]) -> Path | None:
     return None
 
 
+def _resolve_windows_codex_shim(command: list[str]) -> list[str]:
+    """Replace the reviewed npm ``codex.cmd`` shim with Node's native argv.
+
+    Passing data arguments through ``cmd.exe /c`` turns model IDs and paths
+    into shell syntax.  CostMarshal therefore never executes batch files.  The
+    standard npm shim is resolved to its adjacent JavaScript entrypoint; every
+    other ``.cmd``/``.bat`` command fails closed.
+    """
+
+    if os.name != "nt" or not command:
+        return command
+    executable = str(command[0])
+    if not executable.lower().endswith((".cmd", ".bat")):
+        return command
+    resolved_text = shutil.which(executable) or executable
+    resolved = Path(resolved_text).expanduser().resolve()
+    if resolved.name.lower() != "codex.cmd":
+        raise SystemExit(
+            "Windows batch actor commands are rejected; configure a native executable"
+        )
+    javascript = resolved.parent / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
+    local_node = resolved.parent / "node.exe"
+    node_text = str(local_node) if local_node.is_file() else shutil.which("node.exe")
+    if not javascript.is_file() or not node_text:
+        raise SystemExit(
+            "codex.cmd could not be resolved to the reviewed npm Node entrypoint"
+        )
+    return [str(Path(node_text).resolve()), str(javascript.resolve()), *command[1:]]
+
+
 def resolve_codex_command(actor: dict[str, Any]) -> list[str]:
     prefix = (actor.get("runner") or {}).get("command_prefix")
     env_prefix = os.environ.get("COSTMARSHAL_CODEX_COMMAND_JSON")
@@ -341,25 +573,25 @@ def resolve_codex_command(actor: dict[str, Any]) -> list[str]:
         parsed = json.loads(env_prefix)
         if not isinstance(parsed, list) or not parsed or not all(isinstance(item, str) for item in parsed):
             raise SystemExit("COSTMARSHAL_CODEX_COMMAND_JSON must be a non-empty JSON string array")
-        return parsed
+        return _resolve_windows_codex_shim(parsed)
     if isinstance(prefix, list) and prefix and all(isinstance(item, str) for item in prefix):
-        return list(prefix)
+        return _resolve_windows_codex_shim(list(prefix))
     configured = (actor.get("runner") or {}).get("executable") or os.environ.get("COSTMARSHAL_CODEX_BIN")
     if configured:
-        return [str(configured)]
+        return _resolve_windows_codex_shim([str(configured)])
     candidates = ["codex.cmd", "codex"] if os.name == "nt" else ["codex"]
     for candidate in candidates:
         resolved = shutil.which(candidate)
         if resolved:
-            return [resolved]
-    return [candidates[0]]
+            return _resolve_windows_codex_shim([resolved])
+    return _resolve_windows_codex_shim([candidates[0]])
 
 
 def process_argv(argv: list[str]) -> list[str]:
-    executable = argv[0].lower()
-    if os.name == "nt" and executable.endswith((".cmd", ".bat")):
-        comspec = os.environ.get("COMSPEC") or "cmd.exe"
-        return [comspec, "/d", "/s", "/c", subprocess.list2cmdline(argv)]
+    if os.name == "nt" and argv and argv[0].lower().endswith((".cmd", ".bat")):
+        raise SystemExit(
+            "Windows batch actor commands are rejected before process launch"
+        )
     return argv
 
 
@@ -1151,6 +1383,7 @@ def _prepare_semantic_attempt(
             route_envelope_id=str(envelope.get("envelope_id") or ""),
             route_plan_fingerprint_sha256=str(envelope.get("plan_fingerprint") or ""),
             planned_steps=planned_steps,
+            routing_objective=str(envelope.get("routing_objective") or "cost-only"),
         )
         existing_contract = task.get("handoff_contract")
         if existing_contract is not None:
@@ -1556,17 +1789,9 @@ def build_codex_argv(
     return argv
 
 
-def walk_dicts(value: Any) -> Iterable[dict[str, Any]]:
-    if isinstance(value, dict):
-        yield value
-        for child in value.values():
-            yield from walk_dicts(child)
-    elif isinstance(value, list):
-        for child in value:
-            yield from walk_dicts(child)
-
-
-def usage_details_from_events(events: list[dict[str, Any]]) -> tuple[int, int, int, bool]:
+def _usage_observation_from_events(
+    events: list[dict[str, Any]],
+) -> tuple[int, int, int, bool, bool]:
     """Return ordinary input, cached input, output, and pricing completeness.
 
     CostMarshal-native ``cached_input_tokens`` and Anthropic-style
@@ -1583,52 +1808,90 @@ def usage_details_from_events(events: list[dict[str, Any]]) -> tuple[int, int, i
     best_total_input = 0
     best_output = 0
     pricing_complete = True
+    usage_observed = False
     for event in events:
-        for item in walk_dicts(event):
-            input_value = item.get("input_tokens", item.get("prompt_tokens", 0))
-            output_value = item.get("output_tokens", item.get("completion_tokens", 0))
-            cached_value = item.get(
-                "cached_input_tokens",
-                item.get("cache_read_input_tokens", 0),
-            )
-            details = item.get("input_tokens_details", item.get("prompt_tokens_details"))
-            detail_cached = details.get("cached_tokens", 0) if isinstance(details, dict) else 0
-            cache_creation_value = item.get("cache_creation_input_tokens", 0)
-            ordinary_candidate = 0
-            cached_candidate = 0
-            has_input_dimension = False
-            if type(input_value) is int and input_value >= 0:
-                has_input_dimension = True
-                if (
-                    type(detail_cached) is int
-                    and 0 <= detail_cached <= input_value
-                ):
-                    ordinary_candidate = input_value - detail_cached
-                    cached_candidate = detail_cached
-                else:
-                    ordinary_candidate = input_value
-            if type(cached_value) is int and cached_value >= 0:
-                if cached_value:
-                    has_input_dimension = True
-                cached_candidate = max(cached_candidate, cached_value)
-            if type(cache_creation_value) is int and cache_creation_value > 0:
-                # Anthropic reports cache writes outside ordinary input. Count
-                # them in total usage, but do not pretend the ordinary input
-                # rate proves their monetary cost.
-                has_input_dimension = True
-                ordinary_candidate += cache_creation_value
+        # Only a top-level, explicitly named usage envelope is authoritative.
+        # Recursive token-like fields are ordinary provider payload and must
+        # never be able to settle a budget reservation.
+        item = event.get("usage") if isinstance(event, dict) else None
+        if not isinstance(item, dict):
+            continue
+        input_present = "input_tokens" in item or "prompt_tokens" in item
+        output_present = "output_tokens" in item or "completion_tokens" in item
+        if not input_present or not output_present:
+            continue
+        input_value = item.get("input_tokens", item.get("prompt_tokens"))
+        output_value = item.get("output_tokens", item.get("completion_tokens"))
+        if (
+            type(input_value) is not int
+            or input_value < 0
+            or type(output_value) is not int
+            or output_value < 0
+        ):
+            continue
+        cached_present = (
+            "cached_input_tokens" in item or "cache_read_input_tokens" in item
+        )
+        cache_creation_present = "cache_creation_input_tokens" in item
+        cached_value = item.get(
+            "cached_input_tokens",
+            item.get("cache_read_input_tokens"),
+        )
+        if cached_present and (type(cached_value) is not int or cached_value < 0):
+            continue
+        details = item.get("input_tokens_details", item.get("prompt_tokens_details"))
+        detail_cached_present = isinstance(details, dict) and "cached_tokens" in details
+        detail_cached = details.get("cached_tokens") if isinstance(details, dict) else None
+        if details is not None and not isinstance(details, dict):
+            continue
+        if detail_cached_present and (
+            type(detail_cached) is not int
+            or detail_cached < 0
+            or detail_cached > input_value
+        ):
+            continue
+        cache_creation_value = item.get("cache_creation_input_tokens")
+        if cache_creation_present and (
+            type(cache_creation_value) is not int or cache_creation_value < 0
+        ):
+            continue
+        ordinary_candidate = input_value
+        cached_candidate = 0
+        usage_observed = True
+        if detail_cached_present:
+            ordinary_candidate -= detail_cached
+            cached_candidate = detail_cached
+        if cached_present:
+            cached_candidate = max(cached_candidate, cached_value)
+        if cache_creation_present:
+            ordinary_candidate += cache_creation_value
+            if cache_creation_value > 0:
                 pricing_complete = False
-            candidate_total = ordinary_candidate + cached_candidate
-            # Usage events are cumulative snapshots. Keep the ordinary/cached
-            # split from one coherent snapshot instead of taking independent
-            # maxima, which can double count when the cache ratio changes.
-            if has_input_dimension and candidate_total >= best_total_input:
-                best_input = ordinary_candidate
-                best_cached_input = cached_candidate
-                best_total_input = candidate_total
-            if type(output_value) is int and output_value >= 0:
-                best_output = max(best_output, output_value)
-    return best_input, best_cached_input, best_output, pricing_complete
+        candidate_total = ordinary_candidate + cached_candidate
+        # Usage events are cumulative snapshots. Keep the ordinary/cached
+        # split from one coherent snapshot instead of taking independent
+        # maxima, which can double count when the cache ratio changes.
+        if candidate_total >= best_total_input:
+            best_input = ordinary_candidate
+            best_cached_input = cached_candidate
+            best_total_input = candidate_total
+        best_output = max(best_output, output_value)
+    return (
+        best_input,
+        best_cached_input,
+        best_output,
+        pricing_complete,
+        usage_observed,
+    )
+
+
+def usage_details_from_events(events: list[dict[str, Any]]) -> tuple[int, int, int, bool]:
+    """Backward-compatible usage totals plus the pricing-completeness bit."""
+
+    input_tokens, cached_input_tokens, output_tokens, pricing_complete, _ = (
+        _usage_observation_from_events(events)
+    )
+    return input_tokens, cached_input_tokens, output_tokens, pricing_complete
 
 
 def usage_from_events(events: list[dict[str, Any]]) -> tuple[int, int, int]:
@@ -2471,24 +2734,49 @@ def _run_actor_once(
             attempt_id=attempt_id,
             launch_token=launch_token,
         )
+        process_marker = _runner_process_start_marker(
+            (current_actor.get("runtime") or {}).get("backend")
+        )
         current_actor["status"] = "running"
         runtime = current_actor.setdefault("runtime", {})
         runtime["execution_workspace"] = str(execution_workspace)
         runtime["sandbox"] = sandbox
         runtime["runner_pid"] = os.getpid()
-        runtime["pid"] = os.getpid()
+        runtime["runner_process_start_marker"] = process_marker
+        windows_job_runtime = (
+            _inherited_windows_job_runtime(
+                expected_child_pid=runtime.get("windows_job_child_pid"),
+                expected_child_start_marker=runtime.get(
+                    "windows_job_child_start_marker"
+                ),
+            )
+            if runtime.get("backend") == "local" and os.name == "nt"
+            else {}
+        )
+        if windows_job_runtime:
+            for key, value in windows_job_runtime.items():
+                existing = runtime.get(key)
+                if existing is not None and existing != value:
+                    raise SystemExit(
+                        f"Windows local actor Job Object receipt drifted at {key}"
+                    )
+                runtime[key] = value
+            runtime["windows_job_launch_phase"] = "started"
+        else:
+            runtime["pid"] = os.getpid()
         if runtime.get("backend") == "local":
-            runtime["target"] = f"pid:{os.getpid()}"
+            if not windows_job_runtime:
+                runtime["target"] = f"pid:{os.getpid()}"
             runtime["log_path"] = runtime.get("log_path") or str(
                 (layout.transcripts_dir / f"{slugify(actor_id, 'actor')}.log").relative_to(layout.project_dir)
             ).replace("\\", "/")
-        runtime["process_start_marker"] = (
-            pid_start_marker(os.getpid()) or f"unverified:{os.getpid()}:{time.time_ns()}"
-        )
+        if not windows_job_runtime:
+            runtime["process_start_marker"] = process_marker
         runtime["registered_launch_token_sha256"] = hashlib.sha256(str(launch_token).encode("utf-8")).hexdigest()
         runtime["registered_profile_sha256"] = str(
             (current_actor.get("profile_binding") or {}).get("sha256") or ""
         ).removeprefix("sha256:")
+        runtime["registered_recovery_generation"] = native_recovery_generation
         if runtime.get("provider_execution_state") != PROVIDER_COMPLETION_PENDING:
             runtime["provider_execution_state"] = (
                 "started" if required_isolation else "launch_pending_authorization"
@@ -2619,6 +2907,7 @@ def _run_actor_once(
         "actor_id": actor_id,
         "attempt_id": attempt_id,
         "launch_token_sha256": hashlib.sha256(str(launch_token).encode("utf-8")).hexdigest(),
+        "recovery_generation": native_recovery_generation,
     }
     if required_isolation:
         assert required_spec is not None
@@ -2848,7 +3137,10 @@ def _run_actor_once(
                 _control_mutation(
                     layout,
                     command_name="runner_register",
-                    command_id=f"RUNNER-REGISTER-{attempt_id or actor_id}",
+                    command_id=(
+                        f"RUNNER-REGISTER-{attempt_id or actor_id}-"
+                        f"{native_recovery_generation}"
+                    ),
                     payload=registration_payload,
                     mutate=register_runner,
                 )
@@ -3293,10 +3585,14 @@ def _run_actor_once(
                 + "\n",
             )
 
-    input_tokens, cached_input_tokens, output_tokens, usage_pricing_complete = (
-        usage_details_from_events(events)
-    )
-    usage_known = usage_known and usage_pricing_complete
+    (
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        usage_pricing_complete,
+        usage_observed,
+    ) = _usage_observation_from_events(events)
+    usage_known = usage_known and usage_pricing_complete and usage_observed
     if report.is_file() and secret_values:
         report_text = report.read_text(encoding="utf-8", errors="replace")
         safe_report_text = redact_secret_values(report_text, secret_values)

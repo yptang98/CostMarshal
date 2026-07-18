@@ -11,6 +11,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -24,7 +26,11 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .locking import materializer_lock
-from .paths import ProjectLayout
+from .paths import ProjectLayout, actor_runtime_name
+from .session_backend import (
+    backend_from_session,
+    session_backend_config,
+)
 
 
 STORE_SCHEMA_VERSION = 2
@@ -391,39 +397,243 @@ def _manifest_entry(layout: ProjectLayout, path: Path) -> dict[str, Any]:
     }
 
 
-def _pid_is_alive(pid: Any) -> bool:
+def _legacy_session(layout: ProjectLayout) -> tuple[dict[str, Any] | None, str | None]:
     try:
-        value = int(pid)
-    except (TypeError, ValueError):
-        return False
-    if value <= 0:
-        return False
-    try:
-        os.kill(value, 0)
-        return True
-    except PermissionError:
-        return True
-    except OSError:
-        return False
+        session = json.loads(layout.session_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"unreadable session state: {type(exc).__name__}"
+    if not isinstance(session, dict):
+        return None, "session state is not an object"
+    return session, None
 
 
-def _legacy_actor_blockers(layout: ProjectLayout) -> list[str]:
-    blockers: list[str] = []
+def _legacy_actor_runtime(actor: dict[str, Any]) -> dict[str, Any]:
+    runtime = actor.get("runtime")
+    if isinstance(runtime, dict):
+        return runtime
+    legacy = actor.get("tmux")
+    if not isinstance(legacy, dict):
+        return {}
+    return {
+        "backend": "tmux",
+        "session_name": legacy.get("session_name"),
+        "actor_name": legacy.get("window_name"),
+        "target": legacy.get("target"),
+        "started_at": legacy.get("started_at"),
+    }
+
+
+def _required_oci_quiescence(runtime: dict[str, Any]) -> tuple[str, str] | None:
+    """Classify durable required-OCI cleanup without guessing from actor status."""
+
+    lifecycle = str(runtime.get("oci_lifecycle_state") or "")
+    if (
+        lifecycle in {"uncertain_start", "uncertain_cleanup"}
+        or bool(runtime.get("container_cleanup_unconfirmed"))
+    ):
+        return "unknown", "required OCI lifecycle or cleanup is uncertain"
+    possible_external_start = bool(
+        lifecycle
+        or runtime.get("container_name")
+        or runtime.get("container_id")
+        or runtime.get("container_command")
+        or runtime.get("provider_execution_state")
+        in {"started", "finished_pending_finalize", "finished"}
+    )
+    if not possible_external_start:
+        return None
+    exact_cleanup = bool(
+        lifecycle in {"cleaned", "not_started_cleaned"}
+        and runtime.get("container_removed") is True
+        and isinstance(runtime.get("container_name"), str)
+        and runtime.get("container_name")
+        and isinstance(runtime.get("container_command"), list)
+        and runtime.get("container_command")
+        and not (runtime.get("cleanup_identity_drift") or [])
+    )
+    if lifecycle == "cleaned":
+        exact_cleanup = bool(
+            exact_cleanup
+            and re.fullmatch(r"[0-9a-f]{64}", str(runtime.get("container_id") or ""))
+        )
+    if not exact_cleanup:
+        return "unknown", "required OCI runtime lacks an exact container_removed cleanup receipt"
+    return None
+
+
+def _actor_runtime_may_have_started(actor: dict[str, Any], runtime: dict[str, Any]) -> bool:
+    status = str(actor.get("status") or "")
+    return bool(
+        status not in {"", "configured", "ready"}
+        or runtime.get("started_at")
+        or runtime.get("pid")
+        or runtime.get("process_start_marker")
+        or runtime.get("oci_lifecycle_state")
+        or runtime.get("container_name")
+        or runtime.get("container_id")
+    )
+
+
+def _probe_legacy_actor_runtime(
+    *,
+    actor: dict[str, Any],
+    runtime: dict[str, Any],
+    session: dict[str, Any] | None,
+    session_error: str | None,
+) -> tuple[str, str]:
+    actor_id = str(actor.get("id") or "unknown")
+    if not _actor_runtime_may_have_started(actor, runtime):
+        return "stopped", "no durable runtime-start evidence"
+    if session is None:
+        return "unknown", session_error or "session state is unavailable"
+    try:
+        backend_config = session_backend_config(session)
+        if not isinstance(backend_config, dict):
+            raise TypeError("session backend configuration is not an object")
+        backend_kind = str(backend_config.get("kind") or "")
+        if backend_kind not in {"tmux", "local"}:
+            return "unknown", f"unsupported session backend {backend_kind!r}"
+        if str(runtime.get("backend") or "") != backend_kind:
+            return "unknown", "actor runtime backend does not match session authority"
+        backend = backend_from_session(session)
+        if backend_kind == "tmux":
+            expected_session = str(backend_config.get("session_name") or "")
+            expected_actor = actor_runtime_name(actor_id)
+            expected_target = f"{expected_session}:{expected_actor}"
+            if (
+                runtime.get("session_name") != expected_session
+                or runtime.get("actor_name") != expected_actor
+                or runtime.get("target") != expected_target
+            ):
+                return "unknown", "tmux runtime identity does not match actor/session authority"
+            if not backend.available():
+                return "unknown", "tmux backend is unavailable for strict runtime inspection"
+            alive = backend.actor_alive(
+                session_name=expected_session,
+                actor_name=expected_actor,
+                target=expected_target,
+                pid=None,
+                process_start_marker=None,
+            )
+        else:
+            if platform.system() == "Windows":
+                windows_receipt = (
+                    runtime.get("windows_job_name"),
+                    runtime.get("windows_job_identity"),
+                    runtime.get("windows_job_child_pid"),
+                    runtime.get("windows_job_child_start_marker"),
+                )
+                if not windows_receipt[0] or not windows_receipt[1]:
+                    return (
+                        "unknown",
+                        "legacy Windows local runtime has no durable job/tree-absence receipt",
+                    )
+                alive = backend.actor_alive(
+                    session_name=str(backend_config.get("session_name") or ""),
+                    actor_name=str(runtime.get("actor_name") or actor_runtime_name(actor_id)),
+                    target=runtime.get("target"),
+                    pid=runtime.get("pid"),
+                    process_start_marker=runtime.get("process_start_marker"),
+                    windows_job_name=windows_receipt[0],
+                    windows_job_identity=windows_receipt[1],
+                    windows_job_child_pid=windows_receipt[2],
+                    windows_job_child_start_marker=windows_receipt[3],
+                )
+                return ("live", "runtime backend confirms the Windows Job is live") if alive else (
+                    "stopped",
+                    "runtime backend confirms the Windows Job is absent",
+                )
+            if platform.system() != "Linux":
+                return "unknown", "local runtime inspection is unsupported on this platform"
+            marker = runtime.get("process_start_marker")
+            if not isinstance(marker, str) or re.fullmatch(
+                r"linux-proc-v2:[^:]+:[0-9]+:[0-9]+:[0-9]+:[0-9a-f]{64}",
+                marker,
+            ) is None:
+                return "unknown", "Linux local runtime lacks a linux-proc-v2 group/token identity"
+            alive = backend.actor_alive(
+                session_name=str(backend_config.get("session_name") or ""),
+                actor_name=str(runtime.get("actor_name") or actor_runtime_name(actor_id)),
+                target=runtime.get("target"),
+                pid=runtime.get("pid"),
+                process_start_marker=marker,
+            )
+    except Exception as exc:  # noqa: BLE001 - every runtime probe error is an unknown blocker
+        return "unknown", f"runtime inspection failed: {type(exc).__name__}: {exc}"
+    return ("live", "runtime backend confirms the actor is live") if alive else (
+        "stopped",
+        "runtime backend confirms the actor is absent",
+    )
+
+
+def _legacy_actor_quiescence(layout: ProjectLayout) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    session, session_error = _legacy_session(layout)
     for path in sorted(layout.actors_dir.glob("*.json")):
         try:
             actor = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            blockers.append(f"unreadable actor state {path.name}: {type(exc).__name__}")
+            rows.append(
+                {
+                    "actor_id": path.stem,
+                    "state": "unknown",
+                    "reason": f"unreadable actor state {path.name}: {type(exc).__name__}",
+                }
+            )
+            continue
+        if not isinstance(actor, dict):
+            rows.append(
+                {
+                    "actor_id": path.stem,
+                    "state": "unknown",
+                    "reason": f"actor state {path.name} is not an object",
+                }
+            )
             continue
         actor_id = str(actor.get("id") or path.stem)
         status = str(actor.get("status") or "")
-        runtime = actor.get("runtime") if isinstance(actor.get("runtime"), dict) else {}
-        pid = runtime.get("pid")
+        runtime = _legacy_actor_runtime(actor)
         if status in {"running", "starting"}:
-            blockers.append(f"actor {actor_id} has active status {status}")
-        elif _pid_is_alive(pid):
-            blockers.append(f"actor {actor_id} still has a live runtime pid {pid}")
-    return blockers
+            rows.append(
+                {
+                    "actor_id": actor_id,
+                    "state": "live",
+                    "reason": f"actor authority has active status {status}",
+                }
+            )
+            continue
+        isolation = actor.get("isolation")
+        has_oci_runtime = bool(
+            runtime.get("oci_lifecycle_state")
+            or runtime.get("container_name")
+            or runtime.get("container_id")
+            or runtime.get("container_command")
+            or runtime.get("container_cleanup_unconfirmed")
+        )
+        if (
+            isinstance(isolation, dict) and isolation.get("mode") == "required"
+        ) or has_oci_runtime:
+            oci_state = _required_oci_quiescence(runtime)
+            if oci_state is not None:
+                state, reason = oci_state
+                rows.append({"actor_id": actor_id, "state": state, "reason": reason})
+                continue
+        state, reason = _probe_legacy_actor_runtime(
+            actor=actor,
+            runtime=runtime,
+            session=session,
+            session_error=session_error,
+        )
+        rows.append({"actor_id": actor_id, "state": state, "reason": reason})
+    return rows
+
+
+def _legacy_actor_blockers(rows: list[dict[str, str]]) -> list[str]:
+    return [
+        f"actor {row['actor_id']} runtime is {row['state']}: {row['reason']}"
+        for row in rows
+        if row["state"] != "stopped"
+    ]
 
 
 def preview_legacy_migration(layout: ProjectLayout) -> dict[str, Any]:
@@ -433,13 +643,15 @@ def preview_legacy_migration(layout: ProjectLayout) -> dict[str, Any]:
         if path.is_file() and _controlled_file(layout, path)
     ]
     digest = _sha256_text(_canonical_json(entries))
+    actor_quiescence = _legacy_actor_quiescence(layout)
     return {
         "status": "enabled" if marker_path(layout).is_file() else "preview",
         "schema_version": STORE_SCHEMA_VERSION,
         "manifest_sha256": digest,
         "file_count": len(entries),
         "ledger_row_count": sum(int(row["rows"]) for row in entries),
-        "actor_blockers": _legacy_actor_blockers(layout),
+        "actor_quiescence": actor_quiescence,
+        "actor_blockers": _legacy_actor_blockers(actor_quiescence),
         "entries": entries,
     }
 
@@ -712,6 +924,11 @@ def migrate_legacy_store(layout: ProjectLayout) -> dict[str, Any]:
         migration_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{preview['manifest_sha256'][:12]}"
         backup = _copy_backup(layout, preview, migration_id)
         second_preview = preview_legacy_migration(layout)
+        if second_preview["actor_blockers"]:
+            raise ControlStoreError(
+                "migration lost runtime quiescence while its backup was being created; "
+                + "; ".join(second_preview["actor_blockers"])
+            )
         if second_preview["manifest_sha256"] != preview["manifest_sha256"]:
             raise ControlStoreError("legacy project changed while migration backup was being created")
         temporary = layout.scheduler_dir / f"{DB_NAME}.migrating.{uuid.uuid4().hex}"
@@ -747,6 +964,16 @@ def migrate_legacy_store(layout: ProjectLayout) -> dict[str, Any]:
         marker = _marker_payload(connection, preview)
     finally:
         connection.close()
+    cutover_preview = preview_legacy_migration(layout)
+    if cutover_preview["actor_blockers"]:
+        raise ControlStoreError(
+            "migration lost runtime quiescence before cutover; "
+            + "; ".join(cutover_preview["actor_blockers"])
+        )
+    if cutover_preview["manifest_sha256"] != preview["manifest_sha256"]:
+        raise ControlStoreConflict(
+            "legacy project changed before cutover; refusing to install the control-store marker"
+        )
     _fault("migration.after_database_install_before_marker")
     _write_atomic(marker_path(layout), json.dumps(marker, ensure_ascii=False, indent=2) + "\n")
     _fault("migration.after_marker_before_materialize")

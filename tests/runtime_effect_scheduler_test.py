@@ -776,6 +776,15 @@ def main() -> int:
                                 target=str(launch.get("target") or ""),
                                 pid=pid,
                                 process_start_marker=marker,
+                                **{
+                                    key: launch.get(key)
+                                    for key in (
+                                        "windows_job_name",
+                                        "windows_job_identity",
+                                        "windows_job_child_pid",
+                                        "windows_job_child_start_marker",
+                                    )
+                                },
                             )
                         except BaseException as exc:
                             race_errors.append(exc)
@@ -788,15 +797,23 @@ def main() -> int:
                         race_errors.append(exc)
 
         assert not racing_scheduler_thread.is_alive() and not racing_stop_thread.is_alive()
-        assert race_errors == []
+        assert race_errors == [], repr(race_errors)
         assert race_runner_alive_after_stop is False, "STOP left the externally started runner alive"
         assert race_provider_alive_after_stop is False, "STOP left the provider child alive"
-        assert len(race_start_calls) == 1, "the leased SPAWN must enter the backend exactly once"
+        # STOP committed before the Windows prepared callback authorized
+        # ResumeThread. The child must remain suspended and be contained; a
+        # provider call is no longer an acceptable outcome for this race.
+        assert race_start_calls == []
         assert len(race_scheduler_results) == 1
-        assert race_scheduler_results[0]["failed"] == []
-        assert [row["effect_id"] for row in race_scheduler_results[0]["processed"]] == [
-            racing_spawn["start"]["effect_id"]
-        ]
+        assert race_scheduler_results[0]["processed"] == []
+        assert len(race_scheduler_results[0]["failed"]) == 1
+        assert (
+            race_scheduler_results[0]["failed"][0]["effect_id"]
+            == racing_spawn["start"]["effect_id"]
+        )
+        assert "stopped before Windows Job resume authorization" in str(
+            race_scheduler_results[0]["failed"][0]["error"]
+        )
         assert len(race_stop_results) == 1
         racing_stop = race_stop_results[0]
         assert racing_stop["runtime"]["status"] == "applied"
@@ -818,9 +835,8 @@ def main() -> int:
             else 0
         )
         race_provider_pid = read_pid_file(race_provider_pid_file)
-        assert race_provider_pid is not None, "racing provider did not persist its child PID"
-        assert wait_for_pid_exit(race_provider_pid), "racing provider child survived STOP"
-        assert race_provider_calls == 1
+        assert race_provider_pid is None, "provider started after STOP won resume authorization"
+        assert race_provider_calls == 0
         run_json(
             temp,
             "run-scheduler",
@@ -835,7 +851,7 @@ def main() -> int:
             if race_provider_counter.is_file()
             else 0
         ) == race_provider_calls
-        assert len(race_start_calls) == 1
+        assert race_start_calls == []
         assert load_actor(project_layout, racing_spawn["actor_id"])["status"] == "stopped"
         assert load_task(project_layout, "V2-0006")["attempts"][-1]["status"] == "cancelled"
         with sqlite3.connect(project / "scheduler" / "state.db") as connection:
@@ -845,6 +861,108 @@ def main() -> int:
                 ).fetchone()[0]
             )
         assert orphan_effects == 0
+
+        # An explicit recovery generation must not consume a registration made
+        # by the missing prior runner. The original pending effect is fenced
+        # dead and the newly authorized generation performs exactly one start.
+        run_json(
+            temp,
+            "new-task",
+            "--project",
+            str(project),
+            "--title",
+            "generation-fenced-recovery",
+            "--purpose",
+            "prove explicit recovery cannot reuse stale runner registration",
+        )
+        stale_registration = run_json(
+            temp,
+            "dispatch",
+            "--project",
+            str(project),
+            "--task",
+            "V2-0007",
+            "--start",
+            "--unsafe-native",
+            "--command-id",
+            "CMD-SPAWN-STALE-REGISTRATION",
+        )
+        stale_actor = load_actor(project_layout, stale_registration["actor_id"])
+        stale_runtime = stale_actor.setdefault("runtime", {})
+        stale_generation = int(stale_runtime["recovery_generation"])
+        stale_runtime["registered_launch_token_sha256"] = hashlib.sha256(
+            str(stale_actor["launch_token"]).encode("utf-8")
+        ).hexdigest()
+        stale_runtime["registered_profile_sha256"] = str(
+            (stale_actor.get("profile_binding") or {}).get("sha256") or ""
+        ).removeprefix("sha256:")
+        stale_runtime["registered_recovery_generation"] = stale_generation
+        stale_runtime["provider_execution_state"] = "launch_pending_authorization"
+        stale_runtime["pid"] = None
+        stale_runtime["process_start_marker"] = None
+        stale_runtime["target"] = None
+        for key in (
+            "windows_job_name",
+            "windows_job_identity",
+            "windows_job_child_pid",
+            "windows_job_child_start_marker",
+        ):
+            stale_runtime.pop(key, None)
+        stale_actor["status"] = "needs_recovery"
+        save_actor(project_layout, stale_actor)
+        stale_task = load_task(project_layout, "V2-0007")
+        stale_task["status"] = "needs_recovery"
+        stale_task["attempts"][-1]["status"] = "needs_recovery"
+        save_task(project_layout, stale_task)
+
+        explicit_recovery = run_json(
+            temp,
+            "recover",
+            "--project",
+            str(project),
+            "--restart-missing",
+            "--command-id",
+            "CMD-RECOVER-STALE-REGISTRATION",
+        )
+        recovered_actor = load_actor(project_layout, stale_registration["actor_id"])
+        recovered_runtime = recovered_actor["runtime"]
+        recovery_effect_id = str(recovered_runtime["recovery_effect_id"])
+        assert recovered_runtime["recovery_generation"] == stale_generation + 1
+        assert explicit_recovery["restarted"] == [f"queued:{recovery_effect_id}"]
+
+        generation_cycle = run_json(
+            temp,
+            "run-scheduler",
+            "--project",
+            str(project),
+            "--once",
+            env_extra=provider_env,
+        )
+        assert [
+            row["effect_id"] for row in generation_cycle["last_effects"]["failed"]
+        ] == [stale_registration["start"]["effect_id"]]
+        assert [
+            row["effect_id"] for row in generation_cycle["last_effects"]["processed"]
+        ] == [recovery_effect_id]
+        wait_for_count(
+            counter,
+            main_provider_calls + 1,
+            project=project,
+            actor_id=stale_registration["actor_id"],
+        )
+        wait_for_status(project, "V2-0007", "waiting_leader")
+        assert effect_status(
+            project_layout, stale_registration["start"]["effect_id"]
+        )["status"] == "dead"
+        assert effect_status(project_layout, recovery_effect_id)["status"] == "applied"
+        final_registration = load_actor(
+            project_layout, stale_registration["actor_id"]
+        )["runtime"]
+        assert (
+            final_registration["registered_recovery_generation"]
+            == stale_generation + 1
+        )
+        main_provider_calls += 1
 
         slow_workspace = temp / "slow-stop-workspace"
         slow_workspace.mkdir()
@@ -864,21 +982,25 @@ def main() -> int:
                 "off",
             )["project"]
         )
-        slow_actor_path = slow_project / "scheduler" / "actors" / "leader.json"
-        slow_actor_seed = json.loads(slow_actor_path.read_text(encoding="utf-8"))
-        slow_actor_seed["runtime"].update(
-            {
-                "target": "pid:999999",
-                "pid": 999999,
-                "process_start_marker": "slow-stop-marker",
-            }
-        )
-        slow_actor_path.write_text(
-            json.dumps(slow_actor_seed, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
         run_json(temp, "migrate-state", "--project", str(slow_project), "--apply")
         slow_layout = resolve_project(temp / "runtime", str(slow_project))
+        with control_transaction(
+            slow_layout,
+            command_name="test_seed_slow_stop_runtime",
+            command_id="TEST-SEED-SLOW-STOP-RUNTIME",
+            payload={"actor": "leader", "pid": 999999},
+        ) as transaction:
+            if not transaction.replay:
+                slow_actor_seed = load_actor(slow_layout, "leader")
+                slow_actor_seed["runtime"].update(
+                    {
+                        "target": "pid:999999",
+                        "pid": 999999,
+                        "process_start_marker": "slow-stop-marker",
+                    }
+                )
+                save_actor(slow_layout, slow_actor_seed)
+                transaction.set_result({"status": "seeded"})
         slow_actor = load_actor(slow_layout, "leader")
         slow_effect_id = "EFF-STOP-CMD-SLOW-STOP"
         with control_transaction(
@@ -960,6 +1082,24 @@ def main() -> int:
             assert connection.execute(
                 "SELECT status FROM commands WHERE command_id='CMD-SLOW-STOP'"
             ).fetchone()[0] == "completed"
+
+        # The synthetic slow backend above represents a confirmed STOP but has
+        # no real Windows Job receipt. Remove its test-only PID binding before
+        # exercising an idempotent public STOP through the real backend.
+        with control_transaction(
+            slow_layout,
+            command_name="test_clear_slow_stop_runtime",
+            command_id="TEST-CLEAR-SLOW-STOP-RUNTIME",
+            payload={"actor": "leader"},
+        ) as transaction:
+            if not transaction.replay:
+                stopped_actor = load_actor(slow_layout, "leader")
+                stopped_runtime = stopped_actor.setdefault("runtime", {})
+                stopped_runtime["target"] = None
+                stopped_runtime["pid"] = None
+                stopped_runtime["process_start_marker"] = None
+                save_actor(slow_layout, stopped_actor)
+                transaction.set_result({"status": "cleared"})
 
         daemon_acquired = threading.Event()
         daemon_release = threading.Event()
@@ -1424,7 +1564,8 @@ def main() -> int:
                         "daemon_sleep_does_not_block_emergency_stop",
                         "no_effect_commit_view_reconciled_by_scheduler",
                         "stop_cancels_pending_spawn_before_provider",
-                        "stop_linearizes_against_inflight_spawn",
+                        "stop_prevents_inflight_spawn_before_resume_authorization",
+                        "explicit_recovery_rejects_stale_runner_registration",
                         "stop_permanent_failure_remains_recoverable",
                     ],
                     "provider_calls": provider_calls,

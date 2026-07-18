@@ -399,6 +399,14 @@ def main() -> int:
         assert not list((temp / "runtime" / "worker-bundles").rglob("provider.secret"))
         assert not provider_counter.exists(), "pre-cutover required actor reached a provider"
 
+        if os.name == "nt":
+            # Direct child invocation intentionally lacks the production Job
+            # supervisor. Windows Job launch/fencing is covered by the runtime
+            # effect and PID identity suites; Linux CI exercises the following
+            # post-Popen governance barrier with native group/token authority.
+            print("actor governance contract ok (Windows post-Popen barrier skipped)")
+            return 0
+
         # Native execution is permitted only while governance is off. Pause
         # after Popen but before post-spawn authorization, then make the
         # project governed and drift ownership. The child counts a provider

@@ -57,8 +57,10 @@ class HandoffContractTest(unittest.TestCase):
         self,
         tiers: tuple[str, ...] = ("low", "medium", "high"),
         context_allowlist: object = None,
+        planned_steps: list[dict[str, object]] | None = None,
+        estimated_cached_input_tokens: int = 0,
     ) -> dict[str, object]:
-        steps = [self.route_step(tier) for tier in tiers]
+        steps = planned_steps or [self.route_step(tier) for tier in tiers]
         return build_collaboration_contract(
             task_id="V2-0001",
             task_spec={
@@ -80,18 +82,46 @@ class HandoffContractTest(unittest.TestCase):
             max_changes=64,
             max_total_upsert_bytes=1_000_000,
             estimated_input_tokens=20_000,
-            estimated_cached_input_tokens=0,
+            estimated_cached_input_tokens=estimated_cached_input_tokens,
             estimated_output_tokens=10_000,
             handoff_limits=self.limits(),
             route_envelope_id="ENV-001",
             route_plan_fingerprint_sha256=route_plan_fingerprint(
                 steps,
                 input_tokens=20_000,
-                cached_input_tokens=0,
+                cached_input_tokens=estimated_cached_input_tokens,
                 output_tokens=10_000,
             ),
             planned_steps=steps,
         )
+
+    def same_tier_steps(self) -> list[dict[str, object]]:
+        low_a = self.route_step("low")
+        low_b = deepcopy(low_a)
+        low_b.update(
+            {
+                "index": 1,
+                "provider_id": "low-peer-api",
+                "model": "low-peer-model",
+                "profile": "low-peer-profile",
+            }
+        )
+        low_b["execution_identity"] = {
+            "model": "low-peer-model",
+            "profile": "low-peer-profile",
+            "profile_sha256": digest("low-peer-profile"),
+        }
+        low_b["profile_binding"] = {
+            **low_b["profile_binding"],
+            "logical_name": "low-peer-profile",
+            "sha256": digest("low-peer-profile"),
+            "provider_identity": "low-peer-api",
+            "env_key": "LOW_PEER_API_KEY",
+            "model": "low-peer-model",
+            "snapshot_relpath": "profiles/ENV-001/low-peer.toml",
+        }
+        high = self.route_step("high")
+        return [low_a, low_b, high]
 
     @staticmethod
     def route_step(tier: str) -> dict[str, object]:
@@ -280,6 +310,142 @@ class HandoffContractTest(unittest.TestCase):
         )
         self.assertEqual(high["incoming_changes"]["change_count"], 4)
         self.assertNotIn("handoff", high["incoming_changes"])
+
+    def test_v2_contract_allocates_each_attempt_from_its_step_forecast(self) -> None:
+        steps = [self.route_step(tier) for tier in ("low", "medium", "high")]
+        for step in steps:
+            step["token_forecast"] = {
+                "estimated_input_tokens": 25_000,
+                "estimated_cached_input_tokens": 0,
+                "estimated_output_tokens": 10_000,
+                "cache_mode": "reclassified-as-ordinary",
+                "cache_binding": None,
+            }
+        contract = self.contract(
+            planned_steps=steps,
+            estimated_cached_input_tokens=5_000,
+        )
+        self.assertEqual(contract["schema_version"], 2)
+        low = self.first_attempt(contract)
+        self.assertEqual(low["schema_version"], 2)
+        self.assertEqual(low["token_allocation"]["estimated_input_tokens"], 25_000)
+        self.assertEqual(
+            low["token_allocation"]["estimated_cached_input_tokens"], 0
+        )
+        low_output = self.output(
+            contract,
+            low,
+            manifest=digest("forecast-low-changes"),
+            change_count=1,
+            upsert_bytes=100,
+            label="forecast-low",
+        )
+        low_result = self.rejected_result(low_output, 77)
+        low_handoff = build_handoff_capsule(
+            collaboration_contract=contract,
+            attempt_input=low,
+            attempt_output=low_output,
+            leader_result=low_result,
+            handoff_text="The successor receives this only in its ordinary input reserve.",
+        )
+        medium = build_attempt_input_contract(
+            collaboration_contract=contract,
+            attempt_id="ATT-medium-forecast-002",
+            actor_id="agent-v2-forecast-medium",
+            route_step_index=1,
+            incoming_change_manifest_sha256=digest("forecast-low-changes"),
+            incoming_change_count=1,
+            incoming_total_upsert_bytes=100,
+            predecessor_handoff=low_handoff,
+            trusted_predecessor_result=low_result,
+        )
+        allocation = medium["token_allocation"]
+        self.assertEqual(allocation["estimated_input_tokens"], 25_000)
+        self.assertEqual(allocation["estimated_cached_input_tokens"], 0)
+        self.assertEqual(
+            allocation["working_input_budget_tokens"],
+            25_000 - self.limits().continuation_input_reserve_tokens,
+        )
+
+        tampered = deepcopy(contract)
+        tampered["route_policy"]["planned_steps"][1]["token_forecast"][
+            "estimated_cached_input_tokens"
+        ] = 5_000
+        tampered.pop("contract_sha256")
+        with self.assertRaises(ValueError):
+            build_collaboration_contract(
+                task_id="V2-0001",
+                task_spec=contract["task_spec"],
+                base_sha=BASE_SHA,
+                context_allowlist=contract["context_projection"]["allowlist"],
+                context_manifest_sha256=digest("context"),
+                context_file_count=2,
+                context_total_size_bytes=200,
+                write_scope=contract["change_policy"]["write_scope"],
+                initial_change_manifest_sha256=digest("empty-changes"),
+                max_changes=64,
+                max_total_upsert_bytes=1_000_000,
+                estimated_input_tokens=20_000,
+                estimated_cached_input_tokens=5_000,
+                estimated_output_tokens=10_000,
+                handoff_limits=self.limits(),
+                route_envelope_id="ENV-001",
+                route_plan_fingerprint_sha256=contract["route_policy"][
+                    "plan_fingerprint"
+                ],
+                planned_steps=tampered["route_policy"]["planned_steps"],
+            )
+
+    def test_same_tier_peer_is_valid_only_as_a_distinct_non_decreasing_step(self) -> None:
+        steps = self.same_tier_steps()
+        contract = self.contract(planned_steps=steps)
+        self.assertEqual(
+            [step["provider_id"] for step in contract["route_policy"]["planned_steps"]],
+            ["low-api", "low-peer-api", "high-api"],
+        )
+
+        first = self.first_attempt(contract)
+        first_output = self.output(
+            contract,
+            first,
+            manifest=digest("same-tier-changes"),
+            change_count=1,
+            upsert_bytes=100,
+            label="same-tier-low-a",
+        )
+        first_result = self.rejected_result(first_output, 91)
+        capsule = build_handoff_capsule(
+            collaboration_contract=contract,
+            attempt_input=first,
+            attempt_output=first_output,
+            leader_result=first_result,
+            handoff_text="The peer should independently inspect the bounded unresolved edge case.",
+        )
+        peer = build_attempt_input_contract(
+            collaboration_contract=contract,
+            attempt_id="ATT-low-peer-002",
+            actor_id="agent-v2-0001-low-peer",
+            route_step_index=1,
+            incoming_change_manifest_sha256=digest("same-tier-changes"),
+            incoming_change_count=1,
+            incoming_total_upsert_bytes=100,
+            predecessor_handoff=capsule,
+            trusted_predecessor_result=first_result,
+        )
+        self.assertEqual(
+            peer["route_binding"]["planned_step"]["provider_id"],
+            "low-peer-api",
+        )
+
+        repeated = deepcopy(steps)
+        repeated[1]["provider_id"] = "low-api"
+        with self.assertRaisesRegex(HandoffContractError, "repeats a provider_id"):
+            self.contract(planned_steps=repeated)
+
+        downgraded = deepcopy(steps)
+        downgraded[0]["tier"] = "medium"
+        with self.assertRaisesRegex(HandoffContractError, "non-decreasing"):
+            self.contract(planned_steps=downgraded)
 
     def test_token_reserve_is_conservative_and_cannot_exhaust_work_budget(self) -> None:
         with self.assertRaisesRegex(HandoffContractError, "handoff_output_reserve_tokens"):

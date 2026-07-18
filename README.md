@@ -1,23 +1,38 @@
 # CostMarshal
 
-CostMarshal is a scheduler-first, cost-aware multi-provider control plane for Codex CLI. It coordinates low-, medium-, and high-tier APIs, keeps task and attempt state durable, and reserves the strongest provider for work that needs it.
+CostMarshal is a Codex-native, scheduler-first, cost-aware multi-provider control
+plane. It coordinates low-, medium-, and high-tier APIs, keeps task and attempt
+state durable, and reserves the strongest provider for work that needs it.
 
-Current version: `v2.4.0-beta`
+Current version: `v3.0.0`
 
-> v2.4 adds recoverable spawn/stop effects and an enabled digest-pinned OCI worker path on top of real low/medium/high routing. It does not claim that every deployment is economically optimal by default: reviewed prices, token estimates, leader acceptance history, and the release evidence gates are still required.
+> v3.0 makes the Codex plugin the supported product surface, adds cache-safe per-step forecasts, completion-first three-tier routing, same-tier peer continuation, real Windows Job Object containment, and generation-fenced recovery. Reviewed prices, token estimates, leader acceptance history, and external release evidence are still required for deployment-specific economic or security claims.
 
-## What v2.4 does
+## Use from Codex
+
+The supported product surface is the bundled Codex plugin and its
+`orchestrate-cost-aware-agents` Skill. Ask Codex to use CostMarshal in natural
+language; the Skill translates that intent into the bounded scheduler workflow
+and keeps recovery, budget, and evidence details behind the conversation.
+
+The repository-level `SKILL.md` remains the single policy authority for both
+the plugin and legacy standalone Skill installation. `scripts/costmarshal.py`
+is retained as an internal runtime, recovery, automation, and diagnostic entry
+point—not as a requirement for ordinary users to operate CostMarshal manually.
+
+## What v3.0 does
 
 - Routes bounded tasks across three capability tiers: low, medium, and high.
 - Keeps provider identity separate from capability tier, so providers can be replaced without changing policy.
 - Applies a fail-closed safety floor from risk, difficulty, and task type.
 - Filters providers by explicit required capabilities before cost optimization.
-- Exhaustively compares every safe monotonic priced chain, including early-stop and tier-skip plans, by expected cost per leader-accepted result.
+- Exhaustively compares every safe non-decreasing priced chain of at most three distinct providers, including same-tier peers, early-stop, and tier-skip plans, by expected cost per leader-accepted result.
+- Defaults new projects to `completion-first`: the admitted chain retains a strongest-compatible-tier terminal fallback, while leader acceptance at any earlier step stops further spend. Existing projects without the field retain `cost-only`, and either a project or task can opt into `cost-only` explicitly.
 - Bootstraps missing exact conditional evidence across every available safe tier at or above the task floor (low→medium→high for a complete low-floor catalog, medium→high for a medium floor); successors still require leader rejection, and routing returns to the exhaustive economic objective after 10 matching observations per continuation. A high-floor route remains a single high-tier step.
 - Keeps explicit provider requests pinned; an explicit tier with complete prices and token estimates chooses same-tier peers by conservative cost per accepted result before using priority as a tie-breaker.
-- Follows the admitted monotonic provider chain (including an explicitly selected tier skip) and fences stale actor attempts.
+- Follows the admitted non-decreasing provider chain (including a sealed same-tier peer or tier skip) and fences stale actor attempts.
 - Uses durable actors, mailboxes, reports, claims, usage records, and recovery state.
-- Binds every planned step to a price basis and reserves the full chain estimate in a task/project admission envelope before the first dispatch.
+- Binds every planned step to its own token forecast and price basis, reclassifies cached input as ordinary input when its complete origin is absent or provider/model/profile identity changes, and reserves the full chain estimate before first dispatch.
 - Requires an attested OCI boundary for production workers and never silently falls back to a native process.
 - Provides an explicit SQLite WAL cutover for crash-atomic control state, leased runtime effects, and recoverable compatibility views.
 - Supports ArchMarshal governance through explicit, read-only binding checks. It never runs ArchMarshal adopt/apply/lifecycle mutations automatically.
@@ -33,7 +48,7 @@ The safety floor always wins:
 | Low-risk bounded analysis, extraction, docs, tests, verification, or small edits | low |
 | Unknown or judgment-heavy task type | medium |
 
-When all enabled providers have reviewed prices and the task includes non-zero token estimates, CostMarshal evaluates every valid monotonic escalation subchain. This includes single-step, early-stop, and safe tier-skip plans; `--min-success-probability` filters them before the objective is minimized. Without a positive success floor, a chain whose exact continuation lineage has fewer than 10 matching observations enters `conditional-evidence-bootstrap`: CostMarshal seals the most cost-efficient complete monotonic chain, but each successor still requires an explicit leader rejection, so an accepted earlier result stops additional spend. Bootstrap never inserts an assumed success probability. Once the lineage is mature, routing returns to the exhaustive objective:
+When all enabled providers have reviewed prices and the task includes non-zero token estimates, CostMarshal evaluates every valid non-decreasing chain of one to three distinct provider IDs. Mature evidence can therefore justify `low-A -> low-B -> high`, as well as single-step, early-stop, and safe tier-skip plans; provider repetition and tier downgrade are always illegal. New projects default to `completion-first`, which filters candidate plans to those ending at the strongest compatible enabled tier before minimizing the economic objective. This is a fallback, not mandatory spend: every successor still requires explicit leader rejection, so acceptance at low or medium stops the chain. Use `--routing-objective cost-only` to permit a mature plan to terminate economically at a weaker tier; legacy projects missing the field keep that behavior. `--min-success-probability` applies an independent conservative history-based acceptance floor. Without a positive floor, a lineage with fewer than 10 matching observations enters `conditional-evidence-bootstrap`: CostMarshal seals the most cost-efficient complete one-provider-per-tier chain. Bootstrap never inserts an assumed probability or a same-tier exploratory call. Once the lineage is mature, routing returns to the selected objective:
 
 ```text
 expected_chain_cost = C1 + (1-P1)C2 + (1-P1)(1-P2)C3
@@ -43,7 +58,9 @@ objective = expected_chain_cost / success_probability
 
 `Pi` is a conservative probability derived only from explicit leader acceptance records. If pricing or token estimates are missing, routing falls back to the minimum safe tier rather than inventing a cost.
 
-Use `--min-success-probability 0..1` to impose a task SLA floor on priced chains. Routing fails closed when no chain meets it. `init --default-min-success-probability P` stores a project default that is resolved and frozen into each new auto-routed task; a task-level value, including `0`, takes precedence. Omitting both (or explicitly using `0`) permits the evidence-bootstrap phase above; after its exact lineages mature, the ordinary objective may economically stop early or skip a tier.
+Use `--min-success-probability 0..1` to impose a conservative historical leader-acceptance floor on priced chains. Routing fails closed when no chain meets it. `init --default-min-success-probability P` stores a project default that is resolved and frozen into each new auto-routed task; a task-level value, including `0`, takes precedence. Omitting both (or explicitly using `0`) permits the evidence-bootstrap phase above. This is not a formal availability SLA.
+
+The source token estimate is frozen, but each provider step has its own forecast. Step 0 may retain cached input only when the caller supplies a proven provider/model/profile/profile-hash origin. The v3 task entry currently carries counts but no origin, so it conservatively prices those tokens as ordinary input; a different successor does the same. The route fingerprint and v3 budget envelope bind that conversion. An explicit all-zero final usage receipt can settle a reviewed `fixed_attempt`, while a missing usage receipt remains reserved and unsettled.
 
 Each route position needs at least 10 trusted v3 observations for the exact task
 type, difficulty, provider profile SHA-256, and conditional predecessor lineage.
@@ -55,9 +72,15 @@ handoff boundaries. This threshold is a conservative history-based acceptance
 floor, not a formal end-to-end availability SLA or a multiple-comparison-adjusted
 statistical guarantee.
 
-To bound exhaustive planning, CostMarshal accepts at most 16 enabled, capability-compatible providers in any one tier. Larger catalogs fail closed instead of creating an unbounded route search.
+To bound exhaustive automatic planning, CostMarshal accepts at most 16 enabled,
+capability-compatible providers in each tier at or above the task's effective
+safety floor. Providers below that floor cannot enter the plan and do not count
+toward the limit. Explicit provider requests and explicit-tier ranking do not
+enumerate cross-tier chains, so they are not blocked by unrelated catalog
+breadth.
 
-Use the read-only route explanation command before dispatch:
+For diagnostics or automation, the internal CLI can produce a read-only route
+explanation before dispatch:
 
 ```powershell
 python scripts/costmarshal.py route `
@@ -79,18 +102,38 @@ python scripts/costmarshal.py governance-status --project <project-dir>
 
 ## Install
 
-Use [`INSTALL_PROMPT.md`](INSTALL_PROMPT.md) for both first install and update. It resolves
-`$CODEX_HOME` with a `~/.codex` fallback, backs up an existing skill, filters
-Git metadata, generated evidence, runtime state, bytecode, and secrets, and
-leaves both current and legacy runtime roots untouched. Restart Codex if its
-skill list is cached, then run the installed smoke test.
+Use [`INSTALL_PROMPT.md`](INSTALL_PROMPT.md) for a SHA-pinned Codex plugin
+install or update. It registers the repository marketplace, installs
+`costmarshal@costmarshal`, checks the enabled/version/source state and cached
+package, and leaves both current and legacy runtime roots untouched. Start a new
+Codex task after installation so the plugin Skill is discovered.
 
 ```powershell
-$CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
-python "$CodexHome\skills\costmarshal\scripts\install_smoke_test.py"
+# First install
+codex plugin marketplace add yptang98/CostMarshal --ref <reviewed-40-character-commit>
+codex plugin add costmarshal@costmarshal
+codex plugin list --json
+
+# Replace an existing commit-pinned snapshot
+codex plugin remove costmarshal@costmarshal --json
+codex plugin marketplace remove costmarshal --json
+codex plugin marketplace add yptang98/CostMarshal --ref <new-reviewed-40-character-commit> --json
+codex plugin add costmarshal@costmarshal --json
 ```
 
-CostMarshal requires Python 3.11+ and uses only its standard library at runtime. `git` is required for writable worker worktrees. `tmux` is optional; Windows defaults to the local process backend.
+The repository smoke uses a separate temporary `CODEX_HOME`, performs a real
+marketplace v2-to-v3 replacement/install/list/remove cycle, exercises read-only
+route/dashboard/recover operations from the plugin cache, and verifies runtime
+preservation. CostMarshal's
+hidden engine requires Python 3.11+ and uses only its standard library. Ordinary
+users work through Codex rather than typing Python commands. `git` is required
+for writable worker worktrees. `tmux` is optional; Windows defaults to the local
+process backend.
+
+For existing projects and standalone Skill installations, follow
+[`references/migration-v3.md`](references/migration-v3.md). The v2 runtime path
+is intentionally retained; migration never rewrites a sealed route or enables
+ArchMarshal mutations.
 
 The tmux backend uses exact session/window targets and launches each actor in
 the project directory. Session and actor runtime names are restricted to 1-64
@@ -243,6 +286,16 @@ Worker dispatch defaults to `worker_isolation.mode=required`. Docker/Podman sele
 
 The required path now supervises the attested container through the bundled execution adapter: an immutable inherited stdin snapshot, at most one selected credential file, a credential-free provider profile, bounded JSONL, strict `final.md` exchange validation, deterministic container labels, timeout/stop/cleanup, and a path-free credential deletion receipt. Before cleanup, a completed provider call is sealed into project/attempt-scoped report, recursively redacted events, and receipt CAS objects and enters `finished_pending_finalize`. Recovery verifies those bytes and the exact OCI identity, then performs only attach/terminal-inspect/cleanup and local finalization—never another provider start or wait. Docker/Podman logs use explicit bounded rotation; crash recovery streams those logs with hard stdout/stderr limits and preserves the budget reservation when usage cannot be recovered safely. The reviewed image is built from [`container/worker`](container/worker/README.md); both the base image digest and Codex CLI version are mandatory build inputs, and dispatch still requires the resulting immutable image digest.
 
+OCI isolation protects the host workspace and keeps non-selected provider keys
+out of the worker. It does **not** protect the selected provider credential from
+code or model actions running inside that same container: the provider client
+must be able to read it. Output redaction catches accidental literal echoes; it
+is not a data-loss-prevention boundary against encoding or splitting. Use a
+dedicated least-privilege, spend-capped, revocable key and a reviewed worker
+image. Do not run hostile workloads with a valuable raw credential; that threat
+model requires an external credential broker/capability proxy, which v3.0 does
+not ship. See [`SECURITY.md`](SECURITY.md).
+
 Production API access uses an externally provisioned `provider-proxy` topology:
 the worker attaches only to an internal, CostMarshal-labelled network, while a
 separately reviewed proxy is dual-homed to that network and an egress network.
@@ -313,7 +366,7 @@ original command completed. A busy daemon may leave the exact effect honestly
 queued for its next scheduler cycle.
 
 If the leader rejects an attempt but wants the reviewed chain to continue, record the
-decision and then explicitly queue the next provider step in the admitted monotonic chain, which may skip a tier. `record-result` does not
+decision and then explicitly queue the exact next provider step in the admitted non-decreasing chain, which may be a different same-tier provider or may skip a tier. Same-tier continuation is accepted only from the active sealed route envelope; an ad-hoc peer rewrite, provider repeat, or tier downgrade fails closed. `record-result` does not
 silently spend more budget:
 
 ```powershell
@@ -421,7 +474,7 @@ evaluating their commit-bound contents. Without reproduction the gate remains
 `blocked` even if hand-written artifact files claim success.
 
 Release trust roots live in [`release/evidence-policy.json`](release/evidence-policy.json).
-The beta ships them intentionally unset. A reviewed release must preregister
+The v3.0 prerelease ships them intentionally unset. A production-certified release must preregister
 the blind policy manifest and signer allowlist in an earlier commit, and must
 pin the worker repository digest plus provider-proxy image/configuration hashes.
 Environment variables may supply evidence files and local object references;
@@ -510,7 +563,7 @@ python tests/release/run_release_gates.py --reproduce-evidence
 
 ## Current hardening boundary
 
-v2.4-beta has an opt-in SQLite WAL authority, marker-last migration with backups, dirty-view recovery, payload-hashed commands, leased spawn/stop effects, launch-token and lifetime-lock fencing, crash recovery after report publication, immutable dispatch pricing, independent ordinary/cached/output token forecasting, exhaustive monotonic route-chain enumeration, whole-chain admission envelopes, an independent 10,000-case route oracle, and an enabled required-mode OCI adapter plus reproducible worker-image source. Cache-read usage is routed and settled against the attempt-bound snapshot; unsupported cache-write pricing remains unknown and preserves the budget reservation. It remains beta until the machine-readable release gates have real low/medium/high shadow-backtest evidence and live malicious OCI escape evidence for a reviewed image digest. A unit or mocked adapter test is not treated as that external proof.
+v3.0 has an opt-in SQLite WAL authority, marker-last migration with backups, dirty-view recovery, payload-hashed commands, leased spawn/stop/Git effects, launch-token and lifetime fencing, crash recovery after report publication, immutable per-step dispatch pricing, independent ordinary/cached/output forecasts, exhaustive non-decreasing route-chain enumeration, whole-chain admission envelopes, an independent 10,000-case route oracle, Windows Job Object containment, and an enabled required-mode OCI adapter plus reproducible worker-image source. Cache-read usage is settled against the attempt-bound snapshot; cache is never presumed portable across provider/model/profile identities. Real low/medium/high shadow-backtest evidence and live malicious OCI escape evidence for a reviewed image digest remain required for external production certification; unit or mocked adapter tests are not treated as that proof.
 
 ## License
 

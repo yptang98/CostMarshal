@@ -1,0 +1,36 @@
+{
+  "name": "costmarshal",
+  "version": "3.0.0",
+  "description": "Codex-native cost-aware orchestration across low, medium, and high API providers.",
+  "author": {
+    "name": "yptang98",
+    "url": "https://github.com/yptang98"
+  },
+  "homepage": "https://github.com/yptang98/CostMarshal",
+  "repository": "https://github.com/yptang98/CostMarshal",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "orchestration",
+    "cost-aware",
+    "multi-provider",
+    "agents"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "CostMarshal",
+    "shortDescription": "Coordinate low, medium, and high APIs from Codex.",
+    "longDescription": "CostMarshal gives Codex a scheduler-first, recoverable way to coordinate low-, medium-, and high-cost API providers. It preserves safety floors, leader-owned acceptance, immutable pricing and profile evidence, budget reservations, and optional read-only ArchMarshal governance while keeping the local runtime engine behind a Codex-native Skill interface.",
+    "developerName": "yptang98",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Use CostMarshal to complete this task with the best cost-quality tradeoff.",
+      "Route this work across low, medium, and high APIs with recoverable handoffs.",
+      "Audit this CostMarshal project and explain the safest economical route."
+    ]
+  }
+}

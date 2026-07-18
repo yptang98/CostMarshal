@@ -3,10 +3,13 @@
 Paste this into Codex:
 
 ```text
-Uninstall CostMarshal from my Codex skills directory.
+Uninstall the CostMarshal Codex plugin.
 
 Requirements:
-- Remove $CODEX_HOME/skills/costmarshal, or ~/.codex/skills/costmarshal if CODEX_HOME is unset.
+- Verify the installed selector with `codex plugin list --json`.
+- Remove only the plugin with `codex plugin remove costmarshal@costmarshal --json`.
+- Leave the `costmarshal` marketplace configured unless I explicitly ask to remove it.
+- If a legacy standalone `$costmarshal` Skill exists, do not remove or modify it unless I explicitly ask for legacy cleanup.
 - Do not delete CostMarshal runtime state unless I explicitly confirm.
 - If I confirm runtime cleanup, remove $CODEX_HOME/costmarshal-v2 or ~/.codex/costmarshal-v2.
 - Preserve legacy $CODEX_HOME/costmarshal or ~/.codex/costmarshal unless I explicitly confirm legacy cleanup too.

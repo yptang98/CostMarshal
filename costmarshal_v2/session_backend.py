@@ -4,6 +4,7 @@ import csv
 import json
 import os
 import platform
+import queue
 import re
 import secrets
 import shlex
@@ -11,11 +12,18 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .paths import ProjectLayout
+from .windows_job import (
+    WindowsJobError,
+    inspect_windows_job_runtime,
+    stop_windows_job_runtime,
+    validate_windows_job_receipt,
+)
 
 
 ActorCommand = str | list[str]
@@ -28,6 +36,7 @@ _LINUX_PROCESS_TOKEN_RE = re.compile(r"costmarshal-process-([0-9a-f]{64})(?:\s|\
 _LINUX_PROCESS_MARKER_RE = re.compile(
     r"linux-proc-v2:([^:]+):([0-9]+):([0-9]+):([0-9]+):([0-9a-f]{64})\Z"
 )
+WINDOWS_JOB_HANDSHAKE_TIMEOUT_SECONDS = 10.0
 _LOCAL_PROCESS_SUPERVISOR = r"""
 import json
 import os
@@ -69,6 +78,42 @@ while True:
     time.sleep(0.25)
 raise SystemExit(returncode if returncode >= 0 else 128 - returncode)
 """
+
+
+def _bounded_readline(
+    stream: Any,
+    *,
+    label: str,
+    timeout_seconds: float = WINDOWS_JOB_HANDSHAKE_TIMEOUT_SECONDS,
+) -> str:
+    """Read one supervisor receipt without allowing a hung pipe to own STOP forever."""
+
+    result: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=1)
+
+    def read_line() -> None:
+        try:
+            result.put(("line", stream.readline()))
+        except BaseException as exc:  # noqa: BLE001 - transport errors cross the helper thread
+            result.put(("error", exc))
+
+    reader = threading.Thread(
+        target=read_line,
+        name=f"costmarshal-{label}-reader",
+        daemon=True,
+    )
+    reader.start()
+    try:
+        kind, value = result.get(timeout=max(0.01, float(timeout_seconds)))
+    except queue.Empty as exc:
+        raise RuntimeError(
+            f"Windows Job Object supervisor timed out waiting for {label}"
+        ) from exc
+    if kind == "error":
+        assert isinstance(value, BaseException)
+        raise RuntimeError(
+            f"Windows Job Object supervisor failed while reading {label}"
+        ) from value
+    return str(value)
 
 
 def validate_tmux_name(value: str, *, label: str) -> str:
@@ -250,14 +295,48 @@ def pid_is_alive(pid: int | None) -> bool:
         return False
     try:
         if os.name == "nt":
-            result = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
+            # Keep liveness handle-bound and locale/permission independent.
+            # ``tasklist`` may itself be denied in restricted Codex sessions and
+            # its localized text is not an operating-system identity receipt.
+            import ctypes
+            from ctypes import wintypes
+
+            process_query_limited_information = 0x1000
+            synchronize = 0x00100000
+            wait_object_0 = 0
+            wait_timeout = 258
+            error_access_denied = 5
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [
+                wintypes.DWORD,
+                wintypes.BOOL,
+                wintypes.DWORD,
+            ]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            kernel32.WaitForSingleObject.restype = wintypes.DWORD
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            ctypes.set_last_error(0)
+            handle = kernel32.OpenProcess(
+                process_query_limited_information | synchronize,
+                False,
+                int(pid),
             )
-            return _windows_tasklist_contains_pid(result.stdout, pid)
+            if not handle:
+                error = ctypes.get_last_error()
+                # Access denied cannot prove absence. Callers that need STOP
+                # authority use the stronger FILETIME/Job Object receipt path.
+                return error == error_access_denied
+            try:
+                status = int(kernel32.WaitForSingleObject(handle, 0))
+                if status == wait_timeout:
+                    return True
+                if status == wait_object_0:
+                    return False
+                return False
+            finally:
+                kernel32.CloseHandle(handle)
         os.kill(pid, 0)
         # A zombie has no executable runtime left and cannot service provider
         # work. Treating it as live also prevents bounded process-group STOP
@@ -801,7 +880,16 @@ class TmuxBackend:
             ]
         return [create]
 
-    def start_actor(self, *, session_name: str, actor_name: str, command: ActorCommand, cwd: Path, log_path: Path) -> dict[str, Any]:
+    def start_actor(
+        self,
+        *,
+        session_name: str,
+        actor_name: str,
+        command: ActorCommand,
+        cwd: Path,
+        log_path: Path,
+        prepared_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         if not self.available():
             raise RuntimeError(f"tmux executable not found: {self.executable}")
         resolved_cwd = Path(cwd).resolve()
@@ -898,7 +986,16 @@ class LocalProcessBackend:
     ) -> list[list[str]]:
         return [[self.executable, "start", "--session", session_name, "--actor", actor_name, "--", command_display(command)]]
 
-    def start_actor(self, *, session_name: str, actor_name: str, command: ActorCommand, cwd: Path, log_path: Path) -> dict[str, Any]:
+    def start_actor(
+        self,
+        *,
+        session_name: str,
+        actor_name: str,
+        command: ActorCommand,
+        cwd: Path,
+        log_path: Path,
+        prepared_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_handle = log_path.open("a", encoding="utf-8")
         creationflags = 0
@@ -908,7 +1005,189 @@ class LocalProcessBackend:
         launch_command: ActorCommand = command
         launch_shell = isinstance(command, str)
         if os.name == "nt":
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+            supervisor_path = Path(__file__).with_name("windows_job_supervisor.py").resolve()
+            if not supervisor_path.is_file():
+                log_handle.close()
+                raise RuntimeError("Windows Job Object supervisor is unavailable")
+            supervisor = subprocess.Popen(
+                [sys.executable, str(supervisor_path)],
+                cwd=str(cwd),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=log_handle,
+                text=True,
+                creationflags=(
+                    subprocess.CREATE_NEW_PROCESS_GROUP
+                    | subprocess.DETACHED_PROCESS
+                    | subprocess.CREATE_NO_WINDOW
+                ),
+            )
+            receipt = None
+            try:
+                assert supervisor.stdin is not None
+                supervisor.stdin.write(
+                    json.dumps(
+                        {
+                            "command": command,
+                            "shell": isinstance(command, str),
+                            "cwd": str(Path(cwd).resolve()),
+                            "log_path": str(log_path.resolve()),
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                    + "\n"
+                )
+                supervisor.stdin.flush()
+                assert supervisor.stdout is not None
+                receipt_line = _bounded_readline(
+                    supervisor.stdout,
+                    label="prepared receipt",
+                )
+                if not receipt_line:
+                    returncode = supervisor.poll()
+                    raise RuntimeError(
+                        "Windows Job Object supervisor exited without a launch receipt"
+                        + (f" (exit {returncode})" if returncode is not None else "")
+                    )
+                try:
+                    receipt_payload = json.loads(receipt_line)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError("Windows Job Object supervisor returned an invalid receipt") from exc
+                if (
+                    not isinstance(receipt_payload, dict)
+                    or receipt_payload.get("schema") != "costmarshal-windows-job-receipt-v1"
+                    or receipt_payload.get("status") != "prepared"
+                ):
+                    detail = (
+                        receipt_payload.get("error")
+                        if isinstance(receipt_payload, dict)
+                        else "invalid receipt"
+                    )
+                    raise RuntimeError(f"Windows Job Object launch failed: {detail}")
+                receipt = validate_windows_job_receipt(
+                    supervisor_pid=receipt_payload.get("supervisor_pid"),
+                    supervisor_start_marker=receipt_payload.get("supervisor_start_marker"),
+                    job_name=receipt_payload.get("job_name"),
+                    job_identity=receipt_payload.get("job_identity"),
+                    child_pid=receipt_payload.get("child_pid"),
+                    child_start_marker=receipt_payload.get("child_start_marker"),
+                )
+                if receipt.supervisor_pid != supervisor.pid:
+                    raise RuntimeError("Windows Job Object receipt supervisor PID is not the launched process")
+                inspection = inspect_windows_job_runtime(receipt)
+                if not inspection.job_present or inspection.supervisor_state != "alive":
+                    raise RuntimeError("prepared Windows Job Object receipt is no longer live")
+                prepared_launch = {
+                    "target": f"job:{receipt.job_name}",
+                    "pid": receipt.supervisor_pid,
+                    "process_start_marker": receipt.supervisor_start_marker,
+                    "windows_job_name": receipt.job_name,
+                    "windows_job_identity": receipt.job_identity,
+                    "windows_job_child_pid": receipt.child_pid,
+                    "windows_job_child_start_marker": receipt.child_start_marker,
+                    "log_path": str(log_path),
+                }
+                if prepared_callback is not None:
+                    prepared_callback(dict(prepared_launch))
+                supervisor.stdin.write(
+                    json.dumps(
+                        {"action": "resume", "job_identity": receipt.job_identity},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
+                supervisor.stdin.flush()
+                supervisor.stdin.close()
+                started_line = _bounded_readline(
+                    supervisor.stdout,
+                    label="started receipt",
+                )
+                supervisor.stdout.close()
+                try:
+                    started_payload = json.loads(started_line)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        "Windows Job Object supervisor returned an invalid final receipt"
+                    ) from exc
+                if (
+                    not isinstance(started_payload, dict)
+                    or started_payload.get("status") != "started"
+                    or {
+                        key: started_payload.get(key)
+                        for key in (
+                            "schema",
+                            "supervisor_pid",
+                            "supervisor_start_marker",
+                            "job_name",
+                            "job_identity",
+                            "child_pid",
+                            "child_start_marker",
+                        )
+                    }
+                    != {
+                        key: receipt_payload.get(key)
+                        for key in (
+                            "schema",
+                            "supervisor_pid",
+                            "supervisor_start_marker",
+                            "job_name",
+                            "job_identity",
+                            "child_pid",
+                            "child_start_marker",
+                        )
+                    }
+                ):
+                    raise RuntimeError(
+                        "Windows Job Object final receipt does not match the prepared identity"
+                    )
+                final_inspection = inspect_windows_job_runtime(receipt)
+                if not final_inspection.job_present:
+                    raise RuntimeError("started Windows Job Object is no longer live")
+                # The durable supervisor owns its Job handle. CostMarshal keeps
+                # only the PID+FILETIME receipt, so release Popen's duplicate
+                # process handle instead of retaining a hidden second lifetime.
+                supervisor._handle.Close()  # type: ignore[attr-defined]
+                supervisor._handle = None  # type: ignore[attr-defined]
+                supervisor.returncode = 0
+                return {
+                    "commands": [
+                        command_to_string(
+                            [
+                                self.executable,
+                                "start-job",
+                                "--session",
+                                session_name,
+                                "--actor",
+                                actor_name,
+                            ]
+                        )
+                    ],
+                    **prepared_launch,
+                }
+            except BaseException:
+                cleanup_error: BaseException | None = None
+                try:
+                    if receipt is not None:
+                        stop_windows_job_runtime(receipt)
+                    elif supervisor.poll() is None:
+                        supervisor.terminate()
+                    supervisor.wait(timeout=10)
+                except BaseException as exc:  # noqa: BLE001 - cleanup uncertainty replaces the launch error
+                    cleanup_error = exc
+                if cleanup_error is not None:
+                    raise RuntimeError(
+                        "Windows Job Object launch failed and handle-bound cleanup was not confirmed"
+                    ) from cleanup_error
+                raise
+            finally:
+                if supervisor.stdin is not None and not supervisor.stdin.closed:
+                    supervisor.stdin.close()
+                if supervisor.stdout is not None and not supervisor.stdout.closed:
+                    supervisor.stdout.close()
+                log_handle.close()
         else:
             if (
                 platform.system() != "Linux"
@@ -975,7 +1254,7 @@ class LocalProcessBackend:
 
     def stop_plan(self, *, target: str, pid: int | None = None) -> list[list[str]]:
         if os.name == "nt":
-            return [["taskkill", "/PID", str(pid or 0), "/T", "/F"]]
+            return [[self.executable, "verified-job-stop", "--supervisor-pid", str(pid or 0)]]
         return [[self.executable, "verified-stop", "--pid", str(pid or 0)]]
 
     def stop_actor(
@@ -984,19 +1263,34 @@ class LocalProcessBackend:
         target: str,
         pid: int | None = None,
         process_start_marker: str | None = None,
+        windows_job_name: str | None = None,
+        windows_job_identity: str | None = None,
+        windows_job_child_pid: int | None = None,
+        windows_job_child_start_marker: str | None = None,
     ) -> dict[str, Any]:
         if not pid:
             raise RuntimeError("local process backend has no pid to stop")
         if not process_start_marker:
             raise RuntimeError("local process backend has no OS process identity marker; refusing unsafe PID-only stop")
         if os.name == "nt":
-            if not pid_identity_matches(pid, process_start_marker):
-                raise RuntimeError("local process identity changed; refusing to stop a reused PID")
-            argv = ["taskkill", "/PID", str(pid), "/T", "/F"]
-            result = subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-            if result.returncode != 0 and pid_is_alive(pid):
-                raise RuntimeError(f"taskkill failed: {result.stderr.strip() or result.stdout.strip()}")
-            return {"command": command_to_string(argv)}
+            receipt = validate_windows_job_receipt(
+                supervisor_pid=pid,
+                supervisor_start_marker=process_start_marker,
+                job_name=windows_job_name,
+                job_identity=windows_job_identity,
+                child_pid=windows_job_child_pid,
+                child_start_marker=windows_job_child_start_marker,
+            )
+            observation = stop_windows_job_runtime(receipt)
+            rendered = command_to_string(
+                [
+                    self.executable,
+                    "verified-job-stop",
+                    "--job",
+                    receipt.job_name,
+                ]
+            )
+            return {"command": rendered, "commands": [rendered], **observation}
         verified_group = _verified_local_process_group(
             pid,
             process_start_marker,
@@ -1134,11 +1428,23 @@ class LocalProcessBackend:
         target: str | None = None,
         pid: int | None = None,
         process_start_marker: str | None = None,
+        windows_job_name: str | None = None,
+        windows_job_identity: str | None = None,
+        windows_job_child_pid: int | None = None,
+        windows_job_child_start_marker: str | None = None,
     ) -> bool:
         if not pid or not process_start_marker:
             return False
         if os.name == "nt":
-            return pid_identity_matches(pid, process_start_marker)
+            receipt = validate_windows_job_receipt(
+                supervisor_pid=pid,
+                supervisor_start_marker=process_start_marker,
+                job_name=windows_job_name,
+                job_identity=windows_job_identity,
+                child_pid=windows_job_child_pid,
+                child_start_marker=windows_job_child_start_marker,
+            )
+            return inspect_windows_job_runtime(receipt).job_present
         return (
             _verified_local_process_group(
                 pid,

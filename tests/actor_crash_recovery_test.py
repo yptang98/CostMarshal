@@ -74,7 +74,7 @@ def main() -> int:
                     "with counter.open('a', encoding='utf-8') as handle: handle.write('once\\n')",
                     "output = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])",
                     "output.write_text('# Completion Report\\n\\nStatus: done\\n\\n## Result\\ncrash-safe\\n', encoding='utf-8')",
-                    "print(json.dumps({'usage': {'input_tokens': 5, 'output_tokens': 3}}))",
+                    "print(json.dumps({'type': 'status', 'payload': {'input_tokens': 0, 'output_tokens': 0}}))",
                 ]
             )
             + "\n",
@@ -139,6 +139,12 @@ def main() -> int:
         task = json.loads((project / "tasks" / "V2-0001" / "task.json").read_text(encoding="utf-8"))
         assert task["status"] == "waiting_leader"
         assert task["attempts"][-1]["report_sha256"]
+        usage_rows = [
+            line
+            for line in (project / "reports" / "usage.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert usage_rows == [], usage_rows
         assert run_json(temp, "validate", "--project", str(project))["status"] == "ok"
         provider_calls = len(counter.read_text(encoding="utf-8").splitlines())
         assert provider_calls == 1

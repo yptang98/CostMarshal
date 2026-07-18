@@ -39,6 +39,7 @@ from runtime_evidence_contract import (  # noqa: E402
 REQUIRED_LOCAL_TESTS = (
     "tests/unit_test.py",
     "tests/smoke_test.py",
+    "tests/codex_plugin_contract_test.py",
     "tests/local_backend_contract_test.py",
     "tests/tmux_contract_test.py",
     "tests/model_rotation_contract_test.py",
@@ -93,7 +94,11 @@ REQUIRED_TESTS = REQUIRED_LOCAL_TESTS + (
     "tests/oci_live_evidence.py",
     "tests/release/run_release_gates.py",
 )
-AUXILIARY_DOC_OPTIONS = {"--reproduce-evidence"}
+AUXILIARY_DOC_OPTIONS = {
+    "--json",  # Codex plugin marketplace/install machine-readable output.
+    "--ref",  # Codex Git marketplace exact-revision pin.
+    "--reproduce-evidence",
+}
 REPRODUCED_ARTIFACTS = {
     "local_test_suite": "artifacts/local-test-report.json",
     "transactional_runtime_effects": "artifacts/runtime-effect-report.json",

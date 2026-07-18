@@ -14,7 +14,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from costmarshal_v2.paths import ProjectLayout, actor_runtime_name, actor_target, relpath, slugify  # noqa: E402
-from costmarshal_v2.actor_runner import _validate_actor_governance_before_side_effect  # noqa: E402
+from costmarshal_v2.actor_runner import (  # noqa: E402
+    _resolve_windows_codex_shim,
+    _runner_process_start_marker,
+    _validate_actor_governance_before_side_effect,
+    process_argv,
+)
 from costmarshal_v2.scheduler import (  # noqa: E402
     _spawn_effect_payload,
     _stop_effect_payload,
@@ -51,6 +56,63 @@ def assert_true(condition: bool, message: str) -> None:
 
 
 def main() -> int:
+    with tempfile.TemporaryDirectory(prefix="costmarshal-cmd-shim-") as directory:
+        shim_root = Path(directory)
+        shim = shim_root / "codex.cmd"
+        javascript = (
+            shim_root / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
+        )
+        node = shim_root / "node.exe"
+        javascript.parent.mkdir(parents=True)
+        shim.write_text("@echo off\n", encoding="utf-8")
+        javascript.write_text("// fixture\n", encoding="utf-8")
+        node.write_bytes(b"fixture")
+        with patch("costmarshal_v2.actor_runner.os.name", "nt"):
+            resolved = _resolve_windows_codex_shim(
+                [str(shim), "--model", "gpt-safe", "-"]
+            )
+            assert_true(
+                resolved == [str(node.resolve()), str(javascript.resolve()), "--model", "gpt-safe", "-"],
+                "Windows codex.cmd must be replaced with a native Node argv",
+            )
+            try:
+                process_argv([str(shim), "--model", "x&echo INJECTED", "-"])
+            except SystemExit as exc:
+                assert_true(
+                    "batch actor commands are rejected" in str(exc),
+                    "Windows batch rejection should explain the safety boundary",
+                )
+            else:
+                raise AssertionError("Windows batch command reached process launch")
+
+    with (
+        patch("costmarshal_v2.actor_runner.sys.platform", "linux"),
+        patch("costmarshal_v2.actor_runner.pid_start_marker", return_value="linux-proc:boot:1"),
+    ):
+        try:
+            _runner_process_start_marker("local")
+        except SystemExit as exc:
+            assert_true("linux-proc-v2" in str(exc), "Linux local marker failure should be explicit")
+        else:
+            raise AssertionError("Linux local registration accepted a marker without group/token authority")
+    v2_marker = "linux-proc-v2:boot:1:10:10:" + "a" * 64
+    with (
+        patch("costmarshal_v2.actor_runner.sys.platform", "linux"),
+        patch("costmarshal_v2.actor_runner.pid_start_marker", return_value=v2_marker),
+    ):
+        assert_true(
+            _runner_process_start_marker("local") == v2_marker,
+            "Linux local registration should preserve the v2 group/token marker",
+        )
+    with (
+        patch("costmarshal_v2.actor_runner.sys.platform", "linux"),
+        patch("costmarshal_v2.actor_runner.pid_start_marker", return_value="linux-proc:boot:1"),
+    ):
+        assert_true(
+            _runner_process_start_marker("tmux") == "linux-proc:boot:1",
+            "tmux authority must not be confused with the local supervisor chain",
+        )
+
     assert_true(slugify(" Agent V2/0001 ") == "agent-v2-0001", "slugify should normalize actor names")
     assert_true(actor_runtime_name("agent:V2 0001") == "agent-v2-0001", "actor runtime names should be stable slugs")
     assert_true(actor_target("cmv2-demo", "agent:V2 0001") == "cmv2-demo:agent-v2-0001", "runtime targets should combine session/actor")
@@ -175,22 +237,34 @@ def main() -> int:
         "backend": "tmux",
         "runtime_target": "cmv2-demo:agent-v2-0001",
         "launch_token_sha256": spawn_payload["launch_token_sha256"],
+        "recovery_generation": spawn_payload["recovery_generation"],
     }
-    _validate_spawn_observation({"payload": spawn_payload}, valid_observation)
+    spawn_effect = {
+        "payload": spawn_payload,
+        "generation": spawn_payload["recovery_generation"],
+    }
+    _validate_spawn_observation(spawn_effect, valid_observation)
     corrupt_observation = {**valid_observation, "runtime_target": "victim:leader"}
     try:
-        _validate_spawn_observation({"payload": spawn_payload}, corrupt_observation)
+        _validate_spawn_observation(spawn_effect, corrupt_observation)
     except ValueError:
         pass
     else:
         raise AssertionError("spawn observation accepted a tmux target outside its effect fence")
     corrupt_token_observation = {**valid_observation, "launch_token_sha256": "0" * 64}
     try:
-        _validate_spawn_observation({"payload": spawn_payload}, corrupt_token_observation)
+        _validate_spawn_observation(spawn_effect, corrupt_token_observation)
     except ValueError:
         pass
     else:
         raise AssertionError("spawn observation accepted a launch token outside its effect fence")
+    corrupt_generation_observation = {**valid_observation, "recovery_generation": 1}
+    try:
+        _validate_spawn_observation(spawn_effect, corrupt_generation_observation)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("spawn observation accepted a stale recovery generation")
     effect_actor["runtime"].update({"container_name": "worker-1", "container_id": "b" * 64})
     stop_payload = _stop_effect_payload(effect_actor, reason="unit")
     assert_true(

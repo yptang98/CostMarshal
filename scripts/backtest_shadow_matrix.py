@@ -220,6 +220,7 @@ def valid_provider_chain(
     if (
         not isinstance(value, list)
         or not value
+        or len(value) > 3
         or any(not isinstance(provider_id, str) or provider_id not in providers for provider_id in value)
         or len(value) != len(set(value))
     ):
@@ -227,7 +228,7 @@ def valid_provider_chain(
     if any(providers[provider_id].get("enabled") is not True for provider_id in value):
         return False
     ranks = [TIER_RANK[providers[provider_id]["tier"]] for provider_id in value]
-    return ranks == sorted(set(ranks)) and ranks[0] >= TIER_RANK[floor]
+    return ranks == sorted(ranks) and ranks[0] >= TIER_RANK[floor]
 
 
 def validate_policy_manifest(dataset: dict[str, Any], blockers: list[str]) -> dict[str, Any] | None:
@@ -511,13 +512,13 @@ def validate_dataset(
         baseline_provider_ids = raw.get("baseline_provider_ids")
         if not valid_provider_chain(candidate_provider_ids, floor, enabled_providers):
             blockers.append(
-                f"{label}.candidate_provider_ids must name an enabled, strictly tier-increasing "
-                f"provider chain that respects the {floor} floor"
+                f"{label}.candidate_provider_ids must name at most three enabled, unique providers "
+                f"in a non-decreasing tier chain that respects the {floor} floor"
             )
         if not valid_provider_chain(baseline_provider_ids, floor, enabled_providers):
             blockers.append(
-                f"{label}.baseline_provider_ids must name an enabled, strictly tier-increasing "
-                f"provider chain that respects the {floor} floor"
+                f"{label}.baseline_provider_ids must name at most three enabled, unique providers "
+                f"in a non-decreasing tier chain that respects the {floor} floor"
             )
 
         policy_chains_valid = False

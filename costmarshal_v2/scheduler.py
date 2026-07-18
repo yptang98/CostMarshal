@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 from .control_store import (
     ControlStoreError,
@@ -51,6 +51,7 @@ from .change_apply import (
 from .mailbox import deliver_outbox_message, inbox_message_ids, send_message
 from .paths import ProjectLayout, actor_runtime_name, actor_target, default_root, make_project_id, relpath, resolve_project, slugify
 from .session_backend import (
+    LocalProcessBackend,
     actor_runtime,
     backend_from_session,
     command_display,
@@ -195,6 +196,12 @@ SPAWN_RUNTIME_FENCE_KEYS = (
     "runtime_session_name",
     "runtime_actor_name",
     "runtime_target",
+)
+WINDOWS_JOB_RUNTIME_KEYS = (
+    "windows_job_name",
+    "windows_job_identity",
+    "windows_job_child_pid",
+    "windows_job_child_start_marker",
 )
 SCHEDULER_HEARTBEAT_SECONDS = 10.0
 GOVERNANCE_PREFLIGHT_COMMANDS = frozenset(
@@ -564,6 +571,23 @@ def require_probability(value: float | None, label: str) -> float | None:
     return result
 
 
+def effective_routing_objective(
+    project: dict[str, Any], explicit: str | None = None
+) -> tuple[str, str]:
+    raw = explicit
+    source = "task-explicit"
+    if raw is None:
+        policy = project.get("routing_policy")
+        raw = policy.get("routing_objective") if isinstance(policy, dict) else None
+        source = "project-default" if raw is not None else "legacy-cost-only"
+    value = "cost-only" if raw is None else str(raw).strip().lower()
+    if value not in {"completion-first", "cost-only"}:
+        raise SystemExit(
+            "routing objective must be one of: completion-first, cost-only"
+        )
+    return value, source
+
+
 def total_tokens(
     input_tokens: int,
     output_tokens: int,
@@ -743,7 +767,7 @@ def actor_role_contract(role: str) -> list[str]:
             "Escalate rather than changing write scope, reading raw transcripts, exposing secrets, or making architectural decisions outside the brief.",
             "Return one concise final report for leader verification; do not spend tokens trying to edit CostMarshal runtime files.",
         ]
-    return ["Follow the CostMarshal v2 protocol for this actor role."]
+    return ["Follow the CostMarshal v3 protocol for this actor role."]
 
 
 def render_actor_prompt(layout: ProjectLayout, actor: dict[str, Any]) -> str:
@@ -753,7 +777,7 @@ def render_actor_prompt(layout: ProjectLayout, actor: dict[str, Any]) -> str:
     task = load_task(layout, task_id) if task_id and task_exists(layout, task_id) else None
     mailbox = actor.get("mailbox") or {}
     lines = [
-        f"# CostMarshal v2 Actor Prompt: {actor['id']}",
+        f"# CostMarshal v3 Actor Prompt: {actor['id']}",
         "",
         f"Project: {project.get('name')} (`{project.get('project_id')}`)",
         f"Objective: {project.get('objective')}",
@@ -1118,7 +1142,7 @@ def preflight_worker_isolation(
 def protocol_text() -> str:
     return "\n".join(
         [
-            "# CostMarshal v2 Protocol",
+            "# CostMarshal v3 Protocol",
             "",
             "The scheduler is a relay and process supervisor. It does not perform project reasoning, implementation, or technical review.",
             "",
@@ -1281,8 +1305,11 @@ def command_init(args: Any) -> None:
         },
         "provider_catalog": provider_catalog,
         "routing_policy": {
-            "version": 2,
+            "version": 3,
             "mode": "cost-performance",
+            "routing_objective": str(
+                getattr(args, "routing_objective", None) or "completion-first"
+            ),
             "tier_order": ["low", "medium", "high"],
             "project_budget_cny": project_budget,
             "default_min_success_probability": default_min_success,
@@ -1358,6 +1385,7 @@ def start_actor(
     *,
     dry_run: bool,
     persist_runtime_state: bool = True,
+    prepared_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     project = load_project(layout)
     if (
@@ -1434,14 +1462,41 @@ def start_actor(
     if persist_runtime_state:
         save_actor(layout, actor)
         sync_actor_summary(layout, actor)
+    def persist_prepared_runtime(prepared: dict[str, Any]) -> None:
+        if persist_runtime_state:
+            prepared_actor = load_actor(layout, actor["id"])
+            prepared_runtime = actor_runtime(prepared_actor)
+            prepared_actor["status"] = "starting"
+            prepared_runtime["target"] = prepared.get("target")
+            prepared_runtime["pid"] = prepared.get("pid")
+            prepared_runtime["process_start_marker"] = prepared.get(
+                "process_start_marker"
+            )
+            for key in WINDOWS_JOB_RUNTIME_KEYS:
+                if prepared.get(key) is not None:
+                    prepared_runtime[key] = prepared[key]
+            prepared_runtime["windows_job_launch_phase"] = "prepared"
+            save_actor(layout, prepared_actor)
+            sync_actor_summary(layout, prepared_actor)
+        if prepared_callback is not None:
+            prepared_callback(prepared)
+
+    backend_start_kwargs: dict[str, Any] = {}
+    if backend.kind == "local" and os.name == "nt":
+        backend_start_kwargs["prepared_callback"] = persist_prepared_runtime
     launch = backend.start_actor(
         session_name=session_name,
         actor_name=runtime_name,
         command=command,
         cwd=layout.project_dir,
         log_path=layout.transcripts_dir / f"{slugify(actor['id'], 'actor')}.log",
+        **backend_start_kwargs,
     )
-    process_marker = pid_start_marker(launch.get("pid")) if backend.kind == "local" else None
+    process_marker = (
+        launch.get("process_start_marker") or pid_start_marker(launch.get("pid"))
+        if backend.kind == "local"
+        else None
+    )
     if persist_runtime_state:
         actor = load_actor(layout, actor["id"])
         runtime = actor_runtime(actor)
@@ -1451,6 +1506,11 @@ def start_actor(
         runtime["target"] = launch.get("target")
         runtime["pid"] = launch.get("pid")
         runtime["process_start_marker"] = process_marker
+        for key in WINDOWS_JOB_RUNTIME_KEYS:
+            if launch.get(key) is not None:
+                runtime[key] = launch[key]
+        if runtime.get("windows_job_identity"):
+            runtime["windows_job_launch_phase"] = "started"
         runtime["log_path"] = relpath(Path(launch["log_path"]), layout.project_dir) if launch.get("log_path") else None
         save_actor(layout, actor)
         sync_actor_summary(layout, actor)
@@ -1462,7 +1522,10 @@ def start_actor(
             "process_start_marker": process_marker,
             "log_path": relpath(Path(launch["log_path"]), layout.project_dir) if launch.get("log_path") else None,
         }
-    return {
+        for key in WINDOWS_JOB_RUNTIME_KEYS:
+            if launch.get(key) is not None:
+                runtime[key] = launch[key]
+    response = {
         "actor": actor["id"],
         "dry_run": False,
         "backend": backend.kind,
@@ -1472,6 +1535,16 @@ def start_actor(
         "runtime_target": runtime.get("target"),
         "process_start_marker": runtime.get("process_start_marker"),
     }
+    for key in WINDOWS_JOB_RUNTIME_KEYS:
+        if runtime.get(key) is not None:
+            response[key] = runtime[key]
+    return response
+
+
+def _windows_job_backend_kwargs(runtime: dict[str, Any]) -> dict[str, Any]:
+    if runtime.get("backend") != "local":
+        return {}
+    return {key: runtime.get(key) for key in WINDOWS_JOB_RUNTIME_KEYS}
 
 
 def _spawn_effect_id(attempt_id: str) -> str:
@@ -1490,6 +1563,9 @@ def _spawn_effect_payload(actor: dict[str, Any]) -> dict[str, Any]:
     profile_binding = actor.get("profile_binding") or {}
     runtime = actor.get("runtime") or {}
     runtime_backend = runtime.get("backend")
+    recovery_generation = runtime.get("recovery_generation")
+    if type(recovery_generation) is not int or recovery_generation < 0:
+        recovery_generation = 0
     return {
         "actor_id": actor_id,
         "task_id": task_id,
@@ -1500,6 +1576,7 @@ def _spawn_effect_payload(actor: dict[str, Any]) -> dict[str, Any]:
         "runtime_session_name": str(runtime.get("session_name") or ""),
         "runtime_actor_name": str(runtime.get("actor_name") or ""),
         "runtime_target": str(runtime.get("target") or "") if runtime_backend == "tmux" else "",
+        "recovery_generation": recovery_generation,
     }
 
 
@@ -1508,7 +1585,7 @@ def _stop_effect_payload(actor: dict[str, Any], *, reason: str | None) -> dict[s
     actor_id = actor.get("id")
     if not isinstance(actor_id, str) or not actor_id:
         raise ValueError("stop actor id must be a non-empty string")
-    return {
+    payload = {
         "actor_id": actor_id,
         "attempt_id": str(actor.get("attempt_id") or ""),
         "process_start_marker": str(runtime.get("process_start_marker") or ""),
@@ -1516,6 +1593,9 @@ def _stop_effect_payload(actor: dict[str, Any], *, reason: str | None) -> dict[s
         "container_id": str(runtime.get("container_id") or ""),
         "reason": str(reason or ""),
     }
+    for key in WINDOWS_JOB_RUNTIME_KEYS:
+        payload[key] = runtime.get(key)
+    return payload
 
 
 def _validate_stop_effect(layout: ProjectLayout, effect: dict[str, Any]) -> dict[str, Any]:
@@ -1535,6 +1615,9 @@ def _validate_stop_effect(layout: ProjectLayout, effect: dict[str, Any]) -> dict
     if expected_marker and expected_marker != current_marker:
         raise ValueError("stop effect process marker is stale")
     runtime = actor.get("runtime") or {}
+    for key in WINDOWS_JOB_RUNTIME_KEYS:
+        if payload.get(key) is not None and payload.get(key) != runtime.get(key):
+            raise ValueError(f"stop effect {key} fence does not match the actor")
     expected_container_name = str(payload.get("container_name") or "")
     if expected_container_name and expected_container_name != str(runtime.get("container_name") or ""):
         raise ValueError("stop effect container name fence does not match the actor")
@@ -1659,11 +1742,14 @@ def _cleanup_prestart_credential(
         credential_identifier=credential_id,
         bytes_removed=bytes_removed,
     )
-    return {
+    observation = {
         "identifier": credential_id,
         "deleted": deleted,
         "bytes_removed": bytes_removed,
     }
+    return observation
+
+
 def _registered_spawn_observation(actor: dict[str, Any]) -> dict[str, Any] | None:
     """Return durable proof that this exact fenced attempt already entered its runner."""
 
@@ -1673,18 +1759,29 @@ def _registered_spawn_observation(actor: dict[str, Any]) -> dict[str, Any] | Non
         return None
     if runtime.get("registered_profile_sha256") != payload["profile_sha256"]:
         return None
+    registered_generation = runtime.get("registered_recovery_generation")
+    current_generation = runtime.get("recovery_generation")
+    if (
+        type(registered_generation) is not int
+        or registered_generation <= 0
+        or type(current_generation) is not int
+        or registered_generation != current_generation
+    ):
+        return None
     if runtime.get("provider_execution_state") not in {
+        "launch_pending_authorization",
         "started",
         "finished_pending_finalize",
         "finished",
     }:
         return None
-    return {
+    observation = {
         "source": "runner_registration",
         "actor_id": payload["actor_id"],
         "task_id": payload["task_id"],
         "attempt_id": payload["attempt_id"],
         "launch_token_sha256": payload["launch_token_sha256"],
+        "recovery_generation": registered_generation,
         "backend": runtime.get("backend"),
         "pid": runtime.get("pid") or runtime.get("runner_pid"),
         "runtime_target": runtime.get("target"),
@@ -1694,6 +1791,131 @@ def _registered_spawn_observation(actor: dict[str, Any]) -> dict[str, Any] | Non
         "container_command": runtime.get("container_command"),
         "container_network_id": runtime.get("container_network_id"),
     }
+    for key in WINDOWS_JOB_RUNTIME_KEYS:
+        observation[key] = runtime.get(key)
+    return observation
+
+
+def _retire_absent_spawn_runtime(actor: dict[str, Any]) -> None:
+    """Archive a generation's absent process identity before an explicit restart."""
+
+    runtime = actor.setdefault("runtime", {})
+    common_keys = (
+        "registered_launch_token_sha256",
+        "registered_profile_sha256",
+        "registered_recovery_generation",
+        "spawn_effect_id",
+    )
+    local_keys = (
+        "target",
+        "pid",
+        "process_start_marker",
+        "runner_pid",
+        "runner_process_start_marker",
+        "started_at",
+        "windows_job_launch_phase",
+        "prepared_spawn_effect_id",
+        *WINDOWS_JOB_RUNTIME_KEYS,
+    )
+    keys = common_keys + (local_keys if runtime.get("backend") == "local" else ())
+    retired = {
+        key: runtime.get(key)
+        for key in keys
+        if runtime.get(key) is not None
+    }
+    if retired:
+        runtime.setdefault("retired_spawn_runtimes", []).append(
+            {
+                "retired_at": now_iso(),
+                "recovery_generation": runtime.get("recovery_generation"),
+                "confirmed_absent": True,
+                "identity": retired,
+            }
+        )
+    for key in keys:
+        runtime.pop(key, None)
+
+
+def _backend_spawn_observation(
+    layout: ProjectLayout,
+    actor: dict[str, Any],
+    launch: dict[str, Any],
+) -> dict[str, Any]:
+    observation = {
+        "source": "backend_start",
+        "actor_id": actor["id"],
+        "task_id": actor.get("task_id"),
+        "attempt_id": actor.get("attempt_id"),
+        "launch_token_sha256": _spawn_effect_payload(actor)["launch_token_sha256"],
+        "recovery_generation": _spawn_effect_payload(actor)["recovery_generation"],
+        "backend": launch.get("backend") or (actor.get("runtime") or {}).get("backend"),
+        "pid": launch.get("pid"),
+        "runtime_target": launch.get("runtime_target") or launch.get("target"),
+        "process_start_marker": launch.get("process_start_marker"),
+        "log_path": relpath(
+            layout.transcripts_dir / f"{slugify(actor['id'], 'actor')}.log",
+            layout.project_dir,
+        ),
+    }
+    for key in WINDOWS_JOB_RUNTIME_KEYS:
+        observation[key] = launch.get(key)
+    return observation
+
+
+def _require_live_windows_spawn_observation(
+    layout: ProjectLayout,
+    observation: dict[str, Any],
+) -> None:
+    if (
+        observation.get("backend") != "local"
+        or not observation.get("windows_job_identity")
+    ):
+        return
+    runtime = {
+        "backend": "local",
+        "windows_job_name": observation.get("windows_job_name"),
+        "windows_job_identity": observation.get("windows_job_identity"),
+        "windows_job_child_pid": observation.get("windows_job_child_pid"),
+        "windows_job_child_start_marker": observation.get(
+            "windows_job_child_start_marker"
+        ),
+    }
+    if LocalProcessBackend().actor_alive(
+        session_name="windows-job",
+        actor_name="windows-job",
+        target=observation.get("runtime_target"),
+        pid=observation.get("pid"),
+        process_start_marker=observation.get("process_start_marker"),
+        **_windows_job_backend_kwargs(runtime),
+    ):
+        return
+
+    # A short-lived runner can finish and release the named Job before a
+    # crashed SPAWN owner reacquires its lease.  The runner-registration record
+    # is itself the durable proof needed by this effect: it is bound to the
+    # launch token, profile, attempt, and exact Job receipt before provider I/O.
+    # Accept only a terminal registered state whose frozen identity is still
+    # byte-for-byte identical; an absent non-terminal Job remains recovery work
+    # and is never implicitly respawned.
+    actor_id = observation.get("actor_id")
+    if (
+        observation.get("source") == "runner_registration"
+        and isinstance(actor_id, str)
+        and actor_exists(layout, actor_id)
+    ):
+        actor = load_actor(layout, actor_id)
+        registered = _registered_spawn_observation(actor)
+        provider_state = (actor.get("runtime") or {}).get(
+            "provider_execution_state"
+        )
+        if (
+            provider_state in {"finished_pending_finalize", "finished"}
+            and registered == observation
+        ):
+            return
+    raise ValueError(
+        "durable Windows Job spawn identity is absent; automatic respawn is disabled"
+    )
 
 
 def _validate_spawn_effect(layout: ProjectLayout, effect: dict[str, Any]) -> dict[str, Any]:
@@ -1711,6 +1933,11 @@ def _validate_spawn_effect(layout: ProjectLayout, effect: dict[str, Any]) -> dic
     if actor.get("id") != actor_id:
         raise ValueError("spawn effect actor identity does not match its authority path")
     expected = _spawn_effect_payload(actor)
+    effect_generation = effect.get("generation")
+    if type(effect_generation) is not int or effect_generation <= 0:
+        raise ValueError("spawn effect generation is invalid")
+    if expected["recovery_generation"] != effect_generation:
+        raise ValueError("spawn effect recovery generation does not match the actor")
     runtime_fence_keys = set(SPAWN_RUNTIME_FENCE_KEYS)
     present_runtime_fences = runtime_fence_keys.intersection(payload)
     if present_runtime_fences and present_runtime_fences != runtime_fence_keys:
@@ -1743,6 +1970,12 @@ def _validate_spawn_observation(effect: dict[str, Any], observation: dict[str, A
         raise ValueError("spawn observation backend does not match the effect fence")
     if observation.get("launch_token_sha256") != payload.get("launch_token_sha256"):
         raise ValueError("spawn observation launch token does not match the effect fence")
+    if (
+        type(observation.get("recovery_generation")) is not int
+        or observation.get("recovery_generation") != effect.get("generation")
+        or observation.get("recovery_generation") != payload.get("recovery_generation")
+    ):
+        raise ValueError("spawn observation recovery generation does not match the effect fence")
     if payload.get("runtime_backend") == "tmux" and observation.get("runtime_target") != payload.get("runtime_target"):
         raise ValueError("spawn observation tmux target does not match the effect fence")
 
@@ -1780,6 +2013,11 @@ def _record_spawn_observation(
         runtime["process_start_marker"] = (
             observation.get("process_start_marker") or runtime.get("process_start_marker")
         )
+        for key in WINDOWS_JOB_RUNTIME_KEYS:
+            if observation.get(key) is not None:
+                runtime[key] = observation[key]
+        if runtime.get("windows_job_identity"):
+            runtime["windows_job_launch_phase"] = "started"
         runtime["log_path"] = observation.get("log_path") or runtime.get("log_path")
         runtime["spawn_effect_id"] = effect_id
         save_actor(layout, actor)
@@ -2045,6 +2283,10 @@ def _execute_stop_effect(
             ("container_id", "container_id"),
             ("container_command", "container_command"),
             ("container_network_id", "container_network_id"),
+            ("windows_job_name", "windows_job_name"),
+            ("windows_job_identity", "windows_job_identity"),
+            ("windows_job_child_pid", "windows_job_child_pid"),
+            ("windows_job_child_start_marker", "windows_job_child_start_marker"),
         ):
             if spawn_observation.get(observation_key) is not None:
                 runtime[runtime_key] = spawn_observation[observation_key]
@@ -2077,6 +2319,7 @@ def _execute_stop_effect(
                 target=runtime.get("target"),
                 pid=runtime.get("pid"),
                 process_start_marker=runtime.get("process_start_marker"),
+                **_windows_job_backend_kwargs(runtime),
             )
         source = "already_stopped" if provider_finished or not backend_alive else "backend_stop"
         container_status = None
@@ -2129,6 +2372,7 @@ def _execute_stop_effect(
                 target=str(runtime.get("target") or ""),
                 pid=runtime.get("pid"),
                 process_start_marker=runtime.get("process_start_marker"),
+                **_windows_job_backend_kwargs(runtime),
             )
         _scheduler_fault("effect.after_stop_before_observe")
         observation = {
@@ -2145,6 +2389,8 @@ def _execute_stop_effect(
             "container_removed": cleanup.container_removed if cleanup is not None else None,
             "credential_deleted": cleanup.credential.deleted if cleanup is not None else None,
         }
+        for key in WINDOWS_JOB_RUNTIME_KEYS:
+            observation[key] = runtime.get(key)
         observe_effect(layout, effect_id=str(effect["effect_id"]), owner=owner, observation=observation)
         _scheduler_fault("effect.after_stop_observe_before_apply")
     _record_stop_observation(layout, effect=effect, observation=observation)
@@ -2706,26 +2952,131 @@ def _process_runtime_effects_under_instance_lock(
                             actor = _validate_spawn_effect(layout, effect)
                             if actor.get("stop_requested_at") or actor.get("status") == "stopped":
                                 raise ValueError("spawn cancelled by an explicit stop request")
-                            launch = start_actor(layout, actor, dry_run=False, persist_runtime_state=False)
-                            observation = {
-                                "source": "backend_start",
-                                "actor_id": actor["id"],
-                                "task_id": actor.get("task_id"),
-                                "attempt_id": actor.get("attempt_id"),
-                                "launch_token_sha256": _spawn_effect_payload(actor)["launch_token_sha256"],
-                                "backend": launch.get("backend"),
-                                "pid": launch.get("pid"),
-                                "runtime_target": launch.get("runtime_target"),
-                                "process_start_marker": launch.get("process_start_marker"),
-                                "log_path": relpath(
-                                    layout.transcripts_dir / f"{slugify(actor['id'], 'actor')}.log",
-                                    layout.project_dir,
-                                ),
-                            }
+                            prepared_runtime = actor.get("runtime") or {}
+                            if (
+                                prepared_runtime.get("windows_job_launch_phase")
+                                in {"prepared", "resume_authorized"}
+                                and prepared_runtime.get("windows_job_identity")
+                            ):
+                                raise ValueError(
+                                    "a durable Windows Job preparation exists without a final start receipt; "
+                                    "automatic respawn is disabled"
+                                )
+                            prepared_observation: dict[str, Any] | None = None
+
+                            def persist_prepared_observation(
+                                prepared_launch: dict[str, Any],
+                            ) -> None:
+                                nonlocal prepared_observation
+                                candidate = _backend_spawn_observation(
+                                    layout,
+                                    actor,
+                                    {
+                                        **prepared_launch,
+                                        "backend": "local",
+                                        "runtime_target": prepared_launch.get("target"),
+                                    },
+                                )
+                                _validate_spawn_observation(effect, candidate)
+                                with control_transaction(
+                                    layout,
+                                    command_name="effect_spawn_prepared",
+                                    command_id=(
+                                        f"EFFECT-PREPARED-{effect_id}-"
+                                        f"{str(candidate.get('windows_job_identity') or '').removeprefix('windows-job-v1:')}"
+                                    ),
+                                    payload={
+                                        "effect_id": effect_id,
+                                        "prepared_runtime": candidate,
+                                    },
+                                ) as prepared_transaction:
+                                    if not prepared_transaction.replay:
+                                        prepared_actor = _validate_spawn_effect(
+                                            layout, effect
+                                        )
+                                        if (
+                                            prepared_actor.get("stop_requested_at")
+                                            or prepared_actor.get("status") == "stopped"
+                                        ):
+                                            raise ValueError(
+                                                "spawn was stopped before Windows Job resume authorization"
+                                            )
+                                        prepared_runtime = prepared_actor.setdefault(
+                                            "runtime", {}
+                                        )
+                                        existing_identity = prepared_runtime.get(
+                                            "windows_job_identity"
+                                        )
+                                        if (
+                                            existing_identity is not None
+                                            and existing_identity
+                                            != candidate.get("windows_job_identity")
+                                        ):
+                                            raise ValueError(
+                                                "spawn already has a different prepared Windows Job identity"
+                                            )
+                                        prepared_actor["status"] = "starting"
+                                        prepared_runtime["target"] = candidate.get(
+                                            "runtime_target"
+                                        )
+                                        prepared_runtime["pid"] = candidate.get("pid")
+                                        prepared_runtime["process_start_marker"] = (
+                                            candidate.get("process_start_marker")
+                                        )
+                                        for key in WINDOWS_JOB_RUNTIME_KEYS:
+                                            prepared_runtime[key] = candidate.get(key)
+                                        prepared_runtime[
+                                            "windows_job_launch_phase"
+                                        ] = "resume_authorized"
+                                        prepared_runtime[
+                                            "prepared_spawn_effect_id"
+                                        ] = effect_id
+                                        save_actor(layout, prepared_actor)
+                                        sync_actor_summary(layout, prepared_actor)
+                                prepared_observation = candidate
+                                _scheduler_fault(
+                                    "effect.after_spawn_prepared_before_resume"
+                                )
+
+                            launch = start_actor(
+                                layout,
+                                actor,
+                                dry_run=False,
+                                persist_runtime_state=False,
+                                prepared_callback=persist_prepared_observation,
+                            )
+                            final_observation = _backend_spawn_observation(
+                                layout, actor, launch
+                            )
+                            if prepared_observation is not None:
+                                identity_keys = {
+                                    "backend",
+                                    "pid",
+                                    "runtime_target",
+                                    "process_start_marker",
+                                    *WINDOWS_JOB_RUNTIME_KEYS,
+                                }
+                                if any(
+                                    prepared_observation.get(key)
+                                    != final_observation.get(key)
+                                    for key in identity_keys
+                                ):
+                                    raise ValueError(
+                                        "started runtime identity differs from its durable prepared observation"
+                                    )
+                                observation = prepared_observation
+                            else:
+                                observation = final_observation
                             _scheduler_fault("effect.after_spawn_before_observe")
                     _validate_spawn_observation(effect, observation)
-                    if effect.get("status") != "observed":
+                    _require_live_windows_spawn_observation(layout, observation)
+                    current_effect = effect_status(layout, effect_id)
+                    if current_effect.get("status") != "observed":
                         observe_effect(layout, effect_id=effect_id, owner=owner, observation=observation)
+                    elif current_effect.get("observation") != observation:
+                        raise ValueError(
+                            "durable prepared spawn observation changed before apply"
+                        )
                     _record_spawn_observation(layout, effect=effect, observation=observation)
                     applied = apply_effect(
                         layout,
@@ -3043,7 +3394,7 @@ def render_task_brief(task: dict[str, Any]) -> str:
         [
             f"# Task {task['id']}: {task['title']}",
             "",
-            "You are a CostMarshal v2 agent actor. Work only from this brief and the explicitly listed context.",
+            "You are a CostMarshal v3 agent actor. Work only from this brief and the explicitly listed context.",
             "",
             "## Purpose",
             task["purpose"],
@@ -3101,6 +3452,10 @@ def command_new_task(args: Any) -> None:
     if not str(args.purpose or "").strip():
         raise SystemExit("purpose is required")
     project = load_project(layout)
+    routing_objective, routing_objective_source = effective_routing_objective(
+        project,
+        getattr(args, "routing_objective", None),
+    )
     provider_request = str(getattr(args, "provider", None) or "auto").lower()
     tier_request = str(getattr(args, "tier", None) or "auto").lower()
     estimated_input_tokens = require_non_negative_int(getattr(args, "estimated_input_tokens", 0), "estimated-input-tokens")
@@ -3145,6 +3500,7 @@ def command_new_task(args: Any) -> None:
         "task_type": args.task_type,
         "required_capabilities": getattr(args, "required_capabilities", None) or [],
         "min_success_probability": effective_min_success,
+        "routing_objective": routing_objective,
     }
     try:
         route_preview = decide_route(
@@ -3205,6 +3561,8 @@ def command_new_task(args: Any) -> None:
         "required_capabilities": getattr(args, "required_capabilities", None) or [],
         "min_success_probability": effective_min_success,
         "min_success_probability_source": min_success_source,
+        "routing_objective": routing_objective,
+        "routing_objective_source": routing_objective_source,
         "route_preview": route_preview.to_dict(),
         "created_at": now_iso(),
         "updated_at": now_iso(),
@@ -3244,6 +3602,10 @@ def command_route(args: Any) -> None:
 
     layout = resolve_project(args.root, args.project)
     project = load_project(layout)
+    routing_objective, routing_objective_source = effective_routing_objective(
+        project,
+        getattr(args, "routing_objective", None),
+    )
     catalog = project_provider_catalog(project)
     explicit_min_success = require_probability(
         getattr(args, "min_success_probability", None),
@@ -3275,6 +3637,8 @@ def command_route(args: Any) -> None:
         "required_capabilities": getattr(args, "required_capabilities", None) or [],
         "min_success_probability": effective_min_success,
         "min_success_probability_source": min_success_source,
+        "routing_objective": routing_objective,
+        "routing_objective_source": routing_objective_source,
     }
     try:
         trusted_history = trusted_result_rows(layout)
@@ -3572,6 +3936,36 @@ def command_dispatch(args: Any) -> None:
             raw_provider = raw_provider if raw_provider is not None else stored_provider_request
             raw_tier = raw_tier if raw_tier is not None else stored_tier_request
         trusted_history = trusted_result_rows(layout)
+        route_input_tokens = int(task.get("estimated_input_tokens") or 0)
+        route_cached_input_tokens = int(
+            task.get("estimated_cached_input_tokens") or 0
+        )
+        route_output_tokens = int(task.get("estimated_output_tokens") or 0)
+        if (
+            persisted_envelope is not None
+            and persisted_envelope.get("status") == "active"
+            and persisted_envelope.get("schema_version")
+            == ROUTE_BUDGET_ENVELOPE_SCHEMA_V3
+        ):
+            next_step_index = _envelope_step_index(task, persisted_envelope)
+            envelope_steps = persisted_envelope["planned_steps"]
+            if next_step_index < len(envelope_steps):
+                step_forecast = envelope_steps[next_step_index].get(
+                    "token_forecast"
+                )
+                if not isinstance(step_forecast, dict):
+                    raise RoutingValidationError(
+                        "active route step lacks its per-step token forecast"
+                    )
+                route_input_tokens = int(
+                    step_forecast.get("estimated_input_tokens") or 0
+                )
+                route_cached_input_tokens = int(
+                    step_forecast.get("estimated_cached_input_tokens") or 0
+                )
+                route_output_tokens = int(
+                    step_forecast.get("estimated_output_tokens") or 0
+                )
         decision = decide_route(
             routing_task,
             catalog,
@@ -3579,9 +3973,9 @@ def command_dispatch(args: Any) -> None:
             requested_tier=None if raw_tier == "auto" else str(raw_tier).lower(),
             history=trusted_history,
             execution_identities=_routing_execution_identities(project),
-            input_tokens=int(task.get("estimated_input_tokens") or 0),
-            cached_input_tokens=int(task.get("estimated_cached_input_tokens") or 0),
-            output_tokens=int(task.get("estimated_output_tokens") or 0),
+            input_tokens=route_input_tokens,
+            cached_input_tokens=route_cached_input_tokens,
+            output_tokens=route_output_tokens,
         )
     except (ProfileBindingError, RoutingValidationError, ValueError) as exc:
         raise SystemExit(f"Unable to route task: {exc}") from exc
@@ -3992,6 +4386,12 @@ def command_dispatch(args: Any) -> None:
         raise SystemExit("custom worker commands cannot use recoverable runtime effects after SQLite cutover")
     if deferred_start:
         actor["status"] = "starting"
+        # The effect generation is also the runner-registration generation.
+        # A later explicit recovery increments this value, so evidence from a
+        # missing prior runner can never satisfy the new external start.
+        actor.setdefault("runtime", {})["recovery_generation"] = (
+            len(task.get("attempts") or []) + 1
+        )
     save_actor(layout, actor)
     sync_actor_summary(layout, actor)
     session = load_session(layout)
@@ -4141,7 +4541,7 @@ def command_dispatch(args: Any) -> None:
                 effect_id=effect_id,
                 effect_type=SPAWN_EFFECT_TYPE,
                 aggregate_id=attempt_id,
-                generation=len(task.get("attempts") or []),
+                generation=int((actor.get("runtime") or {})["recovery_generation"]),
                 payload=_spawn_effect_payload(actor),
             )
             start_payload = {"status": "queued", "effect_id": effect_id}
@@ -4460,6 +4860,7 @@ def execute_scheduler_command(
             max_cost_cny=command_args.get("max_cost_cny"),
             required_capabilities=as_list(command_args.get("required_capabilities")),
             min_success_probability=command_args.get("min_success_probability"),
+            routing_objective=command_args.get("routing_objective"),
             acceptance=as_list(command_args.get("acceptance")),
             allowed_context=as_list(command_args.get("allowed_context")),
             allowed_path=as_list(command_args.get("allowed_path")),
@@ -4551,9 +4952,21 @@ def execute_scheduler_command(
             task=command_args.get("task") or message.get("task_id"),
             attempt=command_args.get("attempt"),
             model=command_args.get("model"),
-            input_tokens=int(command_args.get("input_tokens") or 0),
-            cached_input_tokens=int(command_args.get("cached_input_tokens") or 0),
-            output_tokens=int(command_args.get("output_tokens") or 0),
+            input_tokens=(
+                None
+                if "input_tokens" not in command_args
+                else int(command_args.get("input_tokens") or 0)
+            ),
+            cached_input_tokens=(
+                None
+                if "cached_input_tokens" not in command_args
+                else int(command_args.get("cached_input_tokens") or 0)
+            ),
+            output_tokens=(
+                None
+                if "output_tokens" not in command_args
+                else int(command_args.get("output_tokens") or 0)
+            ),
             estimated_cost_cny=command_args.get("estimated_cost_cny"),
             final_usage=as_bool(command_args.get("final_usage") or command_args.get("final")),
             note=command_args.get("note"),
@@ -5295,6 +5708,29 @@ def command_escalate(args: Any) -> None:
         catalog = project_provider_catalog(project)
         current_provider = str(attempts[-1].get("provider") or task.get("provider") or "")
         current_spec = provider_by_id(catalog, current_provider)
+        sealed_preferred_chain: list[str] = []
+        sealed_same_tier_successor: str | None = None
+        active_envelope = validate_route_budget_envelope(task)
+        if active_envelope is not None and active_envelope.get("status") == "active":
+            next_step_index = _envelope_step_index(task, active_envelope)
+            envelope_steps = active_envelope["planned_steps"]
+            if (
+                0 < next_step_index < len(envelope_steps)
+                and previous.get("route_envelope_id") == active_envelope.get("envelope_id")
+                and previous.get("route_plan_fingerprint")
+                == active_envelope.get("plan_fingerprint")
+                and previous.get("route_plan_step_index") == next_step_index - 1
+                and envelope_steps[next_step_index - 1].get("provider_id") == current_provider
+                and previous.get("route_plan_step")
+                == envelope_steps[next_step_index - 1]
+            ):
+                sealed_preferred_chain = [
+                    str(step["provider_id"])
+                    for step in envelope_steps
+                ]
+                sealed_next = envelope_steps[next_step_index]
+                if TIER_RANK[str(sealed_next["tier"])] == TIER_RANK[str(current_spec["tier"])]:
+                    sealed_same_tier_successor = str(sealed_next["provider_id"])
         explicit_provider = getattr(args, "provider", None)
         explicit_tier = getattr(args, "to_tier", None)
         if explicit_provider:
@@ -5312,22 +5748,24 @@ def command_escalate(args: Any) -> None:
             )
             target = provider_by_id(catalog, decision.provider_id)
         else:
-            preferred_chain: list[str] = []
-            for prior_attempt in attempts:
-                route = prior_attempt.get("route_decision") or {}
-                chain = route.get("planned_provider_ids") if isinstance(route, dict) else None
-                if (
-                    isinstance(chain, list)
-                    and current_provider in chain
-                    and chain.index(current_provider) < len(chain) - 1
-                ):
-                    preferred_chain = [str(provider_id) for provider_id in chain]
-                    break
+            preferred_chain = sealed_preferred_chain
+            if not preferred_chain:
+                for prior_attempt in attempts:
+                    route = prior_attempt.get("route_decision") or {}
+                    chain = route.get("planned_provider_ids") if isinstance(route, dict) else None
+                    if (
+                        isinstance(chain, list)
+                        and current_provider in chain
+                        and chain.index(current_provider) < len(chain) - 1
+                    ):
+                        preferred_chain = [str(provider_id) for provider_id in chain]
+                        break
             target = next_stronger_provider(
                 catalog,
                 current_provider,
                 required_capabilities=task.get("required_capabilities") or (),
                 preferred_provider_ids=preferred_chain,
+                allow_same_tier_preferred=bool(sealed_preferred_chain),
                 history=trusted_result_rows(layout),
                 execution_identities=_routing_execution_identities(project),
                 task_type=str(task.get("task_type") or "analysis"),
@@ -5338,11 +5776,23 @@ def command_escalate(args: Any) -> None:
             )
         if target is None:
             raise SystemExit(f"Task is already at the strongest enabled provider tier: {args.task}")
-        if TIER_RANK[str(target["tier"])] <= TIER_RANK[str(current_spec["tier"])] and not getattr(args, "force", False):
+        target_rank = TIER_RANK[str(target["tier"])]
+        current_rank = TIER_RANK[str(current_spec["tier"])]
+        if str(target["provider_id"]) == current_provider:
             raise SystemExit(
-                f"Escalation target {target['provider_id']} ({target['tier']}) is not stronger than {current_provider} ({current_spec['tier']})"
+                f"Escalation cannot repeat provider {current_provider}"
             )
-    except (ProfileBindingError, RoutingValidationError) as exc:
+        if target_rank < current_rank:
+            raise SystemExit(
+                f"Escalation target {target['provider_id']} ({target['tier']}) is below "
+                f"{current_provider} ({current_spec['tier']})"
+            )
+        if target_rank == current_rank and str(target["provider_id"]) != sealed_same_tier_successor:
+            raise SystemExit(
+                f"Same-tier escalation target {target['provider_id']} ({target['tier']}) is not "
+                "the exact next provider in the active sealed route envelope"
+            )
+    except (ProfileBindingError, RoutingValidationError, ValueError) as exc:
         raise SystemExit(f"Unable to escalate task: {exc}") from exc
     if incomplete_origin is not None:
         if incomplete_origin.get("escalation_reason") != args.reason:
@@ -5543,6 +5993,7 @@ def command_stop_actor(args: Any) -> None:
                     target=target,
                     pid=pid,
                     process_start_marker=runtime.get("process_start_marker"),
+                    **_windows_job_backend_kwargs(runtime),
                 ),
             }
     if args.dry_run:
@@ -7451,12 +7902,23 @@ def command_record_usage(args: Any) -> None:
                 raise SystemExit(f"Usage {field} binding mismatch for attempt {attempt_id}")
         if bound_attempt.get("usage_final"):
             raise SystemExit(f"Usage is already final for attempt {attempt_id}")
-    input_tokens = require_non_negative_int(args.input_tokens, "input-tokens")
+    raw_input_tokens = getattr(args, "input_tokens", None)
+    raw_cached_input_tokens = getattr(args, "cached_input_tokens", None)
+    raw_output_tokens = getattr(args, "output_tokens", None)
+    usage_observed = any(
+        value is not None
+        for value in (
+            raw_input_tokens,
+            raw_cached_input_tokens,
+            raw_output_tokens,
+        )
+    )
+    input_tokens = require_non_negative_int(raw_input_tokens, "input-tokens")
     cached_input_tokens = require_non_negative_int(
-        getattr(args, "cached_input_tokens", 0),
+        raw_cached_input_tokens,
         "cached-input-tokens",
     )
-    output_tokens = require_non_negative_int(args.output_tokens, "output-tokens")
+    output_tokens = require_non_negative_int(raw_output_tokens, "output-tokens")
     raw_reported_cost = getattr(args, "estimated_cost_cny", None)
     try:
         estimated_cost_cny = (
@@ -7528,10 +7990,10 @@ def command_record_usage(args: Any) -> None:
                 )
             pricing_source = bound_source
             if estimated_cost_cny is not None:
-                cost_verified = (
-                    price_bound
-                    and input_tokens + cached_input_tokens + output_tokens > 0
-                )
+                # An explicit all-zero provider usage receipt still proves the
+                # per-attempt fixed fee.  Omitting every token dimension means
+                # usage is unknown and must keep the reservation unsettled.
+                cost_verified = price_bound and usage_observed
         except RoutingValidationError as exc:
             raise SystemExit(f"Unable to price usage: {exc}") from exc
     row = {
@@ -7555,6 +8017,7 @@ def command_record_usage(args: Any) -> None:
         "total_tokens": total_tokens(input_tokens, output_tokens, cached_input_tokens),
         "estimated_cost_cny": estimated_cost_cny,
         "cost_source": pricing_source,
+        "usage_observed": usage_observed,
         "final_usage": bool(getattr(args, "final_usage", False)),
         "note": args.note or "",
     }
@@ -7572,8 +8035,22 @@ def command_record_usage(args: Any) -> None:
                 attempt["usage_event_count"] = int(
                     attempt.get("usage_event_count") or 0
                 ) + 1
+                prior_events = attempt["usage_event_count"] - 1
+                if "usage_observation_count" not in attempt:
+                    # Old non-zero rows retain their historical verified
+                    # semantics.  Old zero-token rows remain unknown rather
+                    # than being retroactively reinterpreted as explicit zero.
+                    attempt["usage_observation_count"] = (
+                        prior_events
+                        if int(attempt.get("total_tokens") or 0) - row["total_tokens"] > 0
+                        else 0
+                    )
+                if usage_observed:
+                    attempt["usage_observation_count"] = int(
+                        attempt.get("usage_observation_count") or 0
+                    ) + 1
                 if (
-                    row["total_tokens"] > 0 or raw_reported_cost is not None
+                    usage_observed or raw_reported_cost is not None
                 ) and not cost_verified:
                     attempt["usage_cost_unverified"] = True
                 authoritative_units: int | None = None
@@ -7605,7 +8082,8 @@ def command_record_usage(args: Any) -> None:
                     attempt["estimated_cost_cny"] = authoritative_cost
                 cumulative_verified = bool(
                     authoritative_units is not None
-                    and attempt["total_tokens"] > 0
+                    and int(attempt.get("usage_observation_count") or 0)
+                    == int(attempt.get("usage_event_count") or 0)
                     and not attempt.get("usage_cost_unverified")
                 )
                 attempt["actual_cost_verified"] = cumulative_verified
@@ -7616,7 +8094,8 @@ def command_record_usage(args: Any) -> None:
                         attempt.pop("cost_settlement_blocked_reason", None)
                     else:
                         attempt["cost_settlement_blocked_reason"] = (
-                            "final cumulative usage contains unverified tokens or lacks immutable pricing"
+                            "final cumulative usage is missing an explicit token observation, "
+                            "contains unverified cost, or lacks immutable pricing"
                         )
                 attempt["cost_source"] = authoritative_source
                 break
@@ -8432,7 +8911,9 @@ def usage_rows(layout: ProjectLayout) -> list[dict[str, Any]]:
     return read_jsonl(layout.usage_jsonl)
 
 
-ROUTE_BUDGET_ENVELOPE_SCHEMA = "costmarshal-route-budget-envelope-v2"
+ROUTE_BUDGET_ENVELOPE_SCHEMA_V2 = "costmarshal-route-budget-envelope-v2"
+ROUTE_BUDGET_ENVELOPE_SCHEMA_V3 = "costmarshal-route-budget-envelope-v3"
+ROUTE_BUDGET_ENVELOPE_SCHEMA = ROUTE_BUDGET_ENVELOPE_SCHEMA_V3
 _MONEY_SCALE = 1_000_000_000
 _MONEY_QUANTUM = Decimal("0.000000001")
 
@@ -8499,6 +8980,27 @@ def _bind_route_step_profiles(
             )
         step["execution_identity"] = actual_identity
         step["profile_binding"] = binding
+        token_forecast = step.get("token_forecast")
+        if token_forecast is not None:
+            if not isinstance(token_forecast, dict):
+                raise ProfileBindingError(
+                    f"provider {provider['provider_id']} token forecast is invalid"
+                )
+            cache_mode = token_forecast.get("cache_mode")
+            cache_binding = token_forecast.get("cache_binding")
+            if cache_mode in {"bound-origin", "exact-identity-reuse"}:
+                expected_cache_binding = {
+                    "provider_id": str(provider["provider_id"]),
+                    **actual_identity,
+                }
+                if cache_binding != expected_cache_binding:
+                    raise ProfileBindingError(
+                        f"provider {provider['provider_id']} cache identity changed during route admission"
+                    )
+            elif cache_binding is not None:
+                raise ProfileBindingError(
+                    f"provider {provider['provider_id']} has an unexpected cache binding"
+                )
     return bound_steps
 
 
@@ -8729,10 +9231,25 @@ def validate_route_budget_envelope(task: dict[str, Any]) -> dict[str, Any] | Non
         "released_at",
         "release_reason",
     }
+    envelope_schema = raw.get("schema_version")
+    if envelope_schema not in {
+        ROUTE_BUDGET_ENVELOPE_SCHEMA_V2,
+        ROUTE_BUDGET_ENVELOPE_SCHEMA_V3,
+    }:
+        raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope schema is unsupported")
+    if envelope_schema == ROUTE_BUDGET_ENVELOPE_SCHEMA_V3:
+        expected_fields.add("routing_objective")
     if set(raw) != expected_fields:
         raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope has unexpected fields")
-    if raw.get("schema_version") != ROUTE_BUDGET_ENVELOPE_SCHEMA:
-        raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope schema is unsupported")
+    routing_objective = (
+        str(raw.get("routing_objective") or "").strip().lower()
+        if envelope_schema == ROUTE_BUDGET_ENVELOPE_SCHEMA_V3
+        else "cost-only"
+    )
+    if routing_objective not in {"completion-first", "cost-only"}:
+        raise ValueError(
+            f"task {task.get('id') or '?'} route_budget_envelope routing_objective is invalid"
+        )
     if not isinstance(raw.get("envelope_id"), str) or not raw["envelope_id"].startswith("ENV-"):
         raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope envelope_id is invalid")
     status = raw.get("status")
@@ -8756,9 +9273,11 @@ def validate_route_budget_envelope(task: dict[str, Any]) -> dict[str, Any] | Non
         if type(raw.get(field)) is not int or raw[field] < 0:
             raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope {field} is invalid")
     steps = raw.get("planned_steps")
-    if not isinstance(steps, list) or not steps:
+    if not isinstance(steps, list) or not 1 <= len(steps) <= 3:
         raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope planned_steps is invalid")
     step_cost_units = 0
+    seen_provider_ids: set[str] = set()
+    prior_tier_rank = -1
     for index, step in enumerate(steps):
         if not isinstance(step, dict):
             raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope step {index} is invalid")
@@ -8766,8 +9285,15 @@ def validate_route_budget_envelope(task: dict[str, Any]) -> dict[str, Any] | Non
             raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope steps are not contiguous")
         if not isinstance(step.get("provider_id"), str) or not step.get("provider_id"):
             raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope step {index} lacks provider_id")
+        if step["provider_id"] in seen_provider_ids:
+            raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope repeats a provider_id")
+        seen_provider_ids.add(step["provider_id"])
         if step.get("tier") not in TIER_RANK:
             raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope step {index} has invalid tier")
+        tier_rank = TIER_RANK[step["tier"]]
+        if tier_rank < prior_tier_rank:
+            raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope contains a tier downgrade")
+        prior_tier_rank = tier_rank
         if not isinstance(step.get("acceptance_prior"), dict):
             raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope step {index} lacks acceptance_prior")
         if not isinstance(step.get("price_basis"), dict):
@@ -8803,6 +9329,15 @@ def validate_route_budget_envelope(task: dict[str, Any]) -> dict[str, Any] | Non
                 raise ValueError(
                     f"task {task.get('id') or '?'} route_budget_envelope step {index} profile binding is invalid"
                 ) from exc
+        has_forecast = "token_forecast" in step
+        if envelope_schema == ROUTE_BUDGET_ENVELOPE_SCHEMA_V3 and not has_forecast:
+            raise ValueError(
+                f"task {task.get('id') or '?'} route_budget_envelope step {index} lacks token_forecast"
+            )
+        if envelope_schema == ROUTE_BUDGET_ENVELOPE_SCHEMA_V2 and has_forecast:
+            raise ValueError(
+                f"task {task.get('id') or '?'} legacy route_budget_envelope contains a v3 token_forecast"
+            )
         step_cost_units += _money_units(
             step.get("estimated_cost_cny"),
             f"task {task.get('id') or '?'} route_budget_envelope step {index} estimated_cost_cny",
@@ -8817,12 +9352,23 @@ def validate_route_budget_envelope(task: dict[str, Any]) -> dict[str, Any] | Non
     )
     if reserved_units != step_cost_units:
         raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope reserve does not equal its planned steps")
+    if (
+        envelope_schema == ROUTE_BUDGET_ENVELOPE_SCHEMA_V2
+        and status == "active"
+        and len(steps) > 1
+        and int(raw.get("estimated_cached_input_tokens") or 0) > 0
+    ):
+        raise ValueError(
+            f"task {task.get('id') or '?'} active legacy route envelope cannot prove cached-input portability; "
+            "create a new task with a per-step forecast"
+        )
     try:
         fingerprint = route_plan_fingerprint(
             steps,
             input_tokens=raw["estimated_input_tokens"],
             cached_input_tokens=raw["estimated_cached_input_tokens"],
             output_tokens=raw["estimated_output_tokens"],
+            routing_objective=routing_objective,
         )
     except (RoutingValidationError, TypeError, ValueError) as exc:
         raise ValueError(f"task {task.get('id') or '?'} route_budget_envelope fingerprint input is invalid") from exc
@@ -8853,6 +9399,7 @@ def make_route_budget_envelope(
         input_tokens=decision.estimated_input_tokens,
         cached_input_tokens=decision.estimated_cached_input_tokens,
         output_tokens=decision.estimated_output_tokens,
+        routing_objective=decision.routing_objective,
     )
     reserve_units = sum(
         _money_units(
@@ -8869,6 +9416,7 @@ def make_route_budget_envelope(
         "schema_version": ROUTE_BUDGET_ENVELOPE_SCHEMA,
         "envelope_id": envelope_id,
         "plan_fingerprint": plan_fingerprint,
+        "routing_objective": decision.routing_objective,
         "estimated_input_tokens": decision.estimated_input_tokens,
         "estimated_cached_input_tokens": decision.estimated_cached_input_tokens,
         "estimated_output_tokens": decision.estimated_output_tokens,
@@ -8989,6 +9537,13 @@ def validate_envelope_dispatch_step(
             f"task {task.get('id') or '?'} route plan requires step {index} "
             f"{step.get('provider_id')} ({step.get('tier')}), not {decision.provider_id} ({decision.tier})"
         )
+    if (
+        envelope.get("schema_version") == ROUTE_BUDGET_ENVELOPE_SCHEMA_V3
+        and decision.routing_objective != envelope.get("routing_objective")
+    ):
+        raise ValueError(
+            f"task {task.get('id') or '?'} route plan objective drifted before step {index}; replan explicitly"
+        )
     current_basis = provider_price_basis(provider_spec)
     if current_basis != step.get("price_basis"):
         raise ValueError(
@@ -9016,13 +9571,27 @@ def validate_envelope_dispatch_step(
         decision.estimated_cached_input_tokens,
         decision.estimated_output_tokens,
     )
-    bound_forecast = (
-        envelope["estimated_input_tokens"],
-        envelope["estimated_cached_input_tokens"],
-        envelope["estimated_output_tokens"],
-    )
+    if envelope.get("schema_version") == ROUTE_BUDGET_ENVELOPE_SCHEMA_V3:
+        step_forecast = step.get("token_forecast")
+        if not isinstance(step_forecast, dict):
+            raise ValueError(
+                f"task {task.get('id') or '?'} route plan step {index} lacks token forecast"
+            )
+        bound_forecast = (
+            step_forecast.get("estimated_input_tokens"),
+            step_forecast.get("estimated_cached_input_tokens"),
+            step_forecast.get("estimated_output_tokens"),
+        )
+    else:
+        bound_forecast = (
+            envelope["estimated_input_tokens"],
+            envelope["estimated_cached_input_tokens"],
+            envelope["estimated_output_tokens"],
+        )
     if forecast != bound_forecast:
-        raise ValueError(f"task {task.get('id') or '?'} route plan token forecast drifted; replan explicitly")
+        raise ValueError(
+            f"task {task.get('id') or '?'} route plan step {index} token forecast drifted; replan explicitly"
+        )
     return index, step
 
 
@@ -9397,14 +9966,19 @@ def process_liveness(layout: ProjectLayout, actor: dict[str, Any]) -> dict[str, 
     alive = False
     reason = "backend_unavailable"
     if backend_available:
-        alive = backend.actor_alive(
-            session_name=backend_session_name(session),
-            actor_name=runtime_name,
-            target=runtime.get("target"),
-            pid=runtime.get("pid"),
-            process_start_marker=runtime.get("process_start_marker"),
-        )
-        reason = "alive" if alive else "not_found"
+        try:
+            alive = backend.actor_alive(
+                session_name=backend_session_name(session),
+                actor_name=runtime_name,
+                target=runtime.get("target"),
+                pid=runtime.get("pid"),
+                process_start_marker=runtime.get("process_start_marker"),
+                **_windows_job_backend_kwargs(runtime),
+            )
+            reason = "alive" if alive else "not_found"
+        except RuntimeError as exc:
+            alive = False
+            reason = f"needs_recovery:{type(exc).__name__}:{exc}"
     return {"alive": alive, "reason": reason, "backend_available": backend_available}
 
 
@@ -9463,7 +10037,7 @@ def render_dashboard(payload: dict[str, Any]) -> str:
     backend = payload.get("backend") or {}
     scheduler = payload.get("scheduler") or {}
     lines = [
-        f"# CostMarshal v2 Dashboard: {project.get('name')}",
+        f"# CostMarshal v3 Dashboard: {project.get('name')}",
         "",
         f"Project id: `{project.get('project_id')}`",
         f"Objective: {compact_text(project.get('objective') or '', 120)}",
@@ -9555,7 +10129,7 @@ def command_status(args: Any) -> None:
         print_json(payload)
         return
     lines = [
-        f"# CostMarshal v2 Status: {payload['project'].get('name')}",
+        f"# CostMarshal v3 Status: {payload['project'].get('name')}",
         "",
         f"Project id: `{payload['project'].get('project_id')}`",
         f"Backend: `{(payload.get('backend') or {}).get('kind')}`",
@@ -9683,13 +10257,24 @@ def command_recover(args: Any) -> None:
                 issues.append(f"invalid runtime binding for {actor['id']}: {exc}")
                 continue
             runtime_name = runtime.get("actor_name") or actor_runtime_name(actor["id"])
-            is_alive = backend.actor_alive(
-                session_name=session_name,
-                actor_name=runtime_name,
-                target=runtime.get("target"),
-                pid=runtime.get("pid"),
-                process_start_marker=runtime.get("process_start_marker"),
-            )
+            try:
+                is_alive = backend.actor_alive(
+                    session_name=session_name,
+                    actor_name=runtime_name,
+                    target=runtime.get("target"),
+                    pid=runtime.get("pid"),
+                    process_start_marker=runtime.get("process_start_marker"),
+                    **_windows_job_backend_kwargs(runtime),
+                )
+            except RuntimeError as exc:
+                issues.append(
+                    f"runtime identity for {actor['id']} needs recovery: {type(exc).__name__}: {exc}"
+                )
+                actor_data = load_actor(layout, actor["id"])
+                actor_data["status"] = "needs_recovery"
+                save_actor(layout, actor_data)
+                sync_actor_summary(layout, actor_data)
+                continue
             if actor.get("status") in {"running", "starting", "needs_recovery"} and not is_alive:
                 if runtime.get("oci_lifecycle_state") == "uncertain_start":
                     issues.append(
@@ -9845,6 +10430,11 @@ def command_recover(args: Any) -> None:
                             issues.append(f"recoverable actor has no attempt id: {actor_data['id']}")
                             continue
                         actor_runtime_data = actor_data.setdefault("runtime", {})
+                        # is_alive was proved false above using the backend's
+                        # exact runtime authority. Retire that generation before
+                        # preparing a new Windows Job/PID identity; the new
+                        # effect remains independently fenced by generation.
+                        _retire_absent_spawn_runtime(actor_data)
                         recovery_generation = int(actor_runtime_data.get("recovery_generation") or 0) + 1
                         effect_id = (
                             f"EFF-SPAWN-RECOVER-{slugify(attempt_id, 'attempt')}-{recovery_generation}"

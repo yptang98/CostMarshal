@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import costmarshal_v2.actor_runner as actor_runner  # noqa: E402
 from costmarshal_v2.actor_runner import run_actor  # noqa: E402
 from costmarshal_v2.cli import build_parser  # noqa: E402
 from costmarshal_v2.paths import ProjectLayout  # noqa: E402
@@ -44,6 +45,40 @@ from costmarshal_v2.worker_isolation import (  # noqa: E402
 )
 CLI = ROOT / "scripts" / "costmarshal.py"
 IMAGE = "ghcr.io/example/costmarshal-worker@sha256:" + "7" * 64
+
+
+def simulated_windows_job_runtime(
+    *,
+    expected_child_pid: object = None,
+    expected_child_start_marker: object = None,
+) -> dict[str, object]:
+    """Model a verified Job receipt when this test calls run_actor directly."""
+
+    authority_pid = (
+        int(expected_child_pid)
+        if type(expected_child_pid) is int and expected_child_pid > 0
+        else os.getpid()
+    )
+    marker = (
+        str(expected_child_start_marker)
+        if isinstance(expected_child_start_marker, str)
+        and expected_child_start_marker
+        else actor_runner.pid_start_marker(authority_pid)
+        or f"test-marker:{authority_pid}"
+    )
+    return {
+        "pid": authority_pid,
+        "process_start_marker": marker,
+        "target": "job:costmarshal-three-tier-required-test",
+        "windows_job_name": "costmarshal-three-tier-required-test",
+        "windows_job_identity": "b" * 64,
+        "windows_job_child_pid": authority_pid,
+        "windows_job_child_start_marker": marker,
+    }
+
+
+if os.name == "nt":
+    actor_runner._inherited_windows_job_runtime = simulated_windows_job_runtime
 
 
 def cli(temp: Path, *arguments: str) -> dict:

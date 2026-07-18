@@ -9,6 +9,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -37,6 +38,10 @@ from costmarshal_v2.control_store import (  # noqa: E402
     validate_control_store,
 )
 from costmarshal_v2.paths import ProjectLayout  # noqa: E402
+from costmarshal_v2.session_backend import (  # noqa: E402
+    LocalProcessBackend,
+    pid_start_marker,
+)
 
 
 def make_project(base: Path, name: str = "project") -> ProjectLayout:
@@ -292,6 +297,286 @@ raise AssertionError('fault point did not exit')
             migrate_legacy_store(layout)
         self.assertFalse(database_path(layout).exists())
         self.assertFalse(marker_path(layout).exists())
+
+    def test_stopped_tmux_actor_uses_strict_tristate_runtime_inspection(self) -> None:
+        layout = make_project(self.base, "tmux-quiescence")
+        session = {
+            "schema_version": 2,
+            "backend": {
+                "kind": "tmux",
+                "session_name": "cmv2-test",
+                "executable": "tmux",
+            },
+        }
+        layout.session_json.write_text(json.dumps(session), encoding="utf-8")
+        actor = {
+            "id": "agent-v2-0001",
+            "status": "stopped",
+            "runtime": {
+                "backend": "tmux",
+                "session_name": "cmv2-test",
+                "actor_name": "agent-v2-0001",
+                "target": "cmv2-test:agent-v2-0001",
+                "started_at": "2026-01-01T00:00:00+00:00",
+            },
+        }
+        (layout.actors_dir / "agent-v2-0001.json").write_text(
+            json.dumps(actor), encoding="utf-8"
+        )
+
+        live_backend = SimpleNamespace(
+            available=lambda: True,
+            actor_alive=lambda **_kwargs: True,
+        )
+        with patch.object(control_store_module, "backend_from_session", return_value=live_backend):
+            live = preview_legacy_migration(layout)
+        self.assertEqual(live["actor_quiescence"][0]["state"], "live")
+        self.assertTrue(live["actor_blockers"])
+        with (
+            patch.object(control_store_module, "backend_from_session", return_value=live_backend),
+            self.assertRaisesRegex(ControlStoreError, "quiescent project"),
+        ):
+            migrate_legacy_store(layout)
+        self.assertFalse(database_path(layout).exists())
+        self.assertFalse(marker_path(layout).exists())
+
+        absent_backend = SimpleNamespace(
+            available=lambda: True,
+            actor_alive=lambda **_kwargs: False,
+        )
+        with patch.object(control_store_module, "backend_from_session", return_value=absent_backend):
+            absent = preview_legacy_migration(layout)
+        self.assertEqual(absent["actor_quiescence"][0]["state"], "stopped")
+        self.assertEqual(absent["actor_blockers"], [])
+
+        def failed_probe(**_kwargs: object) -> bool:
+            raise RuntimeError("deterministic tmux inspection failure")
+
+        error_backend = SimpleNamespace(available=lambda: True, actor_alive=failed_probe)
+        with patch.object(control_store_module, "backend_from_session", return_value=error_backend):
+            unknown = preview_legacy_migration(layout)
+        self.assertEqual(unknown["actor_quiescence"][0]["state"], "unknown")
+        self.assertIn("inspection failed", unknown["actor_blockers"][0])
+
+    def test_linux_local_quiescence_requires_v2_group_token_identity(self) -> None:
+        layout = make_project(self.base, "local-quiescence")
+        layout.session_json.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "backend": {
+                        "kind": "local",
+                        "session_name": "cmv2-test",
+                        "executable": "local-process",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        actor_path = layout.actors_dir / "agent-v2-0001.json"
+        actor = {
+            "id": "agent-v2-0001",
+            "status": "stopped",
+            "runtime": {
+                "backend": "local",
+                "actor_name": "agent-v2-0001",
+                "pid": 43210,
+                "started_at": "2026-01-01T00:00:00+00:00",
+                "process_start_marker": "linux-proc:boot:1",
+            },
+        }
+        actor_path.write_text(json.dumps(actor), encoding="utf-8")
+        backend = SimpleNamespace(actor_alive=lambda **_kwargs: False)
+        with (
+            patch.object(control_store_module.platform, "system", return_value="Linux"),
+            patch.object(control_store_module, "backend_from_session", return_value=backend),
+        ):
+            legacy = preview_legacy_migration(layout)
+        self.assertEqual(legacy["actor_quiescence"][0]["state"], "unknown")
+        self.assertIn("linux-proc-v2", legacy["actor_blockers"][0])
+
+        actor["runtime"]["process_start_marker"] = "linux-proc-v2:boot:1:43210:43210:" + "a" * 64
+        actor_path.write_text(json.dumps(actor), encoding="utf-8")
+        with (
+            patch.object(control_store_module.platform, "system", return_value="Linux"),
+            patch.object(control_store_module, "backend_from_session", return_value=backend),
+        ):
+            absent = preview_legacy_migration(layout)
+        self.assertEqual(absent["actor_quiescence"][0]["state"], "stopped")
+        self.assertEqual(absent["actor_blockers"], [])
+
+    def test_required_oci_cleanup_uncertainty_blocks_cutover(self) -> None:
+        layout = make_project(self.base, "oci-quiescence")
+        layout.session_json.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "backend": {
+                        "kind": "local",
+                        "session_name": "cmv2-test",
+                        "executable": "local-process",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        actor_path = layout.actors_dir / "agent-v2-0001.json"
+        actor = {
+            "id": "agent-v2-0001",
+            "status": "stopped",
+            "isolation": {"mode": "required"},
+            "runtime": {
+                "backend": "local",
+                "actor_name": "agent-v2-0001",
+                "pid": 43210,
+                "process_start_marker": "linux-proc-v2:boot:1:43210:43210:" + "a" * 64,
+                "oci_lifecycle_state": "uncertain_start",
+                "container_name": "costmarshal-test",
+                "container_command": ["codex", "exec"],
+            },
+        }
+        actor_path.write_text(json.dumps(actor), encoding="utf-8")
+        with patch.object(control_store_module.platform, "system", return_value="Linux"):
+            uncertain = preview_legacy_migration(layout)
+        self.assertIn("OCI", uncertain["actor_blockers"][0])
+
+        actor["runtime"].update(
+            {
+                "oci_lifecycle_state": "cleaned",
+                "container_cleanup_unconfirmed": False,
+                "container_removed": True,
+                "container_id": "b" * 64,
+                "cleanup_identity_drift": [],
+            }
+        )
+        actor_path.write_text(json.dumps(actor), encoding="utf-8")
+        backend = SimpleNamespace(actor_alive=lambda **_kwargs: False)
+        with (
+            patch.object(control_store_module.platform, "system", return_value="Linux"),
+            patch.object(control_store_module, "backend_from_session", return_value=backend),
+        ):
+            cleaned = preview_legacy_migration(layout)
+        self.assertEqual(cleaned["actor_blockers"], [])
+
+        actor["runtime"].pop("container_removed")
+        actor_path.write_text(json.dumps(actor), encoding="utf-8")
+        with patch.object(control_store_module.platform, "system", return_value="Linux"):
+            incomplete = preview_legacy_migration(layout)
+        self.assertIn("container_removed", incomplete["actor_blockers"][0])
+
+    def test_windows_job_receipt_can_prove_absence_but_legacy_pid_cannot(self) -> None:
+        layout = make_project(self.base, "windows-job-quiescence")
+        layout.session_json.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "backend": {
+                        "kind": "local",
+                        "session_name": "cmv2-test",
+                        "executable": "local-process",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        actor_path = layout.actors_dir / "agent-v2-0001.json"
+        actor = {
+            "id": "agent-v2-0001",
+            "status": "stopped",
+            "runtime": {
+                "backend": "local",
+                "actor_name": "agent-v2-0001",
+                "pid": 43210,
+                "process_start_marker": "windows-filetime:1234",
+                "windows_job_name": "Local\\CostMarshal-" + "a" * 64,
+                "windows_job_identity": "windows-job-v1:" + "a" * 64,
+            },
+        }
+        actor_path.write_text(json.dumps(actor), encoding="utf-8")
+        backend = SimpleNamespace(actor_alive=lambda **_kwargs: False)
+        with (
+            patch.object(control_store_module.platform, "system", return_value="Windows"),
+            patch.object(control_store_module, "backend_from_session", return_value=backend),
+        ):
+            absent = preview_legacy_migration(layout)
+        self.assertEqual(absent["actor_blockers"], [])
+
+        actor["runtime"].pop("windows_job_name")
+        actor_path.write_text(json.dumps(actor), encoding="utf-8")
+        with patch.object(control_store_module.platform, "system", return_value="Windows"):
+            legacy = preview_legacy_migration(layout)
+        self.assertEqual(legacy["actor_quiescence"][0]["state"], "unknown")
+        self.assertIn("job/tree-absence", legacy["actor_blockers"][0])
+
+    def test_current_platform_local_runtime_probe_is_fail_closed(self) -> None:
+        layout = make_project(self.base, "platform-quiescence")
+        layout.session_json.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "backend": {
+                        "kind": "local",
+                        "session_name": "cmv2-platform",
+                        "executable": "local-process",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        actor_path = layout.actors_dir / "agent-v2-0001.json"
+        if sys.platform.startswith("linux"):
+            backend = LocalProcessBackend()
+            launch = backend.start_actor(
+                session_name="cmv2-platform",
+                actor_name="agent-v2-0001",
+                command=[sys.executable, "-c", "import time; time.sleep(30)"],
+                cwd=self.base,
+                log_path=self.base / "local-actor.log",
+            )
+            marker = pid_start_marker(launch["pid"])
+            self.assertIsNotNone(marker)
+            actor = {
+                "id": "agent-v2-0001",
+                "status": "stopped",
+                "runtime": {
+                    "backend": "local",
+                    "actor_name": "agent-v2-0001",
+                    "target": launch["target"],
+                    "pid": launch["pid"],
+                    "process_start_marker": marker,
+                    "started_at": "2026-01-01T00:00:00+00:00",
+                },
+            }
+            actor_path.write_text(json.dumps(actor), encoding="utf-8")
+            try:
+                live = preview_legacy_migration(layout)
+                self.assertEqual(live["actor_quiescence"][0]["state"], "live")
+            finally:
+                backend.stop_actor(
+                    target=str(launch["target"]),
+                    pid=int(launch["pid"]),
+                    process_start_marker=marker,
+                )
+        else:
+            actor_path.write_text(
+                json.dumps(
+                    {
+                        "id": "agent-v2-0001",
+                        "status": "stopped",
+                        "runtime": {
+                            "backend": "local",
+                            "actor_name": "agent-v2-0001",
+                            "pid": os.getpid(),
+                            "process_start_marker": pid_start_marker(os.getpid()),
+                            "started_at": "2026-01-01T00:00:00+00:00",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            unknown = preview_legacy_migration(layout)
+            self.assertEqual(unknown["actor_quiescence"][0]["state"], "unknown")
+            self.assertIn("job/tree-absence", unknown["actor_blockers"][0])
 
     def test_repair_audit_cannot_delete_concurrently_materialized_new_view(self) -> None:
         layout = make_project(self.base, "audit-materializer-race")

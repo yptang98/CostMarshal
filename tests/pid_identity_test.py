@@ -6,6 +6,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -16,17 +17,45 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import costmarshal_v2.session_backend as session_backend_module  # noqa: E402
+import costmarshal_v2.actor_runner as actor_runner_module  # noqa: E402
 from costmarshal_v2.session_backend import (  # noqa: E402
     LocalProcessBackend,
+    _bounded_readline,
     _windows_tasklist_contains_pid,
     pid_identity_matches,
     pid_is_alive,
     pid_start_marker,
     select_backend_kind,
 )
+from costmarshal_v2.windows_job import (  # noqa: E402
+    WindowsJobApi,
+    WindowsJobReceipt,
+    stop_windows_job_runtime,
+    validate_windows_job_receipt,
+)
 
 
 class PidIdentityTest(unittest.TestCase):
+    def test_windows_job_receipt_read_is_bounded(self) -> None:
+        release = threading.Event()
+
+        class BlockingStream:
+            def readline(self) -> str:
+                release.wait(5)
+                return ""
+
+        started = time.monotonic()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "timed out waiting for prepared receipt"):
+                _bounded_readline(
+                    BlockingStream(),
+                    label="prepared receipt",
+                    timeout_seconds=0.05,
+                )
+        finally:
+            release.set()
+        self.assertLess(time.monotonic() - started, 1.0)
+
     def test_windows_tasklist_pid_match_is_exact(self) -> None:
         output = '\n'.join(
             [
@@ -60,6 +89,25 @@ class PidIdentityTest(unittest.TestCase):
             self.assertIsNotNone(marker)
             self.assertTrue(pid_identity_matches(process.pid, marker))
             backend = LocalProcessBackend()
+            if os.name == "nt":
+                with self.assertRaisesRegex(RuntimeError, "complete handle-bound Job Object receipt"):
+                    backend.actor_alive(
+                        session_name="test",
+                        actor_name="actor",
+                        target=f"pid:{process.pid}",
+                        pid=process.pid,
+                        process_start_marker=marker,
+                    )
+                with self.assertRaisesRegex(RuntimeError, "complete handle-bound Job Object receipt"):
+                    backend.stop_actor(
+                        target=f"pid:{process.pid}",
+                        pid=process.pid,
+                        process_start_marker=marker,
+                    )
+                self.assertTrue(pid_is_alive(process.pid))
+                process.terminate()
+                process.wait(timeout=10)
+                return
             self.assertFalse(
                 backend.actor_alive(
                     session_name="test",
@@ -100,6 +148,483 @@ class PidIdentityTest(unittest.TestCase):
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=10)
+
+    @unittest.skipUnless(os.name == "nt", "named Job Objects require Windows")
+    def test_windows_stop_uses_bound_handles_when_supervisor_pid_was_reused(self) -> None:
+        receipt = validate_windows_job_receipt(
+            supervisor_pid=321,
+            supervisor_start_marker="windows-filetime:123456",
+            job_name="Local\\CostMarshal-" + "a" * 64,
+            job_identity="windows-job-v1:" + "a" * 64,
+            child_pid=654,
+            child_start_marker="windows-filetime:654321",
+        )
+
+        class FakeApi:
+            def __init__(self) -> None:
+                self.job_terminated = False
+                self.process_termination_called = False
+                self.closed: list[object] = []
+                self.opened_processes: list[tuple[int, str, bool]] = []
+
+            def open_process_exact(self, pid: int, marker: str, *, terminate: bool):
+                self.opened_processes.append((pid, marker, terminate))
+                return None, "identity_changed"
+
+            def open_job(self, name: str, *, terminate: bool):
+                self.opened_job = (name, terminate)
+                return "job-handle"
+
+            def query_limits(self, handle: object) -> int:
+                return 0
+
+            def query_active_pids(self, handle: object):
+                return () if self.job_terminated else (654,)
+
+            def terminate_job(self, handle: object) -> None:
+                self.job_terminated = True
+
+            def terminate_process_handle(self, handle: object) -> None:
+                self.process_termination_called = True
+
+            def wait_process(self, handle: object, timeout_ms: int) -> bool:
+                return True
+
+            def close(self, handle: object) -> None:
+                if handle is not None:
+                    self.closed.append(handle)
+
+        api = FakeApi()
+        with self.assertRaisesRegex(
+            RuntimeError, "not kernel-bound to its exact supervisor"
+        ):
+            stop_windows_job_runtime(receipt, api=api)
+        self.assertEqual(
+            api.opened_processes,
+            [
+                (321, "windows-filetime:123456", True),
+                (654, "windows-filetime:654321", True),
+            ],
+        )
+        self.assertEqual(api.opened_job, (receipt.job_name, True))
+        self.assertFalse(api.job_terminated)
+        self.assertFalse(api.process_termination_called)
+        self.assertIn("job-handle", api.closed)
+
+    @unittest.skipUnless(os.name == "nt", "named Job Objects require Windows")
+    def test_windows_job_tracks_child_after_command_leader_exit_and_stops_tree(self) -> None:
+        backend = LocalProcessBackend()
+        launch: dict[str, object] | None = None
+        child_pid: int | None = None
+        with tempfile.TemporaryDirectory(prefix="costmarshal-windows-job-child-") as raw:
+            temp = Path(raw)
+            child_file = temp / "child.pid"
+            leader_code = (
+                "import pathlib,subprocess,sys; "
+                "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+                "creationflags=subprocess.CREATE_NO_WINDOW); "
+                "pathlib.Path(sys.argv[1]).write_text(str(child.pid),encoding='ascii')"
+            )
+            try:
+                launch = backend.start_actor(
+                    session_name="test",
+                    actor_name="windows-orphan-child",
+                    command=[sys.executable, "-c", leader_code, str(child_file)],
+                    cwd=temp,
+                    log_path=temp / "actor.log",
+                )
+                deadline = time.monotonic() + 10
+                while (
+                    (not child_file.is_file() or child_file.stat().st_size == 0)
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.02)
+                self.assertTrue(
+                    child_file.is_file() and child_file.stat().st_size > 0,
+                    "command leader did not publish child PID",
+                )
+                child_pid = int(child_file.read_text(encoding="ascii"))
+                while (
+                    pid_is_alive(int(launch["windows_job_child_pid"]))
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.02)
+                self.assertFalse(
+                    pid_is_alive(int(launch["windows_job_child_pid"])),
+                    "command leader remained live",
+                )
+                self.assertTrue(pid_is_alive(child_pid), "child should outlive its command leader")
+                kwargs = {
+                    key: launch.get(key)
+                    for key in (
+                        "windows_job_name",
+                        "windows_job_identity",
+                        "windows_job_child_pid",
+                        "windows_job_child_start_marker",
+                    )
+                }
+                self.assertTrue(
+                    backend.actor_alive(
+                        session_name="test",
+                        actor_name="windows-orphan-child",
+                        target=str(launch["target"]),
+                        pid=int(launch["pid"]),
+                        process_start_marker=str(launch["process_start_marker"]),
+                        **kwargs,
+                    )
+                )
+                backend.stop_actor(
+                    target=str(launch["target"]),
+                    pid=int(launch["pid"]),
+                    process_start_marker=str(launch["process_start_marker"]),
+                    **kwargs,
+                )
+                deadline = time.monotonic() + 10
+                while pid_is_alive(child_pid) and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertFalse(pid_is_alive(child_pid), "Job Object child survived STOP")
+                launch = None
+            finally:
+                if launch is not None:
+                    kwargs = {
+                        key: launch.get(key)
+                        for key in (
+                            "windows_job_name",
+                            "windows_job_identity",
+                            "windows_job_child_pid",
+                            "windows_job_child_start_marker",
+                        )
+                    }
+                    try:
+                        backend.stop_actor(
+                            target=str(launch["target"]),
+                            pid=int(launch["pid"]),
+                            process_start_marker=str(launch["process_start_marker"]),
+                            **kwargs,
+                        )
+                    except RuntimeError:
+                        pass
+
+    @unittest.skipUnless(os.name == "nt", "named Job Objects require Windows")
+    def test_windows_job_rejects_breakaway_child(self) -> None:
+        backend = LocalProcessBackend()
+        launch: dict[str, object] | None = None
+        with tempfile.TemporaryDirectory(prefix="costmarshal-windows-job-breakaway-") as raw:
+            temp = Path(raw)
+            result_file = temp / "breakaway.txt"
+            code = "\n".join(
+                [
+                    "import pathlib, subprocess, sys, time",
+                    "result = pathlib.Path(sys.argv[1])",
+                    "try:",
+                    "    subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], creationflags=subprocess.CREATE_BREAKAWAY_FROM_JOB)",
+                    "except OSError as exc:",
+                    "    result.write_text(f'rejected:{exc.winerror}', encoding='ascii')",
+                    "else:",
+                    "    result.write_text('escaped', encoding='ascii')",
+                    "time.sleep(60)",
+                ]
+            )
+            try:
+                launch = backend.start_actor(
+                    session_name="test",
+                    actor_name="windows-breakaway",
+                    command=[sys.executable, "-c", code, str(result_file)],
+                    cwd=temp,
+                    log_path=temp / "actor.log",
+                )
+                deadline = time.monotonic() + 10
+                while (
+                    (not result_file.is_file() or result_file.stat().st_size == 0)
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.02)
+                self.assertTrue(
+                    result_file.is_file() and result_file.stat().st_size > 0,
+                    "breakaway probe did not finish",
+                )
+                self.assertRegex(result_file.read_text(encoding="ascii"), r"rejected:[0-9]+")
+                self.assertNotEqual(result_file.read_text(encoding="ascii"), "escaped")
+            finally:
+                if launch is not None:
+                    kwargs = {
+                        key: launch.get(key)
+                        for key in (
+                            "windows_job_name",
+                            "windows_job_identity",
+                            "windows_job_child_pid",
+                            "windows_job_child_start_marker",
+                        )
+                    }
+                    backend.stop_actor(
+                        target=str(launch["target"]),
+                        pid=int(launch["pid"]),
+                        process_start_marker=str(launch["process_start_marker"]),
+                        **kwargs,
+                    )
+
+    @unittest.skipUnless(os.name == "nt", "named Job Objects require Windows")
+    def test_windows_supervisor_crash_closes_job_and_kills_bound_children(self) -> None:
+        backend = LocalProcessBackend()
+        launch: dict[str, object] | None = None
+        with tempfile.TemporaryDirectory(prefix="costmarshal-windows-job-reopen-") as raw:
+            temp = Path(raw)
+            try:
+                launch = backend.start_actor(
+                    session_name="test",
+                    actor_name="windows-reopen",
+                    command=[sys.executable, "-c", "import time; time.sleep(60)"],
+                    cwd=temp,
+                    log_path=temp / "actor.log",
+                )
+                api = WindowsJobApi()
+                supervisor_handle, state = api.open_process_exact(
+                    int(launch["pid"]),
+                    str(launch["process_start_marker"]),
+                    terminate=True,
+                )
+                self.assertEqual(state, "alive")
+                self.assertIsNotNone(supervisor_handle)
+                assert supervisor_handle is not None
+                try:
+                    api.terminate_process_handle(supervisor_handle)
+                    self.assertTrue(api.wait_process(supervisor_handle, 5000))
+                finally:
+                    api.close(supervisor_handle)
+                kwargs = {
+                    key: launch.get(key)
+                    for key in (
+                        "windows_job_name",
+                        "windows_job_identity",
+                        "windows_job_child_pid",
+                        "windows_job_child_start_marker",
+                    )
+                }
+                deadline = time.monotonic() + 10
+                while (
+                    pid_is_alive(int(launch["windows_job_child_pid"]))
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.02)
+                self.assertFalse(
+                    pid_is_alive(int(launch["windows_job_child_pid"])),
+                    "kill-on-job-close did not contain a supervisor crash",
+                )
+                self.assertFalse(
+                    backend.actor_alive(
+                        session_name="test",
+                        actor_name="windows-reopen",
+                        target=str(launch["target"]),
+                        pid=int(launch["pid"]),
+                        process_start_marker=str(launch["process_start_marker"]),
+                        **kwargs,
+                    ),
+                    "closed Job Object should be absent after crash containment",
+                )
+                result = backend.stop_actor(
+                    target=str(launch["target"]),
+                    pid=int(launch["pid"]),
+                    process_start_marker=str(launch["process_start_marker"]),
+                    **kwargs,
+                )
+                self.assertEqual(result["source"], "windows_job_already_absent")
+                self.assertIn(result["supervisor_state"], {"absent", "exited"})
+                launch = None
+            finally:
+                if launch is not None:
+                    kwargs = {
+                        key: launch.get(key)
+                        for key in (
+                            "windows_job_name",
+                            "windows_job_identity",
+                            "windows_job_child_pid",
+                            "windows_job_child_start_marker",
+                        )
+                    }
+                    backend.stop_actor(
+                        target=str(launch["target"]),
+                        pid=int(launch["pid"]),
+                        process_start_marker=str(launch["process_start_marker"]),
+                        **kwargs,
+                    )
+
+    @unittest.skipUnless(os.name == "nt", "named Job Objects require Windows")
+    def test_windows_natural_completion_releases_supervisor_and_job(self) -> None:
+        backend = LocalProcessBackend()
+        with tempfile.TemporaryDirectory(prefix="costmarshal-windows-job-natural-") as raw:
+            temp = Path(raw)
+            launch = backend.start_actor(
+                session_name="test",
+                actor_name="windows-natural",
+                command=[sys.executable, "-c", "raise SystemExit(0)"],
+                cwd=temp,
+                log_path=temp / "actor.log",
+            )
+            kwargs = {
+                key: launch.get(key)
+                for key in (
+                    "windows_job_name",
+                    "windows_job_identity",
+                    "windows_job_child_pid",
+                    "windows_job_child_start_marker",
+                )
+            }
+            deadline = time.monotonic() + 10
+            while pid_is_alive(int(launch["pid"])) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertFalse(pid_is_alive(int(launch["pid"])))
+            self.assertFalse(
+                backend.actor_alive(
+                    session_name="test",
+                    actor_name="windows-natural",
+                    target=str(launch["target"]),
+                    pid=int(launch["pid"]),
+                    process_start_marker=str(launch["process_start_marker"]),
+                    **kwargs,
+                ),
+                "natural completion left a named Job Object behind",
+            )
+
+    @unittest.skipUnless(os.name == "nt", "named Job Objects require Windows")
+    def test_windows_prepared_callback_failure_contains_suspended_child(self) -> None:
+        backend = LocalProcessBackend()
+        prepared: dict[str, object] = {}
+        with tempfile.TemporaryDirectory(prefix="costmarshal-windows-job-callback-") as raw:
+            temp = Path(raw)
+
+            def reject(receipt: dict[str, object]) -> None:
+                prepared.update(receipt)
+                raise RuntimeError("simulated durable receipt failure")
+
+            with self.assertRaisesRegex(RuntimeError, "simulated durable receipt failure"):
+                backend.start_actor(
+                    session_name="test",
+                    actor_name="windows-callback",
+                    command=[sys.executable, "-c", "import time; time.sleep(60)"],
+                    cwd=temp,
+                    log_path=temp / "actor.log",
+                    prepared_callback=reject,
+                )
+            self.assertTrue(prepared.get("windows_job_identity"))
+            kwargs = {
+                key: prepared.get(key)
+                for key in (
+                    "windows_job_name",
+                    "windows_job_identity",
+                    "windows_job_child_pid",
+                    "windows_job_child_start_marker",
+                )
+            }
+            self.assertFalse(
+                backend.actor_alive(
+                    session_name="test",
+                    actor_name="windows-callback",
+                    target=str(prepared["target"]),
+                    pid=int(prepared["pid"]),
+                    process_start_marker=str(prepared["process_start_marker"]),
+                    **kwargs,
+                )
+            )
+            self.assertFalse(pid_is_alive(int(prepared["windows_job_child_pid"])))
+
+    @unittest.skipUnless(os.name == "nt", "named Job Objects require Windows")
+    def test_windows_runner_rejects_shape_valid_forged_job_environment(self) -> None:
+        backend = LocalProcessBackend()
+        launch: dict[str, object] | None = None
+        with tempfile.TemporaryDirectory(prefix="costmarshal-windows-job-forged-") as raw:
+            temp = Path(raw)
+            try:
+                launch = backend.start_actor(
+                    session_name="test",
+                    actor_name="windows-forged",
+                    command=[sys.executable, "-c", "import time; time.sleep(60)"],
+                    cwd=temp,
+                    log_path=temp / "actor.log",
+                )
+                environment = {
+                    "COSTMARSHAL_WINDOWS_JOB_NAME": str(launch["windows_job_name"]),
+                    "COSTMARSHAL_WINDOWS_JOB_IDENTITY": str(launch["windows_job_identity"]),
+                    "COSTMARSHAL_WINDOWS_JOB_SUPERVISOR_PID": str(launch["pid"]),
+                    "COSTMARSHAL_WINDOWS_JOB_SUPERVISOR_MARKER": str(
+                        launch["process_start_marker"]
+                    ),
+                }
+                with patch.dict(os.environ, environment, clear=False):
+                    with self.assertRaisesRegex(
+                        SystemExit, "not a member of its inherited Job Object"
+                    ):
+                        actor_runner_module._inherited_windows_job_runtime()
+            finally:
+                if launch is not None:
+                    kwargs = {
+                        key: launch.get(key)
+                        for key in (
+                            "windows_job_name",
+                            "windows_job_identity",
+                            "windows_job_child_pid",
+                            "windows_job_child_start_marker",
+                        )
+                    }
+                    backend.stop_actor(
+                        target=str(launch["target"]),
+                        pid=int(launch["pid"]),
+                        process_start_marker=str(launch["process_start_marker"]),
+                        **kwargs,
+                    )
+
+    @unittest.skipUnless(os.name == "nt", "named Job Objects require Windows")
+    def test_windows_swapped_supervisor_and_job_receipts_fail_closed(self) -> None:
+        backend = LocalProcessBackend()
+        launches: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory(prefix="costmarshal-windows-job-swap-") as raw:
+            temp = Path(raw)
+            try:
+                for suffix in ("a", "b"):
+                    launches.append(
+                        backend.start_actor(
+                            session_name="test",
+                            actor_name=f"windows-swap-{suffix}",
+                            command=[sys.executable, "-c", "import time; time.sleep(60)"],
+                            cwd=temp,
+                            log_path=temp / f"actor-{suffix}.log",
+                        )
+                    )
+                first, second = launches
+                with self.assertRaisesRegex(
+                    RuntimeError, "not kernel-bound to its exact supervisor"
+                ):
+                    backend.actor_alive(
+                        session_name="test",
+                        actor_name="windows-swap",
+                        target=str(second["target"]),
+                        pid=int(first["pid"]),
+                        process_start_marker=str(first["process_start_marker"]),
+                        windows_job_name=str(second["windows_job_name"]),
+                        windows_job_identity=str(second["windows_job_identity"]),
+                        windows_job_child_pid=int(second["windows_job_child_pid"]),
+                        windows_job_child_start_marker=str(
+                            second["windows_job_child_start_marker"]
+                        ),
+                    )
+                self.assertTrue(pid_is_alive(int(first["pid"])))
+                self.assertTrue(pid_is_alive(int(second["pid"])))
+            finally:
+                for launch in launches:
+                    kwargs = {
+                        key: launch.get(key)
+                        for key in (
+                            "windows_job_name",
+                            "windows_job_identity",
+                            "windows_job_child_pid",
+                            "windows_job_child_start_marker",
+                        )
+                    }
+                    backend.stop_actor(
+                        target=str(launch["target"]),
+                        pid=int(launch["pid"]),
+                        process_start_marker=str(launch["process_start_marker"]),
+                        **kwargs,
+                    )
 
     @unittest.skipUnless(
         os.name != "nt"

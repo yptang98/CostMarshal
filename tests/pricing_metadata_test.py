@@ -21,7 +21,11 @@ ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "scripts" / "costmarshal.py"
 sys.path.insert(0, str(ROOT))
 
-from costmarshal_v2.actor_runner import usage_details_from_events, usage_from_events  # noqa: E402
+from costmarshal_v2.actor_runner import (  # noqa: E402
+    _usage_observation_from_events,
+    usage_details_from_events,
+    usage_from_events,
+)
 from costmarshal_v2.routing import (  # noqa: E402
     RoutingValidationError,
     build_pricing_snapshot,
@@ -467,7 +471,7 @@ class PricingMetadataTest(unittest.TestCase):
                 output_tokens=0,
             )
 
-    def test_cached_forecast_changes_the_economic_route(self) -> None:
+    def test_unproven_cached_forecast_cannot_change_the_economic_route(self) -> None:
         catalog = canonical_catalog()
         prices = {
             "longcat": (100.0, 1.0),
@@ -507,12 +511,90 @@ class PricingMetadataTest(unittest.TestCase):
             now=NOW,
         )
         self.assertEqual(ordinary.provider_id, "deepseek")
-        self.assertEqual(cached.provider_id, "longcat")
-        self.assertEqual(cached.estimated_cost_cny, 1.0)
+        self.assertEqual(cached.provider_id, "deepseek")
+        self.assertEqual(cached.estimated_cost_cny, 10.0)
         self.assertEqual(cached.estimated_cached_input_tokens, 1_000_000)
+        self.assertEqual(
+            cached.planned_steps[0]["token_forecast"]["cache_mode"],
+            "reclassified-as-ordinary",
+        )
         self.assertIn("0/1000000/0", cached.explanation)
 
-    def test_cached_forecast_without_compatible_price_fails_closed(self) -> None:
+    def test_each_route_step_reclassifies_cache_and_charges_its_fixed_fee_once(self) -> None:
+        catalog = canonical_catalog()
+        prices = {
+            "longcat": (100.0, 1.0, 1.0),
+            # These providers deliberately have no cached-input price. They are
+            # still fully priceable successors because the cache is not portable.
+            "deepseek": (10.0, None, 2.0),
+            "codex": (20.0, None, 3.0),
+        }
+        for provider in catalog["providers"]:
+            input_price, cached_price, fixed_attempt = prices[provider["provider_id"]]
+            provider["pricing"] = build_pricing_snapshot(
+                currency="CNY",
+                source=f"https://pricing.example/per-step-{provider['provider_id']}",
+                reviewed_at="2026-07-15T00:00:00Z",
+                effective_at="2026-07-15T00:00:00Z",
+                expires_at="2026-08-15T00:00:00Z",
+                snapshot_id=f"per-step-{provider['provider_id']}",
+                input_per_1m=input_price,
+                cached_input_per_1m=cached_price,
+                output_per_1m=0.0,
+                fixed_attempt=fixed_attempt,
+            )
+
+        decision = decide_route(
+            {"risk": "low", "task_type": "analysis"},
+            catalog,
+            input_tokens=100_000,
+            cached_input_tokens=900_000,
+            output_tokens=0,
+            now=NOW,
+        )
+
+        self.assertEqual(
+            decision.planned_provider_ids,
+            ("longcat", "deepseek", "codex"),
+        )
+        self.assertEqual(
+            [step["token_forecast"]["cache_mode"] for step in decision.planned_steps],
+            [
+                "reclassified-as-ordinary",
+                "reclassified-as-ordinary",
+                "reclassified-as-ordinary",
+            ],
+        )
+        self.assertEqual(
+            [
+                (
+                    step["token_forecast"]["estimated_input_tokens"],
+                    step["token_forecast"]["estimated_cached_input_tokens"],
+                )
+                for step in decision.planned_steps
+            ],
+            [(1_000_000, 0), (1_000_000, 0), (1_000_000, 0)],
+        )
+        # The cache origin is unproven, so every step pays ordinary input once
+        # plus its own fixed-attempt fee.
+        self.assertEqual(
+            [step["estimated_cost_cny"] for step in decision.planned_steps],
+            ["101", "12", "23"],
+        )
+        self.assertEqual(decision.worst_case_chain_cost_cny_exact, "136")
+        survival = Decimal(1)
+        expected = Decimal(0)
+        for step in decision.planned_steps:
+            expected += survival * Decimal(step["estimated_cost_cny"])
+            survival *= Decimal(1) - Decimal(
+                str(step["acceptance_prior"]["conservative_probability"])
+            )
+        self.assertEqual(
+            decision.expected_chain_cost_cny_exact,
+            format(expected, "f").rstrip("0").rstrip("."),
+        )
+
+    def test_unproven_cached_forecast_uses_ordinary_legacy_price(self) -> None:
         legacy = default_provider_catalog()
         for provider in legacy["providers"]:
             provider["input_cny_per_1m"] = 1.0
@@ -523,25 +605,45 @@ class PricingMetadataTest(unittest.TestCase):
             cached_input_tokens=1000,
             now=NOW,
         )
-        self.assertEqual(decision.optimization_mode, "safe-tier")
+        self.assertEqual(decision.pricing_status, "beta-legacy")
+        self.assertEqual(decision.estimated_cost_cny, 0.001)
         self.assertEqual(
-            decision.pricing_status,
-            "cached-input-unsupported:beta-legacy",
+            decision.planned_steps[0]["token_forecast"],
+            {
+                "estimated_input_tokens": 1000,
+                "estimated_cached_input_tokens": 0,
+                "estimated_output_tokens": 0,
+                "cache_mode": "reclassified-as-ordinary",
+                "cache_binding": None,
+            },
         )
-        self.assertIsNone(decision.estimated_cost_cny)
-        with self.assertRaisesRegex(RoutingValidationError, "pricing status"):
-            decide_route(
-                {
-                    "risk": "low",
-                    "task_type": "analysis",
-                    "min_success_probability": 0.1,
-                },
-                legacy,
-                cached_input_tokens=1000,
-                now=NOW,
-            )
 
     def test_usage_parser_separates_cached_input_dimensions(self) -> None:
+        self.assertEqual(
+            _usage_observation_from_events([]),
+            (0, 0, 0, True, False),
+        )
+        self.assertEqual(
+            _usage_observation_from_events([{"type": "task.completed"}]),
+            (0, 0, 0, True, False),
+        )
+        for untrusted in (
+            {"type": "status", "payload": {"input_tokens": 0, "output_tokens": 0}},
+            {"usage": {"input_tokens": 0}},
+            {"usage": {"output_tokens": 0}},
+            {"usage": {"input_tokens": -1, "output_tokens": 0}},
+            {"usage": {"input_tokens": 0, "output_tokens": "0"}},
+        ):
+            self.assertEqual(
+                _usage_observation_from_events([untrusted]),
+                (0, 0, 0, True, False),
+            )
+        self.assertEqual(
+            _usage_observation_from_events(
+                [{"usage": {"input_tokens": 0, "output_tokens": 0}}]
+            ),
+            (0, 0, 0, True, True),
+        )
         self.assertEqual(
             usage_from_events(
                 [
@@ -897,12 +999,153 @@ class PricingMetadataTest(unittest.TestCase):
                 task["attempts"][0]["route_decision"]["estimated_cached_input_tokens"],
                 500,
             )
-            self.assertEqual(task["attempts"][0]["reserved_cost_cny"], "0.011125")
+            self.assertEqual(task["attempts"][0]["reserved_cost_cny"], "0.0115")
             self.assertEqual(task["attempts"][0]["actual_cost_cny"], "0.011125")
             self.assertEqual(
                 task["attempts"][0]["reserved_cost_cny"],
                 task["attempts"][0]["route_decision"]["planned_steps"][0]["estimated_cost_cny"],
             )
+
+    def test_explicit_zero_usage_settles_fixed_attempt_but_missing_usage_does_not(self) -> None:
+        clock = datetime.now(timezone.utc)
+        reviewed = (clock - timedelta(days=1)).isoformat().replace("+00:00", "Z")
+        expires = (clock + timedelta(days=1)).isoformat().replace("+00:00", "Z")
+        catalog = canonical_catalog(
+            reviewed_at=reviewed,
+            effective_at=reviewed,
+            expires_at=expires,
+        )
+        with tempfile.TemporaryDirectory(prefix="costmarshal-fixed-attempt-zero-") as raw:
+            temp = Path(raw)
+            workspace = temp / "workspace"
+            workspace.mkdir()
+            catalog_path = temp / "catalog.json"
+            catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+            profile_home = temp / "codex-home"
+            env = dict(os.environ)
+            env["CODEX_HOME"] = str(profile_home)
+
+            def run(*args: str) -> dict:
+                completed = subprocess.run(
+                    [sys.executable, str(CLI), "--root", str(temp / "runtime"), *args],
+                    cwd=temp,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                    check=False,
+                )
+                if completed.returncode != 0:
+                    raise AssertionError(
+                        f"command failed: {args}\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+                    )
+                return json.loads(completed.stdout)
+
+            run("configure-profiles", "--codex-home", str(profile_home))
+            project = run(
+                "init",
+                "--name",
+                "fixed-attempt-zero",
+                "--objective",
+                "Distinguish explicit zero usage from missing usage",
+                "--workspace",
+                str(workspace),
+                "--provider-catalog",
+                str(catalog_path),
+                "--governance",
+                "off",
+                "--allow-unsafe-native-workers",
+            )["project"]
+
+            def create_and_dispatch(title: str) -> tuple[str, str, str]:
+                task_id = run(
+                    "new-task",
+                    "--project",
+                    project,
+                    "--title",
+                    title,
+                    "--purpose",
+                    title,
+                    "--provider",
+                    "longcat",
+                    "--estimated-input-tokens",
+                    "1",
+                )["task_id"]
+                dispatched = run(
+                    "dispatch",
+                    "--project",
+                    project,
+                    "--task",
+                    task_id,
+                    "--provider",
+                    "longcat",
+                    "--unsafe-native",
+                )
+                payload = json.loads(
+                    (Path(project) / "tasks" / task_id / "task.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                return task_id, dispatched["actor_id"], payload["attempts"][0]["attempt_id"]
+
+            zero_task, zero_actor, zero_attempt = create_and_dispatch("explicit zero")
+            zero_event = run(
+                "record-usage",
+                "--project",
+                project,
+                "--actor",
+                zero_actor,
+                "--task",
+                zero_task,
+                "--attempt",
+                zero_attempt,
+                "--input-tokens",
+                "0",
+                "--cached-input-tokens",
+                "0",
+                "--output-tokens",
+                "0",
+                "--final",
+            )["event"]
+            self.assertTrue(zero_event["usage_observed"])
+            zero_payload = json.loads(
+                (Path(project) / "tasks" / zero_task / "task.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            zero_state = zero_payload["attempts"][0]
+            self.assertEqual(zero_state["actual_cost_cny"], "0.01")
+            self.assertTrue(zero_state["actual_cost_verified"])
+            self.assertTrue(zero_state["cost_settled"])
+            self.assertEqual(zero_state["usage_observation_count"], 1)
+
+            missing_task, missing_actor, missing_attempt = create_and_dispatch("missing usage")
+            missing_event = run(
+                "record-usage",
+                "--project",
+                project,
+                "--actor",
+                missing_actor,
+                "--task",
+                missing_task,
+                "--attempt",
+                missing_attempt,
+                "--final",
+            )["event"]
+            self.assertFalse(missing_event["usage_observed"])
+            missing_payload = json.loads(
+                (Path(project) / "tasks" / missing_task / "task.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            missing_state = missing_payload["attempts"][0]
+            self.assertEqual(missing_state["actual_cost_cny"], "0.01")
+            self.assertFalse(missing_state["actual_cost_verified"])
+            self.assertFalse(missing_state["cost_settled"])
+            self.assertEqual(missing_state["usage_observation_count"], 0)
+            self.assertIn("missing an explicit token observation", missing_state["cost_settlement_blocked_reason"])
 
 
 if __name__ == "__main__":

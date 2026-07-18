@@ -85,8 +85,8 @@ def command_state_store_status(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="CostMarshal v2 scheduler")
-    parser.add_argument("--root", type=Path, default=default_root(), help="CostMarshal v2 runtime root")
+    parser = argparse.ArgumentParser(description="CostMarshal v3 scheduler")
+    parser.add_argument("--root", type=Path, default=default_root(), help="CostMarshal runtime root (v2 path compatible)")
     parser.add_argument("--version", action="version", version=f"CostMarshal {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -111,7 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
     configure_provider.add_argument("--dry-run", action="store_true")
     configure_provider.set_defaults(func=command_configure_provider)
 
-    init = sub.add_parser("init", help="Create a v2 project without touching legacy state")
+    init = sub.add_parser("init", help="Create a v3 project without touching compatible legacy state")
     init.add_argument("--name", default="")
     init.add_argument("--objective", required=True)
     init.add_argument("--source-project", help="Optional existing project to reference read-only")
@@ -123,6 +123,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--default-min-success-probability",
         type=float,
         help="Optional project success-probability SLA (0..1), frozen onto each new auto-routed task unless overridden",
+    )
+    init.add_argument(
+        "--routing-objective",
+        choices=["completion-first", "cost-only"],
+        default="completion-first",
+        help="Default auto-route objective; completion-first requires a strongest-tier terminal fallback",
     )
     init.add_argument("--governance", choices=["off", "auto", "required"], default="auto", help="ArchMarshal governance gate; checks are strictly read-only")
     init.add_argument(
@@ -200,12 +206,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--estimated-cached-input-tokens",
         type=int,
         default=0,
-        help="Estimated cached input tokens billed at the reviewed cached-input rate",
+        help=(
+            "Estimated cached input tokens; without a frozen cache-origin identity, "
+            "v3 forecasts them conservatively at the ordinary-input rate"
+        ),
     )
     new_task.add_argument("--estimated-output-tokens", type=int, default=0)
     new_task.add_argument("--max-cost-cny", help="Task budget in CNY, with up to 9 decimal places")
     new_task.add_argument("--require-capability", action="append", dest="required_capabilities")
     new_task.add_argument("--min-success-probability", type=float)
+    new_task.add_argument(
+        "--routing-objective",
+        choices=["completion-first", "cost-only"],
+        help="Override the project's auto-route objective for this task",
+    )
     new_task.add_argument("--acceptance", action="append")
     new_task.add_argument("--allowed-context", action="append")
     new_task.add_argument("--allowed-path", action="append")
@@ -231,11 +245,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--estimated-cached-input-tokens",
         type=int,
         default=0,
-        help="Estimated cached input tokens billed at the reviewed cached-input rate",
+        help=(
+            "Estimated cached input tokens; without a frozen cache-origin identity, "
+            "v3 forecasts them conservatively at the ordinary-input rate"
+        ),
     )
     route.add_argument("--estimated-output-tokens", type=int, default=0)
     route.add_argument("--require-capability", action="append", dest="required_capabilities")
     route.add_argument("--min-success-probability", type=float)
+    route.add_argument(
+        "--routing-objective",
+        choices=["completion-first", "cost-only"],
+        help="Override the project's auto-route objective for this read-only explanation",
+    )
     route.set_defaults(func=command_route)
 
     providers = sub.add_parser("providers", help="List and validate the project provider catalog")
@@ -278,7 +300,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_command_id(dispatch)
     dispatch.set_defaults(func=command_dispatch)
 
-    escalate = sub.add_parser("escalate", help="Continue a failed or uncertain task to the next provider step in its admitted monotonic chain")
+    escalate = sub.add_parser("escalate", help="Continue a leader-rejected task to the exact next provider in its admitted non-decreasing chain")
     escalate.add_argument("--project", required=True)
     escalate.add_argument("--task", required=True)
     escalate.add_argument("--reason", required=True)
@@ -458,16 +480,21 @@ def build_parser() -> argparse.ArgumentParser:
     usage.add_argument(
         "--input-tokens",
         type=int,
-        default=0,
-        help="Ordinary input tokens, excluding cached input tokens",
+        default=None,
+        help="Ordinary input tokens; supplying any token flag asserts omitted token dimensions are zero",
     )
     usage.add_argument(
         "--cached-input-tokens",
         type=int,
-        default=0,
-        help="Cached input tokens, recorded separately from ordinary input",
+        default=None,
+        help="Cached input tokens; supplying any token flag asserts omitted token dimensions are zero",
     )
-    usage.add_argument("--output-tokens", type=int, default=0)
+    usage.add_argument(
+        "--output-tokens",
+        type=int,
+        default=None,
+        help="Output tokens; omit all three token flags when provider usage is unknown",
+    )
     usage.add_argument("--estimated-cost-cny", help="Unverified caller-reported cost, up to 9 decimal places")
     usage.add_argument("--final", dest="final_usage", action="store_true", help="Mark this as terminal usage and settle the remaining reservation")
     usage.add_argument("--note")
@@ -488,12 +515,12 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--interval", type=float, default=2.0)
     dashboard.set_defaults(func=command_dashboard)
 
-    status = sub.add_parser("status", help="Show v2 project status")
+    status = sub.add_parser("status", help="Show CostMarshal project status")
     status.add_argument("--project", required=True)
     status.add_argument("--format", choices=["json", "md"], default="md")
     status.set_defaults(func=command_status)
 
-    validate = sub.add_parser("validate", help="Validate v2 project structure")
+    validate = sub.add_parser("validate", help="Validate CostMarshal project structure")
     validate.add_argument("--project", required=True)
     validate.set_defaults(func=command_validate)
 

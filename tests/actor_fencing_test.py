@@ -6,12 +6,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,7 +22,37 @@ ACTOR = ROOT / "scripts" / "costmarshal_actor.py"
 sys.path.insert(0, str(ROOT))
 
 from costmarshal_v2.paths import resolve_project  # noqa: E402
-from costmarshal_v2.scheduler import default_actor_argv  # noqa: E402
+from costmarshal_v2.scheduler import default_actor_argv, start_actor  # noqa: E402
+from costmarshal_v2.state import load_actor  # noqa: E402
+
+
+def authority_bound_runner(
+    command: list[str],
+    *,
+    env: dict[str, str],
+) -> subprocess.Popen[str]:
+    """Launch a direct test runner with the Linux local-backend v2 authority."""
+
+    stdin: int = subprocess.DEVNULL
+    start_new_session = False
+    process_token_fd: int | None = None
+    if sys.platform.startswith("linux"):
+        process_token_fd = os.memfd_create("costmarshal-process-" + secrets.token_hex(32))
+        stdin = process_token_fd
+        start_new_session = True
+    try:
+        return subprocess.Popen(
+            command,
+            text=True,
+            stdin=stdin,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            start_new_session=start_new_session,
+        )
+    finally:
+        if process_token_fd is not None:
+            os.close(process_token_fd)
 
 
 def cli(temp: Path, *args: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
@@ -165,25 +197,144 @@ def main() -> int:
         assert "launch token mismatch" in (wrong.stdout + wrong.stderr)
         assert not counter.exists()
 
-        first = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        first: subprocess.Popen[str] | None = None
+        if os.name == "nt":
+            # Production Windows local starts must pass through the prepared
+            # Job Object callback so the suspended child's exact PID/FILETIME
+            # is durable before it can register or call the provider.
+            with patch.dict(os.environ, env, clear=True):
+                start_actor(layout, load_actor(layout, actor_id), dry_run=False)
+        else:
+            first = authority_bound_runner(command, env=env)
         deadline = time.monotonic() + 10
         while not ready.exists() and time.monotonic() < deadline:
-            if first.poll() is not None:
+            if first is not None and first.poll() is not None:
                 stdout, stderr = first.communicate()
                 raise AssertionError(f"first runner exited before provider start\n{stdout}\n{stderr}")
             time.sleep(0.05)
         assert ready.exists(), "provider did not start"
 
-        duplicate = subprocess.run(command, text=True, capture_output=True, env=env, check=False, timeout=5)
-        assert duplicate.returncode != 0
-        duplicate_error = duplicate.stdout + duplicate.stderr
+        if os.name == "nt":
+            duplicate_result = subprocess.run(
+                command,
+                text=True,
+                capture_output=True,
+                env=env,
+                check=False,
+                timeout=5,
+            )
+            duplicate_stdout = duplicate_result.stdout
+            duplicate_stderr = duplicate_result.stderr
+            duplicate_returncode = duplicate_result.returncode
+        else:
+            duplicate = authority_bound_runner(command, env=env)
+            duplicate_stdout, duplicate_stderr = duplicate.communicate(timeout=5)
+            duplicate_returncode = duplicate.returncode
+        assert duplicate_returncode != 0
+        duplicate_error = duplicate_stdout + duplicate_stderr
         assert (
             "another runner owns this attempt" in duplicate_error
             or "prior provider execution outcome is unknown" in duplicate_error
         )
-        stdout, stderr = first.communicate(timeout=10)
-        assert first.returncode == 0, f"first runner failed\n{stdout}\n{stderr}"
+        if first is not None:
+            stdout, stderr = first.communicate(timeout=10)
+            assert first.returncode == 0, f"first runner failed\n{stdout}\n{stderr}"
+        else:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                finished_actor = load_actor(layout, actor_id)
+                if finished_actor.get("status") in {"stopped", "failed"}:
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("Windows Job runner did not finish")
+            assert finished_actor["status"] == "stopped", finished_actor
         assert counter.read_text(encoding="utf-8").splitlines() == ["invoked"]
+
+        cli_json(
+            temp,
+            "new-task",
+            "--project",
+            str(project),
+            "--title",
+            "usage collision",
+            "--purpose",
+            "reject token-like fields outside usage",
+        )
+        collision_dispatch = cli_json(
+            temp,
+            "dispatch",
+            "--project",
+            str(project),
+            "--task",
+            "V2-0002",
+            "--unsafe-native",
+        )
+        collision_actor = load_actor(layout, collision_dispatch["actor_id"])
+        collision_fake = temp / "fake_codex_collision.py"
+        collision_fake.write_text(
+            "\n".join(
+                [
+                    "import json, pathlib, sys",
+                    "output = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])",
+                    "output.write_text('# Completion Report\\n\\nStatus: done\\n', encoding='utf-8')",
+                    "print(json.dumps({'type': 'status', 'payload': {'input_tokens': 0, 'output_tokens': 0}}))",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        collision_env = dict(env)
+        collision_env["COSTMARSHAL_CODEX_COMMAND_JSON"] = json.dumps(
+            [sys.executable, str(collision_fake)]
+        )
+        collision_process: subprocess.Popen[str] | None = None
+        if os.name == "nt":
+            with patch.dict(os.environ, collision_env, clear=True):
+                start_actor(layout, collision_actor, dry_run=False)
+        else:
+            collision_process = authority_bound_runner(
+                default_actor_argv(layout, collision_actor),
+                env=collision_env,
+            )
+        if collision_process is not None:
+            collision_stdout, collision_stderr = collision_process.communicate(timeout=10)
+            assert collision_process.returncode == 0, (
+                collision_stdout,
+                collision_stderr,
+            )
+        else:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                finished_collision = load_actor(layout, collision_actor["id"])
+                if finished_collision.get("status") in {"stopped", "failed"}:
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("Windows collision actor did not finish")
+            assert finished_collision["status"] == "stopped", finished_collision
+        collision_task = json.loads(
+            (project / "tasks" / "V2-0002" / "task.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert collision_task["attempts"][-1]["usage_status"] == "unknown_recovery_logs"
+        scheduler_inbox = (
+            project / "scheduler" / "mailboxes" / "scheduler" / "inbox.jsonl"
+        )
+        collision_usage = []
+        for line in scheduler_inbox.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            message = json.loads(line)
+            metadata = message.get("metadata") or {}
+            arguments = metadata.get("args") or {}
+            if (
+                metadata.get("command") == "record_usage"
+                and arguments.get("task") == "V2-0002"
+            ):
+                collision_usage.append(arguments)
+        assert collision_usage == [], collision_usage
 
         actor = json.loads(actor_file.read_text(encoding="utf-8"))
         registered = actor["runtime"]["registered_launch_token_sha256"]

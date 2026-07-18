@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke test for the official CostMarshal v2 CLI entrypoint."""
+"""Smoke test for the official CostMarshal v3 CLI entrypoint."""
 
 from __future__ import annotations
 
@@ -53,19 +53,19 @@ def main() -> int:
             temp,
             "init",
             "--name",
-            "official-v2-smoke",
+            "official-v3-smoke",
             "--objective",
-            "Verify official v2 CLI entrypoint",
+            "Verify the official v3 Codex plugin runtime entrypoint",
             "--backend",
             "local",
             "--allow-unsafe-native-workers",
         )
         project = Path(init["project"])
         assert_true(init["backend"] == "local", "official smoke should use portable local backend")
-        assert_true((project / "project.json").is_file(), "init should create v2 project state")
+        assert_true((project / "project.json").is_file(), "init should create v3-compatible project state")
 
         help_text = run(temp, "--version").stdout
-        assert_true("v2.4.0-beta" in help_text, "official CLI should expose v2 version")
+        assert_true("v3.0.0" in help_text, "official CLI should expose v3 version")
 
         plan = run_json(temp, "start-leader", "--project", str(project), "--command", "codex --prompt {prompt_file}", "--dry-run")
         assert_true(plan["backend"] == "local", "start-leader should use v2 backend abstraction")
@@ -77,9 +77,9 @@ def main() -> int:
             "--project",
             str(project),
             "--title",
-            "Official v2 task",
+            "Official v3 task",
             "--purpose",
-            "Exercise official v2 task lifecycle",
+            "Exercise the official v3 task lifecycle",
             "--claim-path",
             "reports/result.md",
         )
@@ -112,6 +112,8 @@ def main() -> int:
             str(project),
             "--task",
             "V2-0001",
+            "--command-id",
+            "official-v3-smoke-result-0001",
             "--status",
             "done",
             "--quality-score",

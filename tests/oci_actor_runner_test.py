@@ -261,6 +261,25 @@ class FakeOciAdapter:
         return SimpleNamespace(container_removed=True, credential=receipt, identity_drift=())
 
 
+class NonUsageCollisionAdapter(FakeOciAdapter):
+    """Return token-like payload fields outside the authoritative usage envelope."""
+
+    def wait(self, handle):
+        (handle.spec.output_exchange / "final.md").write_text(
+            "# Completion Report\n\nStatus: done\n\n## Result\nnon-usage collision\n",
+            encoding="utf-8",
+        )
+        return SimpleNamespace(
+            exit_code=0,
+            stdout_events=(
+                {
+                    "type": "status",
+                    "payload": {"input_tokens": 0, "output_tokens": 0},
+                },
+            ),
+        )
+
+
 class HardExitOciAdapter:
     """File-backed fake daemon that survives the runner's real os._exit()."""
 
@@ -692,6 +711,13 @@ def exercise_legacy_required_recovery(
 
 
 def main() -> int:
+    if os.name == "nt":
+        # Required workers are Linux OCI processes.  Direct in-process runner
+        # calls cannot carry the exact inherited Windows Job Object authority;
+        # Windows lifetime fencing is covered by local_backend/pid/actor tests,
+        # while this OCI contract runs on the Linux CI legs.
+        print("oci actor runner skipped on Windows: Linux OCI contract")
+        return 0
     temp = Path(tempfile.mkdtemp(prefix="costmarshal-v2-oci-actor-runner-"))
     try:
         completion_command, completion_args, completion_body = (
@@ -1464,6 +1490,56 @@ raise SystemExit(actor_runner.run_actor(
         assert attach_report.is_file()
         assert AttachInspectionFailureAdapter.attach_calls == 2
         assert AttachInspectionFailureAdapter.start_calls == 0
+
+        # Token-like fields outside a complete top-level usage envelope are
+        # untrusted provider payload and must never release the reservation.
+        cli(
+            temp,
+            "new-task",
+            "--project",
+            str(project_dir),
+            "--title",
+            "usage collision",
+            "--purpose",
+            "reject non-usage token fields",
+        )
+        collision_dispatch = cli(
+            temp,
+            "dispatch",
+            "--project",
+            str(project_dir),
+            "--task",
+            "V2-0007",
+            "--unsafe-native",
+        )
+        collision_actor = load_actor(layout, collision_dispatch["actor_id"])
+        collision_actor["isolation"] = json.loads(json.dumps(actor["isolation"]))
+        collision_actor = bind_required_collaboration(
+            layout,
+            project,
+            collision_actor,
+        )
+        persist_projection_fixture(layout, project, collision_actor)
+        collision_actor = load_actor(layout, collision_actor["id"])
+        with patch.dict(
+            os.environ,
+            {"CODEX_HOME": str(codex_home)},
+            clear=False,
+        ), patch(
+            "costmarshal_v2.actor_runner.OciWorkerExecutionAdapter",
+            NonUsageCollisionAdapter,
+        ):
+            collision_returncode = run_actor(
+                layout,
+                collision_actor["id"],
+                attempt_id=collision_actor["attempt_id"],
+                launch_token=collision_actor["launch_token"],
+            )
+        assert collision_returncode == 0
+        collision_state = load_task(layout, "V2-0007")
+        assert collision_state["attempts"][-1]["usage_status"] == "unknown_recovery_logs"
+        assert not collision_state["attempts"][-1].get("cost_settled")
+        assert queued_command_args(project_dir, "V2-0007", "record_usage") == []
         print("oci actor runner ok")
         print(
             "COSTMARSHAL_RUNTIME_EVIDENCE="

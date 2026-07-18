@@ -1,8 +1,9 @@
 """Pure, hash-bound contracts for bounded multi-tier handoffs.
 
 This module deliberately has no scheduler, filesystem, provider, or OCI side
-effects.  It defines the immutable evidence chain that a low -> medium -> high
-collaboration runtime can persist around those effects:
+effects.  It defines the immutable evidence chain for at most three distinct
+providers whose tiers never decrease; a mature sealed route may therefore use
+a same-tier peer before a stronger provider:
 
 * one task collaboration contract freezes the Git base, projected context,
   write scope, initial cumulative change manifest, and token reserves;
@@ -50,7 +51,7 @@ _ENVELOPE_ID_RE = re.compile(r"ENV-[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _RESULT_EVIDENCE_SCHEMA = "costmarshal-result-evidence-v3"
 _PROMPT_MAGIC = b"COSTMARSHAL-BOUND-PROMPT-V1\n"
 _TASK_PROMPT_DELIMITER = b"\nCOSTMARSHAL-TASK-PROMPT-V1\n"
-_ROUTE_STEP_KEYS = {
+_ROUTE_STEP_V1_KEYS = {
     "index",
     "provider_id",
     "tier",
@@ -61,6 +62,15 @@ _ROUTE_STEP_KEYS = {
     "acceptance_prior",
     "price_basis",
 }
+_ROUTE_STEP_V2_KEYS = _ROUTE_STEP_V1_KEYS | {"token_forecast"}
+_TOKEN_FORECAST_KEYS = {
+    "estimated_input_tokens",
+    "estimated_cached_input_tokens",
+    "estimated_output_tokens",
+    "cache_mode",
+    "cache_binding",
+}
+_CACHE_BINDING_KEYS = {"provider_id", "model", "profile", "profile_sha256"}
 
 TASK_CONTRACT_KIND = "costmarshal-collaboration-contract"
 ATTEMPT_INPUT_KIND = "costmarshal-attempt-input"
@@ -142,9 +152,13 @@ def _with_self_hash(body: Mapping[str, Any], field: str) -> dict[str, Any]:
 
 
 def _validate_self_hash(
-    value: Mapping[str, Any], *, kind: str, hash_field: str
+    value: Mapping[str, Any],
+    *,
+    kind: str,
+    hash_field: str,
+    schema_versions: frozenset[int] = frozenset({1}),
 ) -> dict[str, Any]:
-    if value.get("schema_version") != 1 or value.get("kind") != kind:
+    if value.get("schema_version") not in schema_versions or value.get("kind") != kind:
         raise HandoffContractError(f"unsupported {kind} schema")
     observed = value.get(hash_field)
     if not isinstance(observed, str) or not _SHA256_RE.fullmatch(observed):
@@ -177,8 +191,11 @@ def _require_identifier(value: object, label: str, pattern: re.Pattern[str]) -> 
 def _validate_route_step(
     step: Mapping[str, Any], *, index: int, prior_rank: int, seen_providers: set[str]
 ) -> int:
-    expected_keys = _ROUTE_STEP_KEYS | {"profile_binding"}
-    if set(step) != expected_keys:
+    route_keys = set(step) - {"profile_binding"}
+    if (
+        route_keys != _ROUTE_STEP_V1_KEYS
+        and route_keys != _ROUTE_STEP_V2_KEYS
+    ) or "profile_binding" not in step:
         raise HandoffContractError(
             f"planned_steps[{index}] has unknown or missing route-step fields"
         )
@@ -201,8 +218,8 @@ def _validate_route_step(
     if provider_id in seen_providers:
         raise HandoffContractError("planned route repeats a provider_id")
     seen_providers.add(provider_id)
-    if tier not in TIER_RANK or TIER_RANK[tier] <= prior_rank:
-        raise HandoffContractError("planned route tiers must be strictly increasing")
+    if tier not in TIER_RANK or TIER_RANK[tier] < prior_rank:
+        raise HandoffContractError("planned route tiers must be non-decreasing")
     if (
         not isinstance(identity.get("model"), str)
         or not identity.get("model")
@@ -240,6 +257,64 @@ def _validate_route_step(
         raise HandoffContractError(
             f"planned_steps[{index}] profile binding drifts from execution_identity"
         )
+    if route_keys == _ROUTE_STEP_V2_KEYS:
+        forecast = _canonical_mapping(
+            step.get("token_forecast"), f"planned_steps[{index}].token_forecast"
+        )
+        _require_exact_keys(
+            forecast,
+            _TOKEN_FORECAST_KEYS,
+            f"planned_steps[{index}].token_forecast",
+        )
+        for field in (
+            "estimated_input_tokens",
+            "estimated_cached_input_tokens",
+            "estimated_output_tokens",
+        ):
+            _require_non_negative_int(
+                forecast.get(field), f"planned_steps[{index}].token_forecast.{field}"
+            )
+        if forecast.get("cache_mode") not in {
+            "none",
+            "bound-origin",
+            "exact-identity-reuse",
+            "reclassified-as-ordinary",
+        }:
+            raise HandoffContractError(
+                f"planned_steps[{index}].token_forecast.cache_mode is invalid"
+            )
+        binding = forecast.get("cache_binding")
+        cache_mode = forecast.get("cache_mode")
+        if cache_mode in {"none", "reclassified-as-ordinary"} and binding is not None:
+            raise HandoffContractError(
+                f"planned_steps[{index}].token_forecast has an unexpected cache binding"
+            )
+        if cache_mode in {"bound-origin", "exact-identity-reuse"} and binding is None:
+            raise HandoffContractError(
+                f"planned_steps[{index}].token_forecast lacks its cache binding"
+            )
+        if binding is not None:
+            binding = _canonical_mapping(
+                binding, f"planned_steps[{index}].token_forecast.cache_binding"
+            )
+            _require_exact_keys(
+                binding,
+                _CACHE_BINDING_KEYS,
+                f"planned_steps[{index}].token_forecast.cache_binding",
+            )
+            if (
+                not isinstance(binding.get("provider_id"), str)
+                or not binding.get("provider_id")
+                or binding.get("provider_id") != provider_id
+                or not isinstance(binding.get("model"), str)
+                or not binding.get("model")
+                or binding.get("model") != identity.get("model")
+                or binding.get("profile") != identity.get("profile")
+                or binding.get("profile_sha256") != identity.get("profile_sha256")
+            ):
+                raise HandoffContractError(
+                    f"planned_steps[{index}] cache binding drifts from execution_identity"
+                )
     return TIER_RANK[tier]
 
 
@@ -350,6 +425,7 @@ def build_collaboration_contract(
     route_envelope_id: str,
     route_plan_fingerprint_sha256: str,
     planned_steps: Iterable[Mapping[str, Any]],
+    routing_objective: str = "cost-only",
 ) -> dict[str, Any]:
     """Freeze one task's collaboration inputs before its first provider launch."""
 
@@ -392,17 +468,27 @@ def build_collaboration_contract(
             prior_rank=prior_rank,
             seen_providers=seen_providers,
         )
+    step_forecast_presence = ["token_forecast" in step for step in canonical_steps]
+    if any(step_forecast_presence) and not all(step_forecast_presence):
+        raise HandoffContractError("planned_steps cannot mix route-step schema versions")
+    contract_schema_version = 2 if all(step_forecast_presence) else 1
+    normalized_objective = str(routing_objective).strip().lower()
+    if normalized_objective not in {"completion-first", "cost-only"}:
+        raise HandoffContractError(
+            "routing_objective must be completion-first or cost-only"
+        )
     expected_plan_fingerprint = route_plan_fingerprint(
         canonical_steps,
         input_tokens=input_tokens,
         cached_input_tokens=cached_tokens,
         output_tokens=output_tokens,
+        routing_objective=normalized_objective,
     )
     if route_plan_fingerprint_sha256 != expected_plan_fingerprint:
         raise HandoffContractError("route plan fingerprint does not match its exact bound steps")
     _require_identifier(route_envelope_id, "route_envelope_id", _ENVELOPE_ID_RE)
     body = {
-        "schema_version": 1,
+        "schema_version": contract_schema_version,
         "kind": TASK_CONTRACT_KIND,
         "task_id": exact_task_id,
         "task_spec": canonical_task_spec,
@@ -458,6 +544,8 @@ def build_collaboration_contract(
             "planned_steps": canonical_steps,
         },
     }
+    if contract_schema_version == 2:
+        body["route_policy"]["routing_objective"] = normalized_objective
     return _with_self_hash(body, "contract_sha256")
 
 
@@ -465,7 +553,10 @@ def validate_collaboration_contract(value: Mapping[str, Any]) -> dict[str, Any]:
     """Validate a task collaboration contract, including its derived budgets."""
 
     contract = _validate_self_hash(
-        value, kind=TASK_CONTRACT_KIND, hash_field="contract_sha256"
+        value,
+        kind=TASK_CONTRACT_KIND,
+        hash_field="contract_sha256",
+        schema_versions=frozenset({1, 2}),
     )
     _require_exact_keys(
         contract,
@@ -521,11 +612,17 @@ def validate_collaboration_contract(value: Mapping[str, Any]) -> dict[str, Any]:
         },
         "token policy",
     )
-    _require_exact_keys(
-        route,
-        {"max_steps", "route_envelope_id", "plan_fingerprint", "planned_steps"},
-        "route policy",
+    route_keys = {"max_steps", "route_envelope_id", "plan_fingerprint", "planned_steps"}
+    if contract.get("schema_version") == 2:
+        route_keys.add("routing_objective")
+    _require_exact_keys(route, route_keys, "route policy")
+    routing_objective = (
+        str(route.get("routing_objective") or "").strip().lower()
+        if contract.get("schema_version") == 2
+        else "cost-only"
     )
+    if routing_objective not in {"completion-first", "cost-only"}:
+        raise HandoffContractError("stored routing objective is invalid")
     _require_sha256(context.get("manifest_sha256"), "context projection hash")
     _canonical_paths(context.get("allowlist"), label="context allowlist", write_paths=False)
     _require_non_negative_int(context.get("file_count"), "context file_count")
@@ -563,7 +660,7 @@ def validate_collaboration_contract(value: Mapping[str, Any]) -> dict[str, Any]:
     _require_non_negative_int(tokens.get("estimated_cached_input_tokens"), "estimated cached input")
     max_steps = _require_positive_int(route.get("max_steps"), "max route steps")
     if max_steps > 3:
-        raise HandoffContractError("CostMarshal collaboration supports at most low/medium/high")
+        raise HandoffContractError("CostMarshal collaboration supports at most three provider attempts")
     _require_identifier(route.get("route_envelope_id"), "route envelope id", _ENVELOPE_ID_RE)
     plan_fingerprint = _require_sha256(route.get("plan_fingerprint"), "route plan fingerprint")
     raw_steps = route.get("planned_steps")
@@ -579,15 +676,60 @@ def validate_collaboration_contract(value: Mapping[str, Any]) -> dict[str, Any]:
             prior_rank=prior_rank,
             seen_providers=seen_providers,
         )
+    step_forecast_presence = [
+        isinstance(step, Mapping) and "token_forecast" in step for step in raw_steps
+    ]
+    if any(step_forecast_presence) and not all(step_forecast_presence):
+        raise HandoffContractError("stored route cannot mix route-step schema versions")
+    expected_contract_schema = 2 if all(step_forecast_presence) else 1
+    if contract.get("schema_version") != expected_contract_schema:
+        raise HandoffContractError("collaboration contract schema does not match its route steps")
     observed_fingerprint = route_plan_fingerprint(
         raw_steps,
         input_tokens=input_tokens,
         cached_input_tokens=int(tokens["estimated_cached_input_tokens"]),
         output_tokens=output_tokens,
+        routing_objective=routing_objective,
     )
     if observed_fingerprint != plan_fingerprint:
         raise HandoffContractError("stored route plan fingerprint is inconsistent")
     return contract
+
+
+def _step_token_allocation(
+    contract: Mapping[str, Any], step_index: int
+) -> dict[str, Any]:
+    """Return the exact attempt budget for one legacy or per-step route."""
+
+    tokens = json.loads(_canonical_json_bytes(contract["token_policy"]))
+    if contract.get("schema_version") == 1:
+        return tokens
+    steps = contract["route_policy"]["planned_steps"]
+    if step_index < 0 or step_index >= len(steps):
+        raise HandoffContractError("route_step_index exceeds the immutable admitted route plan")
+    forecast = _canonical_mapping(
+        steps[step_index].get("token_forecast"),
+        f"planned_steps[{step_index}].token_forecast",
+    )
+    input_tokens = _require_positive_int(
+        forecast.get("estimated_input_tokens"), "step estimated input"
+    )
+    cached_tokens = _require_non_negative_int(
+        forecast.get("estimated_cached_input_tokens"), "step estimated cached input"
+    )
+    output_tokens = _require_positive_int(
+        forecast.get("estimated_output_tokens"), "step estimated output"
+    )
+    input_reserve = int(tokens["continuation_input_reserve_tokens"])
+    output_reserve = int(tokens["handoff_output_reserve_tokens"])
+    if input_tokens <= input_reserve or output_tokens <= output_reserve:
+        raise HandoffContractError("per-step token forecast is exhausted by handoff reserves")
+    tokens["estimated_input_tokens"] = input_tokens
+    tokens["estimated_cached_input_tokens"] = cached_tokens
+    tokens["estimated_output_tokens"] = output_tokens
+    tokens["working_input_budget_tokens"] = input_tokens - input_reserve
+    tokens["working_output_budget_tokens"] = output_tokens - output_reserve
+    return tokens
 
 
 def build_attempt_input_contract(
@@ -685,7 +827,7 @@ def build_attempt_input_contract(
         "planned_step": json.loads(_canonical_json_bytes(planned_steps[step_index])),
     }
     body = {
-        "schema_version": 1,
+        "schema_version": int(contract["schema_version"]),
         "kind": ATTEMPT_INPUT_KIND,
         "task_id": contract["task_id"],
         "attempt_id": exact_attempt_id,
@@ -701,9 +843,7 @@ def build_attempt_input_contract(
             "total_upsert_bytes": total_upsert_bytes,
         },
         "predecessor_handoff": handoff_ref,
-        "token_allocation": json.loads(
-            _canonical_json_bytes(contract["token_policy"])
-        ),
+        "token_allocation": _step_token_allocation(contract, step_index),
     }
     return _with_self_hash(body, "attempt_input_sha256")
 
@@ -714,7 +854,10 @@ def validate_attempt_input(
     collaboration_contract: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     attempt = _validate_self_hash(
-        value, kind=ATTEMPT_INPUT_KIND, hash_field="attempt_input_sha256"
+        value,
+        kind=ATTEMPT_INPUT_KIND,
+        hash_field="attempt_input_sha256",
+        schema_versions=frozenset({1, 2}),
     )
     _require_exact_keys(
         attempt,
@@ -818,12 +961,14 @@ def validate_attempt_input(
     if collaboration_contract is not None:
         contract = validate_collaboration_contract(collaboration_contract)
         if (
+            attempt.get("schema_version") != contract.get("schema_version")
+            or
             attempt.get("task_id") != contract["task_id"]
             or attempt.get("collaboration_contract_sha256") != contract["contract_sha256"]
             or attempt.get("base_sha") != contract["base_sha"]
             or attempt.get("context_manifest_sha256")
             != contract["context_projection"]["manifest_sha256"]
-            or tokens != contract["token_policy"]
+            or tokens != _step_token_allocation(contract, step_index)
             or step_index >= len(contract["route_policy"]["planned_steps"])
             or route_binding["route_envelope_id"]
             != contract["route_policy"]["route_envelope_id"]

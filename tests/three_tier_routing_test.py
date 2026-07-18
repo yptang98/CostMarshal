@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
+import json
 import sys
 import time
 from pathlib import Path
@@ -19,6 +21,7 @@ from costmarshal_v2.routing import (  # noqa: E402
     conditional_leader_acceptance_prior,
     decide_route,
     default_provider_catalog,
+    derive_step_token_forecast,
     estimate_cost_cny,
     leader_acceptance_prior,
     legacy_provider_catalog,
@@ -138,7 +141,218 @@ def paired_chain_history(
     return rows
 
 
+def paired_same_tier_history(total: int = 100, peer_accepts: int = 90) -> list[dict]:
+    """Build exact low-A -> low-B -> high continuation evidence."""
+
+    rows: list[dict] = []
+    for index in range(total):
+        task_id = f"TASK-same-tier-{index}"
+        envelope_id = f"ENV-same-tier-{index}"
+        fingerprint = "sha256:" + f"{index + 10_000:064x}"[-64:]
+        low_attempt_id = f"ATT-low-a-{index}"
+        low_result_id = f"RES-low-a-{index}"
+        rows.append(
+            {
+                "id": low_result_id,
+                "provider_id": "longcat",
+                "model": "LongCat-2.0",
+                "profile": "longcat",
+                "task_type": "analysis",
+                "difficulty": "normal",
+                "task_id": task_id,
+                "attempt_id": low_attempt_id,
+                "route_envelope_id": envelope_id,
+                "route_plan_fingerprint": fingerprint,
+                "route_plan_step_index": 0,
+                "route_predecessors": [],
+                "accepted_by_leader": False,
+                "status": "escalate",
+            }
+        )
+        peer_accepted = index < peer_accepts
+        peer_attempt_id = f"ATT-low-b-{index}"
+        peer_result_id = f"RES-low-b-{index}"
+        low_predecessor = {
+            "provider_id": "longcat",
+            "model": "LongCat-2.0",
+            "profile": "longcat",
+            "profile_sha256": None,
+            "attempt_id": low_attempt_id,
+            "result_id": low_result_id,
+        }
+        rows.append(
+            {
+                "id": peer_result_id,
+                "provider_id": "low-peer",
+                "model": "Low-Peer",
+                "profile": "low-peer",
+                "task_type": "analysis",
+                "difficulty": "normal",
+                "task_id": task_id,
+                "attempt_id": peer_attempt_id,
+                "route_envelope_id": envelope_id,
+                "route_plan_fingerprint": fingerprint,
+                "route_plan_step_index": 1,
+                "route_predecessors": [low_predecessor],
+                "accepted_by_leader": peer_accepted,
+                "status": "done" if peer_accepted else "escalate",
+            }
+        )
+        if peer_accepted:
+            continue
+        rows.append(
+            {
+                "id": f"RES-high-after-peer-{index}",
+                "provider_id": "codex",
+                "model": "inherit",
+                "profile": None,
+                "task_type": "analysis",
+                "difficulty": "normal",
+                "task_id": task_id,
+                "attempt_id": f"ATT-high-after-peer-{index}",
+                "route_envelope_id": envelope_id,
+                "route_plan_fingerprint": fingerprint,
+                "route_plan_step_index": 2,
+                "route_predecessors": [
+                    low_predecessor,
+                    {
+                        "provider_id": "low-peer",
+                        "model": "Low-Peer",
+                        "profile": "low-peer",
+                        "profile_sha256": None,
+                        "attempt_id": peer_attempt_id,
+                        "result_id": peer_result_id,
+                    },
+                ],
+                "accepted_by_leader": True,
+                "status": "done",
+            }
+        )
+    return rows
+
+
 class ThreeTierRoutingTest(unittest.TestCase):
+    def test_route_plan_v2_binds_per_step_forecasts_and_preserves_v1_digest(self) -> None:
+        decision = decide_route(
+            {"risk": "low", "task_type": "analysis"},
+            default_provider_catalog(),
+            input_tokens=100,
+            output_tokens=20,
+        )
+        self.assertEqual(
+            decision.planned_steps[0]["token_forecast"]["cache_mode"],
+            "none",
+        )
+        v2_digest = decision.plan_fingerprint
+        drifted = deepcopy(list(decision.planned_steps))
+        drifted[0]["token_forecast"]["estimated_input_tokens"] += 1
+        with self.assertRaisesRegex(RoutingValidationError, "inconsistent"):
+            route_plan_fingerprint(
+                drifted,
+                input_tokens=100,
+                cached_input_tokens=0,
+                output_tokens=20,
+            )
+
+        legacy_steps = deepcopy(list(decision.planned_steps))
+        for step in legacy_steps:
+            step.pop("token_forecast")
+        legacy_payload = {
+            "schema_version": "costmarshal-route-plan-v1",
+            "estimated_input_tokens": 100,
+            "estimated_cached_input_tokens": 0,
+            "estimated_output_tokens": 20,
+            "planned_steps": legacy_steps,
+        }
+        expected_v1 = "sha256:" + hashlib.sha256(
+            json.dumps(
+                legacy_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(
+            route_plan_fingerprint(
+                legacy_steps,
+                input_tokens=100,
+                cached_input_tokens=0,
+                output_tokens=20,
+            ),
+            expected_v1,
+        )
+        self.assertNotEqual(v2_digest, expected_v1)
+
+    def test_cache_reuse_requires_exact_provider_model_profile_and_hash(self) -> None:
+        provider = default_provider_catalog()["providers"][0]
+        identity = ("model-a", "profile-a", "sha256:" + "a" * 64)
+        origin = {
+            "provider_id": provider["provider_id"],
+            "model": identity[0],
+            "profile": identity[1],
+            "profile_sha256": identity[2],
+        }
+        reused = derive_step_token_forecast(
+            input_tokens=100,
+            cached_input_tokens=900,
+            output_tokens=20,
+            target_provider=provider,
+            target_execution_identity=identity,
+            step_index=1,
+            cache_origin=origin,
+        )
+        self.assertEqual(
+            (reused["estimated_input_tokens"], reused["estimated_cached_input_tokens"]),
+            (100, 900),
+        )
+        self.assertEqual(reused["cache_mode"], "exact-identity-reuse")
+
+        changed_model = derive_step_token_forecast(
+            input_tokens=100,
+            cached_input_tokens=900,
+            output_tokens=20,
+            target_provider=provider,
+            target_execution_identity=("model-b", identity[1], identity[2]),
+            step_index=1,
+            cache_origin=origin,
+        )
+        self.assertEqual(
+            (
+                changed_model["estimated_input_tokens"],
+                changed_model["estimated_cached_input_tokens"],
+                changed_model["cache_mode"],
+            ),
+            (1000, 0, "reclassified-as-ordinary"),
+        )
+
+    def test_unproven_first_step_cache_is_priced_as_ordinary(self) -> None:
+        provider = default_provider_catalog()["providers"][0]
+        forecast = derive_step_token_forecast(
+            input_tokens=100,
+            cached_input_tokens=900,
+            output_tokens=20,
+            target_provider=provider,
+            target_execution_identity=("LongCat-2.0", "longcat", "sha256:" + "a" * 64),
+            step_index=0,
+        )
+        self.assertEqual(
+            forecast,
+            {
+                "estimated_input_tokens": 1000,
+                "estimated_cached_input_tokens": 0,
+                "estimated_output_tokens": 20,
+                "cache_mode": "reclassified-as-ordinary",
+                "cache_binding": None,
+            },
+        )
+
+    def test_model_ids_are_shell_safe_identifiers(self) -> None:
+        catalog = default_provider_catalog()
+        catalog["providers"][0]["model"] = "x&echo-injected"
+        with self.assertRaisesRegex(RoutingValidationError, "model must"):
+            validate_provider_catalog(catalog)
+
     def test_new_and_legacy_catalogs_keep_provider_id_separate_from_tier(self) -> None:
         new = validate_provider_catalog(default_provider_catalog())
         self.assertEqual(
@@ -191,7 +405,7 @@ class ThreeTierRoutingTest(unittest.TestCase):
         with self.assertRaises(RoutingValidationError):
             project_provider_catalog({"provider_catalog": None})
 
-    def test_route_optimization_rejects_unbounded_enabled_peer_sets(self) -> None:
+    def test_auto_route_rejects_unbounded_relevant_peer_sets(self) -> None:
         catalog = default_provider_catalog()
         template = deepcopy(catalog["providers"][0])
         for index in range(16):
@@ -201,6 +415,77 @@ class ThreeTierRoutingTest(unittest.TestCase):
             catalog["providers"].append(peer)
         with self.assertRaisesRegex(RoutingValidationError, "too many enabled"):
             decide_route({"risk": "low", "task_type": "analysis"}, catalog)
+
+    def test_explicit_high_provider_ignores_oversized_low_tier(self) -> None:
+        catalog = default_provider_catalog()
+        template = deepcopy(catalog["providers"][0])
+        for index in range(16):
+            peer = deepcopy(template)
+            peer["provider_id"] = f"low-peer-{index}"
+            peer["profile"] = f"low-peer-{index}"
+            catalog["providers"].append(peer)
+
+        decision = decide_route(
+            {"risk": "low", "task_type": "analysis"},
+            catalog,
+            requested_provider_id="codex",
+        )
+
+        self.assertEqual((decision.provider_id, decision.tier), ("codex", "high"))
+        self.assertEqual(decision.candidate_provider_ids, ("codex",))
+
+    def test_high_floor_ignores_oversized_low_tier_for_auto_route(self) -> None:
+        catalog = default_provider_catalog()
+        template = deepcopy(catalog["providers"][0])
+        for index in range(16):
+            peer = deepcopy(template)
+            peer["provider_id"] = f"low-peer-{index}"
+            peer["profile"] = f"low-peer-{index}"
+            catalog["providers"].append(peer)
+
+        decision = decide_route(
+            {"risk": "high", "task_type": "analysis"},
+            catalog,
+        )
+
+        self.assertEqual((decision.provider_id, decision.tier), ("codex", "high"))
+
+    def test_explicit_provider_bypasses_oversized_same_tier(self) -> None:
+        catalog = default_provider_catalog()
+        template = deepcopy(catalog["providers"][0])
+        for index in range(16):
+            peer = deepcopy(template)
+            peer["provider_id"] = f"low-peer-{index}"
+            peer["profile"] = f"low-peer-{index}"
+            catalog["providers"].append(peer)
+
+        decision = decide_route(
+            {"risk": "low", "task_type": "analysis"},
+            catalog,
+            requested_provider_id="low-peer-15",
+        )
+
+        self.assertEqual(decision.provider_id, "low-peer-15")
+        self.assertEqual(decision.candidate_provider_ids, ("low-peer-15",))
+
+    def test_explicit_tier_only_sorts_oversized_same_tier(self) -> None:
+        catalog = default_provider_catalog()
+        template = deepcopy(catalog["providers"][0])
+        for index in range(16):
+            peer = deepcopy(template)
+            peer["provider_id"] = f"low-peer-{index}"
+            peer["profile"] = f"low-peer-{index}"
+            peer["priority"] = index
+            catalog["providers"].append(peer)
+
+        decision = decide_route(
+            {"risk": "low", "task_type": "analysis"},
+            catalog,
+            requested_tier="low",
+        )
+
+        self.assertEqual((decision.provider_id, decision.tier), ("low-peer-0", "low"))
+        self.assertEqual(len(decision.candidate_provider_ids), 17)
 
     def test_maximum_bounded_catalog_indexes_history_once(self) -> None:
         base = default_provider_catalog()["providers"]
@@ -295,6 +580,30 @@ class ThreeTierRoutingTest(unittest.TestCase):
             "codex",
         )
 
+    def test_next_stronger_provider_reprices_cached_input_as_ordinary(self) -> None:
+        catalog = default_provider_catalog()
+        for provider in catalog["providers"]:
+            provider["input_cny_per_1m"] = 10.0
+            provider["output_cny_per_1m"] = 0.0
+        successor = next_stronger_provider(
+            catalog,
+            "longcat",
+            input_tokens=100_000,
+            cached_input_tokens=900_000,
+        )
+        self.assertEqual(successor["provider_id"], "deepseek")
+        self.assertEqual(
+            successor["token_forecast"],
+            {
+                "estimated_input_tokens": 1_000_000,
+                "estimated_cached_input_tokens": 0,
+                "estimated_output_tokens": 0,
+                "cache_mode": "reclassified-as-ordinary",
+                "cache_binding": None,
+            },
+        )
+        self.assertEqual(successor["estimated_cost_cny"], 10.0)
+
     def test_next_stronger_provider_honors_capabilities_and_reviewed_chain(self) -> None:
         catalog = default_provider_catalog()
         medium_alt = deepcopy(catalog["providers"][1])
@@ -325,6 +634,48 @@ class ThreeTierRoutingTest(unittest.TestCase):
             required_capabilities=("Vision",),
         )
         self.assertEqual(case_preserved["provider_id"], "codex")
+
+    def test_same_tier_preferred_successor_requires_sealed_caller_authority(self) -> None:
+        catalog = default_provider_catalog()
+        peer = deepcopy(catalog["providers"][0])
+        peer.update(
+            {
+                "provider_id": "low-peer",
+                "profile": "low-peer",
+                "model": "Low-Peer",
+                "priority": 2,
+            }
+        )
+        catalog["providers"].append(peer)
+        preferred = ("longcat", "low-peer", "codex")
+
+        ad_hoc = next_stronger_provider(
+            catalog,
+            "longcat",
+            preferred_provider_ids=preferred,
+        )
+        self.assertEqual(ad_hoc["provider_id"], "deepseek")
+        sealed = next_stronger_provider(
+            catalog,
+            "longcat",
+            preferred_provider_ids=preferred,
+            allow_same_tier_preferred=True,
+        )
+        self.assertEqual((sealed["provider_id"], sealed["tier"]), ("low-peer", "low"))
+        with self.assertRaisesRegex(RoutingValidationError, "unique provider IDs"):
+            next_stronger_provider(
+                catalog,
+                "longcat",
+                preferred_provider_ids=("longcat", "longcat"),
+                allow_same_tier_preferred=True,
+            )
+        with self.assertRaisesRegex(RoutingValidationError, "tier downgrade"):
+            next_stronger_provider(
+                catalog,
+                "codex",
+                preferred_provider_ids=("codex", "low-peer"),
+                allow_same_tier_preferred=True,
+            )
 
     def test_reviewed_high_never_bypasses_an_available_fallback_medium(self) -> None:
         catalog = default_provider_catalog()
@@ -682,6 +1033,63 @@ class ThreeTierRoutingTest(unittest.TestCase):
         self.assertEqual(high.planned_provider_ids, ("codex",))
         self.assertEqual(high.optimization_mode, "expected-cost-per-accepted")
 
+    def test_mature_optimizer_can_use_distinct_same_tier_peer_then_high(self) -> None:
+        catalog = default_provider_catalog()
+        peer = deepcopy(catalog["providers"][0])
+        peer.update(
+            {
+                "provider_id": "low-peer",
+                "profile": "low-peer",
+                "model": "Low-Peer",
+                "env_key": "LOW_PEER_API_KEY",
+                "priority": 2,
+            }
+        )
+        catalog["providers"].append(peer)
+        prices = {
+            "longcat": 0.01,
+            "low-peer": 0.02,
+            "deepseek": 1000.0,
+            "codex": 1.0,
+        }
+        for provider in catalog["providers"]:
+            provider["input_cny_per_1m"] = prices[provider["provider_id"]]
+            provider["output_cny_per_1m"] = prices[provider["provider_id"]]
+
+        decision = decide_route(
+            {
+                "risk": "low",
+                "task_type": "analysis",
+                "difficulty": "normal",
+                "min_success_probability": 0.9,
+            },
+            catalog,
+            history=paired_same_tier_history(),
+            input_tokens=1_000_000,
+        )
+
+        self.assertEqual(
+            decision.planned_provider_ids,
+            ("longcat", "low-peer", "codex"),
+        )
+        self.assertEqual(
+            [step["tier"] for step in decision.planned_steps],
+            ["low", "low", "high"],
+        )
+        self.assertEqual(len(set(decision.planned_provider_ids)), 3)
+        self.assertLessEqual(len(decision.planned_provider_ids), 3)
+
+        bootstrap = decide_route(
+            {"risk": "low", "task_type": "analysis", "difficulty": "normal"},
+            catalog,
+            input_tokens=1_000_000,
+        )
+        self.assertEqual(bootstrap.optimization_mode, "conditional-evidence-bootstrap")
+        self.assertEqual(
+            [step["tier"] for step in bootstrap.planned_steps],
+            ["low", "medium", "high"],
+        )
+
     def test_bootstrap_requires_ten_exact_observations_then_returns_to_economics(self) -> None:
         catalog = default_provider_catalog()
         prices = {"longcat": 80.0, "deepseek": 20.0, "codex": 1.0}
@@ -875,6 +1283,35 @@ class ThreeTierRoutingTest(unittest.TestCase):
         )
         self.assertEqual(unconstrained.planned_provider_ids, ("longcat",))
         self.assertEqual(unconstrained.optimization_mode, "expected-cost-per-accepted")
+        completion_first = decide_route(
+            {
+                "risk": "low",
+                "task_type": "analysis",
+                "routing_objective": "completion-first",
+            },
+            catalog,
+            history=paired_chain_history(),
+            input_tokens=1_000_000,
+        )
+        self.assertEqual(completion_first.routing_objective, "completion-first")
+        self.assertEqual(completion_first.planned_provider_ids[-1], "codex")
+        self.assertNotEqual(completion_first.planned_provider_ids, ("longcat",))
+        self.assertNotEqual(
+            completion_first.plan_fingerprint,
+            unconstrained.plan_fingerprint,
+        )
+        explicit_low = decide_route(
+            {
+                "risk": "low",
+                "task_type": "analysis",
+                "routing_objective": "completion-first",
+            },
+            catalog,
+            requested_provider_id="longcat",
+            history=paired_chain_history(),
+            input_tokens=1_000_000,
+        )
+        self.assertEqual(explicit_low.planned_provider_ids, ("longcat",))
         skip_history = []
         for row in paired_chain_history(medium_accepts=0, high_accepts=115):
             if row["provider_id"] == "deepseek":
@@ -895,6 +1332,16 @@ class ThreeTierRoutingTest(unittest.TestCase):
             input_tokens=1_000_000,
         )
         self.assertEqual(constrained.planned_provider_ids, ("longcat", "codex"))
+        with self.assertRaises(RoutingValidationError):
+            decide_route(
+                {
+                    "risk": "low",
+                    "task_type": "analysis",
+                    "routing_objective": "cheapest-at-any-cost",
+                },
+                catalog,
+                input_tokens=1_000_000,
+            )
 
     def test_required_capabilities_are_hard_route_constraints(self) -> None:
         catalog = default_provider_catalog()

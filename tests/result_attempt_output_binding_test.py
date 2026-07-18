@@ -43,6 +43,7 @@ from costmarshal_v2.scheduler import (  # noqa: E402
     audit_result_evidence,
     build_rejected_attempt_handoff,
     execute_scheduler_command,
+    validate_route_budget_envelope,
     validate_envelope_dispatch_step,
 )
 
@@ -548,6 +549,117 @@ class ResultAttemptOutputBindingTest(unittest.TestCase):
                 provider,
                 trusted_history=[mutated],
             )
+
+    def test_exact_envelope_dispatch_accepts_distinct_same_tier_step_only(self) -> None:
+        provider = {
+            "provider_id": "low-b",
+            "tier": "low",
+            "input_cny_per_1m": "1",
+            "output_cny_per_1m": "1",
+        }
+        first = {
+            "provider_id": "low-a",
+            "tier": "low",
+            "price_basis": provider_price_basis(provider),
+            "estimated_cost_cny": "1",
+            "acceptance_prior": {"observations": 0},
+        }
+        peer = {
+            "provider_id": "low-b",
+            "tier": "low",
+            "price_basis": provider_price_basis(provider),
+            "estimated_cost_cny": "1",
+            "acceptance_prior": {"observations": 0},
+        }
+        task = {
+            "id": "V2-0001",
+            "attempts": [
+                {
+                    "route_envelope_id": "ENV-same-tier",
+                    "route_plan_step_index": 0,
+                }
+            ],
+        }
+        envelope = {
+            "planned_steps": [first, peer],
+            "envelope_id": "ENV-same-tier",
+            "estimated_input_tokens": 1_000_000,
+            "estimated_cached_input_tokens": 0,
+            "estimated_output_tokens": 0,
+        }
+        decision = SimpleNamespace(
+            provider_id="low-b",
+            tier="low",
+            planned_steps=(peer,),
+            estimated_input_tokens=1_000_000,
+            estimated_cached_input_tokens=0,
+            estimated_output_tokens=0,
+        )
+        accepted_index, accepted_step = validate_envelope_dispatch_step(
+            task,
+            envelope,
+            decision,
+            provider,
+            trusted_history=[],
+        )
+        self.assertEqual((accepted_index, accepted_step["provider_id"]), (1, "low-b"))
+
+        ad_hoc = SimpleNamespace(**{**decision.__dict__, "provider_id": "low-c"})
+        with self.assertRaisesRegex(ValueError, "route plan requires step 1 low-b"):
+            validate_envelope_dispatch_step(
+                task,
+                envelope,
+                ad_hoc,
+                {**provider, "provider_id": "low-c"},
+                trusted_history=[],
+            )
+
+    def test_route_envelope_allows_non_decreasing_unique_chain_and_rejects_tamper(self) -> None:
+        steps = deepcopy(self.task["handoff_contract"]["route_policy"]["planned_steps"])
+        steps[1]["tier"] = "low"
+
+        def envelope_task(candidate_steps: list[dict[str, object]]) -> dict[str, object]:
+            fingerprint = route_plan_fingerprint(
+                candidate_steps,
+                input_tokens=20_000,
+                cached_input_tokens=0,
+                output_tokens=10_000,
+            )
+            return {
+                "id": "V2-envelope",
+                "attempts": [],
+                "route_budget_envelope": {
+                    "schema_version": "costmarshal-route-budget-envelope-v2",
+                    "envelope_id": "ENV-envelope-validation",
+                    "plan_fingerprint": fingerprint,
+                    "estimated_input_tokens": 20_000,
+                    "estimated_cached_input_tokens": 0,
+                    "estimated_output_tokens": 10_000,
+                    "planned_steps": candidate_steps,
+                    "reserved_cost_cny": "6",
+                    "baseline_commitment_cny": "0",
+                    "status": "active",
+                    "created_at": "2026-07-16T00:00:00Z",
+                    "released_at": None,
+                    "release_reason": None,
+                },
+            }
+
+        validated = validate_route_budget_envelope(envelope_task(steps))
+        self.assertEqual(
+            [step["tier"] for step in validated["planned_steps"]],
+            ["low", "low", "high"],
+        )
+
+        repeated = deepcopy(steps)
+        repeated[1]["provider_id"] = repeated[0]["provider_id"]
+        with self.assertRaisesRegex(ValueError, "repeats a provider_id"):
+            validate_route_budget_envelope(envelope_task(repeated))
+
+        downgraded = deepcopy(steps)
+        downgraded[0]["tier"] = "medium"
+        with self.assertRaisesRegex(ValueError, "tier downgrade"):
+            validate_route_budget_envelope(envelope_task(downgraded))
 
     def test_cross_task_duplicate_attempt_id_invalidates_all_evidence(self) -> None:
         duplicate = deepcopy(self.task)

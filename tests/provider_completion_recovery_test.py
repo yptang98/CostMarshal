@@ -38,6 +38,42 @@ class CrashAfterCleanup(RuntimeError):
     pass
 
 
+def simulated_windows_job_runtime(
+    *,
+    expected_child_pid: object = None,
+    expected_child_start_marker: object = None,
+) -> dict[str, object]:
+    """Model the already-verified supervisor receipt for direct runner tests."""
+
+    authority_pid = (
+        int(expected_child_pid)
+        if type(expected_child_pid) is int and expected_child_pid > 0
+        else os.getpid()
+    )
+    marker = (
+        str(expected_child_start_marker)
+        if isinstance(expected_child_start_marker, str)
+        and expected_child_start_marker
+        else actor_runner.pid_start_marker(authority_pid)
+        or f"test-marker:{authority_pid}"
+    )
+    return {
+        "pid": authority_pid,
+        "process_start_marker": marker,
+        "target": "job:costmarshal-provider-completion-test",
+        "windows_job_name": "costmarshal-provider-completion-test",
+        "windows_job_identity": "a" * 64,
+        "windows_job_child_pid": authority_pid,
+        "windows_job_child_start_marker": marker,
+    }
+
+
+if os.name == "nt":
+    # This contract invokes run_actor directly. Production Windows launches are
+    # covered separately and must inherit a real verified Job Object receipt.
+    actor_runner._inherited_windows_job_runtime = simulated_windows_job_runtime
+
+
 class CompletionAdapter:
     provider_calls = 0
 
@@ -355,7 +391,9 @@ sys.path.insert(0, sys.argv[1])
 sys.path.insert(0, str(Path(sys.argv[1]) / 'tests'))
 import costmarshal_v2.actor_runner as runner
 from costmarshal_v2.paths import ProjectLayout
-from provider_completion_recovery_test import CompletionAdapter
+from provider_completion_recovery_test import CompletionAdapter, simulated_windows_job_runtime
+if runner.os.name == "nt":
+    runner._inherited_windows_job_runtime = simulated_windows_job_runtime
 runner.OciWorkerExecutionAdapter = CompletionAdapter
 raise SystemExit(runner.run_actor(
     ProjectLayout(root=Path(sys.argv[2]), project_dir=Path(sys.argv[3])),

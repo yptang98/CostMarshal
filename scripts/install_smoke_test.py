@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Install/uninstall smoke test for the CostMarshal skill.
-
-This simulates the documented install prompt in a temporary CODEX_HOME.
-It does not touch the user's real Codex home or runtime state.
-"""
+"""Compatibility launcher for the real Codex plugin install smoke."""
 
 from __future__ import annotations
 
@@ -62,7 +58,8 @@ def assert_true(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
-def main() -> int:
+def _legacy_standalone_smoke() -> int:
+    """Retained only as executable migration coverage for old copied installs."""
     assert_true(
         sys.version_info >= MINIMUM_PYTHON,
         "CostMarshal requires Python 3.11+ for installation and runtime",
@@ -93,6 +90,19 @@ def main() -> int:
         assert_true(backup_dir.exists(), "update flow should back up an existing install")
         assert_true((backup_dir / ".env").is_file(), "backup should preserve old local files")
         assert_true((install_dir / "SKILL.md").is_file(), "installed skill should include SKILL.md")
+        assert_true(
+            (install_dir / ".codex-plugin" / "plugin.json").is_file(),
+            "installed package should include the Codex plugin manifest",
+        )
+        assert_true(
+            (
+                install_dir
+                / "skills"
+                / "orchestrate-cost-aware-agents"
+                / "SKILL.md"
+            ).is_file(),
+            "installed package should include the Codex-native Skill entry",
+        )
         assert_true((install_dir / "scripts" / "costmarshal.py").is_file(), "installed skill should include CLI")
         assert_true((install_dir / "container" / "worker" / "Dockerfile").is_file(), "installed skill should include worker image source")
         assert_true((install_dir / "references" / "backtest.md").is_file(), "installed skill should include release references")
@@ -116,7 +126,7 @@ def main() -> int:
                 "--name",
                 "install-smoke",
                 "--objective",
-                "Validate CostMarshal v2 install",
+                "Validate legacy standalone CostMarshal install",
                 "--backend",
                 "local",
             ],
@@ -160,4 +170,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from codex_plugin_install_smoke_test import main as plugin_main
+
+    raise SystemExit(plugin_main())

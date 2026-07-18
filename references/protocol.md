@@ -1,4 +1,4 @@
-# CostMarshal v2.4 Protocol
+# CostMarshal v3.0 Protocol
 
 This is the canonical v2 protocol. Legacy `scripts/mc.py` commands are not part of it.
 
@@ -13,7 +13,7 @@ This is the canonical v2 protocol. Legacy `scripts/mc.py` commands are not part 
 ```text
 planned -> dispatched -> waiting_leader -> done
                     \-> failed
-                    \-> escalate -> next stronger attempt
+                    \-> escalate -> exact admitted successor
 ```
 
 Only `record-result --status done --accepted-by-leader` may create `done`. A worker collect request is limited to `waiting_leader`, `failed`, or `escalate`.
@@ -26,15 +26,17 @@ Mailbox message IDs are idempotency keys. Replaying task creation, dispatch, esc
 
 ## Routing
 
-Safety establishes a minimum tier. Complete, reviewed price and token inputs enable cross-tier chain optimization. Incomplete economic inputs fall back to the minimum safe available tier.
+Safety establishes a minimum tier. Complete, reviewed price and token inputs enable bounded provider-chain optimization. A mature plan contains one to three unique provider IDs with non-decreasing tiers; cold-start bootstrap remains one provider per available tier. New projects use completion-first and retain a strongest-compatible terminal fallback; explicit cost-only and legacy projects may terminate earlier. Every successor still requires leader rejection. Incomplete economic inputs fall back to the minimum safe available tier.
 
-Escalation selects the next enabled stronger tier; a two-tier legacy catalog may skip a missing medium tier.
+Each route step binds its own ordinary/cached/output forecast. Cached input is portable only with a proven exact provider/model/profile/profile-hash origin; a missing origin or different successor identity reclassifies it as ordinary input. Route-plan v2, budget-envelope v3, and collaboration-contract v2 bind this forecast. Missing usage cannot settle a reservation, while an explicit all-zero final observation can settle the immutable per-attempt fixed fee.
+
+Escalation follows the exact next provider in an active sealed envelope. That provider may be a distinct same-tier peer or a stronger tier, and a two-tier legacy catalog may skip a missing medium tier. Without such a sealed same-tier step, escalation remains stronger-tier only; repeats and downgrades are forbidden.
 
 ### Pricing snapshot gate
 
 Non-beta pricing is a nested, immutable snapshot containing currency, source,
 review/effective/expiry timestamps, snapshot ID, canonical SHA-256 hash, normal
-input, cached input, output, and fixed-request rates. Routing evaluates
+input, cached input, output, and fixed-attempt rates. Routing evaluates
 freshness against an injected or UTC clock. A future-reviewed, future-effective,
 expired, mixed-currency, mixed canonical/legacy, hash-mismatched, or unsupported
 snapshot cannot emit a CNY estimate; unbudgeted routing degrades explicitly to
@@ -49,7 +51,14 @@ snapshot.
 
 Production worker dispatch uses `required` isolation and may select only an attested local Docker/Podman Linux engine with a digest-pinned image. Native execution is never a fallback. Unsafe native development execution requires two explicit opt-ins and records a weak attestation. Required governance forbids it.
 
-The beta OCI contract validates mounts, rootfs, UID, capabilities, no-new-privileges, engine locality, image digest, resources, and canary output before state or budget reservation. Required execution uses a bounded JSONL worker adapter with one selected credential, a sanitized profile, stdin-only prompts, a strict output exchange, immutable container identity, and cleanup receipts. Unrestricted bridge networking is forbidden. A `provider-proxy` network must be engine-attested as internal, carry the CostMarshal trust label, and be paired with a separately reviewed dual-homed proxy for controlled egress.
+The v3 OCI contract validates mounts, rootfs, UID, capabilities, no-new-privileges, engine locality, image digest, resources, and canary output before state or budget reservation. Required execution uses a bounded JSONL worker adapter with one selected credential, a sanitized profile, stdin-only prompts, a strict output exchange, immutable container identity, and cleanup receipts. Unrestricted bridge networking is forbidden. A `provider-proxy` network must be engine-attested as internal, carry the CostMarshal trust label, and be paired with a separately reviewed dual-homed proxy for controlled egress.
+
+The selected provider client and credential share one trust domain inside the
+container. OCI boundaries keep that worker away from host files and other
+provider keys, but cannot stop a malicious in-container workload from encoding
+the selected key. Redaction is accidental-disclosure defense only. Hostile
+workloads require an out-of-process credential broker issuing scoped
+attempt/provider/budget/time capabilities; v3.0 does not include that broker.
 
 ## Write isolation
 
