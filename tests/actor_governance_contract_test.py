@@ -23,6 +23,9 @@ SOURCE_HASH = "a" * 64
 SKILL_HEAD = "b" * 64
 IMAGE = "ghcr.io/example/costmarshal-worker@sha256:" + ("c" * 64)
 
+sys.path.insert(0, str(ROOT / "tests"))
+from oci_actor_runner_test import popen_linux_token_bound_child  # noqa: E402
+
 
 def cli(temp: Path, *args: str) -> dict:
     env = os.environ.copy()
@@ -443,7 +446,7 @@ def main() -> int:
                 "COSTMARSHAL_NATIVE_LAUNCH_BARRIER_RELEASE": str(barrier_release),
             }
         )
-        barrier_process = subprocess.Popen(
+        barrier_process = popen_linux_token_bound_child(
             command,
             text=True,
             stdout=subprocess.PIPE,

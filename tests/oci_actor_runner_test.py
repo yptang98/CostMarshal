@@ -79,6 +79,18 @@ def run_linux_token_bound_child(command: list[str], **kwargs) -> subprocess.Comp
         os.close(token_fd)
 
 
+def popen_linux_token_bound_child(command: list[str], **kwargs) -> subprocess.Popen[str]:
+    """Start a long-lived runner fixture with LocalBackend's inherited authority."""
+
+    if not sys.platform.startswith("linux"):
+        return subprocess.Popen(command, **kwargs)
+    token_fd = os.memfd_create(LINUX_RUNNER_PROCESS_TOKEN, flags=0)
+    try:
+        return subprocess.Popen(command, stdin=token_fd, **kwargs)
+    finally:
+        os.close(token_fd)
+
+
 def cli(temp: Path, *args: str) -> dict:
     environment = os.environ.copy()
     environment["COSTMARSHAL_V2_HOME"] = str(temp / "runtime")
