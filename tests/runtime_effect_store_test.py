@@ -499,14 +499,22 @@ raise AssertionError('fault did not exit')
         layout = make_layout(self.base, "observed-recovery")
         migrate_legacy_store(layout)
         prepare_effect(layout, "CMD-observed", "EFF-observed")
-        lease_effect(layout, owner="worker-one", ttl_seconds=0.15)
+        lease_effect(layout, owner="worker-one", ttl_seconds=5)
         observe_effect(
             layout,
             effect_id="EFF-observed",
             owner="worker-one",
             observation={"pid": 1234, "start_marker": "same-process"},
         )
-        time.sleep(0.2)
+        connection = sqlite3.connect(database_path(layout))
+        try:
+            connection.execute(
+                "UPDATE effects SET lease_expires_at=? WHERE effect_id=?",
+                ("1970-01-01T00:00:00Z", "EFF-observed"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
         validation = validate_control_store(layout)
         self.assertEqual(validation["expired_effect_leases"], ["EFF-observed"])
         recovered = lease_effect(layout, owner="worker-two", ttl_seconds=5)

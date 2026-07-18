@@ -276,6 +276,7 @@ def main() -> int:
             "\n".join(
                 [
                     "import json, pathlib, sys",
+                    "sys.stdin.read()",
                     "output = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])",
                     "output.write_text('# Completion Report\\n\\nStatus: done\\n', encoding='utf-8')",
                     "print(json.dumps({'type': 'status', 'payload': {'input_tokens': 0, 'output_tokens': 0}}))",
