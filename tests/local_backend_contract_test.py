@@ -14,6 +14,10 @@ import time
 from pathlib import Path
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from costmarshal_v2.session_backend import pid_is_alive  # noqa: E402
+
+
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "scripts" / "costmarshal.py"
 
@@ -50,20 +54,7 @@ def assert_true(condition: bool, message: str) -> None:
 def pid_alive(pid: int | None) -> bool:
     if not pid:
         return False
-    try:
-        if os.name == "nt":
-            result = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
-            return str(pid) in result.stdout
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+    return pid_is_alive(pid)
 
 
 def kill_pid(pid: int | None) -> None:

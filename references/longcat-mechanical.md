@@ -4,7 +4,10 @@
 
 Use LongCat as a low-tier mechanical executor when a senior or medium worker has already converted a process into a script, command, runbook, or template. LongCat can change a few explicit parameters and run the known flow. It should not invent new methods or debug freely.
 
-Prefer CostMarshal replay memory for this flow. After the strong agent proves the workflow, the leader should run `costmarshal.py promote-memory --project <project> --source-task <task> --name <memory-name> ...`, then create LongCat replay tasks with `--replay-memory <memory-name>`.
+Attach the previously proven runbook through the task's bounded `allowed_context`
+and restrict `allowed_paths`. CostMarshal does not expose a replay-memory command;
+the leader creates a normal task, dispatches it explicitly to the reviewed low
+provider, and records acceptance or escalation through the normal protocol.
 
 ## Eligible Tasks
 
@@ -63,14 +66,14 @@ Success markers:
 
 Failure protocol:
 - Do not modify code to fix failures.
-- Write `FAILED`.
-- Put the last 80 stderr lines in `failed.md`.
-- Set `status.json.state` to `failed` or `escalate`.
+- Stop after the first failed command.
+- Return a final report with `Status: failed` or `Status: escalate`.
+- Include a bounded error summary; never copy credentials or unrelated host paths.
 
 Return artifacts:
-- status.json
-- completion-report.md
-- DONE or FAILED or ESCALATE
+- the explicitly requested task artifact(s)
+- one final report owned and imported by the CostMarshal runner
+- no direct edits to `task.json`, `status.json`, scheduler state, or canonical reports
 ````
 
 ## Leader Checks
@@ -84,7 +87,7 @@ Before dispatch:
 After completion:
 - inspect changed files or generated artifacts
 - verify success markers
-- record replay memory feedback with `record-memory-feedback`
+- record the leader result with `record-result --accepted-by-leader` only after review
 - sample the output when it will inform a decision
 - escalate if LongCat changed anything outside the whitelist
 

@@ -48,7 +48,22 @@ def assert_true(condition: bool, message: str) -> None:
 
 def main() -> int:
     temp = Path(tempfile.mkdtemp(prefix="costmarshal-v2-smoke-"))
+    previous_codex_home = os.environ.get("CODEX_HOME")
     try:
+        # Keep the smoke test independent from the developer's user-level Codex
+        # configuration. Route admission intentionally fails closed when a named
+        # provider profile is missing, so a clean runner must create its fixture.
+        codex_home = temp / "codex-home"
+        os.environ["CODEX_HOME"] = str(codex_home)
+        configured = run_json(
+            temp,
+            "configure-profiles",
+            "--codex-home",
+            str(codex_home),
+        )
+        assert_true(configured["profile"] == "longcat", "smoke fixture should create the low-tier profile")
+        assert_true(Path(configured["path"]).is_file(), "smoke fixture profile should exist")
+
         source = temp / "legacy-source"
         source.mkdir()
         (source / "project.json").write_text('{"schema_version": 1, "id": "legacy-source"}\n', encoding="utf-8")
@@ -81,6 +96,7 @@ def main() -> int:
             "cmv2-smoke",
             "--backend",
             "local",
+            "--allow-unsafe-native-workers",
         )
         project = Path(init["project"])
         assert_true(init["backend"] == "local", "smoke project should force the portable local backend")
@@ -111,7 +127,7 @@ def main() -> int:
             "--agent",
             "deepseek",
             "--model",
-            "deepseek-v4-flash",
+            "LongCat-2.0",
             "--acceptance",
             "Report path is available to the leader",
             "--allowed-context",
@@ -145,9 +161,10 @@ def main() -> int:
             "--agent",
             "deepseek",
             "--model",
-            "deepseek-v4-flash",
+            "LongCat-2.0",
             "--command",
             "codex --model {model}",
+            "--unsafe-native",
         )
         assert_true(dispatch["actor_id"] == "agent-v2-0001", "dispatch should create a task-scoped agent")
         assert_true(Path(dispatch["prompt_file"]).is_file(), "dispatch should create a durable agent prompt")
@@ -241,7 +258,7 @@ def main() -> int:
             "--task",
             "V2-0001",
             "--state",
-            "done",
+            "waiting_leader",
             "--report",
             str(project / "tasks" / "V2-0001" / "missing-report.md"),
             expect_ok=False,
@@ -250,9 +267,45 @@ def main() -> int:
 
         report = project / "tasks" / "V2-0001" / "completion-report.md"
         report.write_text("# Completion Report: V2-0001\n\nStatus: done\n\n## Result\nSmoke done.\n", encoding="utf-8")
-        collect = run_json(temp, "collect", "--project", str(project), "--task", "V2-0001", "--state", "done")
+        run_json(
+            temp,
+            "heartbeat",
+            "--project",
+            str(project),
+            "--actor",
+            "agent-v2-0001",
+            "--status",
+            "waiting",
+        )
+        collect = run_json(temp, "collect", "--project", str(project), "--task", "V2-0001", "--state", "waiting_leader")
         assert_true(collect["actor_id"] == "agent-v2-0001", "collect should infer the task actor")
         result = run_json(
+            temp,
+            "record-result",
+            "--command-id",
+            "CMD-smoke-result",
+            "--project",
+            str(project),
+            "--task",
+            "V2-0001",
+            "--status",
+            "done",
+            "--quality-score",
+            "4",
+            "--accepted-by-leader",
+            "--model",
+            "LongCat-2.0",
+            "--input-tokens",
+            "100",
+            "--output-tokens",
+            "50",
+            "--estimated-cost-cny",
+            "0.01",
+            "--summary",
+            "Smoke accepted",
+        )
+        assert_true(result["event"]["accepted_by_leader"] is True, "record-result should persist leader acceptance")
+        replayed_result = run_json(
             temp,
             "record-result",
             "--project",
@@ -264,8 +317,10 @@ def main() -> int:
             "--quality-score",
             "4",
             "--accepted-by-leader",
+            "--command-id",
+            "CMD-smoke-result",
             "--model",
-            "deepseek-v4-flash",
+            "LongCat-2.0",
             "--input-tokens",
             "100",
             "--output-tokens",
@@ -275,7 +330,25 @@ def main() -> int:
             "--summary",
             "Smoke accepted",
         )
-        assert_true(result["event"]["accepted_by_leader"] is True, "record-result should persist leader acceptance")
+        assert_true(replayed_result["idempotent_replay"] is True, "same result command should replay")
+        duplicate_result = run(
+            temp,
+            "record-result",
+            "--project",
+            str(project),
+            "--task",
+            "V2-0001",
+            "--status",
+            "done",
+            "--quality-score",
+            "4",
+            "--accepted-by-leader",
+            expect_ok=False,
+        )
+        assert_true(
+            "requires --command-id" in (duplicate_result.stdout + duplicate_result.stderr),
+            "a second result without the original command id must be rejected",
+        )
         leader_work = run_json(
             temp,
             "record-leader-work",
@@ -303,7 +376,7 @@ def main() -> int:
             "--project",
             str(project),
             "--task",
-            "V2-missing",
+            "V2-9999",
             "--scope",
             "Missing task",
             "--reason",
@@ -402,6 +475,10 @@ def main() -> int:
         print(json.dumps({"status": "ok", "temporary_state": "cleaned"}, indent=2))
         return 0
     finally:
+        if previous_codex_home is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = previous_codex_home
         resolved = temp.resolve()
         temp_root = Path(tempfile.gettempdir()).resolve()
         if resolved == temp_root or temp_root not in resolved.parents:

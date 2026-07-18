@@ -1,0 +1,5 @@
+*
+!Dockerfile
+!costmarshal-worker.js
+!costmarshal-isolation-canary.js
+!costmarshal-escape-probe.js

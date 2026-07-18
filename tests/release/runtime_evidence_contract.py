@@ -1,0 +1,68 @@
+"""Shared contract for machine-derived runtime recovery evidence."""
+
+from __future__ import annotations
+
+
+RECEIPT_PREFIX = "COSTMARSHAL_RUNTIME_EVIDENCE="
+RUNTIME_EVIDENCE_TESTS = (
+    "tests/runtime_effect_store_test.py",
+    "tests/runtime_effect_scheduler_test.py",
+    "tests/change_workflow_test.py",
+    "tests/actor_crash_recovery_test.py",
+    "tests/runtime_recovery_reliability_test.py",
+    "tests/oci_actor_runner_test.py",
+    "tests/provider_completion_recovery_test.py",
+)
+REQUIRED_RUNTIME_CRASH_POINTS = (
+    "effect.after_lease_commit_before_spawn",
+    "effect.after_registration_before_finalize",
+    "schema.after_effect_hash_backfill_row",
+    "effect.after_spawn_before_observe",
+    "effect.after_stop_before_observe",
+    "effect.after_stop_observe_before_apply",
+    "transaction.after_commit_before_materialize",
+    "git_preview.after_external_before_observe",
+    "git_apply.after_external_before_observe",
+    "git_apply.after_observe_before_projection",
+    "git_apply.after_projection_before_apply",
+    "after_attempt_report_before_publish",
+    "after_credential_before_oci_prepare",
+    "after_oci_prepare_before_start",
+    "after_external_create_before_durable_identity",
+    "after_provider_completion_before_cleanup",
+    "after_provider_cleanup_before_seal",
+    "effect.after_dead_status_before_projection",
+)
+REQUIRED_RUNTIME_RECOVERY_SCENARIOS = (
+    "corrupt_project_emergency_stop_only",
+    "daemon_sleep_does_not_block_emergency_stop",
+    "governance_drift_emergency_stop_replay",
+    "materializer_revision_aba_serialized",
+    "materializer_transient_sharing_retry_bounded",
+    "runner_exit_before_provider_start",
+    "no_effect_commit_view_reconciled_by_scheduler",
+    "stop_cancels_pending_spawn_before_provider",
+    "stop_linearizes_against_inflight_spawn",
+    "stop_permanent_failure_remains_recoverable",
+    "git_preview_content_addressed_publication_replay",
+    "git_apply_external_replay_canonicalized",
+    "git_apply_observed_projection_replay",
+    "git_apply_projected_command_completion_replay",
+    "slow_stop_lease_heartbeat_single_execution",
+    "oci_stop_after_rm_before_observe",
+    "oci_cleanup_ignores_corrupt_native_binding",
+    "spawn_runtime_identity_drift_rejected",
+    "legacy_spawn_runtime_fence_migration",
+    "legacy_json_required_attach_cleanup_only",
+    "credential_after_create_before_oci_prepare",
+    "oci_prepared_before_start",
+    "deterministic_name_attach_after_hard_exit",
+    "cleanup_unconfirmed_preserves_credential",
+    "attach_inspect_failure_preserves_live_identity",
+    "recovered_usage_unknown_preserves_budget_reservation",
+    "provider_completion_precleanup_hard_exit_finalize_only",
+    "provider_completion_sqlite_cleanup_replay",
+    "provider_completion_cas_tamper_fail_closed",
+    "provider_completion_secret_redaction",
+    "provider_completion_reparse_rejected",
+)
