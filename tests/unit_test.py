@@ -47,7 +47,8 @@ from costmarshal_v2.session_backend import (  # noqa: E402
     validate_tmux_name,
     validate_tmux_target,
 )
-from costmarshal_v2.state import can_transition_task  # noqa: E402
+import costmarshal_v2.state as state_module  # noqa: E402
+from costmarshal_v2.state import can_transition_task, read_json, read_jsonl  # noqa: E402
 from costmarshal_v2.session_backend import command_to_string, format_actor_command  # noqa: E402
 
 
@@ -57,6 +58,60 @@ def assert_true(condition: bool, message: str) -> None:
 
 
 def main() -> int:
+    class SharingConflictPath:
+        def __init__(self, content: str, failures: int) -> None:
+            self.content = content
+            self.failures = failures
+            self.reads = 0
+
+        def read_text(self, *, encoding: str) -> str:
+            assert encoding == "utf-8"
+            self.reads += 1
+            if self.reads <= self.failures:
+                raise PermissionError("simulated transient Windows sharing conflict")
+            return self.content
+
+    json_path = SharingConflictPath('{"status": "ok"}\n', failures=2)
+    jsonl_path = SharingConflictPath('{"row": 1}\n{"row": 2}\n', failures=1)
+    with patch.object(state_module, "os", SimpleNamespace(name="nt")), patch.object(
+        state_module.time,
+        "sleep",
+    ):
+        assert_true(read_json(json_path) == {"status": "ok"}, "JSON sharing retry failed")
+        assert_true(json_path.reads == 3, "JSON sharing retry was not bounded to success")
+        assert_true(
+            read_jsonl(jsonl_path) == [{"row": 1}, {"row": 2}],
+            "JSONL sharing retry failed",
+        )
+        assert_true(jsonl_path.reads == 2, "JSONL sharing retry was not exercised")
+
+    denied_path = SharingConflictPath('{"status": "hidden"}\n', failures=2)
+    with patch.object(state_module, "os", SimpleNamespace(name="nt")), patch.object(
+        state_module,
+        "WINDOWS_READ_RETRY_SECONDS",
+        0.0,
+    ):
+        try:
+            read_json(denied_path)
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("persistent Windows permission denial must fail closed")
+
+    posix_denied_path = SharingConflictPath('{"status": "hidden"}\n', failures=1)
+    with patch.object(state_module, "os", SimpleNamespace(name="posix")), patch.object(
+        state_module.time,
+        "sleep",
+    ) as posix_sleep:
+        try:
+            read_json(posix_denied_path)
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("non-Windows permission denial must fail immediately")
+        assert_true(posix_denied_path.reads == 1, "non-Windows permission denial retried")
+        posix_sleep.assert_not_called()
+
     with tempfile.TemporaryDirectory(prefix="costmarshal-cmd-shim-") as directory:
         shim_root = Path(directory)
         shim = shim_root / "codex.cmd"

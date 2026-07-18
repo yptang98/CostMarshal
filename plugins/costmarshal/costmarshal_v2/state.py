@@ -4,6 +4,7 @@ import json
 import os
 import re
 import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +21,9 @@ from .security import SecurityValidationError, validate_actor_id, validate_task_
 
 
 SCHEMA_VERSION = 2
+WINDOWS_READ_RETRY_SECONDS = 1.0
+WINDOWS_READ_RETRY_INITIAL_DELAY_SECONDS = 0.005
+WINDOWS_READ_RETRY_MAX_DELAY_SECONDS = 0.1
 TASK_STATES = {"planned", "dispatched", "running", "waiting_leader", "done", "failed", "escalate", "cancelled"}
 TERMINAL_TASK_STATES = {"done", "failed", "escalate", "cancelled"}
 ACTOR_STATES = {"configured", "starting", "running", "idle", "waiting", "needs_recovery", "stopped", "failed"}
@@ -96,6 +100,24 @@ def atomic_write_json(path: Path, data: Any) -> None:
     atomic_write_text(path, json.dumps(redact(data), ensure_ascii=False, indent=2) + "\n")
 
 
+def _read_text(path: Path) -> str:
+    """Read one state file through transient Windows sharing conflicts."""
+
+    deadline = time.monotonic() + WINDOWS_READ_RETRY_SECONDS
+    delay = WINDOWS_READ_RETRY_INITIAL_DELAY_SECONDS
+    while True:
+        try:
+            return path.read_text(encoding="utf-8")
+        except PermissionError:
+            if os.name != "nt":
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, WINDOWS_READ_RETRY_MAX_DELAY_SECONDS)
+
+
 def read_json(path: Path, default: Any | None = None) -> Any:
     transactional, content = transactional_read_text(path)
     if transactional:
@@ -104,11 +126,13 @@ def read_json(path: Path, default: Any | None = None) -> Any:
                 return default
             raise FileNotFoundError(path)
         return json.loads(content)
-    if not path.exists():
+    try:
+        content = _read_text(path)
+    except FileNotFoundError:
         if default is not None:
             return default
         raise FileNotFoundError(path)
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(content)
 
 
 def append_jsonl(path: Path, row: dict[str, Any]) -> None:
@@ -126,10 +150,12 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     transactional, rows = transactional_read_jsonl(path)
     if transactional:
         return rows
-    if not path.exists():
+    try:
+        content = _read_text(path)
+    except FileNotFoundError:
         return []
     rows: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in content.splitlines():
         if line.strip():
             rows.append(json.loads(line))
     return rows
