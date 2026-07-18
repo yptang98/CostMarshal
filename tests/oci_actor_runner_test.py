@@ -51,6 +51,28 @@ from costmarshal_v2.worker_isolation import (  # noqa: E402
 
 CLI = ROOT / "scripts" / "costmarshal.py"
 IMAGE = "ghcr.io/example/costmarshal-worker@sha256:" + ("a" * 64)
+LINUX_RUNNER_FIXTURE_MARKER = "linux-proc-v2:fixture-boot:1:1:1:" + ("f" * 64)
+LINUX_RUNNER_PROCESS_TOKEN = "costmarshal-process-" + ("e" * 64)
+
+
+def run_actor_fixture(*args, **kwargs) -> int:
+    """Isolate OCI behavior from the separately tested local-launch identity."""
+
+    with patch(
+        "costmarshal_v2.actor_runner._runner_process_start_marker",
+        return_value=LINUX_RUNNER_FIXTURE_MARKER,
+    ):
+        return run_actor(*args, **kwargs)
+
+
+def run_linux_token_bound_child(command: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
+    """Launch a runner fixture with the same inherited memfd authority as LocalBackend."""
+
+    token_fd = os.memfd_create(LINUX_RUNNER_PROCESS_TOKEN, flags=0)
+    try:
+        return subprocess.run(command, stdin=token_fd, **kwargs)
+    finally:
+        os.close(token_fd)
 
 
 def cli(temp: Path, *args: str) -> dict:
@@ -653,7 +675,7 @@ def exercise_legacy_required_recovery(
         "costmarshal_v2.actor_runner.OciWorkerExecutionAdapter",
         LegacyRecoveryOnlyAdapter,
     ):
-        assert run_actor(
+        assert run_actor_fixture(
             layout,
             actor["id"],
             attempt_id=actor["attempt_id"],
@@ -695,7 +717,7 @@ def exercise_legacy_required_recovery(
         LegacyRecoveryOnlyAdapter,
     ):
         try:
-            run_actor(
+            run_actor_fixture(
                 layout,
                 fresh_actor["id"],
                 attempt_id=fresh_actor["attempt_id"],
@@ -994,7 +1016,7 @@ raise SystemExit(run_actor(
                     "COSTMARSHAL_ACTOR_FAULT": fault,
                 }
             )
-            return subprocess.run(
+            return run_linux_token_bound_child(
                 [
                     sys.executable,
                     "-c",
@@ -1037,7 +1059,7 @@ raise SystemExit(run_actor(
             "costmarshal_v2.actor_runner.OciWorkerExecutionAdapter",
             FakeOciAdapter,
         ):
-            returncode = run_actor(
+            returncode = run_actor_fixture(
                 layout,
                 actor["id"],
                 attempt_id=actor["attempt_id"],
@@ -1140,7 +1162,7 @@ raise SystemExit(run_actor(
                     "fixture governance drift after durable provider start",
                 ),
             ):
-                recovered_returncode = run_actor(
+                recovered_returncode = run_actor_fixture(
                     layout,
                     recovered_actor["id"],
                     attempt_id=recovered_actor["attempt_id"],
@@ -1206,7 +1228,7 @@ raise SystemExit(actor_runner.run_actor(
                 "COSTMARSHAL_HARD_EXIT_ON_START": "1",
             }
         )
-        hard_crash = subprocess.run(
+        hard_crash = run_linux_token_bound_child(
             [
                 sys.executable,
                 "-c",
@@ -1255,7 +1277,7 @@ raise SystemExit(actor_runner.run_actor(
                     "fixture governance drift after external provider start",
                 ),
             ):
-                hard_recovered = run_actor(
+                hard_recovered = run_actor_fixture(
                     layout,
                     hard_actor["id"],
                     attempt_id=hard_actor["attempt_id"],
@@ -1304,7 +1326,7 @@ raise SystemExit(actor_runner.run_actor(
             "costmarshal_v2.actor_runner.OciWorkerExecutionAdapter",
             CleanupUnconfirmedAdapter,
         ):
-            cleanup_returncode = run_actor(
+            cleanup_returncode = run_actor_fixture(
                 layout,
                 cleanup_actor["id"],
                 attempt_id=cleanup_actor["attempt_id"],
@@ -1365,7 +1387,7 @@ raise SystemExit(actor_runner.run_actor(
             "costmarshal_v2.actor_runner.OciWorkerExecutionAdapter",
             RecoveryLogsOverflowAdapter,
         ):
-            usage_returncode = run_actor(
+            usage_returncode = run_actor_fixture(
                 layout,
                 usage_actor["id"],
                 attempt_id=usage_actor["attempt_id"],
@@ -1449,7 +1471,7 @@ raise SystemExit(actor_runner.run_actor(
             "costmarshal_v2.actor_runner.OciWorkerExecutionAdapter",
             AttachInspectionFailureAdapter,
         ):
-            attach_uncertain_returncode = run_actor(
+            attach_uncertain_returncode = run_actor_fixture(
                 layout,
                 attach_actor["id"],
                 attempt_id=attach_actor["attempt_id"],
@@ -1475,7 +1497,7 @@ raise SystemExit(actor_runner.run_actor(
             "costmarshal_v2.actor_runner.OciWorkerExecutionAdapter",
             AttachInspectionFailureAdapter,
         ):
-            attach_recovered_returncode = run_actor(
+            attach_recovered_returncode = run_actor_fixture(
                 layout,
                 attach_actor["id"],
                 attempt_id=attach_actor["attempt_id"],
@@ -1529,7 +1551,7 @@ raise SystemExit(actor_runner.run_actor(
             "costmarshal_v2.actor_runner.OciWorkerExecutionAdapter",
             NonUsageCollisionAdapter,
         ):
-            collision_returncode = run_actor(
+            collision_returncode = run_actor_fixture(
                 layout,
                 collision_actor["id"],
                 attempt_id=collision_actor["attempt_id"],
