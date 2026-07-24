@@ -15,7 +15,7 @@
 
   <p>
     <a href="#install-with-one-codex-prompt">Install</a> ·
-    <a href="#use-it">Use it</a> ·
+    <a href="#use-from-codex">Use it</a> ·
     <a href="#how-it-works">How it works</a> ·
     <a href="#providers">Providers</a> ·
     <a href="#documentation">Documentation</a>
@@ -55,7 +55,7 @@ For updates, follow [`INSTALL_PROMPT.md`](INSTALL_PROMPT.md). It preserves both 
 
 </details>
 
-## Use it
+## Use from Codex
 
 CostMarshal is designed to be operated in natural language:
 
@@ -70,7 +70,8 @@ You can also invoke the Skill explicitly:
 $orchestrate-cost-aware-agents plan and execute this task within a 30 CNY budget.
 ```
 
-No Python commands are required for normal use.
+No Python commands are required for normal use. The CLI is retained for
+runtime, recovery, automation, and diagnostics—not as a requirement for ordinary users.
 
 ## Why CostMarshal
 
