@@ -117,6 +117,16 @@ def remove_paired_evidence(project: Path) -> None:
         "".join(f"{line}\n" for line in retained),
         encoding="utf-8",
     )
+    graph_path = project / "scheduler" / "work-graph.json"
+    if graph_path.is_file():
+        graph = json.loads(graph_path.read_text(encoding="utf-8"))
+        for task_id in seeded_task_ids:
+            (graph.get("nodes") or {}).pop(task_id, None)
+        graph["revision"] = int(graph.get("revision") or 0) + 1
+        graph_path.write_text(
+            json.dumps(graph, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
 
 def reset_paired_evidence(temp: Path, project: Path) -> None:

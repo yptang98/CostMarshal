@@ -1,9 +1,9 @@
 ---
 name: costmarshal
-description: "CostMarshal v3.0 internal policy/runtime for the Codex plugin: scheduler-first, cost-aware low/medium/high provider orchestration with per-step cache-safe pricing, completion-first routing, recoverable effects, OCI worker isolation, durable attempts, budget reservations, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
+description: "CostMarshal v3.1 internal policy/runtime for the Codex plugin: scheduler-first, cost-aware low/medium/high provider orchestration with work graphs, artifact gates, evidence-backed model memory, teaching policy, per-step cache-safe pricing, recoverable effects, OCI worker isolation, durable attempts, budget reservations, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
 ---
 
-# CostMarshal v3.0
+# CostMarshal v3.1
 
 Use this skill for long or decomposable work where multiple API price/capability tiers should cooperate under explicit safety, cost, and recovery controls.
 
@@ -25,18 +25,20 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
 12. ArchMarshal integration is read-only. Never auto-adopt, apply, start, end, or modify ArchMarshal.
 13. Every admitted provider profile is an exact-byte SHA-256 snapshot bound to the route, attempt, runtime effect, and OCI identity; launch/recovery never re-resolves mutable profile source bytes.
 14. Every provider attempt is collected before continuation. A worker never authorizes more spend; a sealed required attempt with an admitted successor needs an explicit leader rejection with a bounded handoff before the next tier can start. A terminal rejection without a handoff cannot later continue that sealed route.
+15. A task may dispatch only when every Work Graph dependency is leader-accepted. Artifact, quality, error, dependency, and explicit teaching gates must all pass before acceptance.
+16. Attempt evaluations are immutable observations. Aggregate model memory is rebuildable and contains no raw prompts or artifacts; learned policy can advance only through reviewed replay, shadow, canary, and activation stages.
 
 ## Standard workflow
 
 1. Confirm the writable workspace, provider catalog, budget, and governance mode.
 2. Configure required Codex profiles with `configure-provider`; never store API keys in profile files.
 3. Initialize the project.
-4. Create bounded tasks with explicit risk, difficulty, estimates, acceptance criteria, allowed context, and write scope.
+4. Create bounded work packages with explicit role, dependencies, deliverables, risk, difficulty, estimates, acceptance criteria, allowed context, and write scope.
 5. Run `route` to inspect safety floor, chain, cost, and acceptance prior when economics matter.
 6. Dispatch only after the route explanation and claims are acceptable.
 7. Keep `run-scheduler` active while actors execute.
 8. Review the completion report, tests, and evidence. For a sealed write output, run `preview-changes` before acceptance; it must not modify the source workspace.
-9. Record the leader result. When sealed evidence is insufficient, reject it with a bounded `--handoff`, then explicitly continue to the exact next distinct provider in the admitted non-decreasing chain; that step may be a sealed same-tier peer or may skip a tier.
+9. Record the leader result with quality, efficiency, instruction, handoff, and error evidence. When sealed evidence is insufficient, reject it with a bounded `--handoff`, then explicitly continue to the exact next distinct provider in the admitted non-decreasing chain; that step may be a sealed same-tier peer or may skip a tier.
 10. After accepting reviewed changes, run `apply-changes` once to obtain the hash-bound contract, then repeat with `--apply --preview-sha ... --command-id ...`. The command stages but never commits the exact candidate tree. After SQLite cutover, preview and explicit apply use owner-leased recoverable Git effects; a command may honestly report `queued` when another drainer owns the effect fence.
 11. Run `validate`, and use `recover` after an unclean stop.
 
@@ -50,7 +52,7 @@ python scripts/costmarshal.py configure-provider --codex-home "$env:CODEX_HOME" 
 python scripts/costmarshal.py init --name <name> --objective "<objective>" --workspace <workspace> --provider-catalog <catalog.json> --project-budget-cny <amount> --default-min-success-probability <0..1> --governance off --worker-image <name@sha256:digest>
 
 # Create a bounded task.
-python scripts/costmarshal.py new-task --project <project-dir> --title "<title>" --purpose "<purpose>" --task-type implementation --risk medium --difficulty normal --estimated-input-tokens 100000 --estimated-output-tokens 10000 --claim-path src/file.py --allowed-path src/file.py
+python scripts/costmarshal.py new-task --project <project-dir> --title "<title>" --purpose "<purpose>" --task-type implementation --role builder --depends-on <accepted-task-id> --deliverable completion-report --risk medium --difficulty normal --estimated-input-tokens 100000 --estimated-output-tokens 10000 --claim-path src/file.py --allowed-path src/file.py
 
 # Explain without mutation.
 python scripts/costmarshal.py route --project <project-dir> --task-type implementation --risk medium --difficulty normal --estimated-input-tokens 100000 --estimated-output-tokens 10000
@@ -60,7 +62,7 @@ python scripts/costmarshal.py dispatch --project <project-dir> --task V2-0001 --
 python scripts/costmarshal.py run-scheduler --project <project-dir>
 
 # Accept only after leader review.
-python scripts/costmarshal.py record-result --command-id CMD-RESULT-ACCEPT-001 --project <project-dir> --task V2-0001 --attempt <attempt-id> --status done --quality-score 5 --accepted-by-leader
+python scripts/costmarshal.py record-result --command-id CMD-RESULT-ACCEPT-001 --project <project-dir> --task V2-0001 --attempt <attempt-id> --status done --quality-score 5 --efficiency-score 4 --instruction-score 5 --handoff-score 4 --error-attribution none --accepted-by-leader
 
 # Reject a sealed required attempt and bind the exact successor handoff.
 python scripts/costmarshal.py record-result --command-id CMD-RESULT-REJECT-001 --project <project-dir> --task V2-0001 --attempt <attempt-id> --status escalate --quality-score 2 --handoff "Bounded findings, failed checks, and the exact remaining decision."
@@ -75,6 +77,11 @@ python scripts/costmarshal.py apply-changes --project <project-dir> --task V2-00
 python scripts/costmarshal.py dashboard --project <project-dir>
 python scripts/costmarshal.py providers --project <project-dir>
 python scripts/costmarshal.py budget --project <project-dir>
+python scripts/costmarshal.py work-graph --project <project-dir>
+python scripts/costmarshal.py model-memory --project <project-dir>
+python scripts/costmarshal.py policy-status --project <project-dir>
+# Preview each transition first; add --apply and a stable --command-id only after evidence review.
+python scripts/costmarshal.py policy-transition --project <project-dir> --candidate <policy-id> --to-state replayed --evidence "<reviewed evidence>" --approved-by leader
 python scripts/costmarshal.py governance-status --project <project-dir>
 python scripts/costmarshal.py governance-rebind --project <project-dir>
 python scripts/costmarshal.py validate --project <project-dir>

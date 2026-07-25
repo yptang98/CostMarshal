@@ -107,6 +107,41 @@ from .handoff_contract import (
     validate_handoff_capsule,
     validate_prompt_binding as validate_semantic_prompt_binding,
 )
+from .evolution import (
+    ERROR_ATTRIBUTIONS,
+    EVALUATION_SCHEMA,
+    EvolutionError,
+    active_policy_effects,
+    append_evaluation,
+    append_retrospective_and_candidate,
+    build_attempt_evaluation,
+    build_model_memory,
+    build_project_retrospective,
+    choose_teaching_mode,
+    latest_policy_candidates,
+    profile_for_task,
+    transition_policy_candidate,
+)
+from .quality import (
+    ARTIFACT_SCHEMA,
+    GATE_RESULT_SCHEMA,
+    GateError,
+    append_artifact_event,
+    append_gate_result,
+    build_artifact_event,
+    canonical_sha256,
+    default_gate_spec,
+    evaluate_gates,
+    validate_gate_spec,
+)
+from .work_graph import (
+    WorkGraphError,
+    dispatch_blockers,
+    load_work_graph,
+    ready_task_ids,
+    register_task,
+    sync_task_node,
+)
 from .locking import (
     ProjectLockTimeout,
     project_write_lock,
@@ -734,6 +769,10 @@ def set_task_state(
         except ValueError as exc:
             raise SystemExit(f"Task budget reconciliation failed closed: {exc}") from exc
     save_task(layout, task)
+    try:
+        sync_task_node(layout, task, known_tasks=task_rows(layout))
+    except WorkGraphError as exc:
+        raise SystemExit(f"Work graph update failed closed: {exc}") from exc
     status_payload = {
         "schema_version": SCHEMA_VERSION,
         "task_id": task["id"],
@@ -3401,6 +3440,8 @@ def render_task_brief(task: dict[str, Any]) -> str:
             "",
             "## Task Type",
             task["task_type"],
+            f"- Work role: {task.get('role') or 'builder'}",
+            f"- Dependencies: {', '.join(task.get('dependencies') or []) or 'none'}",
             "",
             "## Routing",
             f"- Risk: {task.get('risk') or 'low'}",
@@ -3418,6 +3459,17 @@ def render_task_brief(task: dict[str, Any]) -> str:
             "",
             "## Acceptance Criteria",
             "\n".join(f"- {item}" for item in task.get("acceptance", [])) or "- Leader acceptance is required.",
+            f"- Required artifacts: {', '.join(task.get('deliverables') or ['completion-report'])}",
+            (
+                "- Quality gate: "
+                f"score >= {(task.get('gates') or {}).get('min_quality_score', 1)}; "
+                f"error severity <= {(task.get('gates') or {}).get('max_error_severity', 5)}"
+            ),
+            (
+                "- Teaching policy: "
+                f"{(task.get('teaching') or {}).get('mode', 'off')} "
+                f"({(task.get('teaching') or {}).get('reason', 'not configured')})"
+            ),
             "",
             "## Allowed Context",
             "\n".join(f"- {item}" for item in task.get("allowed_context", [])) or "- None.",
@@ -3508,7 +3560,7 @@ def command_new_task(args: Any) -> None:
             project_provider_catalog(project),
             requested_provider_id=None if provider_request == "auto" else provider_request,
             requested_tier=None if tier_request == "auto" else tier_request,
-            history=trusted_result_rows(layout),
+            history=global_trusted_result_rows(layout),
             execution_identities=_routing_execution_identities(project),
             input_tokens=estimated_input_tokens,
             cached_input_tokens=estimated_cached_input_tokens,
@@ -3520,6 +3572,24 @@ def command_new_task(args: Any) -> None:
     directory = task_dir(layout, task_id)
     if directory.exists():
         raise SystemExit(f"Task already exists: {task_id}")
+    existing_tasks = task_rows(layout)
+    dependencies = []
+    for raw_dependency in getattr(args, "dependencies", None) or []:
+        dependency = str(raw_dependency).strip()
+        if not dependency:
+            raise SystemExit("depends-on task ids must be non-empty")
+        if dependency == task_id:
+            raise SystemExit("a task cannot depend on itself")
+        if dependency not in dependencies:
+            dependencies.append(dependency)
+    known_task_ids = {
+        str(item.get("id")) for item in existing_tasks if item.get("id")
+    }
+    missing_dependencies = sorted(set(dependencies) - known_task_ids)
+    if missing_dependencies:
+        raise SystemExit(
+            "Unknown work-graph dependencies: " + ", ".join(missing_dependencies)
+        )
     try:
         claim_paths = list(normalize_path_list(args.claim_path or [], kind="claim"))
         allowed_paths = list(normalize_path_list(args.allowed_path or [], kind="allowed"))
@@ -3536,6 +3606,63 @@ def command_new_task(args: Any) -> None:
             "Path claim conflict:\n"
             + "\n".join(f"- {claim.get('path')} claimed by {claim.get('task_id')} ({claim.get('actor_id') or claim.get('agent')})" for claim in conflicts)
         )
+    deliverables = []
+    for raw_deliverable in getattr(args, "deliverables", None) or [
+        "completion-report"
+    ]:
+        deliverable = str(raw_deliverable).strip()
+        if not deliverable:
+            raise SystemExit("deliverable kinds must be non-empty")
+        if deliverable not in deliverables:
+            deliverables.append(deliverable)
+    role = str(getattr(args, "role", None) or "builder")
+    identities = _routing_execution_identities(project)
+    selected_identity = identities.get(route_preview.provider_id) or (
+        "inherit",
+        None,
+        None,
+    )
+    try:
+        memory = build_model_memory(layout.root)
+        teaching_profile = profile_for_task(
+            memory,
+            provider=route_preview.provider_id,
+            model=selected_identity[0],
+            profile_sha256=selected_identity[2],
+            task_type=str(args.task_type),
+            difficulty=str(getattr(args, "difficulty", "normal")),
+            role=role,
+        )
+        teaching = choose_teaching_mode(
+            requested_mode=str(getattr(args, "teaching_mode", None) or "auto"),
+            risk=str(getattr(args, "risk", "low")),
+            profile=teaching_profile,
+            max_cost_cny=max_cost_cny,
+        )
+        active_policy = active_policy_effects(layout)
+        if (
+            str(getattr(args, "teaching_mode", None) or "auto") == "auto"
+            and active_policy["auto_teaching_floor"] == "review"
+        ):
+            teaching.update(
+                {
+                    "mode": "review",
+                    "reason": (
+                        "active reviewed policy requires teaching review after "
+                        "replay, shadow, and canary promotion"
+                    ),
+                    "required_evidence": True,
+                    "enforcement": "required",
+                    "active_policy_ids": active_policy["active_policy_ids"],
+                }
+            )
+        gates = default_gate_spec(
+            min_quality_score=int(getattr(args, "min_quality_score", 1)),
+            max_error_severity=int(getattr(args, "max_error_severity", 5)),
+            required_artifact_kinds=deliverables,
+        )
+    except (EvolutionError, GateError) as exc:
+        raise SystemExit(f"Invalid work-package learning policy: {exc}") from exc
     directory.mkdir(parents=True)
     task = {
         "schema_version": SCHEMA_VERSION,
@@ -3543,6 +3670,11 @@ def command_new_task(args: Any) -> None:
         "title": args.title,
         "purpose": args.purpose,
         "task_type": args.task_type,
+        "role": role,
+        "dependencies": dependencies,
+        "deliverables": deliverables,
+        "gates": gates,
+        "teaching": teaching,
         "risk": getattr(args, "risk", "low"),
         "difficulty": getattr(args, "difficulty", "normal"),
         "provider": "auto",
@@ -3576,6 +3708,10 @@ def command_new_task(args: Any) -> None:
         "created_by_command_id": command_id,
     }
     atomic_write_json(directory / "task.json", task)
+    try:
+        register_task(layout, task, known_tasks=[*existing_tasks, task])
+    except WorkGraphError as exc:
+        raise SystemExit(f"Work graph rejected task: {exc}") from exc
     atomic_write_json(
         directory / "status.json",
         {"schema_version": SCHEMA_VERSION, "task_id": task_id, "state": "planned", "updated_at": now_iso(), "error": None},
@@ -3593,7 +3729,16 @@ def command_new_task(args: Any) -> None:
         claim_paths=claim_paths,
         override=bool(args.allow_lock_conflict),
     )
-    append_event(layout, "task_created", task_id=task_id, agent=args.agent, model=args.model)
+    append_event(
+        layout,
+        "task_created",
+        task_id=task_id,
+        agent=args.agent,
+        model=args.model,
+        role=role,
+        dependencies=dependencies,
+        teaching_mode=teaching["mode"],
+    )
     print_json({"status": "ok", "task_id": task_id, "task": str(directory)})
 
 
@@ -3641,7 +3786,7 @@ def command_route(args: Any) -> None:
         "routing_objective_source": routing_objective_source,
     }
     try:
-        trusted_history = trusted_result_rows(layout)
+        trusted_history = global_trusted_result_rows(layout)
         decision = decide_route(
             task,
             catalog,
@@ -3861,6 +4006,19 @@ def command_dispatch(args: Any) -> None:
         if existing_attempt:
             print_json({"status": "ok", "idempotent_replay": True, "task_id": args.task, "attempt": existing_attempt})
             return
+    try:
+        dependency_blockers = dispatch_blockers(
+            layout,
+            args.task,
+            known_tasks=task_rows(layout),
+        )
+    except WorkGraphError as exc:
+        raise SystemExit(f"Work graph dispatch gate failed: {exc}") from exc
+    if dependency_blockers:
+        raise SystemExit(
+            "Task is not ready for dispatch:\n"
+            + "\n".join(f"- {blocker}" for blocker in dependency_blockers)
+        )
     force = bool(getattr(args, "force", False))
     if task.get("status") in {"done", "failed", "cancelled"} and not force:
         raise SystemExit(f"Task is already terminal: {args.task}")
@@ -3935,7 +4093,7 @@ def command_dispatch(args: Any) -> None:
         else:
             raw_provider = raw_provider if raw_provider is not None else stored_provider_request
             raw_tier = raw_tier if raw_tier is not None else stored_tier_request
-        trusted_history = trusted_result_rows(layout)
+        trusted_history = global_trusted_result_rows(layout)
         route_input_tokens = int(task.get("estimated_input_tokens") or 0)
         route_cached_input_tokens = int(
             task.get("estimated_cached_input_tokens") or 0
@@ -4845,6 +5003,9 @@ def execute_scheduler_command(
             title=str(command_args.get("title") or ""),
             purpose=str(command_args.get("purpose") or ""),
             task_type=str(command_args.get("task_type") or "analysis"),
+            role=str(command_args.get("role") or "builder"),
+            dependencies=as_list(command_args.get("dependencies")),
+            deliverables=as_list(command_args.get("deliverables")),
             agent=str(command_args.get("agent") or "auto"),
             model=str(command_args.get("model") or "inherit"),
             risk=str(command_args.get("risk") or "low"),
@@ -4862,6 +5023,13 @@ def execute_scheduler_command(
             min_success_probability=command_args.get("min_success_probability"),
             routing_objective=command_args.get("routing_objective"),
             acceptance=as_list(command_args.get("acceptance")),
+            min_quality_score=int(command_args.get("min_quality_score") or 1),
+            max_error_severity=int(
+                command_args.get("max_error_severity")
+                if command_args.get("max_error_severity") is not None
+                else 5
+            ),
+            teaching_mode=str(command_args.get("teaching_mode") or "auto"),
             allowed_context=as_list(command_args.get("allowed_context")),
             allowed_path=as_list(command_args.get("allowed_path")),
             claim_path=as_list(command_args.get("claim_path")),
@@ -4930,6 +5098,25 @@ def execute_scheduler_command(
             task=task_id,
             status=str(command_args.get("status") or ""),
             quality_score=int(command_args.get("quality_score") or 0),
+            efficiency_score=(
+                int(command_args["efficiency_score"])
+                if command_args.get("efficiency_score") is not None
+                else None
+            ),
+            instruction_score=(
+                int(command_args["instruction_score"])
+                if command_args.get("instruction_score") is not None
+                else None
+            ),
+            handoff_score=(
+                int(command_args["handoff_score"])
+                if command_args.get("handoff_score") is not None
+                else None
+            ),
+            error_attribution=command_args.get("error_attribution"),
+            error_severity=int(command_args.get("error_severity") or 0),
+            teaching_evidence=command_args.get("teaching_evidence"),
+            artifacts=as_list(command_args.get("artifacts")),
             accepted_by_leader=as_bool(command_args.get("accepted_by_leader") or command_args.get("accepted")),
             agent=command_args.get("agent"),
             actor=command_args.get("actor"),
@@ -7209,6 +7396,15 @@ def _result_request_contract(
         "status": args.status,
         "accepted_by_leader": bool(args.accepted_by_leader),
         "quality_score": int(args.quality_score),
+        "efficiency_score": getattr(args, "efficiency_score", None),
+        "instruction_score": getattr(args, "instruction_score", None),
+        "handoff_score": getattr(args, "handoff_score", None),
+        "error_attribution": getattr(args, "error_attribution", None),
+        "error_severity": int(getattr(args, "error_severity", 0)),
+        "teaching_evidence": str(
+            getattr(args, "teaching_evidence", None) or ""
+        ).strip(),
+        "artifact_arguments": list(getattr(args, "artifacts", None) or []),
         "actor_argument": getattr(args, "actor", None),
         "agent_argument": getattr(args, "agent", None),
         "model_argument": getattr(args, "model", None),
@@ -7388,6 +7584,97 @@ def _apply_leader_result_binding(
     }
     if row["summary"]:
         task["summary"] = row["summary"]
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _result_artifact_events(
+    *,
+    layout: ProjectLayout,
+    project: dict[str, Any],
+    task: dict[str, Any],
+    attempt: dict[str, Any],
+    result: dict[str, Any],
+    report_sha256: str,
+    report_size: int,
+    artifact_arguments: list[str],
+    lifecycle: str,
+) -> list[dict[str, Any]]:
+    events = [
+        build_artifact_event(
+            project_id=str(project.get("project_id") or ""),
+            task_id=str(task["id"]),
+            attempt_id=str(attempt["attempt_id"]),
+            result_id=str(result["id"]),
+            kind="completion-report",
+            path=str(attempt["report_path"]),
+            sha256=report_sha256.removeprefix("sha256:"),
+            size=report_size,
+            lifecycle=lifecycle,
+        )
+    ]
+    raw_workspace = project.get("workspace")
+    workspace = (
+        Path(str(raw_workspace)).expanduser().resolve()
+        if isinstance(raw_workspace, str) and raw_workspace
+        else layout.project_dir.resolve()
+    )
+    allowed_roots = [layout.project_dir.resolve()]
+    if workspace.is_dir():
+        allowed_roots.append(workspace)
+    seen_kinds = {"completion-report"}
+    for argument in artifact_arguments:
+        raw = str(argument)
+        if "=" not in raw:
+            raise SystemExit("--artifact must use KIND=PATH")
+        kind, raw_path = raw.split("=", 1)
+        kind = kind.strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", kind):
+            raise SystemExit(f"Invalid artifact kind: {kind}")
+        if kind in seen_kinds:
+            raise SystemExit(f"Duplicate artifact kind: {kind}")
+        candidate = Path(raw_path.strip()).expanduser()
+        if not candidate.is_absolute():
+            candidate = workspace / candidate
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError as exc:
+            raise SystemExit(f"Artifact is unavailable: {candidate}: {exc}") from exc
+        if not resolved.is_file():
+            raise SystemExit(f"Artifact must be a regular file: {resolved}")
+        if not any(
+            _path_is_within(resolved, root)
+            for root in allowed_roots
+        ):
+            raise SystemExit(
+                f"Artifact must stay inside the project or configured workspace: {resolved}"
+            )
+        payload = resolved.read_bytes()
+        events.append(
+            build_artifact_event(
+                project_id=str(project.get("project_id") or ""),
+                task_id=str(task["id"]),
+                attempt_id=str(attempt["attempt_id"]),
+                result_id=str(result["id"]),
+                kind=kind,
+                path=(
+                    relpath(resolved, workspace)
+                    if _path_is_within(resolved, workspace)
+                    else relpath(resolved, layout.project_dir)
+                ),
+                sha256=hashlib.sha256(payload).hexdigest(),
+                size=len(payload),
+                lifecycle=lifecycle,
+            )
+        )
+        seen_kinds.add(kind)
+    return events
 
 
 def command_record_result(args: Any) -> None:
@@ -7757,6 +8044,11 @@ def command_record_result(args: Any) -> None:
         "needs_escalation": args.status == "escalate",
         "accepted_by_leader": bool(args.accepted_by_leader),
         "quality_score": args.quality_score,
+        "error_attribution": (
+            getattr(args, "error_attribution", None)
+            or ("none" if args.accepted_by_leader else "unknown")
+        ),
+        "error_severity": int(getattr(args, "error_severity", 0)),
         "input_tokens": input_tokens,
         "cached_input_tokens": cached_input_tokens,
         "output_tokens": output_tokens,
@@ -7769,6 +8061,65 @@ def command_record_result(args: Any) -> None:
         "report_sha256": result_report_sha256,
         "report_size": attempt.get("report_size"),
     }
+    try:
+        graph = register_task(layout, task, known_tasks=task_rows(layout))
+        dependency_states = {
+            dependency: str(graph["nodes"][dependency]["state"])
+            for dependency in task.get("dependencies") or []
+        }
+        artifact_events = _result_artifact_events(
+            layout=layout,
+            project=project,
+            task=task,
+            attempt=attempt,
+            result=row,
+            report_sha256=str(result_report_sha256),
+            report_size=int(attempt.get("report_size") or 0),
+            artifact_arguments=list(getattr(args, "artifacts", None) or []),
+            lifecycle=(
+                "accepted"
+                if bool(args.accepted_by_leader)
+                else "rejected"
+            ),
+        )
+        gate_result = evaluate_gates(
+            project_id=str(project.get("project_id") or ""),
+            task=task,
+            result=row,
+            dependency_states=dependency_states,
+            artifact_events=artifact_events,
+            error_severity=int(getattr(args, "error_severity", 0)),
+            teaching_evidence=getattr(args, "teaching_evidence", None),
+        )
+        if bool(args.accepted_by_leader) and not gate_result["passed"]:
+            failed_gates = [
+                str(check["name"])
+                for check in gate_result["checks"]
+                if not check["passed"]
+            ]
+            raise SystemExit(
+                "Leader acceptance is blocked by gates: " + ", ".join(failed_gates)
+            )
+        row["routing_success"] = bool(
+            args.accepted_by_leader
+            and int(args.quality_score) >= 3
+            and int(getattr(args, "error_severity", 0)) <= 1
+            and gate_result["passed"]
+        )
+        evaluation = build_attempt_evaluation(
+            task=task,
+            attempt=attempt,
+            result=row,
+            gate_result=gate_result,
+            error_attribution=getattr(args, "error_attribution", None),
+            error_severity=int(getattr(args, "error_severity", 0)),
+            efficiency_score=getattr(args, "efficiency_score", None),
+            instruction_score=getattr(args, "instruction_score", None),
+            handoff_score=getattr(args, "handoff_score", None),
+            teaching_evidence=getattr(args, "teaching_evidence", None),
+        )
+    except (WorkGraphError, GateError, EvolutionError) as exc:
+        raise SystemExit(f"Result quality evidence is invalid: {exc}") from exc
     if handoff_text:
         preview_task = json.loads(json.dumps(task, ensure_ascii=False, allow_nan=False))
         preview_attempt = next(
@@ -7787,6 +8138,10 @@ def command_record_result(args: Any) -> None:
         except HandoffContractError as exc:
             raise SystemExit(f"Leader handoff validation failed closed: {exc}") from exc
     append_jsonl(layout.results_jsonl, row)
+    for artifact_event in artifact_events:
+        append_artifact_event(layout, artifact_event)
+    append_gate_result(layout, gate_result)
+    append_evaluation(layout, evaluation)
     _apply_leader_result_binding(task, attempt, row)
     if handoff_text:
         _bind_rejected_attempt_handoff(
@@ -7796,7 +8151,29 @@ def command_record_result(args: Any) -> None:
             handoff_text=handoff_text,
         )
     set_task_state(layout, task, args.status)
-    append_event(layout, "result_recorded", task_id=args.task, actor_id=actor_id, result_id=row["id"], status=args.status, accepted_by_leader=bool(args.accepted_by_leader))
+    retrospective = build_project_retrospective(
+        project=project,
+        tasks=task_rows(layout),
+        evaluations=read_jsonl(layout.evaluations_jsonl),
+    )
+    retrospective_recorded = False
+    if retrospective is not None:
+        retrospective_recorded, _ = append_retrospective_and_candidate(
+            layout, retrospective
+        )
+    append_event(
+        layout,
+        "result_recorded",
+        task_id=args.task,
+        actor_id=actor_id,
+        result_id=row["id"],
+        status=args.status,
+        accepted_by_leader=bool(args.accepted_by_leader),
+        routing_success=row["routing_success"],
+        gate_result_id=gate_result["id"],
+        evaluation_id=evaluation["id"],
+        retrospective_recorded=retrospective_recorded,
+    )
     send_message(
         layout,
         sender=SCHEDULER_ID,
@@ -7805,7 +8182,16 @@ def command_record_result(args: Any) -> None:
         body=f"{args.task} recorded as {args.status}; accepted_by_leader={bool(args.accepted_by_leader)}; quality={args.quality_score}.",
         task_id=args.task,
     )
-    print_json({"status": "ok", "recorded": True, "event": row})
+    print_json(
+        {
+            "status": "ok",
+            "recorded": True,
+            "event": row,
+            "gate": gate_result,
+            "evaluation": evaluation,
+            "retrospective_recorded": retrospective_recorded,
+        }
+    )
 
 
 def command_record_leader_work(args: Any) -> None:
@@ -8903,6 +9289,67 @@ def trusted_result_rows(layout: ProjectLayout) -> list[dict[str, Any]]:
     return trusted
 
 
+def _namespace_peer_routing_rows(
+    rows: list[dict[str, Any]], *, namespace: str
+) -> list[dict[str, Any]]:
+    """Prevent ordinary cross-project ID reuse from becoming conflicting evidence."""
+
+    prefix = f"peer:{namespace}:"
+    transformed = json.loads(json.dumps(rows, ensure_ascii=False, allow_nan=False))
+    for row in transformed:
+        for field in (
+            "id",
+            "attempt_id",
+            "command_id",
+            "task_id",
+            "route_envelope_id",
+        ):
+            value = row.get(field)
+            if isinstance(value, str) and value:
+                row[field] = prefix + value
+        predecessors = row.get("route_predecessors")
+        if isinstance(predecessors, list):
+            for predecessor in predecessors:
+                if not isinstance(predecessor, dict):
+                    continue
+                for field in ("attempt_id", "result_id"):
+                    value = predecessor.get(field)
+                    if isinstance(value, str) and value:
+                        predecessor[field] = prefix + value
+    return transformed
+
+
+def global_trusted_result_rows(layout: ProjectLayout) -> list[dict[str, Any]]:
+    """Return verified routing evidence across projects under the same root.
+
+    Every source project is audited against its own immutable attempt/report
+    receipts before its rows are admitted. Invalid or unavailable peer projects
+    are ignored; the active project's audit remains fail-closed.
+    """
+
+    rows = list(trusted_result_rows(layout))
+    seen_projects = {layout.project_dir.resolve()}
+    projects_dir = layout.root / "projects"
+    if not projects_dir.is_dir():
+        return rows
+    for project_dir in sorted(projects_dir.iterdir()):
+        if not project_dir.is_dir() or not (project_dir / "project.json").is_file():
+            continue
+        resolved = project_dir.resolve()
+        if resolved in seen_projects:
+            continue
+        seen_projects.add(resolved)
+        try:
+            peer = ProjectLayout(root=layout.root, project_dir=resolved)
+            trusted, _ = audit_result_evidence(peer)
+        except (OSError, ValueError, ControlStoreError, json.JSONDecodeError):
+            continue
+        relative = resolved.relative_to(layout.root).as_posix()
+        namespace = hashlib.sha256(relative.encode("utf-8")).hexdigest()[:16]
+        rows.extend(_namespace_peer_routing_rows(trusted, namespace=namespace))
+    return rows
+
+
 def leader_work_rows(layout: ProjectLayout) -> list[dict[str, Any]]:
     return read_jsonl(layout.leader_work_jsonl)
 
@@ -9904,6 +10351,24 @@ def task_rows(layout: ProjectLayout) -> list[dict[str, Any]]:
                 "id": task.get("id"),
                 "title": task.get("title"),
                 "status": task.get("status"),
+                "task_type": task.get("task_type"),
+                "risk": task.get("risk"),
+                "difficulty": task.get("difficulty"),
+                "role": task.get("role") or "builder",
+                "dependencies": list(task.get("dependencies") or []),
+                "deliverables": list(task.get("deliverables") or []),
+                "gates": task.get("gates"),
+                "teaching": task.get("teaching"),
+                "required_capabilities": list(
+                    task.get("required_capabilities") or []
+                ),
+                "estimated_input_tokens": task.get("estimated_input_tokens"),
+                "estimated_cached_input_tokens": task.get(
+                    "estimated_cached_input_tokens"
+                ),
+                "estimated_output_tokens": task.get("estimated_output_tokens"),
+                "created_at": task.get("created_at"),
+                "updated_at": task.get("updated_at"),
                 "agent_id": task.get("agent_id"),
                 "provider": task.get("provider"),
                 "profile": task.get("profile"),
@@ -9931,6 +10396,9 @@ def status_payload(layout: ProjectLayout) -> dict[str, Any]:
     results = result_rows(layout)
     leader_work = leader_work_rows(layout)
     usage = usage_rows(layout)
+    evaluations = read_jsonl(layout.evaluations_jsonl)
+    gate_results = read_jsonl(layout.gate_results_jsonl)
+    artifacts = read_jsonl(layout.artifacts_jsonl)
     token_by_actor = actor_token_summary(results, leader_work, usage)
     for actor in actors:
         actor["token_usage"] = token_by_actor.get(actor["id"], empty_token_bucket())
@@ -9951,6 +10419,22 @@ def status_payload(layout: ProjectLayout) -> dict[str, Any]:
         "result_summary": summarize_results(results),
         "leader_self_work": summarize_leader_self_work(leader_work),
         "usage_summary": summarize_usage(usage),
+        "work_graph": load_work_graph(layout),
+        "evolution": {
+            "evaluation_count": len(evaluations),
+            "routing_success_count": sum(
+                row.get("routing_success") is True for row in evaluations
+            ),
+            "gate_count": len(gate_results),
+            "gate_pass_count": sum(row.get("passed") is True for row in gate_results),
+            "artifact_event_count": len(artifacts),
+            "retrospective_count": len(
+                read_jsonl(layout.retrospectives_jsonl)
+            ),
+            "policy_candidate_count": len(
+                read_jsonl(layout.policy_candidates_jsonl)
+            ),
+        },
         "relay_cursors": load_relay_cursors(layout),
         "active_locks": active_lock_rows(layout),
         "control_store": control_store_status(layout),
@@ -10201,6 +10685,18 @@ def command_status(args: Any) -> None:
             lines.append(
                 f"| {event.get('task_id') or '-'} | {event.get('work_type')} | {event.get('risk')} | {event.get('minutes') or 0} | {compact_text(event.get('scope') or '', 64) or '-'} |"
             )
+    evolution = payload["evolution"]
+    graph = payload["work_graph"]
+    lines.extend(
+        [
+            "",
+            "## Work Graph & Evolution",
+            f"- Graph revision: {graph.get('revision', 0)}; ready packages: {len(ready_task_ids(graph))}",
+            f"- Evaluations: {evolution['evaluation_count']}; routing successes: {evolution['routing_success_count']}",
+            f"- Gates: {evolution['gate_count']}; passed: {evolution['gate_pass_count']}; artifact events: {evolution['artifact_event_count']}",
+            f"- Retrospectives: {evolution['retrospective_count']}; policy candidates awaiting staged promotion: {evolution['policy_candidate_count']}",
+        ]
+    )
     lines.extend(["", "## Active Write Claims"])
     if payload["active_locks"]:
         lines.append("| Path | Task | Actor | Agent |")
@@ -10213,6 +10709,76 @@ def command_status(args: Any) -> None:
     for task in payload["tasks"]:
         lines.append(f"| {task['id']} | {task.get('status')} | {task.get('agent_id') or '-'} | {task.get('model') or '-'} | {task.get('report_path') or '-'} |")
     print("\n".join(lines))
+
+
+def command_work_graph(args: Any) -> None:
+    layout = resolve_project(args.root, args.project)
+    graph = load_work_graph(layout)
+    print_json(
+        {
+            "status": "ok",
+            "project": str(layout.project_dir),
+            "ready_task_ids": ready_task_ids(graph),
+            "graph": graph,
+        }
+    )
+
+
+def command_model_memory(args: Any) -> None:
+    layout = resolve_project(args.root, args.project)
+    memory = build_model_memory(layout.root)
+    provider = getattr(args, "provider", None)
+    task_type = getattr(args, "task_type", None)
+    profiles = [
+        profile
+        for profile in memory["profiles"]
+        if (
+            provider is None
+            or (profile.get("identity") or {}).get("provider") == provider
+        )
+        and (
+            task_type is None
+            or (profile.get("scope") or {}).get("task_type") == task_type
+        )
+    ]
+    print_json(
+        {
+            **memory,
+            "profiles": profiles,
+            "filtered_profile_count": len(profiles),
+        }
+    )
+
+
+def command_policy_status(args: Any) -> None:
+    layout = resolve_project(args.root, args.project)
+    print_json(
+        {
+            "status": "ok",
+            "candidates": latest_policy_candidates(layout),
+            "active_effects": active_policy_effects(layout),
+        }
+    )
+
+
+def command_policy_transition(args: Any) -> None:
+    layout = resolve_project(args.root, args.project)
+    if bool(getattr(args, "apply", False)) and not str(
+        getattr(args, "command_id", None) or ""
+    ).strip():
+        raise SystemExit("policy-transition --apply requires --command-id")
+    try:
+        payload = transition_policy_candidate(
+            layout,
+            candidate_id=str(args.candidate),
+            to_state=str(args.to_state),
+            evidence=str(args.evidence),
+            approved_by=str(args.approved_by),
+            apply=bool(args.apply),
+        )
+    except EvolutionError as exc:
+        raise SystemExit(f"Policy transition rejected: {exc}") from exc
+    print_json({"status": "ok", **payload})
 
 
 def command_recover(args: Any) -> None:
@@ -10618,6 +11184,22 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
             issues.append(f"invalid mailbox for {actor['id']}")
     actor_ids = {actor["id"] for actor in actor_rows(layout)}
     task_ids = {task["id"] for task in task_rows(layout)}
+    if layout.work_graph_json.exists():
+        try:
+            graph = load_work_graph(layout)
+            missing_graph_nodes = sorted(task_ids - set(graph["nodes"]))
+            extra_graph_nodes = sorted(set(graph["nodes"]) - task_ids)
+            if missing_graph_nodes:
+                issues.append(
+                    "work graph is missing tasks: " + ", ".join(missing_graph_nodes)
+                )
+            if extra_graph_nodes:
+                issues.append(
+                    "work graph references missing tasks: "
+                    + ", ".join(extra_graph_nodes)
+                )
+        except WorkGraphError as exc:
+            issues.append(f"invalid work graph: {exc}")
     active_claims = active_lock_rows(layout)
     for claim in active_claims:
         if claim.get("task_id") not in task_ids:
@@ -10635,6 +11217,17 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
                 issues.append(f"active claim conflict: {claim.get('path')} ({claim.get('task_id')}) overlaps {other.get('path')} ({other.get('task_id')})")
     for task_json in sorted(layout.tasks_dir.glob("*/task.json")):
         task = read_json(task_json, {})
+        dependencies = task.get("dependencies") or []
+        if not isinstance(dependencies, list) or any(
+            not isinstance(dependency, str) or dependency not in task_ids
+            for dependency in dependencies
+        ):
+            issues.append(f"{task['id']} has invalid work-graph dependencies")
+        if task.get("gates") is not None:
+            try:
+                validate_gate_spec(task["gates"])
+            except GateError as exc:
+                issues.append(f"{task['id']} has invalid gates: {exc}")
         if task.get("agent_id") and task["agent_id"] not in actor_ids:
             issues.append(f"{task['id']} references missing actor {task['agent_id']}")
         if task.get("status") == "done":
@@ -10848,6 +11441,72 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
             issues.append(f"{label} quality_score must be 1-5")
         validate_token_triplet(row, label, issues)
         validate_non_negative_number(row.get("estimated_cost_cny"), f"{label} estimated_cost_cny", issues, allow_none=True)
+    result_by_id = {
+        str(row.get("id")): row
+        for row in result_rows_to_validate
+        if isinstance(row.get("id"), str)
+    }
+    evaluation_rows = (
+        read_rows_for_validation(
+            layout.evaluations_jsonl, "evaluations.jsonl", issues
+        )
+        if layout.evaluations_jsonl.exists()
+        else []
+    )
+    seen_evaluation_results: set[str] = set()
+    for index, row in enumerate(evaluation_rows, start=1):
+        label = f"evaluations.jsonl line {index}"
+        if row.get("schema_version") != EVALUATION_SCHEMA:
+            issues.append(f"{label} has invalid schema")
+        result_id = row.get("result_id")
+        result = result_by_id.get(str(result_id))
+        if result is None:
+            issues.append(f"{label} references missing result {result_id}")
+        elif row.get("source_result_sha256") != canonical_sha256(result):
+            issues.append(f"{label} source result digest mismatch")
+        if result_id in seen_evaluation_results:
+            issues.append(f"{label} duplicates result evaluation {result_id}")
+        seen_evaluation_results.add(str(result_id))
+        error = row.get("error") or {}
+        if error.get("attribution") not in ERROR_ATTRIBUTIONS:
+            issues.append(f"{label} has invalid error attribution")
+    gate_rows = (
+        read_rows_for_validation(
+            layout.gate_results_jsonl, "gate-results.jsonl", issues
+        )
+        if layout.gate_results_jsonl.exists()
+        else []
+    )
+    seen_gate_results: set[str] = set()
+    for index, row in enumerate(gate_rows, start=1):
+        label = f"gate-results.jsonl line {index}"
+        if row.get("schema_version") != GATE_RESULT_SCHEMA:
+            issues.append(f"{label} has invalid schema")
+        result_id = str(row.get("result_id") or "")
+        if result_id not in result_by_id:
+            issues.append(f"{label} references missing result {result_id}")
+        if result_id in seen_gate_results:
+            issues.append(f"{label} duplicates result gate {result_id}")
+        seen_gate_results.add(result_id)
+        checks = row.get("checks")
+        if not isinstance(checks, list) or row.get("passed") != all(
+            isinstance(check, dict) and check.get("passed") is True
+            for check in checks or []
+        ):
+            issues.append(f"{label} gate pass summary is inconsistent")
+    artifact_rows = (
+        read_rows_for_validation(
+            layout.artifacts_jsonl, "artifacts.jsonl", issues
+        )
+        if layout.artifacts_jsonl.exists()
+        else []
+    )
+    for index, row in enumerate(artifact_rows, start=1):
+        label = f"artifacts.jsonl line {index}"
+        if row.get("schema_version") != ARTIFACT_SCHEMA:
+            issues.append(f"{label} has invalid schema")
+        if str(row.get("result_id") or "") not in result_by_id:
+            issues.append(f"{label} references a missing result")
     leader_work_rows_to_validate = read_rows_for_validation(layout.leader_work_jsonl, "leader-work.jsonl", issues)
     for index, row in enumerate(leader_work_rows_to_validate, start=1):
         label = f"leader-work.jsonl line {index}"
@@ -11249,6 +11908,7 @@ for _command_name in (
     "command_record_result",
     "command_record_leader_work",
     "command_record_usage",
+    "command_policy_transition",
     "command_governance_rebind",
     "command_recover",
 ):

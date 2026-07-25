@@ -1,5 +1,30 @@
 # Changelog
 
+## v3.1.0 - 2026-07-25
+
+### Added
+
+- Durable Work Graph nodes with roles, dependency joins, readiness states, and
+  a dispatch gate that requires accepted predecessors.
+- Content-addressed artifact registry and deterministic dependency, leader,
+  quality, error-severity, deliverable, and teaching gates.
+- Immutable six-dimensional attempt evaluations, explicit failure attribution,
+  automatic project retrospectives, and non-activating policy candidates.
+- Rebuildable cross-project model capability/quality memory and a teaching
+  policy for cold-start, high-risk, low-confidence, and repeated-failure scopes.
+- `work-graph` and `model-memory` diagnostics plus task/result CLI fields for
+  dependencies, deliverables, roles, gates, teaching, scores, and artifacts.
+
+### Routing and safety
+
+- Safe automatic routing can use audited evidence from sibling projects under
+  the same runtime root.
+- New evidence distinguishes leader acceptance from quality-aware routing
+  success; low-quality or high-error accepted work does not train the economic
+  router as a success.
+- Learned policy remains staged (`candidate`, replay, shadow, canary, active)
+  and never self-activates from a single observation.
+
 ## v3.0.0 - 2026-07-16
 
 CostMarshal is now a Codex-native plugin with one implicit orchestration Skill;

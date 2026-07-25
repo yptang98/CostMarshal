@@ -73,7 +73,7 @@ def simulated_windows_job_runtime(
     }
 
 
-if os.name == "nt":
+if os.name == "nt" and __name__ == "__main__":
     # This contract invokes run_actor directly. Production Windows launches are
     # covered separately and must inherit a real verified Job Object receipt.
     actor_runner._inherited_windows_job_runtime = simulated_windows_job_runtime

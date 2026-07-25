@@ -33,6 +33,9 @@ from .scheduler import (
     command_budget_status,
     command_governance_status,
     command_governance_rebind,
+    command_model_memory,
+    command_policy_status,
+    command_policy_transition,
     command_providers,
     command_preview_changes,
     command_record_leader_work,
@@ -46,8 +49,11 @@ from .scheduler import (
     command_start_leader,
     command_stop_actor,
     command_status,
+    command_work_graph,
     command_validate,
 )
+from .evolution import ERROR_ATTRIBUTIONS, TEACHING_MODES
+from .work_graph import WORK_ROLES
 
 
 def _add_command_id(parser: argparse.ArgumentParser) -> None:
@@ -189,6 +195,24 @@ def build_parser() -> argparse.ArgumentParser:
     new_task.add_argument("--title", required=True)
     new_task.add_argument("--purpose", required=True)
     new_task.add_argument("--task-type", default="analysis")
+    new_task.add_argument(
+        "--role",
+        choices=sorted(WORK_ROLES),
+        default="builder",
+        help="Work-package role used by routing memory and handoff policy",
+    )
+    new_task.add_argument(
+        "--depends-on",
+        action="append",
+        dest="dependencies",
+        help="Accepted predecessor task id; repeat for a dependency join",
+    )
+    new_task.add_argument(
+        "--deliverable",
+        action="append",
+        dest="deliverables",
+        help="Required artifact kind; defaults to completion-report",
+    )
     new_task.add_argument("--risk", choices=["low", "medium", "high"], default="low")
     new_task.add_argument("--difficulty", choices=["simple", "normal", "hard"], default="normal")
     new_task.add_argument("--provider", default="auto", help="Provider id from the project catalog, or auto")
@@ -221,6 +245,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override the project's auto-route objective for this task",
     )
     new_task.add_argument("--acceptance", action="append")
+    new_task.add_argument(
+        "--min-quality-score",
+        type=int,
+        choices=[1, 2, 3, 4, 5],
+        default=1,
+    )
+    new_task.add_argument(
+        "--max-error-severity",
+        type=int,
+        choices=[0, 1, 2, 3, 4, 5],
+        default=5,
+    )
+    new_task.add_argument(
+        "--teaching-mode",
+        choices=sorted(TEACHING_MODES),
+        default="auto",
+        help="Auto is advisory; explicit review/paired/replay requires evidence at acceptance",
+    )
     new_task.add_argument("--allowed-context", action="append")
     new_task.add_argument("--allowed-path", action="append")
     new_task.add_argument("--claim-path", action="append", help="File or directory path this task claims for writing")
@@ -415,6 +457,44 @@ def build_parser() -> argparse.ArgumentParser:
     result.add_argument("--task", required=True)
     result.add_argument("--status", choices=["done", "failed", "escalate"], required=True)
     result.add_argument("--quality-score", type=int, choices=[1, 2, 3, 4, 5], required=True)
+    result.add_argument(
+        "--efficiency-score",
+        type=int,
+        choices=[1, 2, 3, 4, 5],
+        help="Optional leader score; otherwise derived from token forecast accuracy",
+    )
+    result.add_argument(
+        "--instruction-score",
+        type=int,
+        choices=[1, 2, 3, 4, 5],
+    )
+    result.add_argument(
+        "--handoff-score",
+        type=int,
+        choices=[1, 2, 3, 4, 5],
+    )
+    result.add_argument(
+        "--error-attribution",
+        choices=sorted(ERROR_ATTRIBUTIONS),
+        help="Failure taxonomy; defaults to none for accepted and unknown otherwise",
+    )
+    result.add_argument(
+        "--error-severity",
+        type=int,
+        choices=[0, 1, 2, 3, 4, 5],
+        default=0,
+    )
+    result.add_argument(
+        "--teaching-evidence",
+        help="Review, paired-run, or replay evidence required by an explicit teaching mode",
+    )
+    result.add_argument(
+        "--artifact",
+        action="append",
+        dest="artifacts",
+        metavar="KIND=PATH",
+        help="Additional deliverable receipt; path must stay inside the project or workspace",
+    )
     result.add_argument("--accepted-by-leader", action="store_true")
     result.add_argument("--agent")
     result.add_argument("--actor")
@@ -519,6 +599,46 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--project", required=True)
     status.add_argument("--format", choices=["json", "md"], default="md")
     status.set_defaults(func=command_status)
+
+    graph = sub.add_parser(
+        "work-graph",
+        help="Show dependency readiness and authoritative work-package states",
+    )
+    graph.add_argument("--project", required=True)
+    graph.set_defaults(func=command_work_graph)
+
+    memory = sub.add_parser(
+        "model-memory",
+        help="Rebuild aggregate cross-project model capability and quality memory",
+    )
+    memory.add_argument("--project", required=True)
+    memory.add_argument("--provider")
+    memory.add_argument("--task-type")
+    memory.set_defaults(func=command_model_memory)
+
+    policy_status = sub.add_parser(
+        "policy-status",
+        help="Show staged learning candidates and active reviewed effects",
+    )
+    policy_status.add_argument("--project", required=True)
+    policy_status.set_defaults(func=command_policy_status)
+
+    policy_transition = sub.add_parser(
+        "policy-transition",
+        help="Preview or apply one reviewed candidate lifecycle transition",
+    )
+    policy_transition.add_argument("--project", required=True)
+    policy_transition.add_argument("--candidate", required=True)
+    policy_transition.add_argument(
+        "--to-state",
+        required=True,
+        choices=["replayed", "shadow", "canary", "active", "deprecated", "rolled_back"],
+    )
+    policy_transition.add_argument("--evidence", required=True)
+    policy_transition.add_argument("--approved-by", required=True)
+    policy_transition.add_argument("--apply", action="store_true")
+    _add_command_id(policy_transition)
+    policy_transition.set_defaults(func=command_policy_transition)
 
     validate = sub.add_parser("validate", help="Validate CostMarshal project structure")
     validate.add_argument("--project", required=True)

@@ -1,4 +1,4 @@
-# CostMarshal v3.0 Storage
+# CostMarshal v3.1 Storage
 
 The runtime root defaults to `$COSTMARSHAL_V2_HOME`, then `$CODEX_HOME/costmarshal-v2`, then `~/.codex/costmarshal-v2`.
 
@@ -15,6 +15,7 @@ The runtime root defaults to `$COSTMARSHAL_V2_HOME`, then `$CODEX_HOME/costmarsh
       state.json
       events.jsonl
       relay-cursors.json
+      work-graph.json
       actors/
       mailboxes/
       state.db
@@ -31,6 +32,11 @@ The runtime root defaults to `$COSTMARSHAL_V2_HOME`, then `$CODEX_HOME/costmarsh
       results.jsonl
       usage.jsonl
       leader-work.jsonl
+      artifacts.jsonl
+      gate-results.jsonl
+      evaluations.jsonl
+      retrospectives.jsonl
+      policy-candidates.jsonl
     actor-homes/
     worktrees/
     transcripts/
@@ -44,6 +50,11 @@ Before explicit cutover, the JSON/JSONL files below are the legacy sources of tr
 - `task.json`: task and attempt state, route decisions, reservations, actual cost, and leader result.
 - actor JSON: runtime identity and process metadata.
 - `results.jsonl`: immutable leader judgments used by routing history.
+- `work-graph.json`: dependency, role, readiness, and accepted-join state.
+- `artifacts.jsonl`: content-addressed artifact lifecycle receipts.
+- `gate-results.jsonl`: deterministic acceptance evidence.
+- `evaluations.jsonl`: immutable quality, efficiency, reliability, error, and teaching observations.
+- `retrospectives.jsonl` and `policy-candidates.jsonl`: project summaries and staged, non-activating learning proposals.
 - `usage.jsonl`: immutable usage deltas.
 - `scheduler/events.jsonl`: audit events and completed scheduler command IDs.
 - `locks/claims.json`: active logical write claims.

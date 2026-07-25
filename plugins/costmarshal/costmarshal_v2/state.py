@@ -182,6 +182,26 @@ def ensure_runtime_dirs(layout: ProjectLayout) -> None:
         layout.leader_work_jsonl.touch()
     if not layout.usage_jsonl.exists():
         layout.usage_jsonl.touch()
+    if not layout.artifacts_jsonl.exists():
+        layout.artifacts_jsonl.touch()
+    if not layout.gate_results_jsonl.exists():
+        layout.gate_results_jsonl.touch()
+    if not layout.evaluations_jsonl.exists():
+        layout.evaluations_jsonl.touch()
+    if not layout.retrospectives_jsonl.exists():
+        layout.retrospectives_jsonl.touch()
+    if not layout.policy_candidates_jsonl.exists():
+        layout.policy_candidates_jsonl.touch()
+    if not layout.work_graph_json.exists():
+        atomic_write_json(
+            layout.work_graph_json,
+            {
+                "schema_version": "costmarshal-work-graph-v1",
+                "revision": 0,
+                "updated_at": now_iso(),
+                "nodes": {},
+            },
+        )
     if not layout.relay_cursors_json.exists():
         atomic_write_json(
             layout.relay_cursors_json,

@@ -41,6 +41,7 @@ TREE_FILES = (
     "costmarshal_v2/cli.py",
     "costmarshal_v2/context_projection.py",
     "costmarshal_v2/control_store.py",
+    "costmarshal_v2/evolution.py",
     "costmarshal_v2/governance.py",
     "costmarshal_v2/handoff_contract.py",
     "costmarshal_v2/locking.py",
@@ -48,6 +49,7 @@ TREE_FILES = (
     "costmarshal_v2/paths.py",
     "costmarshal_v2/profile_binding.py",
     "costmarshal_v2/profiles.py",
+    "costmarshal_v2/quality.py",
     "costmarshal_v2/routing.py",
     "costmarshal_v2/scheduler.py",
     "costmarshal_v2/security.py",
@@ -57,6 +59,7 @@ TREE_FILES = (
     "costmarshal_v2/windows_job.py",
     "costmarshal_v2/windows_job_supervisor.py",
     "costmarshal_v2/worker_isolation.py",
+    "costmarshal_v2/work_graph.py",
     "skills/orchestrate-cost-aware-agents/SKILL.md",
     "skills/orchestrate-cost-aware-agents/agents/openai.yaml",
 )
@@ -69,6 +72,7 @@ SCANNED_TREES = (
 )
 INDIVIDUAL_FILES = (
     "references/migration-v3.md",
+    "references/evolution.md",
     "references/protocol.md",
     "references/storage.md",
     "scripts/costmarshal.py",

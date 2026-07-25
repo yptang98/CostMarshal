@@ -1406,7 +1406,15 @@ def leader_acceptance_prior(
                 else "provider+task_type"
             )
 
-    accepted = sum(1 for row in selected if row["accepted_by_leader"] is True)
+    # New evidence may carry a stricter quality-aware routing outcome.  Leader
+    # acceptance remains the trust boundary, while an accepted but low-quality
+    # or high-error attempt no longer teaches the economic router that the
+    # route was successful.
+    accepted = sum(
+        1
+        for row in selected
+        if row.get("routing_success", row["accepted_by_leader"]) is True
+    )
     observations = len(selected)
     evidence_result_ids, evidence_sha256 = acceptance_evidence_provenance(selected)
     posterior_alpha = alpha + accepted

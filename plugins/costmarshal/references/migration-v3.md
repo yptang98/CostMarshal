@@ -1,5 +1,21 @@
 # CostMarshal v3.0 Migration
 
+## v3.1 work graph and evolution ledgers
+
+No destructive state rewrite is required. The first v3.1 task mutation lazily
+creates `scheduler/work-graph.json`; `recover` creates any missing empty
+artifact, gate, evaluation, retrospective, and policy-candidate ledgers.
+Existing tasks are imported as dependency-free `builder` work packages unless
+their task documents already declare roles or dependencies. Existing leader
+results remain auditable and may inform routing, but only v3.1 result records
+carry the stricter quality-aware `routing_success` outcome and six-dimensional
+evaluation.
+
+Run `validate`, inspect `work-graph`, and preview `migrate-state` before enabling
+SQLite. After cutover the new JSON/JSONL files are transactionally owned
+compatibility views automatically; no separate database migration command is
+needed.
+
 CostMarshal 3 keeps the existing `costmarshal_v2` Python package, state schema,
 and `$CODEX_HOME/costmarshal-v2` runtime root so installed projects remain
 discoverable. The product entry changes to the Codex plugin Skill

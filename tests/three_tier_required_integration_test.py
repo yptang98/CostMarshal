@@ -79,7 +79,7 @@ def simulated_windows_job_runtime(
     }
 
 
-if os.name == "nt":
+if os.name == "nt" and __name__ == "__main__":
     actor_runner._inherited_windows_job_runtime = simulated_windows_job_runtime
 
 

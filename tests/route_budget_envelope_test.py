@@ -206,6 +206,16 @@ def remove_seed_evidence(project: Path) -> None:
         if row.strip() and str(json.loads(row).get("task_id") or "") not in seeded_ids
     ]
     results.write_text("".join(f"{row}\n" for row in retained), encoding="utf-8")
+    graph_path = project / "scheduler" / "work-graph.json"
+    if graph_path.is_file():
+        graph = json.loads(graph_path.read_text(encoding="utf-8"))
+        for task_id in seeded_ids:
+            (graph.get("nodes") or {}).pop(task_id, None)
+        graph["revision"] = int(graph.get("revision") or 0) + 1
+        graph_path.write_text(
+            json.dumps(graph, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
 
 def main() -> int:

@@ -1,6 +1,6 @@
 ---
 name: orchestrate-cost-aware-agents
-description: Orchestrate Codex work across low-, medium-, and high-cost API providers with CostMarshal's safety floors, leader acceptance, budget reservations, recoverable execution, and optional read-only ArchMarshal governance. Use when a user asks Codex to optimize cost versus quality, coordinate multiple model/API tiers, operate or audit CostMarshal, resume a CostMarshal run, or complete a task through economical provider handoffs.
+description: Orchestrate Codex work across low-, medium-, and high-cost API providers with CostMarshal's Work Graph, model memory, teaching policy, safety floors, leader acceptance, artifact gates, budget reservations, recoverable execution, and optional read-only ArchMarshal governance. Use when a user asks Codex to optimize cost versus quality, coordinate multiple model/API tiers, operate or audit CostMarshal, resume a CostMarshal run, or complete a task through economical provider handoffs.
 ---
 
 # Orchestrate cost-aware agents
@@ -32,14 +32,20 @@ Classify the user's request before running the internal engine:
   the safety floor, complete admitted chain, per-step reservation, historical
   acceptance evidence, and why a cheaper route was rejected. Do not create a
   task or start a provider.
-- **Do new work**: inspect `status`, create the bounded task with `new-task`, run
-  a read-only route explanation, then `dispatch --start` only within the user's
-  stated workspace, budget, paths, capabilities, and acceptance criteria. Start
-  the scheduler in bounded cycles and stop monitoring only at leader acceptance,
-  explicit failure, budget exhaustion, a recoverable pause, or user stop.
-- **Audit or monitor**: use JSON `status`, `dashboard`, `providers`, `budget`,
-  `validate`, and read-only `governance-status`. Summarize the durable state;
-  never infer success only from a live process.
+- **Do new work**: inspect `status`, `work-graph`, and relevant `model-memory`
+  scopes. Decompose the request into bounded work packages with roles,
+  dependencies, deliverables, gates, and teaching policy. Create each package
+  with `new-task`, run a read-only route explanation, then `dispatch --start`
+  only when its dependencies are accepted and it remains within the user's
+  workspace, budget, paths, capabilities, and acceptance criteria. Start the
+  scheduler in bounded cycles and stop monitoring only at gated leader
+  acceptance, explicit failure, budget exhaustion, a recoverable pause, or user
+  stop.
+- **Audit or monitor**: use JSON `status`, `dashboard`, `work-graph`,
+  `model-memory`, `providers`, `budget`, `validate`, and read-only
+  `governance-status`. Summarize dependency readiness, gates, evaluations,
+  errors, cost, and any unpromoted policy candidate; never infer success only
+  from a live process.
 - **Resume or recover**: run `recover` read-only first. Show the exact restart
   plan before `--restart-missing`; preserve sealed routes, generations, attempts,
   reservations, runtime receipts, and leader ownership. Never silently respawn
@@ -62,6 +68,13 @@ SQLite state, attempt records, price/profile evidence, receipts, or sealed route
 envelopes by hand. Do not run an unbounded foreground watch; advance the
 scheduler with bounded cycles, report progress in Codex, and re-read durable
 state between cycles.
+
+At leader review, record quality, efficiency, instruction following, handoff
+quality, and error attribution. Supply explicit teaching evidence when the work
+package requires review, pairing, or replay. Treat model outcomes not actually
+run as unobserved. A project retrospective may propose a candidate, but never
+promote it directly to active routing; require reviewed replay, shadow, and
+canary evidence first.
 
 The plugin Skill is the only implicit CostMarshal entry. A separately installed
 legacy `$costmarshal` Skill is explicit-only and may coexist solely for migration

@@ -1,4 +1,4 @@
-# CostMarshal v3.0 Protocol
+# CostMarshal v3.1 Protocol
 
 This is the canonical v2 protocol. Legacy `scripts/mc.py` commands are not part of it.
 
@@ -7,6 +7,10 @@ This is the canonical v2 protocol. Legacy `scripts/mc.py` commands are not part 
 - `scheduler`: deterministic relay, locking, supervision, accounting, and recovery.
 - `leader`: planning, task boundaries, review, integration, and final acceptance.
 - `agent-*`: one bounded provider attempt with explicit tier, context, and write scope.
+
+Agent work packages use the roles `scout`, `builder`, `reviewer`, and `expert`.
+The Work Graph is authoritative for dependency readiness. A package cannot
+dispatch until every predecessor is leader-accepted.
 
 ## Task lifecycle
 
@@ -17,6 +21,11 @@ planned -> dispatched -> waiting_leader -> done
 ```
 
 Only `record-result --status done --accepted-by-leader` may create `done`. A worker collect request is limited to `waiting_leader`, `failed`, or `escalate`.
+
+Leader acceptance is also subject to configured gates: dependencies, minimum
+quality, maximum error severity, required artifact kinds, and enforced teaching
+evidence. Each result creates an artifact receipt, gate record, and attempt
+evaluation in the same control transaction.
 
 ## Attempt fencing
 
@@ -31,6 +40,27 @@ Safety establishes a minimum tier. Complete, reviewed price and token inputs ena
 Each route step binds its own ordinary/cached/output forecast. Cached input is portable only with a proven exact provider/model/profile/profile-hash origin; a missing origin or different successor identity reclassifies it as ordinary input. Route-plan v2, budget-envelope v3, and collaboration-contract v2 bind this forecast. Missing usage cannot settle a reservation, while an explicit all-zero final observation can settle the immutable per-attempt fixed fee.
 
 Escalation follows the exact next provider in an active sealed envelope. That provider may be a distinct same-tier peer or a stronger tier, and a two-tier legacy catalog may skip a missing medium tier. Without such a sealed same-tier step, escalation remains stronger-tier only; repeats and downgrades are forbidden.
+
+New routing evidence distinguishes leader acceptance from quality-aware routing
+success. An accepted result trains the economic prior as a success only when its
+gates pass, quality is at least three, and error severity is at most one.
+Audited sibling-project evidence under the same runtime root may contribute to
+the prior; invalid peer evidence is skipped and never weakens the active
+project's audit.
+
+## Evolution and teaching
+
+Attempt evaluations score quality, efficiency, instruction following, handoff,
+reliability, and routing fit from one to five, with explicit error attribution.
+Cross-project model memory is rebuilt from these ledgers and stores aggregates
+only. It cannot override safety, capability, price, budget, profile, isolation,
+or leader gates.
+
+Automatic teaching is advisory for cold starts, risk, weak repeated outcomes,
+and low-confidence scopes. Explicit `review`, `paired`, or `replay` teaching
+requires evidence before acceptance. Policy recommendations begin as
+non-activating candidates and require reviewed replay, shadow, and canary stages
+before activation.
 
 ### Pricing snapshot gate
 

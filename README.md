@@ -8,7 +8,7 @@
 
   <p>
     <a href="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="VERSION"><img alt="Version 3.0.0" src="https://img.shields.io/badge/version-3.0.0-2bb3a3"></a>
+    <a href="VERSION"><img alt="Version 3.1.0" src="https://img.shields.io/badge/version-3.1.0-2bb3a3"></a>
     <a href="https://www.python.org/downloads/"><img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white"></a>
     <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-f0b94b"></a>
   </p>
@@ -83,6 +83,7 @@ runtime, recovery, automation, and diagnostics—not as a requirement for ordina
 | ✅ | Leader-owned acceptance | Workers report results, but only the Codex leader can accept, reject, continue, or apply changes. |
 | ♻️ | Durable recovery | Actors, attempts, mailboxes, budgets, reports, and recovery state survive interrupted sessions. |
 | 🔒 | Bounded execution | Write claims, sealed routes, generation fencing, and optional OCI isolation constrain worker scope. |
+| 🧠 | Evidence-backed evolution | Work graphs, artifact gates, six-dimensional scoring, model memory, and staged policy promotion improve later routing without self-authorizing changes. |
 
 ## How it works
 
@@ -103,6 +104,7 @@ flowchart LR
 3. **Execute** — A task-scoped actor receives only its bound prompt, provider profile, and allowed paths.
 4. **Review** — The Codex leader inspects sealed evidence and explicitly accepts or rejects the attempt.
 5. **Recover** — Durable on-disk state allows the scheduler to resume without relying on chat memory.
+6. **Learn** — Accepted and rejected attempts become auditable evaluations; aggregate model profiles inform later routing and teaching decisions.
 
 ### Routing at a glance
 
@@ -126,7 +128,11 @@ success_probability = 1 - product(1-Pi)
 objective = expected_chain_cost / success_probability
 ```
 
-`Pi` comes only from explicit leader acceptance records. Missing pricing or token estimates never produce an invented cost; routing falls back to the minimum safe tier, and budgeted dispatch fails closed if it cannot form an eligible estimate.
+`Pi` comes only from audited leader result records. New records use a stricter
+quality-aware routing outcome: acceptance, gate passage, quality, and error
+severity must all agree. Missing pricing or token estimates never produce an
+invented cost; routing falls back to the minimum safe tier, and budgeted
+dispatch fails closed if it cannot form an eligible estimate.
 
 CostMarshal reserves the full admitted chain estimate before first dispatch. Every step binds its own token forecast, reviewed price snapshot, provider identity, profile hash, and acceptance evidence. A rejected result can continue only to the exact next provider in the sealed route, and only after explicit leader authorization.
 
@@ -198,6 +204,25 @@ Read [`SECURITY.md`](SECURITY.md) before production use.
 | **Scheduler** | Relays messages, enforces locks, records state, and launches fenced effects | Never plans, reviews, or calls a model itself |
 | **Leader** | Plans, reviews, integrates, and accepts at explicit gates | Runs on demand; does not become a hidden default worker |
 | **Worker** | Executes one bounded attempt with a specific provider and scope | Cannot broaden context, mutate control state, or self-authorize continuation |
+| **Work Graph** | Tracks dependencies, roles, readiness, and accepted joins | A blocked package cannot dispatch |
+| **Artifact & Gate Engine** | Registers content-addressed outputs and evaluates deterministic acceptance policy | Leader acceptance cannot override a failed configured gate |
+| **Evolution Engine** | Records scores/errors, rebuilds cross-project model profiles, chooses teaching policy, and proposes candidates | Observations never activate policy directly |
+
+### How self-evolution stays safe
+
+Each completed attempt records quality, efficiency, instruction following,
+handoff quality, reliability, routing fit, token/cost variance, and an explicit
+error attribution. Cross-project model memory is an aggregate, rebuildable view
+over those immutable ledgers; it contains no prompts, reports, summaries, or raw
+artifacts.
+
+Teaching is selected for cold-start scopes, high-risk work, repeated weak
+outcomes, or low-confidence evidence. Automatic teaching is advisory; an
+explicit `review`, `paired`, or `replay` policy requires bound evidence before
+acceptance. Learned recommendations move through
+`candidate → replayed → shadow → canary → active`, with explicit review at
+every transition. One successful or failed task can never rewrite active
+routing policy by itself.
 
 CostMarshal stores project state under `$CODEX_HOME/costmarshal-v2` when `CODEX_HOME` is set, otherwise under `~/.codex/costmarshal-v2`. The plugin snapshot is curated from an explicit allowlist and excludes repository metadata, development tests, generated artifacts, legacy interfaces, and secret-bearing files.
 
@@ -211,6 +236,7 @@ CostMarshal stores project state under `$CODEX_HOME/costmarshal-v2` when `CODEX_
 | [`references/migration-v3.md`](references/migration-v3.md) | Migrating v2 projects and standalone Skill installs |
 | [`references/protocol.md`](references/protocol.md) | Actor, mailbox, task, and acceptance protocol |
 | [`references/storage.md`](references/storage.md) | Durable state layout and storage semantics |
+| [`references/evolution.md`](references/evolution.md) | Work graph, evaluation memory, teaching triggers, and policy promotion |
 | [`references/backtest.md`](references/backtest.md) | Blind real-provider evaluation format and gates |
 | [`container/worker/README.md`](container/worker/README.md) | Building the digest-pinned worker image |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release history |
@@ -224,6 +250,9 @@ The Python CLI is an internal runtime, automation, recovery, and diagnostic surf
 python scripts/costmarshal.py --help
 python scripts/costmarshal.py route --help
 python scripts/costmarshal.py dashboard --help
+python scripts/costmarshal.py work-graph --help
+python scripts/costmarshal.py model-memory --help
+python scripts/costmarshal.py policy-status --help
 python scripts/costmarshal.py recover --help
 ```
 
