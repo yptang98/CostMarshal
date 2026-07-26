@@ -65,7 +65,7 @@ def main() -> int:
         assert_true((project / "project.json").is_file(), "init should create v3-compatible project state")
 
         help_text = run(temp, "--version").stdout
-        assert_true("v3.4.0" in help_text, "official CLI should expose v3 version")
+        assert_true("v3.5.0" in help_text, "official CLI should expose v3 version")
 
         plan = run_json(temp, "start-leader", "--project", str(project), "--command", "codex --prompt {prompt_file}", "--dry-run")
         assert_true(plan["backend"] == "local", "start-leader should use v2 backend abstraction")
@@ -121,10 +121,24 @@ def main() -> int:
             "--accepted-by-leader",
         )
         assert_true(result["event"]["accepted_by_leader"] is True, "record-result should record leader acceptance")
+        cost_report = run_json(
+            temp,
+            "cost-report",
+            "--project",
+            str(project),
+            "--command-id",
+            "official-v3-smoke-cost-0001",
+        )
+        assert_true(cost_report["recorded"] is True, "cost-report should persist a new evidence snapshot")
+        assert_true(
+            cost_report["report"]["metric"]["accepted_artifact_count"] == 1,
+            "cost-report should center its metric on the accepted task Artifact",
+        )
 
         status = run_json(temp, "status", "--project", str(project), "--format", "json")
         assert_true(status["backend"]["kind"] == "local", "status should expose backend state")
         assert_true(status["result_summary"]["accepted"] == 1, "status should summarize accepted results")
+        assert_true(status["evolution"]["cost_report_count"] == 1, "status should expose total-cost report count")
         dashboard = run_json(temp, "dashboard", "--project", str(project), "--format", "json")
         assert_true(any(row["id"] == "scheduler" for row in dashboard["processes"]), "dashboard should include the scheduler process row")
         agent_process = next(row for row in dashboard["processes"] if row["id"] == "agent-v2-0001")

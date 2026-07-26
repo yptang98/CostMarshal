@@ -1,4 +1,4 @@
-# CostMarshal v3.4 Protocol
+# CostMarshal v3.5 Protocol
 
 This is the canonical v2 protocol. Legacy `scripts/mc.py` commands are not part of it.
 
@@ -26,6 +26,20 @@ Leader acceptance is also subject to configured gates: dependencies, minimum
 quality, maximum error severity, required artifact kinds, and enforced teaching
 evidence. Each result creates an artifact receipt, gate record, and attempt
 evaluation in the same control transaction.
+
+For new tasks with `review`, `paired`, or `replay`, teaching evidence is a
+hash-bound execution graph rather than an arbitrary note. Record the completed
+graph with `record-teaching-run`, then pass its ID through
+`record-result --teaching-run`. Review requires an independent reviewer work
+package; paired mode requires distinct execution identities plus a reviewer
+comparison; replay fixes execution identity and task scope. `auto` remains
+advisory unless a separately reviewed active policy raises the teaching floor.
+
+`cost-report` snapshots execution, verification, rework, handoff/context,
+Leader attention, and failure/recovery evidence. Completed attempt costs come
+from terminal result receipts; unmatched in-progress usage is included once.
+The primary metric is known CNY per accepted Artifact and is explicitly marked
+partial or unavailable when evidence is incomplete.
 
 Leader review can use `leader-snapshot-v1`, a deterministic projection of the
 objective, Work Graph readiness/blocking, pending decisions, recent accepted or

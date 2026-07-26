@@ -30,6 +30,7 @@ from .scheduler import (
     command_artifacts,
     command_batch_acceptance,
     command_collect,
+    command_cost_report,
     command_create_summary,
     command_dispatch,
     command_escalate,
@@ -50,6 +51,7 @@ from .scheduler import (
     command_record_leader_work,
     command_record_decision,
     command_record_result,
+    command_record_teaching_run,
     command_register_artifact,
     command_register_skill_candidate,
     command_promote_knowledge,
@@ -531,7 +533,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     result.add_argument(
         "--teaching-evidence",
-        help="Review, paired-run, or replay evidence required by an explicit teaching mode",
+        help="Legacy free-form evidence for tasks created before structured teaching graphs",
+    )
+    result.add_argument(
+        "--teaching-run",
+        help="Validated teaching run id required by a structured teaching graph",
     )
     result.add_argument(
         "--artifact",
@@ -797,6 +803,30 @@ def build_parser() -> argparse.ArgumentParser:
     memory.add_argument("--provider")
     memory.add_argument("--task-type")
     memory.set_defaults(func=command_model_memory)
+
+    teaching_run = sub.add_parser(
+        "record-teaching-run",
+        help="Bind completed result/gate evidence to a task teaching execution graph",
+    )
+    teaching_run.add_argument("--project", required=True)
+    teaching_run.add_argument("--task", required=True)
+    teaching_run.add_argument(
+        "--binding",
+        action="append",
+        required=True,
+        metavar="NODE_ID=EVIDENCE_ID",
+    )
+    teaching_run.add_argument("--conclusion", required=True)
+    _add_command_id(teaching_run)
+    teaching_run.set_defaults(func=command_record_teaching_run)
+
+    cost_report = sub.add_parser(
+        "cost-report",
+        help="Build and persist an observable total-cost report per accepted Artifact",
+    )
+    cost_report.add_argument("--project", required=True)
+    _add_command_id(cost_report)
+    cost_report.set_defaults(func=command_cost_report)
 
     policy_status = sub.add_parser(
         "policy-status",

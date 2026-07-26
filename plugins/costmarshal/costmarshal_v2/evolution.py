@@ -19,7 +19,8 @@ from .state import append_jsonl, new_id, now_iso, read_jsonl
 EVALUATION_SCHEMA = "costmarshal-attempt-evaluation-v1"
 RETROSPECTIVE_SCHEMA = "costmarshal-project-retrospective-v1"
 POLICY_CANDIDATE_SCHEMA = "costmarshal-policy-candidate-v1"
-MODEL_MEMORY_SCHEMA = "costmarshal-model-memory-v1"
+MODEL_MEMORY_SCHEMA = "costmarshal-model-memory-v2"
+MODEL_EVIDENCE_HALF_LIFE_DAYS = 90.0
 ERROR_ATTRIBUTIONS = frozenset(
     {
         "none",
@@ -273,11 +274,62 @@ def _iter_project_evaluations(root: Path) -> Iterable[dict[str, Any]]:
                 yield row
 
 
+def _memory_reference_time(value: datetime | None) -> datetime:
+    reference = value or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        raise EvolutionError("model-memory reference time must include a timezone")
+    return reference.astimezone(timezone.utc)
+
+
+def _observation_weight(timestamp: Any, reference: datetime) -> float:
+    if not isinstance(timestamp, str) or not timestamp:
+        return 1.0
+    try:
+        observed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return 1.0
+    if observed.tzinfo is None:
+        return 1.0
+    age_days = max(
+        0.0,
+        (reference - observed.astimezone(timezone.utc)).total_seconds() / 86400.0,
+    )
+    return 0.5 ** (age_days / MODEL_EVIDENCE_HALF_LIFE_DAYS)
+
+
+def _wilson_interval(successes: int, trials: int, z: float = 1.96) -> dict[str, float]:
+    if trials <= 0:
+        return {"lower": 0.0, "upper": 1.0, "confidence_level": 0.95}
+    proportion = successes / trials
+    denominator = 1.0 + z * z / trials
+    center = (proportion + z * z / (2.0 * trials)) / denominator
+    margin = (
+        z
+        * (
+            (
+                proportion * (1.0 - proportion) / trials
+                + z * z / (4.0 * trials * trials)
+            )
+            ** 0.5
+        )
+        / denominator
+    )
+    return {
+        "lower": round(max(0.0, center - margin), 4),
+        "upper": round(min(1.0, center + margin), 4),
+        "confidence_level": 0.95,
+    }
+
+
 def build_model_memory(
-    root: Path, *, evaluations: Iterable[dict[str, Any]] | None = None
+    root: Path,
+    *,
+    evaluations: Iterable[dict[str, Any]] | None = None,
+    reference_time: datetime | None = None,
 ) -> dict[str, Any]:
     """Build a disposable cross-project aggregate; raw prompts never enter it."""
 
+    reference = _memory_reference_time(reference_time)
     raw_source = list(evaluations) if evaluations is not None else list(
         _iter_project_evaluations(root)
     )
@@ -340,7 +392,23 @@ def build_model_memory(
             )
             for name in score_names
         }
+        observation_weights = [
+            _observation_weight(row.get("timestamp"), reference) for row in rows
+        ]
+        weight_total = sum(observation_weights)
+        weighted_means = {
+            name: round(
+                sum(
+                    float((row.get("scores") or {}).get(name) or 0) * weight
+                    for row, weight in zip(rows, observation_weights)
+                )
+                / weight_total,
+                3,
+            )
+            for name in score_names
+        }
         sample_count = len(rows)
+        effective_sample_count = weight_total
         accepted = sum(row.get("accepted") is True for row in rows)
         routing_successes = sum(row.get("routing_success") is True for row in rows)
         actual_tokens = [
@@ -385,8 +453,18 @@ def build_model_memory(
                 "routing_success_count": routing_successes,
                 "acceptance_rate": round(accepted / sample_count, 4),
                 "routing_success_rate": round(routing_successes / sample_count, 4),
-                "confidence": round(min(1.0, sample_count / 12.0), 4),
+                "confidence": round(
+                    min(1.0, effective_sample_count / 12.0), 4
+                ),
+                "effective_sample_count": round(effective_sample_count, 4),
+                "confidence_intervals": {
+                    "acceptance_rate": _wilson_interval(accepted, sample_count),
+                    "routing_success_rate": _wilson_interval(
+                        routing_successes, sample_count
+                    ),
+                },
                 "score_means": means,
+                "recency_weighted_score_means": weighted_means,
                 "usage_means": {
                     "actual_tokens": round(fmean(actual_tokens), 3),
                     "forecast_ratio": (
@@ -428,6 +506,18 @@ def build_model_memory(
         "generated_at": now_iso(),
         "source": "rebuildable-project-evaluation-ledgers",
         "privacy": "aggregate-only; no prompts, reports, summaries, or raw artifacts",
+        "evidence_policy": {
+            "identity_scope": "exact provider/model/profile/profile_sha256",
+            "task_scope": "exact task_type/difficulty/role",
+            "model_version_isolation": True,
+            "recency_half_life_days": MODEL_EVIDENCE_HALF_LIFE_DAYS,
+            "confidence_interval": "two-sided Wilson 95%",
+            "routing_note": (
+                "Routing consumes exact leader result evidence; this aggregate "
+                "is a rebuildable inspection and teaching-policy view."
+            ),
+        },
+        "reference_time": reference.isoformat(),
         "evaluation_count": len(source),
         "profiles": profiles,
         "evidence_sha256": canonical_sha256(evidence_ids),

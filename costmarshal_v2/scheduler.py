@@ -123,6 +123,18 @@ from .evolution import (
     profile_for_task,
     transition_policy_candidate,
 )
+from .cost_model import (
+    CostModelError,
+    build_total_cost_report,
+    validate_total_cost_report,
+)
+from .teaching import (
+    TeachingError,
+    build_teaching_execution_graph,
+    build_teaching_run,
+    validate_teaching_execution_graph,
+    validate_teaching_run,
+)
 from .quality import (
     ARTIFACT_SCHEMA,
     GATE_RESULT_SCHEMA,
@@ -3764,7 +3776,24 @@ def command_new_task(args: Any) -> None:
             max_error_severity=int(getattr(args, "max_error_severity", 5)),
             required_artifact_kinds=deliverables,
         )
-    except (EvolutionError, GateError) as exc:
+        teaching["execution_graph"] = build_teaching_execution_graph(
+            project_id=str(project.get("project_id") or ""),
+            task_id=task_id,
+            mode=str(teaching.get("mode") or "off"),
+            task_input={
+                "title": str(args.title),
+                "purpose": str(args.purpose),
+                "task_type": str(args.task_type),
+                "role": role,
+                "risk": str(getattr(args, "risk", "low")),
+                "difficulty": str(getattr(args, "difficulty", "normal")),
+                "dependencies": dependencies,
+                "deliverables": deliverables,
+                "required_capabilities": required_capabilities,
+                "gates": gates,
+            },
+        )
+    except (EvolutionError, GateError, TeachingError) as exc:
         raise SystemExit(f"Invalid work-package learning policy: {exc}") from exc
     directory.mkdir(parents=True)
     task = {
@@ -5222,6 +5251,7 @@ def execute_scheduler_command(
             error_attribution=command_args.get("error_attribution"),
             error_severity=int(command_args.get("error_severity") or 0),
             teaching_evidence=command_args.get("teaching_evidence"),
+            teaching_run=command_args.get("teaching_run"),
             artifacts=as_list(command_args.get("artifacts")),
             accepted_by_leader=as_bool(command_args.get("accepted_by_leader") or command_args.get("accepted")),
             agent=command_args.get("agent"),
@@ -7831,6 +7861,42 @@ def command_record_result(args: Any) -> None:
         raise SystemExit("quality-score must be 1-5")
     task = load_task(layout, args.task)
     project = load_project(layout)
+    teaching_graph = (task.get("teaching") or {}).get("execution_graph")
+    teaching_run_id = str(getattr(args, "teaching_run", None) or "").strip()
+    if teaching_graph is not None:
+        if getattr(args, "teaching_evidence", None):
+            raise SystemExit(
+                "this task has a structured teaching graph; use --teaching-run"
+            )
+        if teaching_run_id:
+            matching_run = next(
+                (
+                    row
+                    for row in read_jsonl(layout.teaching_runs_jsonl)
+                    if row.get("run_id") == teaching_run_id
+                ),
+                None,
+            )
+            if matching_run is None:
+                raise SystemExit(f"Teaching run not found: {teaching_run_id}")
+            try:
+                validate_teaching_run(
+                    matching_run,
+                    task=task,
+                    tasks=task_rows(layout),
+                    results=result_rows(layout),
+                    gates=read_jsonl(layout.gate_results_jsonl),
+                )
+            except TeachingError as exc:
+                raise SystemExit(f"Teaching run is invalid: {exc}") from exc
+            args.teaching_evidence = teaching_run_id
+        elif (
+            args.accepted_by_leader
+            and (task.get("teaching") or {}).get("enforcement") == "required"
+        ):
+            raise SystemExit(
+                "Leader acceptance requires a validated --teaching-run"
+            )
     attempts = task.get("attempts") or []
     requested_attempt = getattr(args, "attempt", None)
     attempt = next((row for row in attempts if row.get("attempt_id") == requested_attempt), None) if requested_attempt else (attempts[-1] if attempts else None)
@@ -10591,6 +10657,8 @@ def status_payload(layout: ProjectLayout) -> dict[str, Any]:
             "skill_candidate_count": len(
                 read_jsonl(layout.skill_candidates_jsonl)
             ),
+            "cost_report_count": len(read_jsonl(layout.cost_reports_jsonl)),
+            "teaching_run_count": len(read_jsonl(layout.teaching_runs_jsonl)),
         },
         "relay_cursors": load_relay_cursors(layout),
         "active_locks": active_lock_rows(layout),
@@ -11299,6 +11367,7 @@ def command_batch_acceptance(args: Any) -> None:
         "error_attribution",
         "error_severity",
         "teaching_evidence",
+        "teaching_run",
         "artifacts",
         "accepted_by_leader",
         "agent",
@@ -11320,6 +11389,7 @@ def command_batch_acceptance(args: Any) -> None:
         "error_attribution": None,
         "error_severity": 0,
         "teaching_evidence": None,
+        "teaching_run": None,
         "artifacts": [],
         "accepted_by_leader": False,
         "agent": None,
@@ -11516,6 +11586,75 @@ def command_model_memory(args: Any) -> None:
             "filtered_profile_count": len(profiles),
         }
     )
+
+
+def command_cost_report(args: Any) -> None:
+    """Build and persist one evidence-bound total-cost snapshot."""
+
+    layout = resolve_project(args.root, args.project)
+    try:
+        report = build_total_cost_report(
+            project=load_project(layout),
+            tasks=task_rows(layout),
+            results=result_rows(layout),
+            evaluations=read_jsonl(layout.evaluations_jsonl),
+            gate_results=read_jsonl(layout.gate_results_jsonl),
+            artifact_rows=read_jsonl(layout.artifacts_jsonl),
+            leader_work=leader_work_rows(layout),
+            usage_events=usage_rows(layout),
+        )
+        existing = read_jsonl(layout.cost_reports_jsonl)
+        recorded = not any(
+            row.get("report_id") == report["report_id"] for row in existing
+        )
+        if recorded:
+            append_jsonl(layout.cost_reports_jsonl, report)
+    except CostModelError as exc:
+        raise SystemExit(f"Total cost report is invalid: {exc}") from exc
+    print_json({"status": "ok", "recorded": recorded, "report": report})
+
+
+def _teaching_bindings(values: list[str]) -> dict[str, str]:
+    bindings: dict[str, str] = {}
+    for raw in values:
+        node_id, separator, evidence_id = str(raw).partition("=")
+        node_id = node_id.strip()
+        evidence_id = evidence_id.strip()
+        if not separator or not node_id or not evidence_id:
+            raise TeachingError(
+                "teaching binding must use NODE_ID=EVIDENCE_ID"
+            )
+        if node_id in bindings:
+            raise TeachingError(f"duplicate teaching node binding: {node_id}")
+        bindings[node_id] = evidence_id
+    return bindings
+
+
+def command_record_teaching_run(args: Any) -> None:
+    """Validate and persist one completed teaching execution graph."""
+
+    layout = resolve_project(args.root, args.project)
+    task = load_task(layout, args.task)
+    project = load_project(layout)
+    try:
+        row = build_teaching_run(
+            project_id=str(project.get("project_id") or ""),
+            task=task,
+            bindings=_teaching_bindings(list(args.binding or [])),
+            tasks=task_rows(layout),
+            results=result_rows(layout),
+            gates=read_jsonl(layout.gate_results_jsonl),
+            conclusion=str(args.conclusion),
+        )
+        existing = read_jsonl(layout.teaching_runs_jsonl)
+        recorded = not any(
+            item.get("run_id") == row["run_id"] for item in existing
+        )
+        if recorded:
+            append_jsonl(layout.teaching_runs_jsonl, row)
+    except TeachingError as exc:
+        raise SystemExit(f"Teaching run rejected: {exc}") from exc
+    print_json({"status": "ok", "recorded": recorded, "teaching_run": row})
 
 
 def command_policy_status(args: Any) -> None:
@@ -11996,6 +12135,24 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
                 validate_gate_spec(task["gates"])
             except GateError as exc:
                 issues.append(f"{task['id']} has invalid gates: {exc}")
+        teaching_graph = (task.get("teaching") or {}).get("execution_graph")
+        if teaching_graph is not None:
+            try:
+                validated_teaching_graph = validate_teaching_execution_graph(
+                    teaching_graph
+                )
+                if (
+                    validated_teaching_graph.get("task_id") != task.get("id")
+                    or validated_teaching_graph.get("project_id")
+                    != project.get("project_id")
+                    or validated_teaching_graph.get("mode")
+                    != (task.get("teaching") or {}).get("mode")
+                ):
+                    issues.append(
+                        f"{task['id']} teaching graph binding is inconsistent"
+                    )
+            except TeachingError as exc:
+                issues.append(f"{task['id']} has invalid teaching graph: {exc}")
         if task.get("agent_id") and task["agent_id"] not in actor_ids:
             issues.append(f"{task['id']} references missing actor {task['agent_id']}")
         if task.get("status") == "done":
@@ -12355,6 +12512,47 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
             validate_skill_candidate(row, artifact_rows=artifact_rows)
         except ProjectKnowledgeError as exc:
             issues.append(f"skill-candidates.jsonl line {index} is invalid: {exc}")
+    cost_report_rows = (
+        read_rows_for_validation(
+            layout.cost_reports_jsonl, "cost-reports.jsonl", issues
+        )
+        if layout.cost_reports_jsonl.exists()
+        else []
+    )
+    for index, row in enumerate(cost_report_rows, start=1):
+        try:
+            validate_total_cost_report(row)
+        except CostModelError as exc:
+            issues.append(f"cost-reports.jsonl line {index} is invalid: {exc}")
+    teaching_run_rows = (
+        read_rows_for_validation(
+            layout.teaching_runs_jsonl, "teaching-runs.jsonl", issues
+        )
+        if layout.teaching_runs_jsonl.exists()
+        else []
+    )
+    task_by_id = {
+        str(item.get("id")): load_task(layout, str(item.get("id")))
+        for item in task_rows(layout)
+        if item.get("id")
+    }
+    for index, row in enumerate(teaching_run_rows, start=1):
+        source_task = task_by_id.get(str(row.get("task_id") or ""))
+        if source_task is None:
+            issues.append(
+                f"teaching-runs.jsonl line {index} references a missing task"
+            )
+            continue
+        try:
+            validate_teaching_run(
+                row,
+                task=source_task,
+                tasks=task_rows(layout),
+                results=result_rows_to_validate,
+                gates=gate_rows,
+            )
+        except TeachingError as exc:
+            issues.append(f"teaching-runs.jsonl line {index} is invalid: {exc}")
     leader_work_rows_to_validate = read_rows_for_validation(layout.leader_work_jsonl, "leader-work.jsonl", issues)
     for index, row in enumerate(leader_work_rows_to_validate, start=1):
         label = f"leader-work.jsonl line {index}"
@@ -12763,6 +12961,8 @@ for _command_name in (
     "command_register_skill_candidate",
     "command_record_leader_work",
     "command_record_usage",
+    "command_cost_report",
+    "command_record_teaching_run",
     "command_policy_transition",
     "command_governance_rebind",
     "command_recover",

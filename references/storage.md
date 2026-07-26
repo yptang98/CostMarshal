@@ -1,4 +1,4 @@
-# CostMarshal v3.4 Storage
+# CostMarshal v3.5 Storage
 
 The runtime root defaults to `$COSTMARSHAL_V2_HOME`, then `$CODEX_HOME/costmarshal-v2`, then `~/.codex/costmarshal-v2`.
 
@@ -41,6 +41,8 @@ The runtime root defaults to `$COSTMARSHAL_V2_HOME`, then `$CODEX_HOME/costmarsh
       leader-decisions.jsonl
       knowledge.jsonl
       skill-candidates.jsonl
+      teaching-runs.jsonl
+      cost-reports.jsonl
     knowledge/
     summaries/
     skill-candidates/
@@ -65,6 +67,10 @@ Before explicit cutover, the JSON/JSONL files below are the legacy sources of tr
   graph, budget, and artifact revisions without loading raw transcripts.
 - `gate-results.jsonl`: deterministic acceptance evidence.
 - `evaluations.jsonl`: immutable quality, efficiency, reliability, error, and teaching observations.
+- `teaching-runs.jsonl`: hash-bound teaching graph nodes tied to exact result
+  and passing Gate evidence.
+- `cost-reports.jsonl`: observable total-cost snapshots centered on accepted
+  Artifacts; unknown monetary observations remain explicit.
 - `retrospectives.jsonl` and `policy-candidates.jsonl`: project summaries and staged, non-activating learning proposals.
 - `usage.jsonl`: immutable usage deltas.
 - `scheduler/events.jsonl`: audit events and completed scheduler command IDs.

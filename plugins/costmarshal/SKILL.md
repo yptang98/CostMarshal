@@ -1,9 +1,9 @@
 ---
 name: costmarshal
-description: "CostMarshal v3.4 internal policy/runtime for the Codex plugin: scheduler-first, capability-aware and cost-aware low/medium/high provider orchestration with accepted project knowledge, project-local Skill candidates, Leader Snapshots, structured handoffs, atomic batch acceptance, project artifact lineage, reviewed API presets, image input, work graphs, artifact gates, evidence-backed model memory, teaching policy, per-step cache-safe pricing, recoverable effects, OCI worker isolation, durable attempts, budget reservations, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
+description: "CostMarshal v3.5 internal policy/runtime for the Codex plugin: scheduler-first, capability-aware and cost-aware low/medium/high provider orchestration with total-cost reports, structured teaching execution graphs, recency-aware exact-version model memory, accepted project knowledge, project-local Skill candidates, Leader Snapshots, structured handoffs, atomic batch acceptance, project artifact lineage, reviewed API presets, image input, work graphs, artifact gates, per-step cache-safe pricing, recoverable effects, OCI worker isolation, durable attempts, budget reservations, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
 ---
 
-# CostMarshal v3.4
+# CostMarshal v3.5
 
 Use this skill for long or decomposable work where multiple API price/capability tiers should cooperate under explicit safety, cost, and recovery controls.
 
@@ -28,6 +28,9 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
 15. A task may dispatch only when every Work Graph dependency is leader-accepted. Artifact, quality, error, dependency, and explicit teaching gates must all pass before acceptance.
 16. Attempt evaluations are immutable observations. Aggregate model memory is rebuildable and contains no raw prompts or artifacts; learned policy can advance only through reviewed replay, shadow, canary, and activation stages.
 17. Provider API capabilities and worker transport capabilities are separate. Route only on their reviewed intersection; a local image input must be committed, bound into allowed context, and require `input:image`.
+18. Model memory is isolated by exact provider/model/profile hash and task scope, reports 95% Wilson intervals, and decays aggregate confidence with a 90-day half-life. External/tool/dependency/budget/context failures remain auditable but must not penalize model capability.
+19. New non-off teaching tasks use a hash-bound execution graph. Enforced acceptance requires a validated teaching-run ID; review, paired comparison, and replay evidence must satisfy their distinct fixed topologies.
+20. Total-cost reports center on known cost per accepted Artifact and separately expose execution, verification, rework, handoff/context, Leader attention, and failure/recovery observations. Never invent a monetary price for unknown costs, time, tokens, or context.
 
 ## Standard workflow
 
@@ -40,8 +43,13 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
 7. Keep `run-scheduler` active while actors execute.
 8. Review the completion report, tests, and evidence. For a sealed write output, run `preview-changes` before acceptance; it must not modify the source workspace.
 9. Record the leader result with quality, efficiency, instruction, handoff, and error evidence. When sealed evidence is insufficient, reject it with a bounded five-part `structured-handoff-v2` JSON file, then explicitly continue to the exact next distinct provider in the admitted non-decreasing chain; that step may be a sealed same-tier peer or may skip a tier.
+   If the task has an enforced teaching graph, complete its independent review,
+   paired comparison, or fixed replay first; record exact node bindings with
+   `record-teaching-run`, then supply the returned ID to `record-result`.
 10. After accepting reviewed changes, run `apply-changes` once to obtain the hash-bound contract, then repeat with `--apply --preview-sha ... --command-id ...`. The command stages but never commits the exact candidate tree. After SQLite cutover, preview and explicit apply use owner-leased recoverable Git effects; a command may honestly report `queued` when another drainer owns the effect fence.
-11. Run `validate`, and use `recover` after an unclean stop.
+11. Record a `cost-report` at meaningful project/milestone review points; read
+    partial and unknown monetary evidence literally.
+12. Run `validate`, and use `recover` after an unclean stop.
 
 ## Commands
 
@@ -95,6 +103,8 @@ python scripts/costmarshal.py providers --project <project-dir>
 python scripts/costmarshal.py budget --project <project-dir>
 python scripts/costmarshal.py work-graph --project <project-dir>
 python scripts/costmarshal.py model-memory --project <project-dir>
+python scripts/costmarshal.py record-teaching-run --project <project-dir> --task <task-id> --binding <node=result-id> --conclusion "<reviewed conclusion>" --command-id CMD-TEACH-001
+python scripts/costmarshal.py cost-report --project <project-dir> --command-id CMD-COST-001
 python scripts/costmarshal.py policy-status --project <project-dir>
 # Preview each transition first; add --apply and a stable --command-id only after evidence review.
 python scripts/costmarshal.py policy-transition --project <project-dir> --candidate <policy-id> --to-state replayed --evidence "<reviewed evidence>" --approved-by leader

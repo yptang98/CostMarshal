@@ -128,6 +128,14 @@ class ProjectLayout:
         return self.reports_dir / "skill-candidates.jsonl"
 
     @property
+    def cost_reports_jsonl(self) -> Path:
+        return self.reports_dir / "cost-reports.jsonl"
+
+    @property
+    def teaching_runs_jsonl(self) -> Path:
+        return self.reports_dir / "teaching-runs.jsonl"
+
+    @property
     def transcripts_dir(self) -> Path:
         return self.project_dir / "transcripts"
 

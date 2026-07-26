@@ -8,7 +8,7 @@
 
   <p>
     <a href="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="VERSION"><img alt="Version 3.4.0" src="https://img.shields.io/badge/version-3.4.0-2bb3a3"></a>
+    <a href="VERSION"><img alt="Version 3.5.0" src="https://img.shields.io/badge/version-3.5.0-2bb3a3"></a>
     <a href="https://www.python.org/downloads/"><img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white"></a>
     <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-f0b94b"></a>
   </p>
@@ -86,6 +86,12 @@ runtime, recovery, automation, and diagnostics—not as a requirement for ordina
 | 🧠 | Evidence-backed evolution | Work graphs, artifact gates, six-dimensional scoring, model memory, and staged policy promotion improve later routing without self-authorizing changes. |
 | 📦 | Project continuity | Transcript-free Leader Snapshots, structured handoffs, atomic batch acceptance, and immutable artifact lineage keep long projects moving. |
 | 📚 | Accepted knowledge | Charter, architecture, ADR, interface, fact, risk, and milestone indexes can only come from accepted evidence or an explicit Leader decision. |
+
+Total-cost reports complement routing estimates with observable project
+economics: known monetary cost per accepted Artifact, execution and review
+tokens/time, retries, handoffs, Leader attention, and failure/recovery counts.
+Unknown costs remain explicit; CostMarshal never assigns invented prices to
+time, tokens, or context.
 
 ## How it works
 
@@ -245,6 +251,7 @@ Read [`SECURITY.md`](SECURITY.md) before production use.
 | **Work Graph** | Tracks dependencies, roles, readiness, and accepted joins | A blocked package cannot dispatch |
 | **Artifact & Gate Engine** | Registers content-addressed outputs and evaluates deterministic acceptance policy | Leader acceptance cannot override a failed configured gate |
 | **Evolution Engine** | Records scores/errors, rebuilds cross-project model profiles, chooses teaching policy, and proposes candidates | Observations never activate policy directly |
+| **Cost Engine** | Builds evidence-bound total-cost snapshots per accepted Artifact | Unknown monetary observations remain explicit; time and tokens are never assigned invented prices |
 
 ### How self-evolution stays safe
 
@@ -252,12 +259,19 @@ Each completed attempt records quality, efficiency, instruction following,
 handoff quality, reliability, routing fit, token/cost variance, and an explicit
 error attribution. Cross-project model memory is an aggregate, rebuildable view
 over those immutable ledgers; it contains no prompts, reports, summaries, or raw
-artifacts.
+artifacts. Profiles are isolated by exact provider/model/profile hash and task
+scope, publish 95% Wilson intervals, and reduce stale evidence with a 90-day
+half-life. Failures attributed to environment, tools, dependencies, budget,
+context, routing, or human review remain auditable but do not count as negative
+model-capability evidence.
 
 Teaching is selected for cold-start scopes, high-risk work, repeated weak
 outcomes, or low-confidence evidence. Automatic teaching is advisory; an
-explicit `review`, `paired`, or `replay` policy requires bound evidence before
-acceptance. Learned recommendations move through
+explicit `review`, `paired`, or `replay` policy creates a fixed execution graph
+and requires a validated teaching run before enforced acceptance. Review binds
+a separate reviewer result, paired mode binds two model identities plus a
+comparison, and replay holds model identity and task scope fixed. Learned
+recommendations move through
 `candidate → replayed → shadow → canary → active`, with explicit review at
 every transition. One successful or failed task can never rewrite active
 routing policy by itself.
@@ -291,6 +305,8 @@ python scripts/costmarshal.py route --help
 python scripts/costmarshal.py dashboard --help
 python scripts/costmarshal.py work-graph --help
 python scripts/costmarshal.py model-memory --help
+python scripts/costmarshal.py record-teaching-run --help
+python scripts/costmarshal.py cost-report --help
 python scripts/costmarshal.py policy-status --help
 python scripts/costmarshal.py recover --help
 ```

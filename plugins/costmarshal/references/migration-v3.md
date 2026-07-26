@@ -1,5 +1,27 @@
 # CostMarshal v3 Migration
 
+## v3.5 total cost, model memory, and teaching graphs
+
+v3.5 adds optional `reports/cost-reports.jsonl` and
+`reports/teaching-runs.jsonl` ledgers. Existing projects remain valid; runtime
+directory initialization creates missing empty views without rewriting tasks,
+results, or Artifacts.
+
+Historical tasks may continue to read legacy free-form teaching evidence.
+Newly created non-off teaching tasks include a hash-bound execution graph and
+use a validated `--teaching-run` for enforced acceptance. No migration invents
+teaching evidence from old notes.
+
+Model memory is rebuilt, not migrated. The v2 aggregate isolates exact
+provider/model/profile hashes, adds 95% Wilson intervals, and applies a 90-day
+confidence half-life. Raw immutable evaluations remain unchanged. External
+failure attribution is retained for audit and total cost but no longer counts
+as negative model-capability routing evidence.
+
+Total-cost reports are explicit snapshots. Existing usage and result rows are
+not assigned synthetic prices, so historical projects may correctly report a
+partial or unavailable monetary metric.
+
 ## v3.4 project knowledge and reuse
 
 v3.4 adds optional Leader decision, project knowledge, and project-local Skill

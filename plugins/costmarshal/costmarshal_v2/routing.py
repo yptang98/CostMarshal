@@ -1292,6 +1292,23 @@ def _leader_rows(
         # truthy strings must not train the routing prior.
         if type(row.get("accepted_by_leader")) is not bool:
             continue
+        # Failures outside the execution model's control are retained in the
+        # audit/evaluation ledgers, but must not make that model appear less
+        # capable to the router. Positive acceptance still remains evidence.
+        if (
+            row.get("accepted_by_leader") is False
+            and row.get("error_attribution")
+            in {
+                "routing",
+                "context",
+                "tool",
+                "environment",
+                "dependency",
+                "budget",
+                "human-review",
+            }
+        ):
+            continue
         if execution_identity is not None:
             if _row_execution_identity(row) != execution_identity:
                 continue

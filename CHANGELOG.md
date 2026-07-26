@@ -1,5 +1,36 @@
 # Changelog
 
+## v3.5.0 - 2026-07-26
+
+### Added
+
+- Added evidence-bound total-cost reports centered on cost per accepted
+  Artifact, with execution, verification, rework, context/handoff, Leader
+  attention, and failure/recovery dimensions.
+- Added structured teaching execution graphs and validated teaching-run
+  ledgers for independent review, paired comparison, and fixed replay.
+- Added 95% Wilson intervals, a 90-day evidence half-life, effective sample
+  counts, and recency-weighted scores to exact model/profile/task memory.
+
+### Changed
+
+- Exact provider/model/profile/profile-hash identity continues to isolate model
+  versions; stale observations now reduce aggregate confidence.
+- Routing retains externally caused failures for audit but excludes routing,
+  context, tool, environment, dependency, budget, and human-review failures
+  from negative model-capability evidence.
+- New structured-teaching tasks require a validated teaching run for enforced
+  acceptance; legacy free-form evidence remains read-compatible only.
+
+### Safety
+
+- Total-cost reports never invent monetary prices for observed time, tokens,
+  handoffs, or unknown provider/Leader costs. The metric is marked partial or
+  unavailable when evidence is incomplete.
+- Teaching evidence binds exact result and Gate hashes and cannot activate a
+  learned policy; replay, shadow, canary, and explicit activation remain
+  separate reviewed transitions.
+
 ## v3.4.0 - 2026-07-26
 
 ### Added
