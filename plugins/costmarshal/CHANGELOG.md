@@ -11,6 +11,8 @@
   cannot inherit the host session.
 - Added a narrow read-time normalization for v3.1.0's default Codex catalog
   entry without changing custom provider credential contracts.
+- Made Windows CI verify bounded retry counts and durable effect recovery
+  instead of treating shared-runner scheduling pauses as product failures.
 
 ## v3.1.0 - 2026-07-25
 

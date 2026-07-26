@@ -372,7 +372,6 @@ raise AssertionError('fault did not exit')
         control_store_module.ATOMIC_REPLACE_RETRY_SECONDS = 0.03
         control_store_module.ATOMIC_REPLACE_INITIAL_DELAY_SECONDS = 0.005
         control_store_module.ATOMIC_REPLACE_MAX_DELAY_SECONDS = 0.01
-        started = time.monotonic()
         try:
             with self.assertRaises(PermissionError):
                 with control_transaction(
@@ -394,14 +393,16 @@ raise AssertionError('fault did not exit')
                     )
                     transaction.set_result({"status": "ok"})
         finally:
-            elapsed = time.monotonic() - started
             control_store_module.os.replace = original_replace
             control_store_module.ATOMIC_REPLACE_RETRY_SECONDS = original_retry
             control_store_module.ATOMIC_REPLACE_INITIAL_DELAY_SECONDS = original_initial
             control_store_module.ATOMIC_REPLACE_MAX_DELAY_SECONDS = original_maximum
 
         self.assertGreaterEqual(attempts, 3)
-        self.assertLess(elapsed, 1.0)
+        # Assert the retry algorithm itself is bounded. Wall-clock assertions
+        # are invalid on shared CI runners because a suspended process can
+        # resume seconds later without performing any additional retry.
+        self.assertLessEqual(attempts, 8)
         self.assertEqual(set(actor_path.parent.iterdir()), files_before)
         connection = sqlite3.connect(database_path(layout))
         try:

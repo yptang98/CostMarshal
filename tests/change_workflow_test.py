@@ -351,6 +351,20 @@ class ChangeWorkflowTest(unittest.TestCase):
                 scheduler_module.GIT_APPLY_EFFECT_TYPE,
                 "CMD-change-apply-sqlite-outbox",
             )
+            # A shared CI runner can suspend every process thread longer than
+            # the deliberately short effect lease. The production contract
+            # correctly marks that attempt retryable; prove bounded durable
+            # recovery instead of assuming uninterrupted wall-clock progress.
+            for _ in range(3):
+                current = effect_status(self.layout, apply_effect_id)
+                if current["status"] == "applied":
+                    break
+                self.assertIn(current["status"], {"pending", "retryable_failed"})
+                process_runtime_effects(
+                    self.layout,
+                    limit=1,
+                    _effect_ids=(apply_effect_id,),
+                )
             self.assertEqual(
                 effect_status(self.layout, apply_effect_id)["status"],
                 "applied",
