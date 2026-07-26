@@ -135,6 +135,23 @@ from .quality import (
     evaluate_gates,
     validate_gate_spec,
 )
+from .project_artifacts import (
+    PROJECT_ARTIFACT_KINDS,
+    PROJECT_ARTIFACT_LIFECYCLES,
+    PROJECT_ARTIFACT_SCHEMA,
+    ProjectArtifactError,
+    append_project_artifact,
+    build_project_artifact,
+    query_project_artifacts,
+    validate_project_artifact,
+    verify_project_artifact_source,
+)
+from .leader_snapshot import (
+    LEADER_SNAPSHOT_SCHEMA,
+    LeaderSnapshotError,
+    build_leader_snapshot,
+    validate_leader_snapshot,
+)
 from .work_graph import (
     WorkGraphError,
     dispatch_blockers,
@@ -1372,6 +1389,10 @@ def command_init(args: Any) -> None:
             "binding": governance_inspection.get("binding"),
         },
         "manager_mode": "on-demand",
+        "handoff_policy": {
+            "write_schema": "structured-handoff-v2",
+            "legacy_text_mode": "read-only",
+        },
         "source_project": str(source_project) if source_project else None,
         "source_project_mode": "read-only-reference" if source_project else "none",
         "scheduler_contract": {
@@ -7511,7 +7532,7 @@ def build_rejected_attempt_handoff(
     task: dict[str, Any],
     attempt: dict[str, Any],
     trusted_result: dict[str, Any],
-    handoff_text: str,
+    handoff_text: str | dict[str, Any],
 ) -> dict[str, Any]:
     """Purely seal one audited rejection for a successor; never dispatch it."""
 
@@ -7585,13 +7606,17 @@ def build_rejected_attempt_handoff(
         raise HandoffContractError(
             "handoff result request does not bind the sealed attempt output"
         )
-    return build_handoff_capsule(
-        collaboration_contract=contract,
-        attempt_input=attempt_input,
-        attempt_output=attempt_output,
-        leader_result=trusted_result,
-        handoff_text=handoff_text,
-    )
+    capsule_arguments: dict[str, Any] = {
+        "collaboration_contract": contract,
+        "attempt_input": attempt_input,
+        "attempt_output": attempt_output,
+        "leader_result": trusted_result,
+    }
+    if isinstance(handoff_text, dict):
+        capsule_arguments["structured_handoff"] = handoff_text
+    else:
+        capsule_arguments["handoff_text"] = handoff_text
+    return build_handoff_capsule(**capsule_arguments)
 
 
 def _bind_rejected_attempt_handoff(
@@ -7599,7 +7624,7 @@ def _bind_rejected_attempt_handoff(
     task: dict[str, Any],
     attempt: dict[str, Any],
     trusted_result: dict[str, Any],
-    handoff_text: str,
+    handoff_text: str | dict[str, Any],
 ) -> bool:
     """Idempotently persist the exact capsule/result pair consumed by a successor."""
 
@@ -7748,6 +7773,33 @@ def _result_artifact_events(
     return events
 
 
+def _load_result_handoff_argument(args: Any) -> str | dict[str, Any]:
+    raw = getattr(args, "handoff", None)
+    handoff_file = getattr(args, "handoff_file", None)
+    if raw and handoff_file:
+        raise SystemExit("choose exactly one --handoff or --handoff-file")
+    if handoff_file:
+        path = Path(handoff_file).expanduser()
+        try:
+            if path.stat().st_size > 1024 * 1024:
+                raise SystemExit("structured handoff file exceeds 1 MiB")
+            decoded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"structured handoff file is invalid: {exc}") from exc
+        if not isinstance(decoded, dict):
+            raise SystemExit("structured handoff file must contain one JSON object")
+        return decoded
+    if isinstance(raw, dict):
+        return json.loads(
+            json.dumps(raw, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        )
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        raise SystemExit("handoff must be legacy text or a structured JSON object")
+    return raw
+
+
 def command_record_result(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
     require_task(layout, args.task)
@@ -7819,7 +7871,17 @@ def command_record_result(args: Any) -> None:
             else "unsealed-legacy-non-required"
         )
         result_report_sha256 = attempt.get("report_sha256")
-    handoff_text = getattr(args, "handoff", None) or ""
+    handoff_text = _load_result_handoff_argument(args)
+    args.handoff = handoff_text
+    handoff_policy = project.get("handoff_policy") or {}
+    if (
+        handoff_text
+        and handoff_policy.get("write_schema") == "structured-handoff-v2"
+        and not isinstance(handoff_text, dict)
+    ):
+        raise SystemExit(
+            "new projects require --handoff-file with a structured-handoff-v2 JSON object"
+        )
     admitted_successor = _attempt_has_admitted_successor(task, attempt)
     if (
         attempt_output_boundary == "sealed-required"
@@ -7905,7 +7967,7 @@ def command_record_result(args: Any) -> None:
                         task=task,
                         attempt=attempt,
                         trusted_result=recorded,
-                        handoff_text=str(recorded_handoff),
+                        handoff_text=recorded_handoff,
                     )
                 except HandoffContractError as exc:
                     raise SystemExit(f"Leader handoff replay failed closed: {exc}") from exc
@@ -7962,7 +8024,7 @@ def command_record_result(args: Any) -> None:
                     task=task,
                     attempt=attempt,
                     trusted_result=orphan,
-                    handoff_text=str(orphan_handoff),
+                    handoff_text=orphan_handoff,
                 )
             except HandoffContractError as exc:
                 raise SystemExit(f"Leader handoff recovery failed closed: {exc}") from exc
@@ -9201,7 +9263,7 @@ def audit_result_evidence(
             ):
                 reject(index, "request contract does not match its result/output binding")
             handoff_argument = request_contract.get("handoff_argument")
-            if not isinstance(handoff_argument, str):
+            if not isinstance(handoff_argument, (str, dict)):
                 reject(index, "request contract handoff argument is invalid")
             elif handoff_argument:
                 if (
@@ -9227,8 +9289,14 @@ def audit_result_evidence(
                         != (attempt.get("attempt_input") or {}).get("attempt_input_sha256")
                         or validated_capsule.get("attempt_output_sha256")
                         != expected_attempt_output_sha256
-                        or (validated_capsule.get("handoff") or {}).get("text")
-                        != handoff_argument
+                        or (
+                            (validated_capsule.get("handoff") or {}).get(
+                                "payload"
+                                if isinstance(handoff_argument, dict)
+                                else "text"
+                            )
+                            != handoff_argument
+                        )
                     ):
                         reject(index, "persisted handoff does not match its exact result/attempt")
             else:
@@ -10683,6 +10751,231 @@ def command_status(args: Any) -> None:
     if args.format == "json":
         print_json(payload)
         return
+    _print_status_markdown(payload)
+
+
+def command_register_artifact(args: Any) -> None:
+    """Register metadata for one current-project artifact without moving its source."""
+
+    layout = resolve_project(args.root, args.project)
+    project = load_project(layout)
+    command_id = str(getattr(args, "command_id", None) or new_id("CMD"))
+    metadata: dict[str, Any] = {}
+    raw_metadata = getattr(args, "metadata_json", None)
+    if raw_metadata:
+        try:
+            decoded = json.loads(raw_metadata)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"artifact metadata is invalid JSON: {exc}") from exc
+        if not isinstance(decoded, dict):
+            raise SystemExit("artifact metadata must be a JSON object")
+        metadata = decoded
+    existing = read_jsonl(layout.artifacts_jsonl)
+    try:
+        row = build_project_artifact(
+            layout=layout,
+            project=project,
+            command_id=command_id,
+            kind=args.kind,
+            name=args.name,
+            lifecycle=args.lifecycle,
+            local_path=getattr(args, "path", None),
+            external_uri=getattr(args, "external_uri", None),
+            external_size_bytes=getattr(args, "size_bytes", None),
+            external_sha256=getattr(args, "sha256", None),
+            derived_from=list(getattr(args, "derived_from", None) or []),
+            task_id=getattr(args, "task", None),
+            date_bucket=getattr(args, "date_bucket", None),
+            metadata=metadata,
+            existing_rows=existing,
+        )
+        recorded = append_project_artifact(layout, row)
+        if not recorded:
+            row = next(
+                item
+                for item in existing
+                if item.get("event_id") == row.get("event_id")
+            )
+    except ProjectArtifactError as exc:
+        raise SystemExit(f"Project artifact rejected: {exc}") from exc
+    if recorded:
+        append_event(
+            layout,
+            "project_artifact_registered",
+            artifact_id=row["artifact_id"],
+            artifact_event_id=row["event_id"],
+            artifact_kind=row["kind"],
+            source_mutation=False,
+        )
+    print_json({"status": "ok", "recorded": recorded, "artifact": row})
+
+
+def command_artifacts(args: Any) -> None:
+    """Query only project-level artifacts; legacy task receipts remain readable elsewhere."""
+
+    layout = resolve_project(args.root, args.project)
+    try:
+        rows = query_project_artifacts(
+            read_jsonl(layout.artifacts_jsonl),
+            kind=getattr(args, "kind", None),
+            lifecycle=getattr(args, "lifecycle", None),
+            task_id=getattr(args, "task", None),
+            date_bucket=getattr(args, "date_bucket", None),
+        )
+    except ProjectArtifactError as exc:
+        raise SystemExit(f"Project artifact catalog is invalid: {exc}") from exc
+    print_json(
+        {
+            "status": "ok",
+            "schema_version": PROJECT_ARTIFACT_SCHEMA,
+            "count": len(rows),
+            "artifacts": rows,
+        }
+    )
+
+
+def command_leader_snapshot(args: Any) -> None:
+    """Create one immutable snapshot, deduplicated by its durable state hash."""
+
+    layout = resolve_project(args.root, args.project)
+    project = load_project(layout)
+    try:
+        snapshot = build_leader_snapshot(
+            project=project,
+            graph=load_work_graph(layout),
+            tasks=task_rows(layout),
+            artifact_rows=read_jsonl(layout.artifacts_jsonl),
+        )
+        existing = read_jsonl(layout.leader_snapshots_jsonl)
+        for row in existing:
+            validate_leader_snapshot(row)
+    except (LeaderSnapshotError, WorkGraphError) as exc:
+        raise SystemExit(f"Leader Snapshot rejected: {exc}") from exc
+    recorded = not any(
+        row.get("snapshot_id") == snapshot["snapshot_id"] for row in existing
+    )
+    if recorded:
+        append_jsonl(layout.leader_snapshots_jsonl, snapshot)
+        append_event(
+            layout,
+            "leader_snapshot_recorded",
+            snapshot_id=snapshot["snapshot_id"],
+            snapshot_sha256=snapshot["snapshot_sha256"],
+            work_graph_revision=snapshot["state_binding"]["work_graph_revision"],
+        )
+    print_json({"status": "ok", "recorded": recorded, "snapshot": snapshot})
+
+
+def command_batch_acceptance(args: Any) -> None:
+    """Apply independent record-result gates inside one atomic SQLite command."""
+
+    layout = resolve_project(args.root, args.project)
+    if not control_store_enabled(layout):
+        raise SystemExit(
+            "batch acceptance requires the SQLite control store; run migrate-state --apply first"
+        )
+    batch_command_id = str(getattr(args, "command_id", None) or "").strip()
+    if not batch_command_id:
+        raise SystemExit("batch acceptance requires an explicit stable --command-id")
+    try:
+        payload = json.loads(
+            Path(args.file).expanduser().read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"batch acceptance file is invalid: {exc}") from exc
+    decisions = payload.get("decisions") if isinstance(payload, dict) else None
+    if not isinstance(decisions, list) or not decisions:
+        raise SystemExit("batch acceptance requires a non-empty decisions list")
+    allowed = {
+        "task",
+        "status",
+        "quality_score",
+        "efficiency_score",
+        "instruction_score",
+        "handoff_score",
+        "error_attribution",
+        "error_severity",
+        "teaching_evidence",
+        "artifacts",
+        "accepted_by_leader",
+        "agent",
+        "actor",
+        "attempt",
+        "model",
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "estimated_cost_cny",
+        "summary",
+        "handoff",
+        "note",
+    }
+    defaults = {
+        "efficiency_score": None,
+        "instruction_score": None,
+        "handoff_score": None,
+        "error_attribution": None,
+        "error_severity": 0,
+        "teaching_evidence": None,
+        "artifacts": [],
+        "accepted_by_leader": False,
+        "agent": None,
+        "actor": None,
+        "attempt": None,
+        "model": None,
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "estimated_cost_cny": None,
+        "summary": None,
+        "handoff": None,
+        "note": None,
+    }
+    outputs: list[dict[str, Any]] = []
+    seen_tasks: set[str] = set()
+    for index, raw in enumerate(decisions):
+        if not isinstance(raw, dict) or set(raw) - allowed:
+            raise SystemExit(f"batch decision {index} has unknown or invalid fields")
+        for required in ("task", "status", "quality_score"):
+            if required not in raw:
+                raise SystemExit(f"batch decision {index} lacks {required}")
+        task_id = str(raw["task"])
+        if task_id in seen_tasks:
+            raise SystemExit(f"batch contains duplicate task decision: {task_id}")
+        seen_tasks.add(task_id)
+        values = {**defaults, **raw}
+        nested = SimpleNamespace(
+            root=args.root,
+            project=args.project,
+            command_id=f"{batch_command_id}:{index:04d}",
+            **values,
+        )
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buffer):
+                command_record_result(nested)
+        except SystemExit as exc:
+            raise SystemExit(
+                f"batch decision {index} for {task_id} failed; transaction rolled back: {exc}"
+            ) from exc
+        try:
+            outputs.append(json.loads(buffer.getvalue()))
+        except json.JSONDecodeError as exc:
+            raise SystemExit(
+                f"batch decision {index} produced invalid command output"
+            ) from exc
+    print_json(
+        {
+            "status": "ok",
+            "schema_version": "costmarshal-batch-acceptance-v1",
+            "command_id": batch_command_id,
+            "decision_count": len(outputs),
+            "results": outputs,
+        }
+    )
+
+
+def _print_status_markdown(payload: dict[str, Any]) -> None:
     lines = [
         f"# CostMarshal v3 Status: {payload['project'].get('name')}",
         "",
@@ -11574,10 +11867,42 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
     )
     for index, row in enumerate(artifact_rows, start=1):
         label = f"artifacts.jsonl line {index}"
-        if row.get("schema_version") != ARTIFACT_SCHEMA:
+        if row.get("schema_version") == ARTIFACT_SCHEMA:
+            if str(row.get("result_id") or "") not in result_by_id:
+                issues.append(f"{label} references a missing result")
+        elif row.get("schema_version") == PROJECT_ARTIFACT_SCHEMA:
+            try:
+                known_project_artifact_ids = {
+                    str(item.get("artifact_id"))
+                    for item in artifact_rows
+                    if item.get("artifact_id")
+                }
+                validate_project_artifact(
+                    row,
+                    known_artifact_ids=known_project_artifact_ids,
+                )
+                verify_project_artifact_source(
+                    layout,
+                    project,
+                    row,
+                    known_artifact_ids=known_project_artifact_ids,
+                )
+            except ProjectArtifactError as exc:
+                issues.append(f"{label} is invalid: {exc}")
+        else:
             issues.append(f"{label} has invalid schema")
-        if str(row.get("result_id") or "") not in result_by_id:
-            issues.append(f"{label} references a missing result")
+    snapshot_rows = (
+        read_rows_for_validation(
+            layout.leader_snapshots_jsonl, "leader-snapshots.jsonl", issues
+        )
+        if layout.leader_snapshots_jsonl.exists()
+        else []
+    )
+    for index, row in enumerate(snapshot_rows, start=1):
+        try:
+            validate_leader_snapshot(row)
+        except LeaderSnapshotError as exc:
+            issues.append(f"leader-snapshots.jsonl line {index} is invalid: {exc}")
     leader_work_rows_to_validate = read_rows_for_validation(layout.leader_work_jsonl, "leader-work.jsonl", issues)
     for index, row in enumerate(leader_work_rows_to_validate, start=1):
         label = f"leader-work.jsonl line {index}"
@@ -11977,6 +12302,9 @@ for _command_name in (
     "command_preview_changes",
     "command_apply_changes",
     "command_record_result",
+    "command_batch_acceptance",
+    "command_register_artifact",
+    "command_leader_snapshot",
     "command_record_leader_work",
     "command_record_usage",
     "command_policy_transition",

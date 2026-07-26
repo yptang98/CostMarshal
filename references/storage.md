@@ -1,4 +1,4 @@
-# CostMarshal v3.2 Storage
+# CostMarshal v3.3 Storage
 
 The runtime root defaults to `$COSTMARSHAL_V2_HOME`, then `$CODEX_HOME/costmarshal-v2`, then `~/.codex/costmarshal-v2`.
 
@@ -37,6 +37,10 @@ The runtime root defaults to `$COSTMARSHAL_V2_HOME`, then `$CODEX_HOME/costmarsh
       evaluations.jsonl
       retrospectives.jsonl
       policy-candidates.jsonl
+      leader-snapshots.jsonl
+    knowledge/
+    summaries/
+    skill-candidates/
     actor-homes/
     worktrees/
     transcripts/
@@ -52,7 +56,10 @@ Before explicit cutover, the JSON/JSONL files below are the legacy sources of tr
 - actor JSON: runtime identity and process metadata.
 - `results.jsonl`: immutable leader judgments used by routing history.
 - `work-graph.json`: dependency, role, readiness, and accepted-join state.
-- `artifacts.jsonl`: content-addressed artifact lifecycle receipts.
+- `artifacts.jsonl`: task receipts plus `costmarshal-project-artifact-v1`
+  metadata and `costmarshal-artifact-lineage-v1` provenance.
+- `leader-snapshots.jsonl`: immutable `leader-snapshot-v1` views bound to the
+  graph, budget, and artifact revisions without loading raw transcripts.
 - `gate-results.jsonl`: deterministic acceptance evidence.
 - `evaluations.jsonl`: immutable quality, efficiency, reliability, error, and teaching observations.
 - `retrospectives.jsonl` and `policy-candidates.jsonl`: project summaries and staged, non-activating learning proposals.
@@ -62,6 +69,20 @@ Before explicit cutover, the JSON/JSONL files below are the legacy sources of tr
 - `locks/project.lock`: OS advisory single-writer gate.
 
 `status.json` is a materialized task status view and must match `task.json` under `validate`.
+
+## Project artifact boundary
+
+CostMarshal manages only metadata for the current CostMarshal project. A local
+small file stays at its source path and is registered with size and SHA-256;
+`validate` fails closed if it drifts. Files larger than the local threshold are
+external-reference-only and require a non-secret URI, exact size, and SHA-256.
+URIs containing credentials, query strings, or fragments are rejected.
+
+Summaries, milestone records, and Skill candidates are new artifacts with
+non-empty `derived_from` lineage. `YYYY/MM/DD_name` is a logical query bucket,
+not a request to duplicate or reorganize source files. Skill candidates remain
+inside the project runtime; CostMarshal does not export or install global
+Skills.
 
 ## Compatibility
 

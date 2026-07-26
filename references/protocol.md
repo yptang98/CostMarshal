@@ -1,4 +1,4 @@
-# CostMarshal v3.2 Protocol
+# CostMarshal v3.3 Protocol
 
 This is the canonical v2 protocol. Legacy `scripts/mc.py` commands are not part of it.
 
@@ -27,11 +27,26 @@ quality, maximum error severity, required artifact kinds, and enforced teaching
 evidence. Each result creates an artifact receipt, gate record, and attempt
 evaluation in the same control transaction.
 
+Leader review can use `leader-snapshot-v1`, a deterministic projection of the
+objective, Work Graph readiness/blocking, pending decisions, recent accepted or
+rejected artifacts, risks, and budget state. It is bound to graph, budget, and
+artifact revisions and never embeds the raw transcript.
+
+`batch-acceptance` evaluates each task through its normal independent Gates
+inside one payload-hashed SQLite transaction. One invalid decision rolls back
+the complete batch, so partial acceptance cannot leak into later decisions.
+
 ## Attempt fencing
 
 Every attempt has a unique `attempt_id`, actor ID, provider ID, tier, and launch token. The runner holds an attempt-specific lifetime lock, revalidates the current task/attempt/actor binding, and registers a process start marker before invoking a provider. A duplicate runner or an attempt whose prior execution outcome is unknown must not invoke the provider.
 
 Mailbox message IDs are idempotency keys. Replaying task creation, dispatch, escalation, collection, usage, or result commands must not duplicate their durable effect.
+
+New projects write `structured-handoff-v2`: one conclusion, bounded facts,
+typed Artifact/path/Gate evidence, unresolved issues, and next actions. The
+capsule preserves the existing byte/token reserves and immutable result/output
+bindings. Legacy text handoffs remain read-compatible but are not writable by
+new projects.
 
 ## Routing
 

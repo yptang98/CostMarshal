@@ -78,6 +78,16 @@ ATTEMPT_OUTPUT_KIND = "costmarshal-attempt-output"
 PROMPT_BINDING_KIND = "costmarshal-prompt-binding"
 HANDOFF_CAPSULE_KIND = "costmarshal-handoff-capsule"
 APPLY_PREVIEW_KIND = "costmarshal-change-apply-preview"
+STRUCTURED_HANDOFF_SCHEMA = "structured-handoff-v2"
+STRUCTURED_HANDOFF_FIELDS = (
+    "conclusion",
+    "facts",
+    "evidence",
+    "unresolved",
+    "next_actions",
+)
+MAX_STRUCTURED_HANDOFF_ITEMS = 32
+MAX_STRUCTURED_HANDOFF_ITEM_BYTES = 2048
 
 
 @dataclass(frozen=True)
@@ -343,6 +353,91 @@ def _require_exact_keys(value: Mapping[str, Any], expected: set[str], label: str
         raise HandoffContractError(
             f"{label} has unknown or missing fields: expected {sorted(expected)}, got {sorted(observed)}"
         )
+
+
+def _validate_handoff_text_value(
+    value: str,
+    label: str,
+    *,
+    allow_empty: bool = False,
+    max_bytes: int | None = MAX_STRUCTURED_HANDOFF_ITEM_BYTES,
+) -> str:
+    if not isinstance(value, str) or (not allow_empty and not value.strip()):
+        raise HandoffContractError(f"{label} must be non-empty text")
+    payload = value.encode("utf-8", errors="strict")
+    if max_bytes is not None and len(payload) > max_bytes:
+        raise HandoffContractError(f"{label} exceeds its byte limit")
+    if any(
+        (ord(character) < 32 and character not in {"\n", "\t"})
+        or ord(character) == 127
+        for character in value
+    ):
+        raise HandoffContractError(f"{label} contains forbidden control characters")
+    if (
+        _PROMPT_MAGIC.rstrip(b"\n").decode("ascii") in value
+        or _TASK_PROMPT_DELIMITER.strip().decode("ascii") in value
+    ):
+        raise HandoffContractError(f"{label} contains reserved CostMarshal prompt framing")
+    return value
+
+
+def validate_structured_handoff(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the five-part successor handoff and typed evidence references."""
+
+    handoff = _canonical_mapping(value, "structured handoff")
+    _require_exact_keys(handoff, set(STRUCTURED_HANDOFF_FIELDS), "structured handoff")
+    handoff["conclusion"] = _validate_handoff_text_value(
+        handoff.get("conclusion"), "structured handoff conclusion"
+    )
+    for field in ("facts", "unresolved", "next_actions"):
+        items = handoff.get(field)
+        if not isinstance(items, list) or len(items) > MAX_STRUCTURED_HANDOFF_ITEMS:
+            raise HandoffContractError(
+                f"structured handoff {field} must be a bounded list"
+            )
+        handoff[field] = [
+            _validate_handoff_text_value(item, f"structured handoff {field}[{index}]")
+            for index, item in enumerate(items)
+        ]
+    evidence = handoff.get("evidence")
+    if not isinstance(evidence, list) or len(evidence) > MAX_STRUCTURED_HANDOFF_ITEMS:
+        raise HandoffContractError("structured handoff evidence must be a bounded list")
+    normalized_evidence: list[dict[str, str]] = []
+    for index, item in enumerate(evidence):
+        evidence_item = _canonical_mapping(
+            item, f"structured handoff evidence[{index}]"
+        )
+        _require_exact_keys(
+            evidence_item, {"type", "ref"}, f"structured handoff evidence[{index}]"
+        )
+        if evidence_item.get("type") not in {"artifact", "path", "gate"}:
+            raise HandoffContractError(
+                f"structured handoff evidence[{index}].type is invalid"
+            )
+        normalized_evidence.append(
+            {
+                "type": str(evidence_item["type"]),
+                "ref": _validate_handoff_text_value(
+                    evidence_item.get("ref"),
+                    f"structured handoff evidence[{index}].ref",
+                ),
+            }
+        )
+    handoff["evidence"] = normalized_evidence
+    return json.loads(_canonical_json_bytes(handoff))
+
+
+def _handoff_payload_bytes(capsule: Mapping[str, Any]) -> bytes:
+    handoff = _canonical_mapping(capsule.get("handoff"), "handoff")
+    if capsule.get("schema_version") == 1:
+        text = handoff.get("text")
+        if not isinstance(text, str):
+            raise HandoffContractError("legacy handoff text is invalid")
+        return text.encode("utf-8", errors="strict")
+    payload = validate_structured_handoff(
+        _canonical_mapping(handoff.get("payload"), "structured handoff payload")
+    )
+    return _canonical_json_bytes(payload)
 
 
 def _canonical_paths(
@@ -810,7 +905,7 @@ def build_attempt_input_contract(
             or total_upsert_bytes != outgoing["total_upsert_bytes"]
         ):
             raise HandoffContractError("incoming change counters do not match the predecessor capsule")
-        handoff_payload = capsule["handoff"]["text"].encode("utf-8")
+        handoff_payload = _handoff_payload_bytes(capsule)
         token_policy = contract["token_policy"]
         if len(handoff_payload) > token_policy["max_handoff_bytes"]:
             raise HandoffContractError("predecessor handoff exceeds the task byte limit")
@@ -991,6 +1086,8 @@ def _bound_prompt_parts(
         capsule_sha256 = None
         handoff_sha256 = None
         handoff_bytes = b""
+        structured_payload = None
+        handoff_schema_version = 1
     else:
         if predecessor_handoff is None:
             raise HandoffContractError("continuation prompt requires the exact predecessor handoff")
@@ -1003,20 +1100,31 @@ def _bound_prompt_parts(
             raise HandoffContractError("prompt predecessor handoff does not match attempt input")
         capsule_sha256 = capsule["capsule_sha256"]
         handoff_sha256 = capsule["handoff"]["sha256"]
-        handoff_bytes = capsule["handoff"]["text"].encode("utf-8")
+        handoff_bytes = _handoff_payload_bytes(capsule)
+        structured_payload = (
+            capsule["handoff"].get("payload")
+            if capsule.get("schema_version") == 2
+            else None
+        )
+        handoff_schema_version = int(capsule.get("schema_version") or 1)
     header = {
-        "schema_version": 1,
+        "schema_version": handoff_schema_version,
         "attempt_input_sha256": attempt["attempt_input_sha256"],
         "predecessor_capsule_sha256": capsule_sha256,
         "handoff_sha256": handoff_sha256,
         "handoff_size_bytes": len(handoff_bytes),
     }
-    evidence_envelope = {
-        "schema_version": 1,
+    evidence_envelope: dict[str, Any] = {
+        "schema_version": handoff_schema_version,
         "kind": "costmarshal-untrusted-predecessor-evidence",
         "capsule_sha256": capsule_sha256,
-        "text": handoff_bytes.decode("utf-8", errors="strict") if handoff_bytes else None,
     }
+    if handoff_schema_version == 2:
+        evidence_envelope["structured_handoff"] = structured_payload
+    else:
+        evidence_envelope["text"] = (
+            handoff_bytes.decode("utf-8", errors="strict") if handoff_bytes else None
+        )
     return header, _canonical_json_bytes(evidence_envelope)
 
 
@@ -1319,7 +1427,8 @@ def build_handoff_capsule(
     attempt_input: Mapping[str, Any],
     attempt_output: Mapping[str, Any],
     leader_result: Mapping[str, Any],
-    handoff_text: str,
+    handoff_text: str | None = None,
+    structured_handoff: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Seal one leader-rejected attempt into a bounded successor-visible capsule."""
 
@@ -1358,20 +1467,34 @@ def build_handoff_capsule(
         result.get("id"), "leader result id", _RESULT_ID_RE
     )
     leader_result_sha256 = _sha256(_canonical_json_bytes(result))
-    if not isinstance(handoff_text, str):
-        raise HandoffContractError("handoff_text must be text")
-    if any(
-        (ord(character) < 32 and character not in {"\n", "\t"})
-        or ord(character) == 127
-        for character in handoff_text
-    ):
-        raise HandoffContractError("handoff text contains forbidden control characters")
-    if (
-        _PROMPT_MAGIC.rstrip(b"\n").decode("ascii") in handoff_text
-        or _TASK_PROMPT_DELIMITER.strip().decode("ascii") in handoff_text
-    ):
-        raise HandoffContractError("handoff text contains reserved CostMarshal prompt framing")
-    handoff_bytes = handoff_text.encode("utf-8", errors="strict")
+    if (handoff_text is None) == (structured_handoff is None):
+        raise HandoffContractError(
+            "choose exactly one legacy text or structured handoff payload"
+        )
+    if structured_handoff is not None:
+        structured_payload = validate_structured_handoff(structured_handoff)
+        handoff_bytes = _canonical_json_bytes(structured_payload)
+        capsule_schema_version = 2
+        handoff_record = {
+            "encoding": "utf-8",
+            "format": STRUCTURED_HANDOFF_SCHEMA,
+            "payload": structured_payload,
+            "size_bytes": len(handoff_bytes),
+            "sha256": _sha256(handoff_bytes),
+            "token_upper_bound": len(handoff_bytes),
+        }
+    else:
+        assert handoff_text is not None
+        _validate_handoff_text_value(handoff_text, "handoff text", max_bytes=None)
+        handoff_bytes = handoff_text.encode("utf-8", errors="strict")
+        capsule_schema_version = 1
+        handoff_record = {
+            "encoding": "utf-8",
+            "text": handoff_text,
+            "size_bytes": len(handoff_bytes),
+            "sha256": _sha256(handoff_bytes),
+            "token_upper_bound": len(handoff_bytes),
+        }
     token_policy = contract["token_policy"]
     if not handoff_bytes or len(handoff_bytes) > token_policy["max_handoff_bytes"]:
         raise HandoffContractError("handoff text is empty or exceeds its immutable byte limit")
@@ -1384,7 +1507,7 @@ def build_handoff_capsule(
         raise HandoffContractError("handoff text exceeds the conservative continuation input reserve")
     predecessor = attempt.get("predecessor_handoff")
     body = {
-        "schema_version": 1,
+        "schema_version": capsule_schema_version,
         "kind": HANDOFF_CAPSULE_KIND,
         "task_id": contract["task_id"],
         "attempt_id": attempt["attempt_id"],
@@ -1403,13 +1526,7 @@ def build_handoff_capsule(
             "evidence_sha256": leader_result_sha256,
         },
         "report_receipt": json.loads(_canonical_json_bytes(output["report_receipt"])),
-        "handoff": {
-            "encoding": "utf-8",
-            "text": handoff_text,
-            "size_bytes": len(handoff_bytes),
-            "sha256": _sha256(handoff_bytes),
-            "token_upper_bound": len(handoff_bytes),
-        },
+        "handoff": handoff_record,
         "outgoing_changes": json.loads(_canonical_json_bytes(output["outgoing_changes"])),
     }
     return _with_self_hash(body, "capsule_sha256")
@@ -1421,7 +1538,10 @@ def validate_handoff_capsule(
     trusted_leader_result: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     capsule = _validate_self_hash(
-        value, kind=HANDOFF_CAPSULE_KIND, hash_field="capsule_sha256"
+        value,
+        kind=HANDOFF_CAPSULE_KIND,
+        hash_field="capsule_sha256",
+        schema_versions=frozenset({1, 2}),
     )
     _require_exact_keys(
         capsule,
@@ -1484,24 +1604,47 @@ def validate_handoff_capsule(
     _require_sha256(report.get("sha256"), "report hash")
     _require_positive_int(report.get("size_bytes"), "report size")
     handoff = _canonical_mapping(capsule.get("handoff"), "handoff")
-    _require_exact_keys(
-        handoff,
-        {"encoding", "text", "size_bytes", "sha256", "token_upper_bound"},
-        "handoff",
-    )
-    if handoff.get("encoding") != "utf-8" or not isinstance(handoff.get("text"), str):
-        raise HandoffContractError("handoff text encoding is invalid")
-    payload = handoff["text"].encode("utf-8", errors="strict")
+    if capsule["schema_version"] == 1:
+        expected_handoff_keys = {
+            "encoding",
+            "text",
+            "size_bytes",
+            "sha256",
+            "token_upper_bound",
+        }
+    else:
+        expected_handoff_keys = {
+            "encoding",
+            "format",
+            "payload",
+            "size_bytes",
+            "sha256",
+            "token_upper_bound",
+        }
+    _require_exact_keys(handoff, expected_handoff_keys, "handoff")
+    if handoff.get("encoding") != "utf-8":
+        raise HandoffContractError("handoff encoding is invalid")
+    if capsule["schema_version"] == 1:
+        if not isinstance(handoff.get("text"), str):
+            raise HandoffContractError("handoff text encoding is invalid")
+        payload = handoff["text"].encode("utf-8", errors="strict")
+    else:
+        if handoff.get("format") != STRUCTURED_HANDOFF_SCHEMA:
+            raise HandoffContractError("structured handoff format is invalid")
+        structured_payload = validate_structured_handoff(
+            _canonical_mapping(handoff.get("payload"), "structured handoff payload")
+        )
+        if structured_payload != handoff.get("payload"):
+            raise HandoffContractError("structured handoff payload is not canonical")
+        payload = _canonical_json_bytes(structured_payload)
     if handoff.get("size_bytes") != len(payload) or handoff.get("token_upper_bound") != len(payload):
         raise HandoffContractError("handoff byte/token counters are inconsistent")
     if handoff.get("sha256") != _sha256(payload):
         raise HandoffContractError("handoff text receipt is invalid")
-    if any(
-        (ord(character) < 32 and character not in {"\n", "\t"})
-        or ord(character) == 127
-        for character in handoff["text"]
-    ):
-        raise HandoffContractError("handoff text contains forbidden control characters")
+    if capsule["schema_version"] == 1:
+        _validate_handoff_text_value(
+            handoff["text"], "handoff text", max_bytes=None
+        )
     outgoing = _canonical_mapping(capsule.get("outgoing_changes"), "outgoing changes")
     _require_exact_keys(
         outgoing,
@@ -1725,6 +1868,7 @@ __all__ = [
     "HandoffContractError",
     "HandoffLimits",
     "PROMPT_BINDING_KIND",
+    "STRUCTURED_HANDOFF_SCHEMA",
     "TASK_CONTRACT_KIND",
     "build_apply_preview_contract",
     "build_attempt_input_contract",
@@ -1742,4 +1886,5 @@ __all__ = [
     "validate_collaboration_phase_transition",
     "validate_handoff_capsule",
     "validate_prompt_binding",
+    "validate_structured_handoff",
 ]

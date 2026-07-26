@@ -1,5 +1,15 @@
 # CostMarshal v3 Migration
 
+## v3.3 Leader and project artifact loop
+
+Existing v3.2 projects remain readable and may continue to replay their sealed
+text handoffs. New projects write `structured-handoff-v2`. Project artifact,
+lineage, and Leader Snapshot ledgers are additive; CostMarshal does not move
+source files or take ownership of external project/Skill directories.
+
+`batch-acceptance` requires an explicit SQLite cutover because its all-or-none
+result/Gate semantics rely on a single durable transaction.
+
 ## v3.2 provider capabilities and image input
 
 No state rewrite is required. Existing custom capability labels remain valid

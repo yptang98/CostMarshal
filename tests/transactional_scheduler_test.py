@@ -372,6 +372,136 @@ def main() -> int:
                 "SELECT COUNT(*) FROM effects WHERE command_id='CMD-escalate-nested-start' AND status='pending'"
             ).fetchone()[0] == 1
 
+        batch_actors: dict[str, str] = {}
+        for sequence in (4, 5):
+            task_id = f"V2-{sequence:04d}"
+            run_json(
+                temp,
+                "new-task",
+                "--project",
+                str(project),
+                "--title",
+                f"batch-{sequence}",
+                "--purpose",
+                "exercise atomic batch acceptance",
+                "--command-id",
+                f"CMD-new-batch-{sequence}",
+            )
+            dispatched = run_json(
+                temp,
+                "dispatch",
+                "--project",
+                str(project),
+                "--task",
+                task_id,
+                "--unsafe-native",
+                "--command-id",
+                f"CMD-dispatch-batch-{sequence}",
+            )
+            batch_actors[task_id] = dispatched["actor_id"]
+            (project / "tasks" / task_id / "completion-report.md").write_text(
+                f"# Completion Report: {task_id}\n\nStatus: done\n",
+                encoding="utf-8",
+            )
+            run_json(
+                temp,
+                "heartbeat",
+                "--project",
+                str(project),
+                "--actor",
+                dispatched["actor_id"],
+                "--status",
+                "waiting",
+            )
+            run_json(
+                temp,
+                "collect",
+                "--command-id",
+                f"CMD-collect-batch-{sequence}",
+                "--project",
+                str(project),
+                "--task",
+                task_id,
+                "--state",
+                "waiting_leader",
+            )
+        failed_batch_path = temp / "failed-batch.json"
+        failed_batch_path.write_text(
+            json.dumps(
+                {
+                    "decisions": [
+                        {
+                            "task": "V2-0004",
+                            "status": "done",
+                            "quality_score": 4,
+                            "accepted_by_leader": True,
+                        },
+                        {
+                            "task": "V2-9999",
+                            "status": "done",
+                            "quality_score": 4,
+                            "accepted_by_leader": True,
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        failed_batch = run(
+            temp,
+            "batch-acceptance",
+            "--project",
+            str(project),
+            "--file",
+            str(failed_batch_path),
+            "--command-id",
+            "CMD-batch-failed",
+            ok=False,
+        )
+        assert "transaction rolled back" in failed_batch.stderr
+        rolled_back = json.loads(
+            (project / "tasks" / "V2-0004" / "task.json").read_text(encoding="utf-8")
+        )
+        assert rolled_back["status"] == "waiting_leader"
+        assert rolled_back.get("leader_result_id") is None
+
+        batch_path = temp / "batch.json"
+        batch_path.write_text(
+            json.dumps(
+                {
+                    "decisions": [
+                        {
+                            "task": task_id,
+                            "status": "done",
+                            "quality_score": 4,
+                            "accepted_by_leader": True,
+                        }
+                        for task_id in ("V2-0004", "V2-0005")
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        accepted_batch = run_json(
+            temp,
+            "batch-acceptance",
+            "--project",
+            str(project),
+            "--file",
+            str(batch_path),
+            "--command-id",
+            "CMD-batch-accepted",
+        )
+        assert accepted_batch["decision_count"] == 2
+        for task_id in ("V2-0004", "V2-0005"):
+            accepted_task = json.loads(
+                (project / "tasks" / task_id / "task.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            assert accepted_task["status"] == "done"
+            assert accepted_task["leader_result"]["accepted_by_leader"] is True
+
         store = run_json(temp, "state-store", "--project", str(project))
         assert store["status"] == "ok"
         with sqlite3.connect(project / "scheduler" / "state.db") as connection:

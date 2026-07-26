@@ -100,6 +100,22 @@ class ProjectLayout:
         return self.reports_dir / "policy-candidates.jsonl"
 
     @property
+    def leader_snapshots_jsonl(self) -> Path:
+        return self.reports_dir / "leader-snapshots.jsonl"
+
+    @property
+    def summaries_dir(self) -> Path:
+        return self.project_dir / "summaries"
+
+    @property
+    def knowledge_dir(self) -> Path:
+        return self.project_dir / "knowledge"
+
+    @property
+    def skill_candidates_dir(self) -> Path:
+        return self.project_dir / "skill-candidates"
+
+    @property
     def transcripts_dir(self) -> Path:
         return self.project_dir / "transcripts"
 

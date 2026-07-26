@@ -171,6 +171,9 @@ def ensure_runtime_dirs(layout: ProjectLayout) -> None:
         layout.reports_dir,
         layout.transcripts_dir,
         layout.project_dir / "artifacts",
+        layout.summaries_dir,
+        layout.knowledge_dir,
+        layout.skill_candidates_dir,
         layout.project_dir / "locks",
     ]:
         path.mkdir(parents=True, exist_ok=True)
@@ -192,6 +195,8 @@ def ensure_runtime_dirs(layout: ProjectLayout) -> None:
         layout.retrospectives_jsonl.touch()
     if not layout.policy_candidates_jsonl.exists():
         layout.policy_candidates_jsonl.touch()
+    if not layout.leader_snapshots_jsonl.exists():
+        layout.leader_snapshots_jsonl.touch()
     if not layout.work_graph_json.exists():
         atomic_write_json(
             layout.work_graph_json,

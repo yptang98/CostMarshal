@@ -76,6 +76,7 @@ REQUIRED_LOCAL_TESTS = (
     "tests/actor_security_contract_test.py",
     "tests/context_projection_test.py",
     "tests/handoff_contract_test.py",
+    "tests/v3_3_leader_artifact_contract_test.py",
     "tests/change_apply_test.py",
     "tests/change_workflow_test.py",
     "tests/reliability_contract_test.py",

@@ -396,6 +396,66 @@ class HandoffContractTest(unittest.TestCase):
                 planned_steps=tampered["route_policy"]["planned_steps"],
             )
 
+    def test_structured_handoff_v2_is_typed_bounded_and_successor_visible(self) -> None:
+        contract = self.contract()
+        low = self.first_attempt(contract)
+        low_output = self.output(
+            contract,
+            low,
+            manifest=digest("structured-low-changes"),
+            change_count=1,
+            upsert_bytes=128,
+            label="structured-low",
+        )
+        low_result = self.rejected_result(low_output, 88)
+        structured = {
+            "conclusion": "Parser structure is valid but one edge case remains.",
+            "facts": ["The immutable parser tests pass."],
+            "evidence": [
+                {"type": "artifact", "ref": "PART-0123456789abcdef"},
+                {"type": "gate", "ref": "quality-gate"},
+            ],
+            "unresolved": ["Clarify empty-input behavior."],
+            "next_actions": ["Add the edge-case test before implementation."],
+        }
+        capsule = build_handoff_capsule(
+            collaboration_contract=contract,
+            attempt_input=low,
+            attempt_output=low_output,
+            leader_result=low_result,
+            structured_handoff=structured,
+        )
+        self.assertEqual(capsule["schema_version"], 2)
+        self.assertEqual(capsule["handoff"]["payload"], structured)
+        self.assertEqual(validate_handoff_capsule(capsule), capsule)
+        medium = build_attempt_input_contract(
+            collaboration_contract=contract,
+            attempt_id="ATT-medium-structured-002",
+            actor_id="agent-v2-structured-medium",
+            route_step_index=1,
+            incoming_change_manifest_sha256=digest("structured-low-changes"),
+            incoming_change_count=1,
+            incoming_total_upsert_bytes=128,
+            predecessor_handoff=capsule,
+            trusted_predecessor_result=low_result,
+        )
+        prompt = build_bound_prompt_bytes(
+            attempt_input=medium,
+            task_prompt_bytes=b"Continue from structured evidence.",
+            predecessor_handoff=capsule,
+        )
+        self.assertIn(b'"conclusion"', prompt)
+        invalid = deepcopy(structured)
+        invalid["evidence"] = [{"type": "url", "ref": "https://example.invalid"}]
+        with self.assertRaisesRegex(HandoffContractError, "type is invalid"):
+            build_handoff_capsule(
+                collaboration_contract=contract,
+                attempt_input=low,
+                attempt_output=low_output,
+                leader_result=low_result,
+                structured_handoff=invalid,
+            )
+
     def test_same_tier_peer_is_valid_only_as_a_distinct_non_decreasing_step(self) -> None:
         steps = self.same_tier_steps()
         contract = self.contract(planned_steps=steps)

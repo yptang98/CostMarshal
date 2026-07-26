@@ -27,6 +27,8 @@ from .scheduler import (
     LEADER_WORK_TYPES,
     RISKS,
     command_apply_changes,
+    command_artifacts,
+    command_batch_acceptance,
     command_collect,
     command_dispatch,
     command_escalate,
@@ -44,6 +46,7 @@ from .scheduler import (
     command_preview_changes,
     command_record_leader_work,
     command_record_result,
+    command_register_artifact,
     command_record_usage,
     command_recover,
     command_relay,
@@ -53,10 +56,12 @@ from .scheduler import (
     command_start_leader,
     command_stop_actor,
     command_status,
+    command_leader_snapshot,
     command_work_graph,
     command_validate,
 )
 from .evolution import ERROR_ATTRIBUTIONS, TEACHING_MODES
+from .project_artifacts import PROJECT_ARTIFACT_KINDS, PROJECT_ARTIFACT_LIFECYCLES
 from .work_graph import WORK_ROLES
 
 
@@ -548,13 +553,74 @@ def build_parser() -> argparse.ArgumentParser:
     result.add_argument("--output-tokens", type=int, default=0)
     result.add_argument("--estimated-cost-cny", help="Unverified caller-reported cost, up to 9 decimal places")
     result.add_argument("--summary")
-    result.add_argument(
+    handoff_source = result.add_mutually_exclusive_group()
+    handoff_source.add_argument(
         "--handoff",
-        help="Bound successor handoff for a rejected sealed required attempt",
+        help="Legacy bounded text handoff; read-compatible projects only",
+    )
+    handoff_source.add_argument(
+        "--handoff-file",
+        help="UTF-8 structured-handoff-v2 JSON object for a rejected sealed required attempt",
     )
     result.add_argument("--note")
     _add_command_id(result)
     result.set_defaults(func=command_record_result)
+
+    batch_acceptance = sub.add_parser(
+        "batch-acceptance",
+        help="Atomically apply multiple independent Leader result decisions",
+    )
+    batch_acceptance.add_argument("--project", required=True)
+    batch_acceptance.add_argument(
+        "--file",
+        required=True,
+        help="UTF-8 JSON object containing a non-empty decisions list",
+    )
+    _add_command_id(batch_acceptance)
+    batch_acceptance.set_defaults(func=command_batch_acceptance)
+
+    register_artifact = sub.add_parser(
+        "register-artifact",
+        help="Register a current-project artifact reference without copying or moving its source",
+    )
+    register_artifact.add_argument("--project", required=True)
+    register_artifact.add_argument("--kind", choices=sorted(PROJECT_ARTIFACT_KINDS), required=True)
+    register_artifact.add_argument("--name", required=True)
+    register_artifact.add_argument(
+        "--lifecycle",
+        choices=sorted(PROJECT_ARTIFACT_LIFECYCLES),
+        default="candidate",
+    )
+    source = register_artifact.add_mutually_exclusive_group(required=True)
+    source.add_argument("--path", help="Small local file inside the current project boundary")
+    source.add_argument("--external-uri", help="Non-secret external reference for a large artifact")
+    register_artifact.add_argument("--size-bytes", type=int)
+    register_artifact.add_argument("--sha256")
+    register_artifact.add_argument("--derived-from", action="append")
+    register_artifact.add_argument("--task")
+    register_artifact.add_argument("--date-bucket")
+    register_artifact.add_argument("--metadata-json")
+    _add_command_id(register_artifact)
+    register_artifact.set_defaults(func=command_register_artifact)
+
+    artifacts = sub.add_parser(
+        "artifacts",
+        help="Query project-level artifact metadata and lineage",
+    )
+    artifacts.add_argument("--project", required=True)
+    artifacts.add_argument("--kind", choices=sorted(PROJECT_ARTIFACT_KINDS))
+    artifacts.add_argument("--lifecycle", choices=sorted(PROJECT_ARTIFACT_LIFECYCLES))
+    artifacts.add_argument("--task")
+    artifacts.add_argument("--date-bucket")
+    artifacts.set_defaults(func=command_artifacts)
+
+    leader_snapshot = sub.add_parser(
+        "leader-snapshot",
+        help="Record a deterministic transcript-free Leader Snapshot",
+    )
+    leader_snapshot.add_argument("--project", required=True)
+    _add_command_id(leader_snapshot)
+    leader_snapshot.set_defaults(func=command_leader_snapshot)
 
     leader_work = sub.add_parser("record-leader-work", help="Audit direct leader implementation-like work")
     leader_work.add_argument("--project", required=True)

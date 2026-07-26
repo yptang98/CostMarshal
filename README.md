@@ -8,7 +8,7 @@
 
   <p>
     <a href="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="VERSION"><img alt="Version 3.2.0" src="https://img.shields.io/badge/version-3.2.0-2bb3a3"></a>
+    <a href="VERSION"><img alt="Version 3.3.0" src="https://img.shields.io/badge/version-3.3.0-2bb3a3"></a>
     <a href="https://www.python.org/downloads/"><img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white"></a>
     <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-f0b94b"></a>
   </p>
@@ -84,6 +84,7 @@ runtime, recovery, automation, and diagnostics—not as a requirement for ordina
 | ♻️ | Durable recovery | Actors, attempts, mailboxes, budgets, reports, and recovery state survive interrupted sessions. |
 | 🔒 | Bounded execution | Write claims, sealed routes, generation fencing, and optional OCI isolation constrain worker scope. |
 | 🧠 | Evidence-backed evolution | Work graphs, artifact gates, six-dimensional scoring, model memory, and staged policy promotion improve later routing without self-authorizing changes. |
+| 📦 | Project continuity | Transcript-free Leader Snapshots, structured handoffs, atomic batch acceptance, and immutable artifact lineage keep long projects moving. |
 
 ## How it works
 
@@ -105,6 +106,12 @@ flowchart LR
 4. **Review** — The Codex leader inspects sealed evidence and explicitly accepts or rejects the attempt.
 5. **Recover** — Durable on-disk state allows the scheduler to resume without relying on chat memory.
 6. **Learn** — Accepted and rejected attempts become auditable evaluations; aggregate model profiles inform later routing and teaching decisions.
+
+Project continuity does not take over your global workspace. CostMarshal keeps
+only current-project metadata: small local artifacts remain in place and are
+referenced by hash; large outputs remain on external storage; summaries and
+Skill candidates retain explicit lineage. CostMarshal never installs global
+Skills or moves source project files.
 
 ### Routing at a glance
 

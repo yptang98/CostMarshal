@@ -1,9 +1,9 @@
 ---
 name: costmarshal
-description: "CostMarshal v3.2 internal policy/runtime for the Codex plugin: scheduler-first, capability-aware and cost-aware low/medium/high provider orchestration with reviewed API presets, image input, work graphs, artifact gates, evidence-backed model memory, teaching policy, per-step cache-safe pricing, recoverable effects, OCI worker isolation, durable attempts, budget reservations, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
+description: "CostMarshal v3.3 internal policy/runtime for the Codex plugin: scheduler-first, capability-aware and cost-aware low/medium/high provider orchestration with Leader Snapshots, structured handoffs, atomic batch acceptance, project artifact lineage, reviewed API presets, image input, work graphs, artifact gates, evidence-backed model memory, teaching policy, per-step cache-safe pricing, recoverable effects, OCI worker isolation, durable attempts, budget reservations, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
 ---
 
-# CostMarshal v3.2
+# CostMarshal v3.3
 
 Use this skill for long or decomposable work where multiple API price/capability tiers should cooperate under explicit safety, cost, and recovery controls.
 
@@ -39,7 +39,7 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
 6. Dispatch only after the route explanation and claims are acceptable.
 7. Keep `run-scheduler` active while actors execute.
 8. Review the completion report, tests, and evidence. For a sealed write output, run `preview-changes` before acceptance; it must not modify the source workspace.
-9. Record the leader result with quality, efficiency, instruction, handoff, and error evidence. When sealed evidence is insufficient, reject it with a bounded `--handoff`, then explicitly continue to the exact next distinct provider in the admitted non-decreasing chain; that step may be a sealed same-tier peer or may skip a tier.
+9. Record the leader result with quality, efficiency, instruction, handoff, and error evidence. When sealed evidence is insufficient, reject it with a bounded five-part `structured-handoff-v2` JSON file, then explicitly continue to the exact next distinct provider in the admitted non-decreasing chain; that step may be a sealed same-tier peer or may skip a tier.
 10. After accepting reviewed changes, run `apply-changes` once to obtain the hash-bound contract, then repeat with `--apply --preview-sha ... --command-id ...`. The command stages but never commits the exact candidate tree. After SQLite cutover, preview and explicit apply use owner-leased recoverable Git effects; a command may honestly report `queued` when another drainer owns the effect fence.
 11. Run `validate`, and use `recover` after an unclean stop.
 
@@ -70,8 +70,14 @@ python scripts/costmarshal.py run-scheduler --project <project-dir>
 python scripts/costmarshal.py record-result --command-id CMD-RESULT-ACCEPT-001 --project <project-dir> --task V2-0001 --attempt <attempt-id> --status done --quality-score 5 --efficiency-score 4 --instruction-score 5 --handoff-score 4 --error-attribution none --accepted-by-leader
 
 # Reject a sealed required attempt and bind the exact successor handoff.
-python scripts/costmarshal.py record-result --command-id CMD-RESULT-REJECT-001 --project <project-dir> --task V2-0001 --attempt <attempt-id> --status escalate --quality-score 2 --handoff "Bounded findings, failed checks, and the exact remaining decision."
+python scripts/costmarshal.py record-result --command-id CMD-RESULT-REJECT-001 --project <project-dir> --task V2-0001 --attempt <attempt-id> --status escalate --quality-score 2 --handoff-file <structured-handoff.json>
 python scripts/costmarshal.py escalate --project <project-dir> --task V2-0001 --reason "Leader rejected the current result" --start
+
+# Project continuity metadata never moves source files or installs global Skills.
+python scripts/costmarshal.py leader-snapshot --project <project-dir> --command-id CMD-SNAPSHOT-001
+python scripts/costmarshal.py register-artifact --project <project-dir> --kind summary --name milestone-1 --lifecycle accepted --path <summary.md> --derived-from <artifact-id> --command-id CMD-ARTIFACT-001
+python scripts/costmarshal.py artifacts --project <project-dir> --lifecycle accepted
+python scripts/costmarshal.py batch-acceptance --project <project-dir> --file <decisions.json> --command-id CMD-BATCH-001
 
 # For a sealed write result, preview before acceptance; explicitly apply after acceptance.
 python scripts/costmarshal.py preview-changes --command-id CMD-CHANGE-PREVIEW-001 --project <project-dir> --task V2-0001 --attempt <attempt-id>

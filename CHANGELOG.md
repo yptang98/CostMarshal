@@ -1,5 +1,28 @@
 # Changelog
 
+## v3.3.0 - 2026-07-26
+
+### Added
+
+- Added deterministic, transcript-free `leader-snapshot-v1` records bound to
+  Work Graph, budget, and Artifact revisions.
+- Added `structured-handoff-v2` with conclusion, facts, typed evidence,
+  unresolved issues, and next actions; new projects write only this schema
+  while legacy text capsules remain readable.
+- Added SQLite-atomic batch acceptance with independent per-task Gates and
+  complete rollback when any decision fails.
+- Added current-project Artifact registration, immutable lineage, logical date
+  buckets, external-only large-artifact references, and filtered queries.
+
+### Safety
+
+- Artifact registration never copies, moves, overwrites, or deletes sources.
+- Local references are confined to the current runtime/workspace/read-only
+  source project and are reverified by `validate`; external URIs reject
+  credentials, query strings, and fragments.
+- Skill candidates remain project-local metadata and are never installed into
+  a global Skill directory.
+
 ## v3.2.0 - 2026-07-26
 
 ### Added
