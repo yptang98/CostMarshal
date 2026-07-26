@@ -152,6 +152,20 @@ from .leader_snapshot import (
     build_leader_snapshot,
     validate_leader_snapshot,
 )
+from .project_knowledge import (
+    KNOWLEDGE_KINDS,
+    LEADER_DECISION_SCHEMA,
+    PROJECT_KNOWLEDGE_SCHEMA,
+    SKILL_CANDIDATE_SCHEMA,
+    ProjectKnowledgeError,
+    build_leader_decision,
+    build_project_knowledge,
+    build_skill_candidate,
+    validate_leader_decision,
+    validate_project_knowledge,
+    validate_skill_candidate,
+    require_accepted_artifacts,
+)
 from .work_graph import (
     WorkGraphError,
     dispatch_blockers,
@@ -10573,6 +10587,10 @@ def status_payload(layout: ProjectLayout) -> dict[str, Any]:
             "policy_candidate_count": len(
                 read_jsonl(layout.policy_candidates_jsonl)
             ),
+            "knowledge_count": len(read_jsonl(layout.knowledge_jsonl)),
+            "skill_candidate_count": len(
+                read_jsonl(layout.skill_candidates_jsonl)
+            ),
         },
         "relay_cursors": load_relay_cursors(layout),
         "active_locks": active_lock_rows(layout),
@@ -10786,6 +10804,7 @@ def command_register_artifact(args: Any) -> None:
             derived_from=list(getattr(args, "derived_from", None) or []),
             task_id=getattr(args, "task", None),
             date_bucket=getattr(args, "date_bucket", None),
+            model=getattr(args, "model", None),
             metadata=metadata,
             existing_rows=existing,
         )
@@ -10830,6 +10849,390 @@ def command_artifacts(args: Any) -> None:
             "schema_version": PROJECT_ARTIFACT_SCHEMA,
             "count": len(rows),
             "artifacts": rows,
+        }
+    )
+
+
+def command_create_summary(args: Any) -> None:
+    """Create a deterministic lineage manifest and register it as a Summary Artifact."""
+
+    layout = resolve_project(args.root, args.project)
+    project = load_project(layout)
+    artifacts = read_jsonl(layout.artifacts_jsonl)
+    sources = list(getattr(args, "source_artifacts", None) or [])
+    try:
+        sources = require_accepted_artifacts(sources, artifacts)
+    except ProjectKnowledgeError as exc:
+        raise SystemExit(f"Project summary rejected: {exc}") from exc
+    latest: dict[str, dict[str, Any]] = {}
+    for row in artifacts:
+        artifact_id = row.get("artifact_id")
+        if isinstance(artifact_id, str):
+            latest[artifact_id] = row
+    title = str(args.title).strip()
+    if not title:
+        raise SystemExit("Project summary title is required")
+    summary_kind = "milestone-summary" if args.scope == "milestone" else "summary"
+    lines = [
+        f"# {title}",
+        "",
+        f"- Scope: {args.scope}",
+        f"- Project: {project.get('project_id')}",
+        f"- Source Artifact count: {len(sources)}",
+        "",
+        "## Accepted source Artifacts",
+        "",
+        "| Artifact | Kind | Task | SHA-256 |",
+        "| --- | --- | --- | --- |",
+    ]
+    for artifact_id in sources:
+        row = latest[artifact_id]
+        storage = row.get("storage") or {}
+        digest = storage.get("sha256") or row.get("sha256") or "-"
+        lines.append(
+            f"| {artifact_id} | {row.get('kind') or '-'} | "
+            f"{row.get('task_id') or '-'} | {digest} |"
+        )
+    note = str(getattr(args, "note", None) or "").strip()
+    if note:
+        lines.extend(["", "## Leader note", "", note])
+    content = "\n".join(lines) + "\n"
+    target = layout.summaries_dir / f"{slugify(args.name, 'summary')}.md"
+    if target.exists() and target.read_text(encoding="utf-8") != content:
+        raise SystemExit(
+            "summary target already exists with different content; use a new summary name"
+        )
+    atomic_write_text(target, content)
+    nested = SimpleNamespace(
+        root=args.root,
+        project=args.project,
+        command_id=getattr(args, "command_id", None),
+        kind=summary_kind,
+        name=args.name,
+        lifecycle="accepted",
+        path=str(target),
+        external_uri=None,
+        size_bytes=None,
+        sha256=None,
+        derived_from=sources,
+        task=getattr(args, "task", None),
+        date_bucket=getattr(args, "date_bucket", None),
+        metadata_json=json.dumps(
+            {"summary_scope": args.scope},
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+    )
+    command_register_artifact(nested)
+
+
+def command_record_decision(args: Any) -> None:
+    """Record one explicit Leader decision as a possible knowledge source."""
+
+    layout = resolve_project(args.root, args.project)
+    project = load_project(layout)
+    command_id = str(getattr(args, "command_id", None) or new_id("CMD"))
+    try:
+        row = build_leader_decision(
+            project_id=str(project.get("project_id") or ""),
+            command_id=command_id,
+            statement=args.statement,
+            rationale=args.rationale,
+            task_id=getattr(args, "task", None),
+        )
+        existing = read_jsonl(layout.leader_decisions_jsonl)
+        conflict = next(
+            (
+                item
+                for item in existing
+                if item.get("command_id") == command_id
+                and item.get("decision_id") != row["decision_id"]
+            ),
+            None,
+        )
+        if conflict is not None:
+            raise ProjectKnowledgeError(
+                "command id is already bound to a different Leader decision"
+            )
+        recorded = not any(
+            item.get("decision_id") == row["decision_id"] for item in existing
+        )
+        if recorded:
+            append_jsonl(layout.leader_decisions_jsonl, row)
+        else:
+            row = next(
+                item
+                for item in existing
+                if item.get("decision_id") == row["decision_id"]
+            )
+    except ProjectKnowledgeError as exc:
+        raise SystemExit(f"Leader decision rejected: {exc}") from exc
+    print_json({"status": "ok", "recorded": recorded, "decision": row})
+
+
+def command_promote_knowledge(args: Any) -> None:
+    """Promote only accepted evidence or an explicit Leader decision."""
+
+    layout = resolve_project(args.root, args.project)
+    project = load_project(layout)
+    command_id = str(getattr(args, "command_id", None) or new_id("CMD"))
+    artifacts = read_jsonl(layout.artifacts_jsonl)
+    decisions = read_jsonl(layout.leader_decisions_jsonl)
+    try:
+        row = build_project_knowledge(
+            project_id=str(project.get("project_id") or ""),
+            command_id=command_id,
+            kind=args.kind,
+            title=args.title,
+            source_artifact_ids=list(
+                getattr(args, "source_artifacts", None) or []
+            ),
+            artifact_rows=artifacts,
+            leader_decision_id=getattr(args, "leader_decision", None),
+            leader_decisions=decisions,
+            task_id=getattr(args, "task", None),
+        )
+        existing = read_jsonl(layout.knowledge_jsonl)
+        conflict = next(
+            (
+                item
+                for item in existing
+                if item.get("command_id") == command_id
+                and item.get("knowledge_id") != row["knowledge_id"]
+            ),
+            None,
+        )
+        if conflict is not None:
+            raise ProjectKnowledgeError(
+                "command id is already bound to different project knowledge"
+            )
+        recorded = not any(
+            item.get("knowledge_id") == row["knowledge_id"] for item in existing
+        )
+        if recorded:
+            append_jsonl(layout.knowledge_jsonl, row)
+        else:
+            row = next(
+                item
+                for item in existing
+                if item.get("knowledge_id") == row["knowledge_id"]
+            )
+    except ProjectKnowledgeError as exc:
+        raise SystemExit(f"Project knowledge rejected: {exc}") from exc
+    print_json({"status": "ok", "recorded": recorded, "knowledge": row})
+
+
+def command_knowledge(args: Any) -> None:
+    layout = resolve_project(args.root, args.project)
+    artifacts = read_jsonl(layout.artifacts_jsonl)
+    decisions = read_jsonl(layout.leader_decisions_jsonl)
+    rows: list[dict[str, Any]] = []
+    try:
+        for row in read_jsonl(layout.knowledge_jsonl):
+            validated = validate_project_knowledge(
+                row,
+                artifact_rows=artifacts,
+                leader_decisions=decisions,
+            )
+            if getattr(args, "kind", None) and validated["kind"] != args.kind:
+                continue
+            if getattr(args, "task", None) and validated["task_id"] != args.task:
+                continue
+            rows.append(validated)
+    except ProjectKnowledgeError as exc:
+        raise SystemExit(f"Project knowledge catalog is invalid: {exc}") from exc
+    print_json(
+        {
+            "status": "ok",
+            "schema_version": PROJECT_KNOWLEDGE_SCHEMA,
+            "count": len(rows),
+            "knowledge": rows,
+        }
+    )
+
+
+def command_register_skill_candidate(args: Any) -> None:
+    """Register reusable evidence without exporting or installing any Skill."""
+
+    layout = resolve_project(args.root, args.project)
+    project = load_project(layout)
+    command_id = str(getattr(args, "command_id", None) or new_id("CMD"))
+    artifacts = read_jsonl(layout.artifacts_jsonl)
+    artifact = next(
+        (
+            row
+            for row in reversed(artifacts)
+            if row.get("artifact_id") == args.artifact
+        ),
+        None,
+    )
+    if (
+        not isinstance(artifact, dict)
+        or artifact.get("schema_version") != PROJECT_ARTIFACT_SCHEMA
+        or artifact.get("kind") != "skill-candidate"
+        or artifact.get("lifecycle") != "accepted"
+    ):
+        raise SystemExit(
+            "Skill candidate metadata requires an accepted project-local skill-candidate Artifact"
+        )
+    sources = list(getattr(args, "source_artifacts", None) or [])
+    if sources != list(artifact.get("derived_from") or []):
+        raise SystemExit(
+            "Skill candidate evidence must exactly match its Artifact derived_from lineage"
+        )
+    try:
+        row = build_skill_candidate(
+            project_id=str(project.get("project_id") or ""),
+            command_id=command_id,
+            name=args.name,
+            artifact_id=args.artifact,
+            source_artifact_ids=sources,
+            artifact_rows=artifacts,
+            applicability=args.applicability,
+            inputs=list(args.inputs or []),
+            steps=list(args.steps or []),
+            verification=list(args.verification or []),
+            failure_boundaries=list(args.failure_boundaries or []),
+        )
+        existing = read_jsonl(layout.skill_candidates_jsonl)
+        conflict = next(
+            (
+                item
+                for item in existing
+                if item.get("command_id") == command_id
+                and item.get("candidate_id") != row["candidate_id"]
+            ),
+            None,
+        )
+        if conflict is not None:
+            raise ProjectKnowledgeError(
+                "command id is already bound to a different Skill candidate"
+            )
+        recorded = not any(
+            item.get("candidate_id") == row["candidate_id"] for item in existing
+        )
+        if recorded:
+            append_jsonl(layout.skill_candidates_jsonl, row)
+        else:
+            row = next(
+                item
+                for item in existing
+                if item.get("candidate_id") == row["candidate_id"]
+            )
+    except ProjectKnowledgeError as exc:
+        raise SystemExit(f"Skill candidate rejected: {exc}") from exc
+    print_json(
+        {
+            "status": "ok",
+            "recorded": recorded,
+            "candidate": row,
+            "exported": False,
+            "installed_globally": False,
+        }
+    )
+
+
+def command_export_skill_candidate(args: Any) -> None:
+    """Explicitly materialize a project-local export; never install it globally."""
+
+    layout = resolve_project(args.root, args.project)
+    project = load_project(layout)
+    artifacts = read_jsonl(layout.artifacts_jsonl)
+    candidates = read_jsonl(layout.skill_candidates_jsonl)
+    try:
+        candidate = next(
+            validate_skill_candidate(row, artifact_rows=artifacts)
+            for row in candidates
+            if row.get("candidate_id") == args.candidate
+        )
+    except StopIteration as exc:
+        raise SystemExit("Skill candidate not found") from exc
+    except ProjectKnowledgeError as exc:
+        raise SystemExit(f"Skill candidate is invalid: {exc}") from exc
+    artifact = next(
+        (
+            row
+            for row in reversed(artifacts)
+            if row.get("artifact_id") == candidate["artifact_id"]
+        ),
+        None,
+    )
+    if not isinstance(artifact, dict):
+        raise SystemExit("Skill candidate Artifact is missing")
+    try:
+        verify_project_artifact_source(
+            layout,
+            project,
+            artifact,
+            known_artifact_ids={
+                str(row.get("artifact_id"))
+                for row in artifacts
+                if row.get("artifact_id")
+            },
+        )
+    except ProjectArtifactError as exc:
+        raise SystemExit(f"Skill candidate source is invalid: {exc}") from exc
+    storage = artifact.get("storage") or {}
+    if storage.get("mode") != "local-reference":
+        raise SystemExit("Skill candidate export requires a verified local SKILL.md")
+    source = Path(str(storage.get("path") or "")).resolve(strict=True)
+    if source.name.casefold() != "skill.md":
+        raise SystemExit("Skill candidate Artifact must reference a SKILL.md file")
+    export_name = slugify(str(candidate["name"]), "skill-candidate")
+    export_dir = (layout.skill_candidates_dir / export_name).resolve()
+    export_dir.relative_to(layout.skill_candidates_dir.resolve())
+    target_skill = export_dir / "SKILL.md"
+    evidence = {
+        "schema_version": "costmarshal-skill-export-evidence-v1",
+        "candidate_id": candidate["candidate_id"],
+        "candidate_sha256": candidate["candidate_sha256"],
+        "artifact_id": artifact["artifact_id"],
+        "source_artifact_ids": candidate["source_artifact_ids"],
+        "source_skill_sha256": storage["sha256"],
+        "scope": "project-local-export",
+        "global_install_authorized": False,
+    }
+    preview_body = {
+        "schema_version": "costmarshal-skill-export-preview-v1",
+        "candidate_id": candidate["candidate_id"],
+        "target_directory": str(export_dir),
+        "skill_sha256": storage["sha256"],
+        "evidence_sha256": canonical_sha256(evidence),
+        "global_install": False,
+    }
+    preview_sha256 = canonical_sha256(preview_body)
+    preview = {**preview_body, "preview_sha256": preview_sha256}
+    if not getattr(args, "apply", False):
+        print_json({"status": "preview", "preview": preview})
+        return
+    if getattr(args, "preview_sha", None) != preview_sha256:
+        raise SystemExit("--apply requires the exact preceding --preview-sha")
+    if not str(getattr(args, "command_id", None) or "").strip():
+        raise SystemExit("--apply requires an explicit stable --command-id")
+    with project_write_lock(layout):
+        payload = source.read_bytes()
+        export_dir.mkdir(parents=True, exist_ok=True)
+        if target_skill.exists() and target_skill.read_bytes() != payload:
+            raise SystemExit("Skill export target already contains different bytes")
+        atomic_write_bytes(target_skill, payload)
+        evidence_path = export_dir / "evidence.json"
+        if evidence_path.exists():
+            try:
+                if read_json(evidence_path) != evidence:
+                    raise SystemExit(
+                        "Skill export evidence target already contains different metadata"
+                    )
+            except json.JSONDecodeError as exc:
+                raise SystemExit("Skill export evidence is malformed") from exc
+        atomic_write_json(evidence_path, evidence)
+    print_json(
+        {
+            "status": "ok",
+            "exported": True,
+            "export_directory": str(export_dir),
+            "preview_sha256": preview_sha256,
+            "installed_globally": False,
+            "next_step": "Use an external reviewed Skill-management workflow to validate and install if desired.",
         }
     )
 
@@ -11059,6 +11462,7 @@ def _print_status_markdown(payload: dict[str, Any]) -> None:
             f"- Evaluations: {evolution['evaluation_count']}; routing successes: {evolution['routing_success_count']}",
             f"- Gates: {evolution['gate_count']}; passed: {evolution['gate_pass_count']}; artifact events: {evolution['artifact_event_count']}",
             f"- Retrospectives: {evolution['retrospective_count']}; policy candidates awaiting staged promotion: {evolution['policy_candidate_count']}",
+            f"- Project knowledge: {evolution['knowledge_count']}; project-local Skill candidates: {evolution['skill_candidate_count']}",
         ]
     )
     lines.extend(["", "## Active Write Claims"])
@@ -11903,6 +12307,54 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
             validate_leader_snapshot(row)
         except LeaderSnapshotError as exc:
             issues.append(f"leader-snapshots.jsonl line {index} is invalid: {exc}")
+    decision_rows = (
+        read_rows_for_validation(
+            layout.leader_decisions_jsonl, "leader-decisions.jsonl", issues
+        )
+        if layout.leader_decisions_jsonl.exists()
+        else []
+    )
+    for index, row in enumerate(decision_rows, start=1):
+        try:
+            validated_decision = validate_leader_decision(row)
+            decision_task = validated_decision.get("task_id")
+            if decision_task and decision_task not in task_ids:
+                issues.append(
+                    f"leader-decisions.jsonl line {index} references missing task {decision_task}"
+                )
+        except ProjectKnowledgeError as exc:
+            issues.append(f"leader-decisions.jsonl line {index} is invalid: {exc}")
+    knowledge_rows = (
+        read_rows_for_validation(layout.knowledge_jsonl, "knowledge.jsonl", issues)
+        if layout.knowledge_jsonl.exists()
+        else []
+    )
+    for index, row in enumerate(knowledge_rows, start=1):
+        try:
+            validated_knowledge = validate_project_knowledge(
+                row,
+                artifact_rows=artifact_rows,
+                leader_decisions=decision_rows,
+            )
+            knowledge_task = validated_knowledge.get("task_id")
+            if knowledge_task and knowledge_task not in task_ids:
+                issues.append(
+                    f"knowledge.jsonl line {index} references missing task {knowledge_task}"
+                )
+        except ProjectKnowledgeError as exc:
+            issues.append(f"knowledge.jsonl line {index} is invalid: {exc}")
+    skill_candidate_rows = (
+        read_rows_for_validation(
+            layout.skill_candidates_jsonl, "skill-candidates.jsonl", issues
+        )
+        if layout.skill_candidates_jsonl.exists()
+        else []
+    )
+    for index, row in enumerate(skill_candidate_rows, start=1):
+        try:
+            validate_skill_candidate(row, artifact_rows=artifact_rows)
+        except ProjectKnowledgeError as exc:
+            issues.append(f"skill-candidates.jsonl line {index} is invalid: {exc}")
     leader_work_rows_to_validate = read_rows_for_validation(layout.leader_work_jsonl, "leader-work.jsonl", issues)
     for index, row in enumerate(leader_work_rows_to_validate, start=1):
         label = f"leader-work.jsonl line {index}"
@@ -12304,7 +12756,11 @@ for _command_name in (
     "command_record_result",
     "command_batch_acceptance",
     "command_register_artifact",
+    "command_create_summary",
     "command_leader_snapshot",
+    "command_record_decision",
+    "command_promote_knowledge",
+    "command_register_skill_candidate",
     "command_record_leader_work",
     "command_record_usage",
     "command_policy_transition",

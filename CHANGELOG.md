@@ -1,5 +1,20 @@
 # Changelog
 
+## v3.4.0 - 2026-07-26
+
+### Added
+
+- Added accepted-evidence-only project knowledge for Charter, Architecture,
+  ADR, Interface, Accepted Fact, Risk, and Milestone Summary records.
+- Added immutable explicit Leader decisions as an alternative auditable source
+  for project knowledge.
+- Added deterministic project/milestone summary manifests with accepted
+  Artifact lineage and logical `YYYY/MM/DD_name` views.
+- Added project-local Skill Candidate metadata requiring successful evidence
+  from at least two distinct tasks.
+- Added explicit Skill export preview/apply inside the project runtime; export
+  never writes to or installs a global Skill directory.
+
 ## v3.3.0 - 2026-07-26
 
 ### Added

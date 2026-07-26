@@ -1,6 +1,6 @@
 ---
 name: orchestrate-cost-aware-agents
-description: Orchestrate Codex work across low-, medium-, and high-cost API providers with CostMarshal's Work Graph, Leader Snapshots, structured handoffs, project artifact lineage, model memory, teaching policy, safety floors, leader acceptance, artifact gates, budget reservations, recoverable execution, and optional read-only ArchMarshal governance. Use when a user asks Codex to optimize cost versus quality, coordinate multiple model/API tiers, operate or audit CostMarshal, resume a CostMarshal run, or complete a task through economical provider handoffs.
+description: Orchestrate Codex work across low-, medium-, and high-cost API providers with CostMarshal's accepted project knowledge, project-local Skill candidates, Work Graph, Leader Snapshots, structured handoffs, project artifact lineage, model memory, teaching policy, safety floors, leader acceptance, artifact gates, budget reservations, recoverable execution, and optional read-only ArchMarshal governance. Use when a user asks Codex to optimize cost versus quality, coordinate multiple model/API tiers, operate or audit CostMarshal, resume a CostMarshal run, or complete a task through economical provider handoffs.
 ---
 
 # Orchestrate cost-aware agents

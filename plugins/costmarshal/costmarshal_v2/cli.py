@@ -30,8 +30,10 @@ from .scheduler import (
     command_artifacts,
     command_batch_acceptance,
     command_collect,
+    command_create_summary,
     command_dispatch,
     command_escalate,
+    command_export_skill_candidate,
     command_heartbeat,
     command_init,
     command_new_task,
@@ -40,13 +42,17 @@ from .scheduler import (
     command_governance_status,
     command_governance_rebind,
     command_model_memory,
+    command_knowledge,
     command_policy_status,
     command_policy_transition,
     command_providers,
     command_preview_changes,
     command_record_leader_work,
+    command_record_decision,
     command_record_result,
     command_register_artifact,
+    command_register_skill_candidate,
+    command_promote_knowledge,
     command_record_usage,
     command_recover,
     command_relay,
@@ -62,6 +68,7 @@ from .scheduler import (
 )
 from .evolution import ERROR_ATTRIBUTIONS, TEACHING_MODES
 from .project_artifacts import PROJECT_ARTIFACT_KINDS, PROJECT_ARTIFACT_LIFECYCLES
+from .project_knowledge import KNOWLEDGE_KINDS
 from .work_graph import WORK_ROLES
 
 
@@ -612,7 +619,23 @@ def build_parser() -> argparse.ArgumentParser:
     artifacts.add_argument("--lifecycle", choices=sorted(PROJECT_ARTIFACT_LIFECYCLES))
     artifacts.add_argument("--task")
     artifacts.add_argument("--date-bucket")
+    artifacts.add_argument("--model")
     artifacts.set_defaults(func=command_artifacts)
+
+    create_summary = sub.add_parser(
+        "create-summary",
+        help="Create a deterministic project or milestone summary with accepted Artifact lineage",
+    )
+    create_summary.add_argument("--project", required=True)
+    create_summary.add_argument("--scope", choices=["project", "milestone"], required=True)
+    create_summary.add_argument("--name", required=True)
+    create_summary.add_argument("--title", required=True)
+    create_summary.add_argument("--source-artifact", action="append", dest="source_artifacts", required=True)
+    create_summary.add_argument("--task")
+    create_summary.add_argument("--date-bucket")
+    create_summary.add_argument("--note")
+    _add_command_id(create_summary)
+    create_summary.set_defaults(func=command_create_summary)
 
     leader_snapshot = sub.add_parser(
         "leader-snapshot",
@@ -621,6 +644,66 @@ def build_parser() -> argparse.ArgumentParser:
     leader_snapshot.add_argument("--project", required=True)
     _add_command_id(leader_snapshot)
     leader_snapshot.set_defaults(func=command_leader_snapshot)
+
+    record_decision = sub.add_parser(
+        "record-decision",
+        help="Record an explicit Leader decision that may source project knowledge",
+    )
+    record_decision.add_argument("--project", required=True)
+    record_decision.add_argument("--statement", required=True)
+    record_decision.add_argument("--rationale", required=True)
+    record_decision.add_argument("--task")
+    _add_command_id(record_decision)
+    record_decision.set_defaults(func=command_record_decision)
+
+    promote_knowledge = sub.add_parser(
+        "promote-knowledge",
+        help="Index accepted Artifact evidence or an explicit Leader decision as project knowledge",
+    )
+    promote_knowledge.add_argument("--project", required=True)
+    promote_knowledge.add_argument("--kind", choices=sorted(KNOWLEDGE_KINDS), required=True)
+    promote_knowledge.add_argument("--title", required=True)
+    promote_knowledge.add_argument("--source-artifact", action="append", dest="source_artifacts")
+    promote_knowledge.add_argument("--leader-decision")
+    promote_knowledge.add_argument("--task")
+    _add_command_id(promote_knowledge)
+    promote_knowledge.set_defaults(func=command_promote_knowledge)
+
+    knowledge = sub.add_parser(
+        "knowledge",
+        help="Query accepted project knowledge without reading raw transcripts",
+    )
+    knowledge.add_argument("--project", required=True)
+    knowledge.add_argument("--kind", choices=sorted(KNOWLEDGE_KINDS))
+    knowledge.add_argument("--task")
+    knowledge.set_defaults(func=command_knowledge)
+
+    skill_candidate = sub.add_parser(
+        "register-skill-candidate",
+        help="Register a project-local Skill candidate without exporting or installing it",
+    )
+    skill_candidate.add_argument("--project", required=True)
+    skill_candidate.add_argument("--name", required=True)
+    skill_candidate.add_argument("--artifact", required=True)
+    skill_candidate.add_argument("--source-artifact", action="append", dest="source_artifacts", required=True)
+    skill_candidate.add_argument("--applicability", required=True)
+    skill_candidate.add_argument("--input", action="append", dest="inputs", required=True)
+    skill_candidate.add_argument("--step", action="append", dest="steps", required=True)
+    skill_candidate.add_argument("--verification", action="append", required=True)
+    skill_candidate.add_argument("--failure-boundary", action="append", dest="failure_boundaries", required=True)
+    _add_command_id(skill_candidate)
+    skill_candidate.set_defaults(func=command_register_skill_candidate)
+
+    export_skill = sub.add_parser(
+        "export-skill-candidate",
+        help="Preview or explicitly materialize a project-local Skill export without installing it",
+    )
+    export_skill.add_argument("--project", required=True)
+    export_skill.add_argument("--candidate", required=True)
+    export_skill.add_argument("--apply", action="store_true")
+    export_skill.add_argument("--preview-sha")
+    _add_command_id(export_skill)
+    export_skill.set_defaults(func=command_export_skill_candidate)
 
     leader_work = sub.add_parser("record-leader-work", help="Audit direct leader implementation-like work")
     leader_work.add_argument("--project", required=True)

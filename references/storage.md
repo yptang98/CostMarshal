@@ -1,4 +1,4 @@
-# CostMarshal v3.3 Storage
+# CostMarshal v3.4 Storage
 
 The runtime root defaults to `$COSTMARSHAL_V2_HOME`, then `$CODEX_HOME/costmarshal-v2`, then `~/.codex/costmarshal-v2`.
 
@@ -38,6 +38,9 @@ The runtime root defaults to `$COSTMARSHAL_V2_HOME`, then `$CODEX_HOME/costmarsh
       retrospectives.jsonl
       policy-candidates.jsonl
       leader-snapshots.jsonl
+      leader-decisions.jsonl
+      knowledge.jsonl
+      skill-candidates.jsonl
     knowledge/
     summaries/
     skill-candidates/
@@ -83,6 +86,13 @@ non-empty `derived_from` lineage. `YYYY/MM/DD_name` is a logical query bucket,
 not a request to duplicate or reorganize source files. Skill candidates remain
 inside the project runtime; CostMarshal does not export or install global
 Skills.
+
+Knowledge records are indexes, not a second source tree. They may cite only an
+accepted Artifact or a hash-bound explicit Leader decision. A Skill Candidate
+requires evidence from at least two distinct accepted tasks. Explicit export
+materializes `SKILL.md` and `evidence.json` under the current project's
+`skill-candidates/` directory; CostMarshal never writes that export into a
+global Skill directory.
 
 ## Compatibility
 

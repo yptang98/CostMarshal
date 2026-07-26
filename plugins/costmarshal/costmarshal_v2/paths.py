@@ -104,6 +104,14 @@ class ProjectLayout:
         return self.reports_dir / "leader-snapshots.jsonl"
 
     @property
+    def leader_decisions_jsonl(self) -> Path:
+        return self.reports_dir / "leader-decisions.jsonl"
+
+    @property
+    def knowledge_jsonl(self) -> Path:
+        return self.reports_dir / "knowledge.jsonl"
+
+    @property
     def summaries_dir(self) -> Path:
         return self.project_dir / "summaries"
 
@@ -114,6 +122,10 @@ class ProjectLayout:
     @property
     def skill_candidates_dir(self) -> Path:
         return self.project_dir / "skill-candidates"
+
+    @property
+    def skill_candidates_jsonl(self) -> Path:
+        return self.reports_dir / "skill-candidates.jsonl"
 
     @property
     def transcripts_dir(self) -> Path:

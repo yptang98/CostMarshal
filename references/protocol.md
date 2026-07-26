@@ -1,4 +1,4 @@
-# CostMarshal v3.3 Protocol
+# CostMarshal v3.4 Protocol
 
 This is the canonical v2 protocol. Legacy `scripts/mc.py` commands are not part of it.
 
@@ -47,6 +47,20 @@ typed Artifact/path/Gate evidence, unresolved issues, and next actions. The
 capsule preserves the existing byte/token reserves and immutable result/output
 bindings. Legacy text handoffs remain read-compatible but are not writable by
 new projects.
+
+## Project knowledge and reuse
+
+Project knowledge has an accepted-only promotion boundary. Charter,
+Architecture, ADR, Interface, Accepted Fact, Risk, and Milestone Summary
+records must cite accepted Artifact IDs or an explicit hash-bound Leader
+decision. Rejected attempts never become knowledge automatically.
+
+Project and milestone summaries are deterministic lineage manifests. Date paths
+such as `YYYY/MM/DD_name` are logical filters and never duplicate source files.
+A Skill Candidate requires accepted evidence from two distinct tasks and
+records applicability, inputs, steps, verification, and failure boundaries.
+Candidate export is explicit, project-local, and separate from global Skill
+validation or installation.
 
 ## Routing
 

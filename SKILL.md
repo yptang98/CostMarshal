@@ -1,9 +1,9 @@
 ---
 name: costmarshal
-description: "CostMarshal v3.3 internal policy/runtime for the Codex plugin: scheduler-first, capability-aware and cost-aware low/medium/high provider orchestration with Leader Snapshots, structured handoffs, atomic batch acceptance, project artifact lineage, reviewed API presets, image input, work graphs, artifact gates, evidence-backed model memory, teaching policy, per-step cache-safe pricing, recoverable effects, OCI worker isolation, durable attempts, budget reservations, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
+description: "CostMarshal v3.4 internal policy/runtime for the Codex plugin: scheduler-first, capability-aware and cost-aware low/medium/high provider orchestration with accepted project knowledge, project-local Skill candidates, Leader Snapshots, structured handoffs, atomic batch acceptance, project artifact lineage, reviewed API presets, image input, work graphs, artifact gates, evidence-backed model memory, teaching policy, per-step cache-safe pricing, recoverable effects, OCI worker isolation, durable attempts, budget reservations, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
 ---
 
-# CostMarshal v3.3
+# CostMarshal v3.4
 
 Use this skill for long or decomposable work where multiple API price/capability tiers should cooperate under explicit safety, cost, and recovery controls.
 
@@ -78,6 +78,11 @@ python scripts/costmarshal.py leader-snapshot --project <project-dir> --command-
 python scripts/costmarshal.py register-artifact --project <project-dir> --kind summary --name milestone-1 --lifecycle accepted --path <summary.md> --derived-from <artifact-id> --command-id CMD-ARTIFACT-001
 python scripts/costmarshal.py artifacts --project <project-dir> --lifecycle accepted
 python scripts/costmarshal.py batch-acceptance --project <project-dir> --file <decisions.json> --command-id CMD-BATCH-001
+python scripts/costmarshal.py record-decision --project <project-dir> --statement "<decision>" --rationale "<reason>" --command-id CMD-DECISION-001
+python scripts/costmarshal.py promote-knowledge --project <project-dir> --kind architecture --title "<title>" --source-artifact <accepted-artifact-id> --command-id CMD-KNOWLEDGE-001
+python scripts/costmarshal.py create-summary --project <project-dir> --scope milestone --name milestone-1 --title "<title>" --source-artifact <accepted-artifact-id> --command-id CMD-SUMMARY-001
+python scripts/costmarshal.py register-skill-candidate --project <project-dir> --name <name> --artifact <accepted-skill-candidate-artifact> --source-artifact <task-1-artifact> --source-artifact <task-2-artifact> --applicability "<when>" --input "<input>" --step "<step>" --verification "<gate>" --failure-boundary "<stop condition>" --command-id CMD-SKILL-CANDIDATE-001
+python scripts/costmarshal.py export-skill-candidate --project <project-dir> --candidate <candidate-id>
 
 # For a sealed write result, preview before acceptance; explicitly apply after acceptance.
 python scripts/costmarshal.py preview-changes --command-id CMD-CHANGE-PREVIEW-001 --project <project-dir> --task V2-0001 --attempt <attempt-id>

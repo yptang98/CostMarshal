@@ -50,6 +50,7 @@ TREE_FILES = (
     "costmarshal_v2/paths.py",
     "costmarshal_v2/profile_binding.py",
     "costmarshal_v2/project_artifacts.py",
+    "costmarshal_v2/project_knowledge.py",
     "costmarshal_v2/profiles.py",
     "costmarshal_v2/provider_presets.py",
     "costmarshal_v2/quality.py",

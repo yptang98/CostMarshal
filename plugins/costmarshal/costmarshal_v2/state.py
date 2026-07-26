@@ -197,6 +197,12 @@ def ensure_runtime_dirs(layout: ProjectLayout) -> None:
         layout.policy_candidates_jsonl.touch()
     if not layout.leader_snapshots_jsonl.exists():
         layout.leader_snapshots_jsonl.touch()
+    if not layout.leader_decisions_jsonl.exists():
+        layout.leader_decisions_jsonl.touch()
+    if not layout.knowledge_jsonl.exists():
+        layout.knowledge_jsonl.touch()
+    if not layout.skill_candidates_jsonl.exists():
+        layout.skill_candidates_jsonl.touch()
     if not layout.work_graph_json.exists():
         atomic_write_json(
             layout.work_graph_json,

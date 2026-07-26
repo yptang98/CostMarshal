@@ -1,5 +1,12 @@
 # CostMarshal v3 Migration
 
+## v3.4 project knowledge and reuse
+
+v3.4 adds optional Leader decision, project knowledge, and project-local Skill
+Candidate ledgers. Existing projects remain readable when these ledgers are
+absent; the first v3.4 mutation creates them through the same control-store
+transaction boundary. No migration copies source artifacts or installs Skills.
+
 ## v3.3 Leader and project artifact loop
 
 Existing v3.2 projects remain readable and may continue to replay their sealed

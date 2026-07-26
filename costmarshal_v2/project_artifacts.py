@@ -83,18 +83,23 @@ def _logical_bucket(value: str | None, name: str) -> str:
     if value:
         parts = str(value).replace("\\", "/").split("/")
         if (
-            len(parts) != 4
-            or not all(part.isdigit() for part in parts[:3])
-            or not _SAFE_NAME_RE.fullmatch(parts[3])
+            len(parts) != 3
+            or not all(part.isdigit() for part in parts[:2])
+            or "_" not in parts[2]
         ):
             raise ProjectArtifactError(
                 "date bucket must use YYYY/MM/DD_name without changing source files"
             )
+        day_text, logical_name = parts[2].split("_", 1)
+        if not day_text.isdigit() or not _SAFE_NAME_RE.fullmatch(logical_name):
+            raise ProjectArtifactError(
+                "date bucket must use YYYY/MM/DD_name without changing source files"
+            )
         try:
-            date(int(parts[0]), int(parts[1]), int(parts[2]))
+            date(int(parts[0]), int(parts[1]), int(day_text))
         except ValueError as exc:
             raise ProjectArtifactError("date bucket contains an invalid date") from exc
-        return "/".join(parts)
+        return f"{parts[0]}/{parts[1]}/{day_text}_{logical_name}"
     today = date.today()
     return f"{today:%Y/%m/%d}_{name}"
 
@@ -310,6 +315,32 @@ def build_project_artifact(
             sha256=external_sha256,
         )
     sources = list(dict.fromkeys(str(item) for item in derived_from if str(item)))
+    source_rows = list(existing_rows)
+    latest_lifecycle: dict[str, str] = {}
+    source_tasks: dict[str, str | None] = {}
+    for item in source_rows:
+        artifact_id = item.get("artifact_id")
+        if isinstance(artifact_id, str) and artifact_id:
+            latest_lifecycle[artifact_id] = str(item.get("lifecycle") or "")
+            raw_task_id = item.get("task_id")
+            source_tasks[artifact_id] = str(raw_task_id) if raw_task_id else None
+    if kind in {"summary", "milestone-summary", "skill-candidate"}:
+        unaccepted = [
+            item for item in sources if latest_lifecycle.get(item) != "accepted"
+        ]
+        if unaccepted:
+            raise ProjectArtifactError(
+                f"{kind} sources must be accepted artifacts: "
+                + ", ".join(unaccepted)
+            )
+    if kind == "skill-candidate":
+        source_task_ids = {
+            source_tasks.get(item) for item in sources if source_tasks.get(item)
+        }
+        if len(sources) < 2 or len(source_task_ids) < 2:
+            raise ProjectArtifactError(
+                "skill-candidate requires accepted evidence from two distinct tasks"
+            )
     identity = {
         "project_id": project.get("project_id"),
         "kind": kind,
@@ -344,7 +375,7 @@ def build_project_artifact(
     }
     known_ids = {
         str(item.get("artifact_id"))
-        for item in existing_rows
+        for item in source_rows
         if isinstance(item, Mapping) and item.get("artifact_id")
     }
     return validate_project_artifact(row, known_artifact_ids=known_ids)
@@ -399,6 +430,7 @@ def query_project_artifacts(
     lifecycle: str | None = None,
     task_id: str | None = None,
     date_bucket: str | None = None,
+    model: str | None = None,
 ) -> list[dict[str, Any]]:
     source_rows = list(rows)
     result: list[dict[str, Any]] = []
@@ -418,6 +450,8 @@ def query_project_artifacts(
         if task_id is not None and row["task_id"] != task_id:
             continue
         if date_bucket is not None and row["date_bucket"] != date_bucket:
+            continue
+        if model is not None and row["metadata"].get("model") != model:
             continue
         result.append(row)
     return sorted(result, key=lambda item: (item["timestamp"], item["event_id"]))
