@@ -16,6 +16,7 @@ class CiContractTest(unittest.TestCase):
         text = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("pull_request:", text)
         self.assertIn("workflow_dispatch:", text)
+        self.assertRegex(text, r"branches:\s+- v2\s+- v3")
         self.assertIn("ubuntu-latest", text)
         self.assertIn("windows-latest", text)
         self.assertIn('          - "3.11"', text)
