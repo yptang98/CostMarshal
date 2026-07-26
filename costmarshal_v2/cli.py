@@ -18,7 +18,11 @@ from .locking import (
     scheduler_instance_lock,
 )
 from .paths import default_root, resolve_project
-from .profiles import command_configure_profiles, command_configure_provider
+from .profiles import (
+    command_configure_profiles,
+    command_configure_provider,
+    command_provider_presets,
+)
 from .scheduler import (
     LEADER_WORK_TYPES,
     RISKS,
@@ -103,16 +107,39 @@ def build_parser() -> argparse.ArgumentParser:
     configure_profiles.add_argument("--dry-run", action="store_true")
     configure_profiles.set_defaults(func=command_configure_profiles)
 
-    configure_provider = sub.add_parser("configure-provider", help="Create a user-level Codex profile for a custom API without storing its key")
+    provider_presets = sub.add_parser(
+        "provider-presets",
+        help="List reviewed provider/model API presets and effective runtime capabilities",
+    )
+    provider_presets.add_argument(
+        "--preset",
+        help="Show one preset or provider alias, for example deepseek, kimi, longcat, mimo, or doubao",
+    )
+    provider_presets.set_defaults(func=command_provider_presets)
+
+    configure_provider = sub.add_parser(
+        "configure-provider",
+        help="Create a user-level Codex profile from a reviewed preset or custom API without storing its key",
+    )
     configure_provider.add_argument("--codex-home")
-    configure_provider.add_argument("--profile", required=True)
-    configure_provider.add_argument("--provider-id", required=True)
+    configure_provider.add_argument(
+        "--preset",
+        help="Reviewed preset or alias; inspect choices with provider-presets",
+    )
+    configure_provider.add_argument("--profile")
+    configure_provider.add_argument("--provider-id")
     configure_provider.add_argument("--display-name")
-    configure_provider.add_argument("--base-url", required=True)
-    configure_provider.add_argument("--model", required=True)
-    configure_provider.add_argument("--env-key", required=True)
-    configure_provider.add_argument("--wire-api")
+    configure_provider.add_argument("--base-url")
+    configure_provider.add_argument("--model")
+    configure_provider.add_argument("--env-key")
+    configure_provider.add_argument("--wire-api", choices=["responses"])
     configure_provider.add_argument("--reasoning-effort", choices=["minimal", "low", "medium", "high", "xhigh"])
+    configure_provider.add_argument(
+        "--tier",
+        choices=["low", "medium", "high"],
+        default="medium",
+        help="Tier used in the catalog template returned for a preset",
+    )
     configure_provider.add_argument("--force", action="store_true")
     configure_provider.add_argument("--dry-run", action="store_true")
     configure_provider.set_defaults(func=command_configure_provider)
@@ -238,6 +265,12 @@ def build_parser() -> argparse.ArgumentParser:
     new_task.add_argument("--estimated-output-tokens", type=int, default=0)
     new_task.add_argument("--max-cost-cny", help="Task budget in CNY, with up to 9 decimal places")
     new_task.add_argument("--require-capability", action="append", dest="required_capabilities")
+    new_task.add_argument(
+        "--input-image",
+        action="append",
+        dest="input_images",
+        help="Tracked workspace-relative image to attach; repeat for multiple images",
+    )
     new_task.add_argument("--min-success-probability", type=float)
     new_task.add_argument(
         "--routing-objective",

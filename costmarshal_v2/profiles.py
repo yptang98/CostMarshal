@@ -7,6 +7,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from .provider_presets import (
+    provider_presets_payload,
+    resolve_provider_preset,
+)
 from .state import atomic_write_text
 
 
@@ -34,15 +38,7 @@ def codex_home(path: str | os.PathLike[str] | None = None) -> Path:
 
 
 def longcat_profile_text() -> str:
-    return provider_profile_text(
-        provider_id="longcat",
-        display_name="LongCat",
-        base_url="https://api.longcat.chat/openai/v1",
-        model="LongCat-2.0",
-        env_key="LONGCAT_API_KEY",
-        wire_api="responses",
-        reasoning_effort="low",
-    )
+    return provider_preset_profile_text("longcat-2.0")
 
 
 def _toml_string(value: str) -> str:
@@ -104,8 +100,11 @@ def provider_profile_text(
         raise SystemExit("model must be non-empty and contain no control characters")
     if not ENV_KEY_RE.fullmatch(env_key):
         raise SystemExit("env key must be a valid environment variable name")
-    if wire_api and not PROVIDER_ID_RE.fullmatch(wire_api):
-        raise SystemExit("wire API must contain only letters, numbers, hyphens, and underscores")
+    if wire_api and wire_api != "responses":
+        raise SystemExit(
+            "current Codex workers require wire API 'responses'; use a reviewed "
+            "gateway for Chat Completions-only providers"
+        )
     if reasoning_effort and reasoning_effort not in {"minimal", "low", "medium", "high", "xhigh"}:
         raise SystemExit("reasoning effort must be one of minimal, low, medium, high, or xhigh")
     lines = [
@@ -129,6 +128,33 @@ def provider_profile_text(
         lines.append(f"wire_api = {_toml_string(wire_api)}")
     lines.extend([f"env_key = {_toml_string(env_key)}", ""])
     return "\n".join(lines)
+
+
+def provider_preset_profile_text(
+    preset_id: str,
+    *,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+) -> str:
+    try:
+        preset = resolve_provider_preset(preset_id)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    if preset.wire_api != "responses":
+        raise SystemExit(
+            f"{preset.preset_id} is not directly compatible with the current "
+            "Responses-only Codex worker; use a reviewed Responses gateway "
+            "and configure that gateway as a custom provider"
+        )
+    return provider_profile_text(
+        provider_id=preset.provider_id,
+        display_name=preset.display_name,
+        base_url=preset.base_url,
+        model=model or preset.default_model,
+        env_key=preset.env_key,
+        wire_api=preset.wire_api,
+        reasoning_effort=reasoning_effort or preset.reasoning_effort,
+    )
 
 
 def write_profile(*, home: Path, profile: str, text: str, force: bool, dry_run: bool) -> dict[str, Any]:
@@ -156,23 +182,90 @@ def command_configure_profiles(args: Any) -> None:
 
 
 def command_configure_provider(args: Any) -> None:
-    text = provider_profile_text(
-        provider_id=str(args.provider_id),
-        display_name=str(args.display_name or args.provider_id),
-        base_url=str(args.base_url),
-        model=str(args.model),
-        env_key=str(args.env_key),
-        wire_api=str(args.wire_api) if args.wire_api else None,
-        reasoning_effort=str(args.reasoning_effort) if args.reasoning_effort else None,
-    )
+    preset_name = str(getattr(args, "preset", None) or "").strip()
+    if preset_name:
+        custom_fields = {
+            "--provider-id": getattr(args, "provider_id", None),
+            "--display-name": getattr(args, "display_name", None),
+            "--base-url": getattr(args, "base_url", None),
+            "--env-key": getattr(args, "env_key", None),
+            "--wire-api": getattr(args, "wire_api", None),
+        }
+        conflicts = [name for name, value in custom_fields.items() if value is not None]
+        if conflicts:
+            raise SystemExit(
+                "--preset cannot be combined with connection overrides: "
+                + ", ".join(conflicts)
+            )
+        try:
+            preset = resolve_provider_preset(preset_name)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        profile = str(getattr(args, "profile", None) or preset.provider_id)
+        model = str(getattr(args, "model", None) or preset.default_model)
+        text = provider_preset_profile_text(
+            preset.preset_id,
+            model=model,
+            reasoning_effort=(
+                str(args.reasoning_effort) if args.reasoning_effort else None
+            ),
+        )
+        provider_id = preset.provider_id
+        env_key = preset.env_key
+    else:
+        required = {
+            "--profile": getattr(args, "profile", None),
+            "--provider-id": getattr(args, "provider_id", None),
+            "--base-url": getattr(args, "base_url", None),
+            "--model": getattr(args, "model", None),
+            "--env-key": getattr(args, "env_key", None),
+        }
+        missing = [name for name, value in required.items() if not value]
+        if missing:
+            raise SystemExit(
+                "custom provider configuration requires: " + ", ".join(missing)
+            )
+        profile = str(args.profile)
+        model = str(args.model)
+        provider_id = str(args.provider_id)
+        env_key = str(args.env_key)
+        text = provider_profile_text(
+            provider_id=provider_id,
+            display_name=str(args.display_name or args.provider_id),
+            base_url=str(args.base_url),
+            model=model,
+            env_key=env_key,
+            wire_api=str(args.wire_api) if args.wire_api else None,
+            reasoning_effort=str(args.reasoning_effort) if args.reasoning_effort else None,
+        )
     payload = write_profile(
         home=codex_home(args.codex_home),
-        profile=str(args.profile),
+        profile=profile,
         text=text,
         force=bool(args.force),
         dry_run=bool(args.dry_run),
     )
-    payload["provider_id"] = str(args.provider_id)
-    payload["model"] = str(args.model)
-    payload["env_key"] = str(args.env_key)
+    payload["provider_id"] = provider_id
+    payload["model"] = model
+    payload["env_key"] = env_key
+    if preset_name:
+        payload["preset"] = preset.preset_id
+        payload["capabilities"] = {
+            "api": list(preset.api_capabilities),
+            "effective": list(preset.effective_capabilities),
+            "runtime_unavailable": list(preset.unavailable_runtime_capabilities),
+        }
+        payload["catalog_provider"] = preset.catalog_provider(
+            tier=str(getattr(args, "tier", None) or "medium"),
+            profile=profile,
+            model=model,
+        )
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def command_provider_presets(args: Any) -> None:
+    try:
+        payload = provider_presets_payload(getattr(args, "preset", None))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     print(json.dumps(payload, ensure_ascii=False, indent=2))

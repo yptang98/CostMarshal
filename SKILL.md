@@ -1,9 +1,9 @@
 ---
 name: costmarshal
-description: "CostMarshal v3.1 internal policy/runtime for the Codex plugin: scheduler-first, cost-aware low/medium/high provider orchestration with work graphs, artifact gates, evidence-backed model memory, teaching policy, per-step cache-safe pricing, recoverable effects, OCI worker isolation, durable attempts, budget reservations, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
+description: "CostMarshal v3.2 internal policy/runtime for the Codex plugin: scheduler-first, capability-aware and cost-aware low/medium/high provider orchestration with reviewed API presets, image input, work graphs, artifact gates, evidence-backed model memory, teaching policy, per-step cache-safe pricing, recoverable effects, OCI worker isolation, durable attempts, budget reservations, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
 ---
 
-# CostMarshal v3.1
+# CostMarshal v3.2
 
 Use this skill for long or decomposable work where multiple API price/capability tiers should cooperate under explicit safety, cost, and recovery controls.
 
@@ -27,11 +27,12 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
 14. Every provider attempt is collected before continuation. A worker never authorizes more spend; a sealed required attempt with an admitted successor needs an explicit leader rejection with a bounded handoff before the next tier can start. A terminal rejection without a handoff cannot later continue that sealed route.
 15. A task may dispatch only when every Work Graph dependency is leader-accepted. Artifact, quality, error, dependency, and explicit teaching gates must all pass before acceptance.
 16. Attempt evaluations are immutable observations. Aggregate model memory is rebuildable and contains no raw prompts or artifacts; learned policy can advance only through reviewed replay, shadow, canary, and activation stages.
+17. Provider API capabilities and worker transport capabilities are separate. Route only on their reviewed intersection; a local image input must be committed, bound into allowed context, and require `input:image`.
 
 ## Standard workflow
 
 1. Confirm the writable workspace, provider catalog, budget, and governance mode.
-2. Configure required Codex profiles with `configure-provider`; never store API keys in profile files.
+2. Inspect `provider-presets`, then configure required Codex profiles with `configure-provider --preset`; never store API keys in profile files.
 3. Initialize the project.
 4. Create bounded work packages with explicit role, dependencies, deliverables, risk, difficulty, estimates, acceptance criteria, allowed context, and write scope.
 5. Run `route` to inspect safety floor, chain, cost, and acceptance prior when economics matter.
@@ -45,14 +46,18 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
 ## Commands
 
 ```powershell
-# Configure an OpenAI-compatible provider profile.
-python scripts/costmarshal.py configure-provider --codex-home "$env:CODEX_HOME" --profile medium-api --provider-id medium-api --base-url "https://reviewed-endpoint/v1" --model "reviewed-model" --env-key MEDIUM_API_KEY
+# Inspect and configure a reviewed provider preset.
+python scripts/costmarshal.py provider-presets --preset mimo
+python scripts/costmarshal.py configure-provider --codex-home "$env:CODEX_HOME" --preset mimo-v2.5 --profile mimo --tier medium
 
 # Initialize three-tier routing.
 python scripts/costmarshal.py init --name <name> --objective "<objective>" --workspace <workspace> --provider-catalog <catalog.json> --project-budget-cny <amount> --default-min-success-probability <0..1> --governance off --worker-image <name@sha256:digest>
 
 # Create a bounded task.
 python scripts/costmarshal.py new-task --project <project-dir> --title "<title>" --purpose "<purpose>" --task-type implementation --role builder --depends-on <accepted-task-id> --deliverable completion-report --risk medium --difficulty normal --estimated-input-tokens 100000 --estimated-output-tokens 10000 --claim-path src/file.py --allowed-path src/file.py
+
+# Attach a committed image; this also requires input:image and adds it to context.
+python scripts/costmarshal.py new-task --project <project-dir> --title "<title>" --purpose "<purpose>" --input-image assets/reference.png
 
 # Explain without mutation.
 python scripts/costmarshal.py route --project <project-dir> --task-type implementation --risk medium --difficulty normal --estimated-input-tokens 100000 --estimated-output-tokens 10000

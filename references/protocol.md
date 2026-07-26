@@ -1,4 +1,4 @@
-# CostMarshal v3.1 Protocol
+# CostMarshal v3.2 Protocol
 
 This is the canonical v2 protocol. Legacy `scripts/mc.py` commands are not part of it.
 
@@ -36,6 +36,14 @@ Mailbox message IDs are idempotency keys. Replaying task creation, dispatch, esc
 ## Routing
 
 Safety establishes a minimum tier. Complete, reviewed price and token inputs enable bounded provider-chain optimization. A mature plan contains one to three unique provider IDs with non-decreasing tiers; cold-start bootstrap remains one provider per available tier. New projects use completion-first and retain a strongest-compatible terminal fallback; explicit cost-only and legacy projects may terminate earlier. Every successor still requires leader rejection. Incomplete economic inputs fall back to the minimum safe available tier.
+
+Required capabilities are hard constraints evaluated before price or acceptance
+history. Built-in provider presets publish only the intersection of documented
+API capability and worker transport capability. `--input-image` accepts a
+committed workspace-relative image, adds it to allowed context, and adds
+`input:image`; the scheduler rejects text-only routes before provider launch.
+Audio/video/document API support is informational until the worker protocol can
+bind and transport that modality end to end.
 
 Each route step binds its own ordinary/cached/output forecast. Cached input is portable only with a proven exact provider/model/profile/profile-hash origin; a missing origin or different successor identity reclassifies it as ordinary input. Route-plan v2, budget-envelope v3, and collaboration-contract v2 bind this forecast. Missing usage cannot settle a reservation, while an explicit all-zero final observation can settle the immutable per-attempt fixed fee.
 

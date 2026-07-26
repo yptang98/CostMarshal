@@ -18,6 +18,8 @@ import re
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, localcontext
 from typing import Any, Iterable, Mapping, Sequence
 
+from .provider_presets import resolve_provider_preset
+
 
 CATALOG_SCHEMA_VERSION = 1
 ROUTE_PLAN_SCHEMA_V1 = "costmarshal-route-plan-v1"
@@ -202,6 +204,7 @@ def _provider(
     profile: str | None,
     model: str | None,
     env_key: str | None,
+    capabilities: Iterable[str] = (),
 ) -> dict[str, Any]:
     return {
         "provider_id": provider_id,
@@ -215,23 +218,54 @@ def _provider(
         # reviewed prices rather than silently relying on stale vendor pricing.
         "input_cny_per_1m": None,
         "output_cny_per_1m": None,
-        "capabilities": [],
+        "capabilities": list(capabilities),
     }
 
 
 def default_provider_catalog() -> dict[str, Any]:
     """Return a fresh three-tier catalog suitable for a newly created project."""
 
+    longcat = resolve_provider_preset("longcat")
+    deepseek = resolve_provider_preset("deepseek")
     return {
         "schema_version": CATALOG_SCHEMA_VERSION,
         "providers": [
-            _provider("longcat", "low", profile="longcat", model="LongCat-2.0", env_key="LONGCAT_API_KEY"),
-            _provider("deepseek", "medium", profile="deepseek", model="inherit", env_key="DEEPSEEK_API_KEY"),
+            _provider(
+                "longcat",
+                "low",
+                profile="longcat",
+                model=longcat.default_model,
+                env_key=longcat.env_key,
+                capabilities=longcat.effective_capabilities,
+            ),
+            _provider(
+                "deepseek",
+                "medium",
+                profile="deepseek",
+                model="inherit",
+                env_key=deepseek.env_key,
+                capabilities=deepseek.effective_capabilities,
+            ),
             # Native Codex execution may reuse the actor-private copy of the
             # host's Codex login. Required OCI workers cannot inherit that
             # persisted session, so their explicit API-key path uses Codex's
             # standard OPENAI_API_KEY contract.
-            _provider("codex", "high", profile=None, model="inherit", env_key="OPENAI_API_KEY"),
+            _provider(
+                "codex",
+                "high",
+                profile=None,
+                model="inherit",
+                env_key="OPENAI_API_KEY",
+                capabilities=(
+                    "input:text",
+                    "output:text",
+                    "reasoning",
+                    "tool-calling",
+                    "structured-output",
+                    "long-context",
+                    "code",
+                ),
+            ),
         ],
     }
 

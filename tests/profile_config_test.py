@@ -37,6 +37,78 @@ def run(*args: str, expect: int = 0) -> subprocess.CompletedProcess[str]:
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="costmarshal-profile-") as raw:
         home = Path(raw)
+        presets = json.loads(run("provider-presets").stdout)
+        by_id = {
+            item["preset_id"]: item for item in presets["presets"]
+        }
+        assert {
+            "deepseek-v4-flash",
+            "deepseek-v4-pro",
+            "kimi-k3",
+            "kimi-k2.6",
+            "longcat-2.0",
+            "mimo-v2.5",
+            "mimo-v2.5-pro",
+            "doubao-seed-2.0-lite",
+        } == set(by_id)
+        assert by_id["deepseek-v4-flash"]["api_multimodal"] is False
+        assert by_id["longcat-2.0"]["wire_api"] == "responses"
+        assert by_id["kimi-k2.6"]["api_multimodal"] is True
+        assert by_id["kimi-k2.6"]["runtime_multimodal"] is False
+        assert by_id["kimi-k2.6"]["effective_capabilities"] == []
+        assert by_id["kimi-k2.6"]["codex_compatible"] is False
+        assert "input:video" not in by_id["kimi-k2.6"]["effective_capabilities"]
+        assert "input:audio" in by_id["mimo-v2.5"]["api_capabilities"]
+        assert "input:audio" not in by_id["mimo-v2.5"]["effective_capabilities"]
+        assert "input:image" in by_id["mimo-v2.5"]["effective_capabilities"]
+
+        configured_preset = json.loads(
+            run(
+                "configure-provider",
+                "--codex-home",
+                str(home),
+                "--preset",
+                "mimo-v2.5",
+                "--tier",
+                "medium",
+            ).stdout
+        )
+        assert configured_preset["profile"] == "mimo"
+        assert configured_preset["env_key"] == "MIMO_API_KEY"
+        assert configured_preset["catalog_provider"]["capabilities"] == by_id[
+            "mimo-v2.5"
+        ]["effective_capabilities"]
+        assert "input:video" not in configured_preset["catalog_provider"]["capabilities"]
+        mimo_text = (home / "mimo.config.toml").read_text(encoding="utf-8")
+        assert 'base_url = "https://api.xiaomimimo.com/v1"' in mimo_text
+        assert 'wire_api = "responses"' in mimo_text
+        assert "MIMO_API_KEY" in mimo_text
+        assert "sk-" not in mimo_text
+
+        unsupported = run(
+            "configure-provider",
+            "--codex-home",
+            str(home),
+            "--preset",
+            "kimi-k2.6",
+            "--dry-run",
+            expect=1,
+        )
+        assert "Responses-only Codex worker" in unsupported.stderr
+
+        conflict = run(
+            "configure-provider",
+            "--codex-home",
+            str(home),
+            "--preset",
+            "mimo",
+            "--provider-id",
+            "other",
+            "--dry-run",
+            expect=1,
+        )
+        assert "cannot be combined" in conflict.stderr
+
         dry = run(
             "configure-provider",
             "--codex-home",

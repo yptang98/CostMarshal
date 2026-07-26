@@ -71,6 +71,7 @@ from .session_backend import (
 )
 from .security import (
     SecurityValidationError,
+    ensure_workspace_containment,
     normalize_allowed_path as secure_normalize_allowed_path,
     normalize_claim_path as secure_normalize_claim_path,
     normalize_path_list,
@@ -206,6 +207,8 @@ LEADER_ID = "leader"
 RESULT_TASK_STATES = {"done", "failed", "escalate"}
 RISKS = {"high", "medium", "low"}
 LEADER_WORK_TYPES = {"planning", "integration", "verification", "emergency-fix", "trivial-glue", "other"}
+IMAGE_INPUT_SUFFIXES = frozenset({".gif", ".jpeg", ".jpg", ".png", ".webp"})
+MAX_IMAGE_INPUT_BYTES = 16 * 1024 * 1024
 SCHEDULER_COMMANDS = {
     "create_task",
     "dispatch_task",
@@ -3321,6 +3324,49 @@ def _required_context_paths(
     return normalize_path_list(normalized, kind="allowed")
 
 
+def _validated_input_images(
+    project: dict[str, Any],
+    raw_images: list[object],
+) -> tuple[str, ...]:
+    """Bind image attachments to committed, workspace-relative files."""
+
+    if not raw_images:
+        return ()
+    workspace = Path(str(project.get("workspace") or "")).expanduser().resolve()
+    if not workspace.is_dir():
+        raise SecurityValidationError(
+            "input images require an existing configured workspace"
+        )
+    images = normalize_path_list(raw_images, kind="allowed")
+    for image in images:
+        if Path(image).suffix.casefold() not in IMAGE_INPUT_SUFFIXES:
+            raise SecurityValidationError(
+                f"input image has an unsupported extension: {image}"
+            )
+        resolved = ensure_workspace_containment(
+            workspace,
+            workspace / image,
+            must_exist=True,
+        )
+        if not resolved.is_file() or resolved.stat().st_size > MAX_IMAGE_INPUT_BYTES:
+            raise SecurityValidationError(
+                f"input image must be a regular file no larger than 16 MiB: {image}"
+            )
+        try:
+            subprocess.run(
+                ["git", "-C", str(workspace), "cat-file", "-e", f"HEAD:{image}"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+            raise SecurityValidationError(
+                f"input image must exist in the workspace's committed HEAD: {image}"
+            ) from exc
+    return images
+
+
 def _exact_workspace_base(workspace: Path, requested_base: str | None = None) -> str:
     try:
         git_root = Path(
@@ -3457,6 +3503,10 @@ def render_task_brief(task: dict[str, Any]) -> str:
                 f"{int(task.get('estimated_output_tokens') or 0)}"
             ),
             "",
+            "## Input Images",
+            "\n".join(f"- {item}" for item in task.get("input_images", []))
+            or "- None.",
+            "",
             "## Acceptance Criteria",
             "\n".join(f"- {item}" for item in task.get("acceptance", [])) or "- Leader acceptance is required.",
             f"- Required artifacts: {', '.join(task.get('deliverables') or ['completion-report'])}",
@@ -3504,6 +3554,24 @@ def command_new_task(args: Any) -> None:
     if not str(args.purpose or "").strip():
         raise SystemExit("purpose is required")
     project = load_project(layout)
+    try:
+        input_images = list(
+            _validated_input_images(
+                project,
+                list(getattr(args, "input_images", None) or []),
+            )
+        )
+    except SecurityValidationError as exc:
+        raise SystemExit(f"Task image input is invalid: {exc}") from exc
+    required_capabilities = list(
+        dict.fromkeys(getattr(args, "required_capabilities", None) or [])
+    )
+    if input_images and "input:image" not in required_capabilities:
+        required_capabilities.append("input:image")
+    allowed_context = list(getattr(args, "allowed_context", None) or [])
+    allowed_context.extend(
+        image for image in input_images if image not in allowed_context
+    )
     routing_objective, routing_objective_source = effective_routing_objective(
         project,
         getattr(args, "routing_objective", None),
@@ -3550,7 +3618,7 @@ def command_new_task(args: Any) -> None:
         "risk": getattr(args, "risk", "low"),
         "difficulty": getattr(args, "difficulty", "normal"),
         "task_type": args.task_type,
-        "required_capabilities": getattr(args, "required_capabilities", None) or [],
+        "required_capabilities": required_capabilities,
         "min_success_probability": effective_min_success,
         "routing_objective": routing_objective,
     }
@@ -3690,7 +3758,8 @@ def command_new_task(args: Any) -> None:
         "estimated_cached_input_tokens": estimated_cached_input_tokens,
         "estimated_output_tokens": estimated_output_tokens,
         "max_cost_cny": max_cost_cny,
-        "required_capabilities": getattr(args, "required_capabilities", None) or [],
+        "required_capabilities": required_capabilities,
+        "input_images": input_images,
         "min_success_probability": effective_min_success,
         "min_success_probability_source": min_success_source,
         "routing_objective": routing_objective,
@@ -3699,7 +3768,7 @@ def command_new_task(args: Any) -> None:
         "created_at": now_iso(),
         "updated_at": now_iso(),
         "acceptance": args.acceptance or [],
-        "allowed_context": args.allowed_context or [],
+        "allowed_context": allowed_context,
         "allowed_paths": allowed_paths,
         "claimed_paths": [normalize_claim_path(path) for path in claim_paths],
         "lock_conflict_override": bool(args.allow_lock_conflict),
@@ -3738,6 +3807,7 @@ def command_new_task(args: Any) -> None:
         role=role,
         dependencies=dependencies,
         teaching_mode=teaching["mode"],
+        input_image_count=len(input_images),
     )
     print_json({"status": "ok", "task_id": task_id, "task": str(directory)})
 
@@ -5020,6 +5090,7 @@ def execute_scheduler_command(
             estimated_output_tokens=int(command_args.get("estimated_output_tokens") or 0),
             max_cost_cny=command_args.get("max_cost_cny"),
             required_capabilities=as_list(command_args.get("required_capabilities")),
+            input_images=as_list(command_args.get("input_images")),
             min_success_probability=command_args.get("min_success_probability"),
             routing_objective=command_args.get("routing_objective"),
             acceptance=as_list(command_args.get("acceptance")),

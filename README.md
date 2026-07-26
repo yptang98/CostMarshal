@@ -8,7 +8,7 @@
 
   <p>
     <a href="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="VERSION"><img alt="Version 3.1.1" src="https://img.shields.io/badge/version-3.1.1-2bb3a3"></a>
+    <a href="VERSION"><img alt="Version 3.2.0" src="https://img.shields.io/badge/version-3.2.0-2bb3a3"></a>
     <a href="https://www.python.org/downloads/"><img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white"></a>
     <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-f0b94b"></a>
   </p>
@@ -142,21 +142,58 @@ For the complete routing and accounting contract, read the repository-level [`SK
 
 ## Providers
 
-The default catalog establishes three replaceable capability tiers:
+CostMarshal includes reviewed API presets for common providers. A preset knows
+the endpoint, protocol, key variable, current model, and capabilities—but never
+contains a key or an unreviewed price.
 
-| Provider ID | Tier | Execution profile | Authentication |
-| --- | :---: | --- | --- |
-| `longcat` | Low | `longcat` | `LONGCAT_API_KEY` |
-| `deepseek` | Medium | `deepseek` | `DEEPSEEK_API_KEY` |
-| `codex` | High | Native Codex CLI | Existing Codex sign-in; isolated workers use `OPENAI_API_KEY` |
+| Provider | Included models | API input | CostMarshal input |
+| --- | --- | --- | --- |
+| DeepSeek | V4 Flash / Pro | Text | Responses gateway required |
+| Kimi | K3 / K2.6 | Text, image; K2.6 also video | Responses gateway required |
+| LongCat | 2.0 | Text | Text |
+| Xiaomi MiMo | 2.5 / 2.5 Pro | 2.5: text, image, audio, video | Text, image |
+| Doubao Ark | Seed 2.0 Lite | Text, image, audio, video | Text, image |
+| Codex | Native signed-in model | Model-dependent | Text |
 
-Ask Codex to configure a provider without exposing its key:
+Ask Codex to configure the providers and assign tiers without exposing keys:
 
 ```text
-Configure CostMarshal for my low-, medium-, and high-tier providers.
-Keep credentials outside actor workspaces, never print secret values, and
-validate every profile and reviewed pricing snapshot before routing work.
+Configure CostMarshal with DeepSeek, Kimi, LongCat, MiMo, and Doubao as
+appropriate. Inspect the built-in provider presets, assign reviewed low/medium/
+high tiers, keep credentials outside actor workspaces, and require an exact
+input:image capability for tasks that include images.
 ```
+
+Modern Codex workers use the OpenAI Responses protocol. MiMo and Doubao expose
+it officially; this LongCat deployment is live-verified with it. DeepSeek and
+Kimi currently document Chat Completions/Anthropic APIs, so CostMarshal reports
+their capabilities but refuses to generate a misleading direct Codex profile;
+use a separately reviewed Responses gateway for those two.
+
+Multimodal is enforced end to end: routing uses the intersection of the model's
+documented API capabilities and what the current worker can actually transport.
+Local images are supported and are passed through the immutable task/context
+contract; audio and video remain visible as API facts but are not yet routable.
+See [`references/providers.md`](references/providers.md) for the exact models,
+capability vocabulary, limitations, and official documentation links.
+
+<details>
+<summary><strong>Provider profile and catalog setup</strong></summary>
+
+The internal CLI can inspect presets and create profiles without storing API
+keys:
+
+```powershell
+python scripts/costmarshal.py provider-presets
+python scripts/costmarshal.py provider-presets --preset mimo
+
+python scripts/costmarshal.py configure-provider `
+  --preset mimo-v2.5 `
+  --profile mimo `
+  --tier medium
+```
+
+Budgeted routing requires a hash-bound pricing snapshot for each enabled provider. Use `costmarshal_v2.routing.build_pricing_snapshot(...)` to canonicalize reviewed CNY rates and timestamps; do not hand-edit snapshot hashes. Expired, future-effective, mixed-currency, malformed, or incomplete pricing fails closed.
 
 Provider identity is separate from capability tier, so the catalog can be
 replaced without changing routing policy. Native Codex execution reuses an
@@ -165,25 +202,6 @@ must not inherit the host session, its explicit OpenAI API path uses the
 standard `OPENAI_API_KEY`. Other provider credentials are supplied through the
 process environment or an external secrets file. No credential is written into
 profiles, prompts, reports, or repository files.
-
-<details>
-<summary><strong>Provider profile and catalog setup</strong></summary>
-
-The internal CLI can create Codex profiles without storing API keys:
-
-```powershell
-python scripts/costmarshal.py configure-profiles
-
-python scripts/costmarshal.py configure-provider `
-  --profile deepseek `
-  --provider-id deepseek `
-  --display-name "DeepSeek" `
-  --base-url "https://your-reviewed-provider-endpoint/v1" `
-  --model "your-reviewed-model" `
-  --env-key DEEPSEEK_API_KEY
-```
-
-Budgeted routing requires a hash-bound pricing snapshot for each enabled provider. Use `costmarshal_v2.routing.build_pricing_snapshot(...)` to canonicalize reviewed CNY rates and timestamps; do not hand-edit snapshot hashes. Expired, future-effective, mixed-currency, malformed, or incomplete pricing fails closed.
 
 The home directory resolution order is an explicit `--codex-home`, then non-empty `CODEX_HOME`, then `~/.codex`. Service and container launches should use an absolute `CODEX_HOME`.
 
@@ -241,6 +259,7 @@ CostMarshal stores project state under `$CODEX_HOME/costmarshal-v2` when `CODEX_
 | [`SECURITY.md`](SECURITY.md) | Threat model, isolation guarantees, and limitations |
 | [`references/migration-v3.md`](references/migration-v3.md) | Migrating v2 projects and standalone Skill installs |
 | [`references/protocol.md`](references/protocol.md) | Actor, mailbox, task, and acceptance protocol |
+| [`references/providers.md`](references/providers.md) | Provider presets, API/runtime capabilities, and multimodal input |
 | [`references/storage.md`](references/storage.md) | Durable state layout and storage semantics |
 | [`references/evolution.md`](references/evolution.md) | Work graph, evaluation memory, teaching triggers, and policy promotion |
 | [`references/backtest.md`](references/backtest.md) | Blind real-provider evaluation format and gates |

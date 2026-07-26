@@ -1,5 +1,29 @@
 # Changelog
 
+## v3.2.0 - 2026-07-26
+
+### Added
+
+- Added reviewed provider/model presets for DeepSeek V4, Kimi K3/K2.6,
+  LongCat 2.0, Xiaomi MiMo 2.5, and Doubao Seed 2.0 Lite.
+- Added a machine-readable `provider-presets` diagnostic and
+  `configure-provider --preset`, returning a safe profile plus an unpriced
+  provider-catalog template.
+- Separated documented API capabilities from effective end-to-end worker
+  capabilities so unsupported modalities cannot enter hard routing.
+- Added committed local image inputs through `new-task --input-image`, immutable
+  context projection, native Codex execution, and the OCI worker bootstrap.
+
+### Changed
+
+- Populated the default provider catalog with conservative text/agent
+  capabilities while preserving existing model/profile execution identities.
+- Kept LongCat on the Responses wire protocol required by current Codex after a
+  live deployment check, while recording that its public docs describe Chat
+  Completions.
+- Documented the canonical capability vocabulary and the current audio/video
+  transport limitation; provider pricing remains separately reviewed.
+
 ## v3.1.1 - 2026-07-26
 
 ### Fixed

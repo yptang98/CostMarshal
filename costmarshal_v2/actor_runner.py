@@ -105,6 +105,8 @@ PROVIDER_COMPLETION_PENDING = "finished_pending_finalize"
 NATIVE_LAUNCH_BARRIER_STAGE_ENV = "COSTMARSHAL_NATIVE_LAUNCH_BARRIER_STAGE"
 NATIVE_LAUNCH_BARRIER_READY_ENV = "COSTMARSHAL_NATIVE_LAUNCH_BARRIER_READY"
 NATIVE_LAUNCH_BARRIER_RELEASE_ENV = "COSTMARSHAL_NATIVE_LAUNCH_BARRIER_RELEASE"
+IMAGE_INPUT_SUFFIXES = frozenset({".gif", ".jpeg", ".jpg", ".png", ".webp"})
+MAX_IMAGE_INPUT_BYTES = 16 * 1024 * 1024
 
 
 def _actor_fault(name: str) -> None:
@@ -1747,6 +1749,57 @@ def publish_task_report(layout: ProjectLayout, actor: dict[str, Any], attempt_re
         )
 
 
+def bound_input_images(
+    layout: ProjectLayout,
+    actor: dict[str, Any],
+    execution_workspace: Path,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return verified host and container paths for immutable image inputs."""
+
+    if actor.get("role") != "agent" or not actor.get("task_id"):
+        return (), ()
+    task = load_task(layout, str(actor["task_id"]))
+    try:
+        images = normalize_path_list(task.get("input_images") or [], kind="allowed")
+    except SecurityValidationError as exc:
+        raise SystemExit(f"worker image input paths are invalid: {exc}") from exc
+    if not images:
+        return (), ()
+    if "input:image" not in set(task.get("required_capabilities") or []):
+        raise SystemExit(
+            "worker image inputs are not bound to the input:image routing capability"
+        )
+    contract = actor.get("collaboration_contract")
+    if isinstance(contract, dict):
+        admitted_context = set(contract.get("context_paths") or [])
+        missing = sorted(set(images) - admitted_context)
+        if missing:
+            raise SystemExit(
+                "worker image inputs are outside the frozen context projection: "
+                + ", ".join(missing)
+            )
+    host_paths: list[str] = []
+    container_paths: list[str] = []
+    for image in images:
+        if Path(image).suffix.casefold() not in IMAGE_INPUT_SUFFIXES:
+            raise SystemExit(f"worker image input extension is unsupported: {image}")
+        try:
+            resolved = ensure_workspace_containment(
+                execution_workspace,
+                execution_workspace / image,
+                must_exist=True,
+            )
+        except SecurityValidationError as exc:
+            raise SystemExit(f"worker image input is unavailable: {image}: {exc}") from exc
+        if not resolved.is_file() or resolved.stat().st_size > MAX_IMAGE_INPUT_BYTES:
+            raise SystemExit(
+                f"worker image input must be a regular file no larger than 16 MiB: {image}"
+            )
+        host_paths.append(str(resolved))
+        container_paths.append("/workspace/" + image)
+    return tuple(host_paths), tuple(container_paths)
+
+
 def build_codex_argv(
     layout: ProjectLayout,
     actor: dict[str, Any],
@@ -1779,6 +1832,9 @@ def build_codex_argv(
     if actor.get("role") == "leader":
         insert_at = argv.index("--json")
         argv[insert_at:insert_at] = ["--add-dir", str(layout.project_dir)]
+    host_images, _ = bound_input_images(layout, actor, workspace)
+    if host_images:
+        argv.extend(["--image", *host_images])
     profile = actor.get("profile")
     if profile:
         argv.extend(["--profile", str(profile)])
@@ -2271,6 +2327,9 @@ def _required_worker_bundle(
     model = actor.get("model")
     if model and model != "inherit":
         command.extend(["--model", str(model)])
+    _, container_images = bound_input_images(layout, actor, execution_workspace)
+    for image in container_images:
+        command.extend(["--image", image])
     return spec, command, secret_values
 
 

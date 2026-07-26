@@ -1,4 +1,4 @@
-# CostMarshal v3.1 Storage
+# CostMarshal v3.2 Storage
 
 The runtime root defaults to `$COSTMARSHAL_V2_HOME`, then `$CODEX_HOME/costmarshal-v2`, then `~/.codex/costmarshal-v2`.
 
@@ -47,7 +47,8 @@ The runtime root defaults to `$COSTMARSHAL_V2_HOME`, then `$CODEX_HOME/costmarsh
 Before explicit cutover, the JSON/JSONL files below are the legacy sources of truth. After `migrate-state --apply`, `scheduler/state.db` is authoritative for mutable control documents, append-only ledgers, payload-hashed commands, and leased runtime effects; the JSON/JSONL files become compatibility views rebuilt from the committed transaction.
 
 - `project.json`: provider catalog, routing/budget policy, workspace, and governance binding.
-- `task.json`: task and attempt state, route decisions, reservations, actual cost, and leader result.
+- `task.json`: task and attempt state, route decisions, required capabilities,
+  immutable image-input paths, reservations, actual cost, and leader result.
 - actor JSON: runtime identity and process metadata.
 - `results.jsonl`: immutable leader judgments used by routing history.
 - `work-graph.json`: dependency, role, readiness, and accepted-join state.

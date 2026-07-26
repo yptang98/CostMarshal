@@ -9,7 +9,9 @@ const { spawn } = require("child_process");
 const MAX_PROMPT_BYTES = 2 * 1024 * 1024;
 const MAX_CREDENTIAL_BYTES = 256 * 1024;
 const MAX_PROFILE_BYTES = 256 * 1024;
+const MAX_IMAGE_BYTES = 16 * 1024 * 1024;
 const ENV_KEY = /^[A-Z_][A-Z0-9_]{0,127}$/;
+const IMAGE_SUFFIXES = new Set([".gif", ".jpeg", ".jpg", ".png", ".webp"]);
 
 function fail(message, exitCode = 64) {
   const output = process.env.COSTMARSHAL_OUTPUT_PATH;
@@ -30,6 +32,7 @@ function fail(message, exitCode = 64) {
 
 function parseArgs(argv) {
   let model = null;
+  const images = [];
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
     if (value === "--jsonl") continue;
@@ -38,9 +41,27 @@ function parseArgs(argv) {
       index += 1;
       continue;
     }
+    if (value === "--image" && index + 1 < argv.length) {
+      const image = path.resolve(argv[index + 1]);
+      const workspacePrefix = `${path.sep}workspace${path.sep}`;
+      if (
+        !image.startsWith(workspacePrefix) ||
+        !IMAGE_SUFFIXES.has(path.extname(image).toLowerCase())
+      ) fail("invalid worker image input");
+      const info = fs.statSync(image);
+      const real = fs.realpathSync(image);
+      if (
+        !info.isFile() ||
+        info.size > MAX_IMAGE_BYTES ||
+        !real.startsWith(workspacePrefix)
+      ) fail("invalid worker image input");
+      images.push(image);
+      index += 1;
+      continue;
+    }
     fail("invalid worker argument");
   }
-  return { model };
+  return { model, images };
 }
 
 function fixedPath(envName, expected) {
@@ -61,7 +82,7 @@ async function readPrompt() {
 }
 
 async function main() {
-  const { model } = parseArgs(process.argv.slice(2));
+  const { model, images } = parseArgs(process.argv.slice(2));
   const profile = fixedPath("COSTMARSHAL_PROFILE_PATH", "/bootstrap/profile.config.toml");
   const output = fixedPath("COSTMARSHAL_OUTPUT_PATH", "/out/final.md");
   const workspaceMode = process.env.COSTMARSHAL_WORKSPACE_MODE;
@@ -124,6 +145,7 @@ async function main() {
     output,
   ];
   if (model) args.push("--model", model);
+  for (const image of images) args.push("--image", image);
   args.push("-");
 
   const child = spawn("codex", args, {

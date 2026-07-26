@@ -49,6 +49,7 @@ TREE_FILES = (
     "costmarshal_v2/paths.py",
     "costmarshal_v2/profile_binding.py",
     "costmarshal_v2/profiles.py",
+    "costmarshal_v2/provider_presets.py",
     "costmarshal_v2/quality.py",
     "costmarshal_v2/routing.py",
     "costmarshal_v2/scheduler.py",
@@ -73,6 +74,7 @@ SCANNED_TREES = (
 INDIVIDUAL_FILES = (
     "references/migration-v3.md",
     "references/evolution.md",
+    "references/providers.md",
     "references/protocol.md",
     "references/storage.md",
     "scripts/costmarshal.py",

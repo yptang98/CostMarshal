@@ -60,6 +60,9 @@ def main() -> int:
         '"--skip-git-repo-check"',
         '"--json"',
         '"--output-last-message"',
+        '"--image"',
+        "workspacePrefix",
+        "MAX_IMAGE_BYTES",
         'shell: false',
         'fs.existsSync(output)',
     ):

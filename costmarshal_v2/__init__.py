@@ -4,4 +4,4 @@ The v2 package implements the official scheduler-first runtime with durable
 mailboxes and pluggable actor backends.
 """
 
-__version__ = "v3.1.1"
+__version__ = "v3.2.0"
