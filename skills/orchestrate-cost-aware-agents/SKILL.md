@@ -1,6 +1,6 @@
 ---
 name: orchestrate-cost-aware-agents
-description: Orchestrate Codex work across low-, medium-, and high-cost API providers with CostMarshal's accepted project knowledge, project-local Skill candidates, Work Graph, Leader Snapshots, structured handoffs, project artifact lineage, model memory, teaching policy, safety floors, leader acceptance, artifact gates, budget reservations, recoverable execution, and optional read-only ArchMarshal governance. Use when a user asks Codex to optimize cost versus quality, coordinate multiple model/API tiers, operate or audit CostMarshal, resume a CostMarshal run, or complete a task through economical provider handoffs.
+description: Orchestrate Codex work across low-, medium-, and high-cost API providers with CostMarshal's repository-bound Workstreams, staged integration Gates, accepted project knowledge, project-local Skill candidates, Work Graph, Leader Snapshots, structured handoffs, project artifact lineage, model memory, teaching policy, safety floors, leader acceptance, artifact gates, budget reservations, recoverable execution, and optional read-only ArchMarshal governance. Use when a user asks Codex to optimize cost versus quality, coordinate multiple model/API tiers or repositories, operate or audit CostMarshal, resume a CostMarshal run, or complete a task through economical provider handoffs.
 ---
 
 # Orchestrate cost-aware agents
@@ -41,11 +41,18 @@ Classify the user's request before running the internal engine:
   scheduler in bounded cycles and stop monitoring only at gated leader
   acceptance, explicit failure, budget exhaustion, a recoverable pause, or user
   stop.
+- **Coordinate a large project**: inspect `repositories` and `workstreams`
+  before task creation. Register only explicit committed Git roots, bind each
+  task to one repository and optional Workstream, and respect Workstream
+  dependencies, concurrency, and CNY allocations. At a milestone, freeze a
+  complete staged integration plan and request a Leader Gate; never claim
+  cross-repository atomicity or mutate source repositories while planning.
 - **Audit or monitor**: use JSON `status`, `dashboard`, `work-graph`,
-  `model-memory`, `providers`, `budget`, `validate`, and read-only
-  `governance-status`. Summarize dependency readiness, gates, evaluations,
-  errors, cost, and any unpromoted policy candidate; never infer success only
-  from a live process.
+  `workstreams`, `repositories`, `production-status`, `model-memory`,
+  `providers`, `budget`, `validate`, and read-only `governance-status`.
+  Summarize dependency readiness, integration Gates, evaluations, errors,
+  cost, and any unpromoted policy candidate; never infer success only from a
+  live process.
 - **Resume or recover**: run `recover` read-only first. Show the exact restart
   plan before `--restart-missing`; preserve sealed routes, generations, attempts,
   reservations, runtime receipts, and leader ownership. Never silently respawn

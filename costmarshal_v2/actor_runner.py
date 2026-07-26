@@ -493,7 +493,7 @@ def isolated_actor_env(
     env.pop("COSTMARSHAL_SECRETS_FILE", None)
     path = default_secrets_file(project)
     if path and layout is not None:
-        workspace = workspace_path(layout, project)
+        workspace = workspace_path(layout, project, actor)
         for forbidden_root, label in ((workspace, "actor workspace"), (layout.root.resolve(), "CostMarshal runtime")):
             try:
                 path.resolve().relative_to(forbidden_root)
@@ -597,11 +597,19 @@ def process_argv(argv: list[str]) -> list[str]:
     return argv
 
 
-def workspace_path(layout: ProjectLayout, project: dict[str, Any]) -> Path:
+def workspace_path(
+    layout: ProjectLayout,
+    project: dict[str, Any],
+    actor: dict[str, Any] | None = None,
+) -> Path:
     # ``source_project`` is explicitly a read-only reference in the v2 project
     # contract. Older project files may omit ``workspace``; never turn that
     # omission into write access to the source project.
-    configured = project.get("workspace")
+    configured = (
+        actor.get("workspace")
+        if isinstance(actor, dict) and actor.get("workspace")
+        else project.get("workspace")
+    )
     if not configured:
         raise SystemExit("project workspace is missing; source_project remains read-only and cannot be used as an actor workspace")
     resolved = Path(str(configured)).expanduser().resolve()
@@ -1488,7 +1496,7 @@ def actor_execution_workspace(
     the source workspace is never the worker's writable root.
     """
 
-    source = workspace_path(layout, project)
+    source = workspace_path(layout, project, actor)
     if actor.get("role") == "leader":
         return source, str((actor.get("runner") or {}).get("sandbox") or "workspace-write"), (), None
     task_id = actor.get("task_id")
@@ -1810,7 +1818,7 @@ def build_codex_argv(
     sandbox: str | None = None,
 ) -> list[str]:
     runner = actor.get("runner") or {}
-    workspace = execution_workspace or workspace_path(layout, project)
+    workspace = execution_workspace or workspace_path(layout, project, actor)
     argv = resolve_codex_command(actor) + [
         "--ask-for-approval",
         str(runner.get("approval_policy") or "never"),
@@ -2173,7 +2181,7 @@ def _required_worker_bundle(
     forbidden_mount_roots = [layout.project_dir.resolve()]
     if isinstance(actor.get("collaboration_contract"), dict):
         forbidden_mount_roots.append(
-            Path(str(project.get("workspace") or "")).expanduser().resolve()
+            workspace_path(layout, project, actor)
         )
     source_project = project.get("source_project")
     if source_project:

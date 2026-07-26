@@ -207,6 +207,10 @@ def ensure_runtime_dirs(layout: ProjectLayout) -> None:
         layout.cost_reports_jsonl.touch()
     if not layout.teaching_runs_jsonl.exists():
         layout.teaching_runs_jsonl.touch()
+    if not layout.integration_plans_jsonl.exists():
+        layout.integration_plans_jsonl.touch()
+    if not layout.integration_gates_jsonl.exists():
+        layout.integration_gates_jsonl.touch()
     if not layout.work_graph_json.exists():
         atomic_write_json(
             layout.work_graph_json,

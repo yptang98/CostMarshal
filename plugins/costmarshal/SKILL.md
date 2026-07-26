@@ -1,9 +1,9 @@
 ---
 name: costmarshal
-description: "CostMarshal v3.5 internal policy/runtime for the Codex plugin: scheduler-first, capability-aware and cost-aware low/medium/high provider orchestration with total-cost reports, structured teaching execution graphs, recency-aware exact-version model memory, accepted project knowledge, project-local Skill candidates, Leader Snapshots, structured handoffs, atomic batch acceptance, project artifact lineage, reviewed API presets, image input, work graphs, artifact gates, per-step cache-safe pricing, recoverable effects, OCI worker isolation, durable attempts, budget reservations, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
+description: "CostMarshal v4.0 internal policy/runtime for the Codex plugin: scheduler-first, capability-aware and cost-aware low/medium/high provider orchestration across repository-bound Workstreams, with staged integration Gates, total-cost reports, structured teaching execution graphs, recency-aware exact-version model memory, accepted project knowledge, project-local Skill candidates, Leader Snapshots, structured handoffs, atomic batch acceptance, project artifact lineage, reviewed API presets, image input, work graphs, artifact gates, per-step cache-safe pricing, recoverable effects, OCI worker isolation, durable attempts, budget reservations, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
 ---
 
-# CostMarshal v3.5
+# CostMarshal v4.0
 
 Use this skill for long or decomposable work where multiple API price/capability tiers should cooperate under explicit safety, cost, and recovery controls.
 
@@ -31,25 +31,44 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
 18. Model memory is isolated by exact provider/model/profile hash and task scope, reports 95% Wilson intervals, and decays aggregate confidence with a 90-day half-life. External/tool/dependency/budget/context failures remain auditable but must not penalize model capability.
 19. New non-off teaching tasks use a hash-bound execution graph. Enforced acceptance requires a validated teaching-run ID; review, paired comparison, and replay evidence must satisfy their distinct fixed topologies.
 20. Total-cost reports center on known cost per accepted Artifact and separately expose execution, verification, rework, handoff/context, Leader attention, and failure/recovery observations. Never invent a monetary price for unknown costs, time, tokens, or context.
+21. Repository registration is metadata-only and immutable. Never move, adopt,
+    rewrite, or manage the user's source repositories or global project/Skill
+    directories.
+22. A Workstream owns an explicit repository set, dependency set, concurrency
+    quota, and optional CNY allocation. Downstream dispatch requires a
+    hash-valid passed integration Gate for every predecessor Workstream.
+23. Cross-repository integration is staged, never atomic. Freeze the complete
+    current Workstream task set, accepted interface Artifacts, exact Git heads,
+    and verified rollback ancestors before Leader Gate review.
+24. Production-boundary configuration is not production certification. Until
+    an attested external workload-identity Broker adapter exists,
+    `production-status` remains blocked and enforced mode must block dispatch.
 
 ## Standard workflow
 
 1. Confirm the writable workspace, provider catalog, budget, and governance mode.
 2. Inspect `provider-presets`, then configure required Codex profiles with `configure-provider --preset`; never store API keys in profile files.
 3. Initialize the project.
-4. Create bounded work packages with explicit role, dependencies, deliverables, risk, difficulty, estimates, acceptance criteria, allowed context, and write scope.
-5. Run `route` to inspect safety floor, chain, cost, and acceptance prior when economics matter.
-6. Dispatch only after the route explanation and claims are acceptable.
-7. Keep `run-scheduler` active while actors execute.
-8. Review the completion report, tests, and evidence. For a sealed write output, run `preview-changes` before acceptance; it must not modify the source workspace.
-9. Record the leader result with quality, efficiency, instruction, handoff, and error evidence. When sealed evidence is insufficient, reject it with a bounded five-part `structured-handoff-v2` JSON file, then explicitly continue to the exact next distinct provider in the admitted non-decreasing chain; that step may be a sealed same-tier peer or may skip a tier.
+4. For a large project, register each Git root and create bounded Workstreams
+   before creating tasks. Otherwise use the default repository and standalone
+   tasks.
+5. Create bounded work packages with explicit repository/Workstream ownership,
+   role, dependencies, deliverables, risk, difficulty, estimates, acceptance
+   criteria, allowed context, and write scope.
+6. Run `route` to inspect safety floor, chain, cost, and acceptance prior when economics matter.
+7. Dispatch only after the route explanation, Workstream quotas, and claims are acceptable.
+8. Keep `run-scheduler` active while actors execute.
+9. Review the completion report, tests, and evidence. For a sealed write output, run `preview-changes` before acceptance; it must not modify the source workspace.
+10. Record the leader result with quality, efficiency, instruction, handoff, and error evidence. When sealed evidence is insufficient, reject it with a bounded five-part `structured-handoff-v2` JSON file, then explicitly continue to the exact next distinct provider in the admitted non-decreasing chain; that step may be a sealed same-tier peer or may skip a tier.
    If the task has an enforced teaching graph, complete its independent review,
    paired comparison, or fixed replay first; record exact node bindings with
    `record-teaching-run`, then supply the returned ID to `record-result`.
-10. After accepting reviewed changes, run `apply-changes` once to obtain the hash-bound contract, then repeat with `--apply --preview-sha ... --command-id ...`. The command stages but never commits the exact candidate tree. After SQLite cutover, preview and explicit apply use owner-leased recoverable Git effects; a command may honestly report `queued` when another drainer owns the effect fence.
-11. Record a `cost-report` at meaningful project/milestone review points; read
+11. After accepting reviewed changes, run `apply-changes` once to obtain the hash-bound contract, then repeat with `--apply --preview-sha ... --command-id ...`. The command stages but never commits the exact candidate tree. After SQLite cutover, preview and explicit apply use owner-leased recoverable Git effects; a command may honestly report `queued` when another drainer owns the effect fence.
+12. At a Workstream milestone, create a staged integration plan and record its
+    Leader Gate. Do not describe the plan as an atomic cross-repository commit.
+13. Record a `cost-report` at meaningful project/milestone review points; read
     partial and unknown monetary evidence literally.
-12. Run `validate`, and use `recover` after an unclean stop.
+14. Run `validate`, and use `recover` after an unclean stop.
 
 ## Commands
 
@@ -91,6 +110,14 @@ python scripts/costmarshal.py promote-knowledge --project <project-dir> --kind a
 python scripts/costmarshal.py create-summary --project <project-dir> --scope milestone --name milestone-1 --title "<title>" --source-artifact <accepted-artifact-id> --command-id CMD-SUMMARY-001
 python scripts/costmarshal.py register-skill-candidate --project <project-dir> --name <name> --artifact <accepted-skill-candidate-artifact> --source-artifact <task-1-artifact> --source-artifact <task-2-artifact> --applicability "<when>" --input "<input>" --step "<step>" --verification "<gate>" --failure-boundary "<stop condition>" --command-id CMD-SKILL-CANDIDATE-001
 python scripts/costmarshal.py export-skill-candidate --project <project-dir> --candidate <candidate-id>
+
+# Large-project coordination is project-local and source-preserving.
+python scripts/costmarshal.py register-repository --project <project-dir> --repository-id api --path <git-root> --role service --command-id CMD-REPO-001
+python scripts/costmarshal.py create-workstream --project <project-dir> --workstream-id foundation --name "Foundation" --objective "<objective>" --repository api --budget-cny 10 --concurrency-limit 2 --command-id CMD-WS-001
+python scripts/costmarshal.py new-task --project <project-dir> --repository api --workstream foundation --title "<title>" --purpose "<purpose>"
+python scripts/costmarshal.py create-integration-plan --project <project-dir> --milestone M1 --workstream foundation --task <task-id> --repository api --interface-artifact <accepted-artifact-id> --rollback-ref api=<full-commit> --command-id CMD-PLAN-001
+python scripts/costmarshal.py integration-gate --project <project-dir> --plan <plan-id> --approved-by leader --command-id CMD-IGATE-001
+python scripts/costmarshal.py production-status --project <project-dir>
 
 # For a sealed write result, preview before acceptance; explicitly apply after acceptance.
 python scripts/costmarshal.py preview-changes --command-id CMD-CHANGE-PREVIEW-001 --project <project-dir> --task V2-0001 --attempt <attempt-id>

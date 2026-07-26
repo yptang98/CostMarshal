@@ -135,6 +135,29 @@ from .teaching import (
     validate_teaching_execution_graph,
     validate_teaching_run,
 )
+from .large_project import (
+    LargeProjectError,
+    append_workstream,
+    build_integration_gate,
+    build_integration_plan,
+    build_production_boundary,
+    build_repository,
+    build_workstream,
+    empty_repository_registry,
+    empty_workstream_registry,
+    enforce_workstream_budget,
+    production_status,
+    repository_for_task,
+    upsert_repository,
+    validate_integration_gate,
+    validate_integration_plan,
+    validate_production_boundary,
+    validate_repository_registry,
+    validate_workstream_registry,
+    verify_repository_binding,
+    workstream_dispatch_blockers,
+    workstream_statuses,
+)
 from .quality import (
     ARTIFACT_SCHEMA,
     GATE_RESULT_SCHEMA,
@@ -372,6 +395,138 @@ def _effect_lease_guard(
 
 def print_json(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _repository_registry(
+    layout: ProjectLayout,
+    project: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    raw = read_json(layout.repositories_json, empty_repository_registry())
+    try:
+        registry = validate_repository_registry(raw)
+    except LargeProjectError as exc:
+        raise SystemExit(f"Repository registry is invalid: {exc}") from exc
+    if registry["repositories"] or project is None:
+        return registry
+    workspace = project.get("workspace")
+    if not isinstance(workspace, str) or not workspace:
+        return registry
+    try:
+        default_repository = build_repository(
+            repository_id="default",
+            path=workspace,
+            role="primary",
+            require_git=False,
+            is_default=True,
+        )
+        return upsert_repository(registry, default_repository)
+    except LargeProjectError as exc:
+        raise SystemExit(f"Default repository binding is invalid: {exc}") from exc
+
+
+def _workstream_registry(
+    layout: ProjectLayout,
+    repository_registry: dict[str, Any],
+) -> dict[str, Any]:
+    raw = read_json(layout.workstreams_json, empty_workstream_registry())
+    try:
+        return validate_workstream_registry(
+            raw, repository_registry=repository_registry
+        )
+    except LargeProjectError as exc:
+        raise SystemExit(f"Workstream registry is invalid: {exc}") from exc
+
+
+def _persist_repository_registry_if_missing(
+    layout: ProjectLayout,
+    registry: dict[str, Any],
+) -> None:
+    """Freeze a synthesized legacy default before new v4 state binds to it."""
+
+    if not layout.repositories_json.exists():
+        atomic_write_json(layout.repositories_json, registry)
+
+
+def _accepted_integration_workstreams(layout: ProjectLayout) -> set[str]:
+    plans: dict[str, dict[str, Any]] = {}
+    for row in read_jsonl(layout.integration_plans_jsonl):
+        plan = validate_integration_plan(row)
+        plan_id = str(plan["plan_id"])
+        if plan_id in plans:
+            raise LargeProjectError(f"duplicate integration plan: {plan_id}")
+        plans[plan_id] = plan
+    accepted: set[str] = set()
+    gate_ids: set[str] = set()
+    for row in read_jsonl(layout.integration_gates_jsonl):
+        plan = plans.get(str(row.get("plan_id") or ""))
+        if plan is None:
+            raise LargeProjectError(
+                "integration Gate references a missing plan"
+            )
+        gate = validate_integration_gate(row, plan=plan)
+        gate_id = str(gate["gate_id"])
+        if gate_id in gate_ids:
+            raise LargeProjectError(f"duplicate integration Gate: {gate_id}")
+        gate_ids.add(gate_id)
+        if gate.get("passed") is True:
+            accepted.update(
+                str(workstream_id)
+                for workstream_id in gate.get("workstream_ids") or []
+            )
+    return accepted
+
+
+def _project_for_repository(
+    project: dict[str, Any],
+    repository: dict[str, Any],
+    registry: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        **project,
+        "workspace": repository["path"],
+        "active_repository_id": repository["repository_id"],
+        "additional_artifact_roots": [
+            row["path"] for row in registry["repositories"].values()
+        ],
+    }
+
+
+def _project_for_task(
+    layout: ProjectLayout,
+    project: dict[str, Any],
+    task: dict[str, Any],
+) -> dict[str, Any]:
+    registry = _repository_registry(layout, project)
+    try:
+        repository = repository_for_task(
+            project=project,
+            registry=registry,
+            repository_id=task.get("repository_id"),
+        )
+    except LargeProjectError as exc:
+        raise SystemExit(f"Task repository binding is invalid: {exc}") from exc
+    expected_binding = task.get("repository_binding_sha256")
+    if (
+        expected_binding is not None
+        and expected_binding != repository.get("binding_sha256")
+    ):
+        raise SystemExit("Task repository registry binding has drifted")
+    return _project_for_repository(project, repository, registry)
+
+
+def _task_lock_claim_paths(
+    task: dict[str, Any],
+    claims: list[str] | None = None,
+) -> list[str]:
+    raw_claims = list(task.get("claimed_paths") or []) if claims is None else claims
+    repository_id = task.get("repository_id")
+    if repository_id in {None, "default"}:
+        return raw_claims
+    prefix = f"repositories/{slugify(str(repository_id), 'repository')}"
+    return [
+        prefix if normalize_claim_path(path) == "." else f"{prefix}/{path}"
+        for path in raw_claims
+    ]
 
 
 def default_scheduler_state() -> dict[str, Any]:
@@ -852,7 +1007,7 @@ def actor_role_contract(role: str) -> list[str]:
             "Escalate rather than changing write scope, reading raw transcripts, exposing secrets, or making architectural decisions outside the brief.",
             "Return one concise final report for leader verification; do not spend tokens trying to edit CostMarshal runtime files.",
         ]
-    return ["Follow the CostMarshal v3 protocol for this actor role."]
+    return ["Follow the CostMarshal v4 protocol for this actor role."]
 
 
 def render_actor_prompt(layout: ProjectLayout, actor: dict[str, Any]) -> str:
@@ -862,7 +1017,7 @@ def render_actor_prompt(layout: ProjectLayout, actor: dict[str, Any]) -> str:
     task = load_task(layout, task_id) if task_id and task_exists(layout, task_id) else None
     mailbox = actor.get("mailbox") or {}
     lines = [
-        f"# CostMarshal v3 Actor Prompt: {actor['id']}",
+        f"# CostMarshal v4 Actor Prompt: {actor['id']}",
         "",
         f"Project: {project.get('name')} (`{project.get('project_id')}`)",
         f"Objective: {project.get('objective')}",
@@ -1227,7 +1382,7 @@ def preflight_worker_isolation(
 def protocol_text() -> str:
     return "\n".join(
         [
-            "# CostMarshal v3 Protocol",
+            "# CostMarshal v4 Protocol",
             "",
             "The scheduler is a relay and process supervisor. It does not perform project reasoning, implementation, or technical review.",
             "",
@@ -1428,6 +1583,21 @@ def command_init(args: Any) -> None:
         },
     }
     atomic_write_json(layout.project_json, project)
+    try:
+        repository_registry = upsert_repository(
+            empty_repository_registry(),
+            build_repository(
+                repository_id="default",
+                path=workspace,
+                role="primary",
+                require_git=False,
+                is_default=True,
+            ),
+        )
+    except LargeProjectError as exc:
+        raise SystemExit(f"Unable to initialize repository registry: {exc}") from exc
+    atomic_write_json(layout.repositories_json, repository_registry)
+    atomic_write_json(layout.workstreams_json, empty_workstream_registry())
     session = {
         "schema_version": SCHEMA_VERSION,
         "project_id": project_id,
@@ -1728,7 +1898,7 @@ def _required_stop_spec(layout: ProjectLayout, actor: dict[str, Any]) -> WorkerE
         # project configuration.  Recoverable OCI actors persist the execution
         # workspace before start, so corrupt project.json does not block STOP.
         project = load_project(layout)
-        execution_workspace = project.get("workspace")
+        execution_workspace = actor.get("workspace") or project.get("workspace")
     attempt_id = str(actor.get("attempt_id") or "")
     bundle = (
         layout.root
@@ -3526,7 +3696,7 @@ def render_task_brief(task: dict[str, Any]) -> str:
         [
             f"# Task {task['id']}: {task['title']}",
             "",
-            "You are a CostMarshal v3 agent actor. Work only from this brief and the explicitly listed context.",
+            "You are a CostMarshal v4 agent actor. Work only from this brief and the explicitly listed context.",
             "",
             "## Purpose",
             task["purpose"],
@@ -3534,6 +3704,8 @@ def render_task_brief(task: dict[str, Any]) -> str:
             "## Task Type",
             task["task_type"],
             f"- Work role: {task.get('role') or 'builder'}",
+            f"- Repository: {task.get('repository_id') or 'default'}",
+            f"- Workstream: {task.get('workstream_id') or 'standalone'}",
             f"- Dependencies: {', '.join(task.get('dependencies') or []) or 'none'}",
             "",
             "## Routing",
@@ -3601,10 +3773,45 @@ def command_new_task(args: Any) -> None:
     if not str(args.purpose or "").strip():
         raise SystemExit("purpose is required")
     project = load_project(layout)
+    repository_registry = _repository_registry(layout, project)
+    _persist_repository_registry_if_missing(layout, repository_registry)
+    workstream_registry = _workstream_registry(layout, repository_registry)
+    try:
+        repository = repository_for_task(
+            project=project,
+            registry=repository_registry,
+            repository_id=getattr(args, "repository", None),
+        )
+    except LargeProjectError as exc:
+        raise SystemExit(f"Task repository is invalid: {exc}") from exc
+    repository_id = str(repository["repository_id"])
+    workstream_id = str(getattr(args, "workstream", None) or "").strip() or None
+    if workstream_id is not None:
+        stream = workstream_registry["workstreams"].get(workstream_id)
+        if stream is None:
+            raise SystemExit(f"Unknown workstream: {workstream_id}")
+        if repository_id not in stream["repository_ids"]:
+            raise SystemExit(
+                f"Repository {repository_id} is outside workstream {workstream_id}"
+            )
+        try:
+            accepted_workstreams = _accepted_integration_workstreams(layout)
+        except LargeProjectError as exc:
+            raise SystemExit(
+                f"Integration Gate ledger is invalid: {exc}"
+            ) from exc
+        if workstream_id in accepted_workstreams:
+            raise SystemExit(
+                f"Workstream {workstream_id} already passed its integration Gate "
+                "and is closed to new tasks"
+            )
+    task_project = _project_for_repository(
+        project, repository, repository_registry
+    )
     try:
         input_images = list(
             _validated_input_images(
-                project,
+                task_project,
                 list(getattr(args, "input_images", None) or []),
             )
         )
@@ -3672,7 +3879,7 @@ def command_new_task(args: Any) -> None:
     try:
         route_preview = decide_route(
             routing_stub,
-            project_provider_catalog(project),
+            project_provider_catalog(task_project),
             requested_provider_id=None if provider_request == "auto" else provider_request,
             requested_tier=None if tier_request == "auto" else tier_request,
             history=global_trusted_result_rows(layout),
@@ -3715,7 +3922,11 @@ def command_new_task(args: Any) -> None:
         raise SystemExit(
             "Every allowed write path must be covered by a write claim: " + ", ".join(uncovered_allowed)
         )
-    conflicts = active_lock_conflicts(layout, task_id, claim_paths)
+    lock_claim_paths = _task_lock_claim_paths(
+        {"repository_id": repository_id},
+        [normalize_claim_path(path) for path in claim_paths],
+    )
+    conflicts = active_lock_conflicts(layout, task_id, lock_claim_paths)
     if conflicts and not args.allow_lock_conflict:
         raise SystemExit(
             "Path claim conflict:\n"
@@ -3785,6 +3996,8 @@ def command_new_task(args: Any) -> None:
                 "purpose": str(args.purpose),
                 "task_type": str(args.task_type),
                 "role": role,
+                "workstream_id": workstream_id,
+                "repository_id": repository_id,
                 "risk": str(getattr(args, "risk", "low")),
                 "difficulty": str(getattr(args, "difficulty", "normal")),
                 "dependencies": dependencies,
@@ -3807,6 +4020,9 @@ def command_new_task(args: Any) -> None:
         "deliverables": deliverables,
         "gates": gates,
         "teaching": teaching,
+        "workstream_id": workstream_id,
+        "repository_id": repository_id,
+        "repository_binding_sha256": repository["binding_sha256"],
         "risk": getattr(args, "risk", "low"),
         "difficulty": getattr(args, "difficulty", "normal"),
         "provider": "auto",
@@ -3859,7 +4075,7 @@ def command_new_task(args: Any) -> None:
         task_id=task_id,
         actor=None,
         agent=args.agent,
-        claim_paths=claim_paths,
+        claim_paths=lock_claim_paths,
         override=bool(args.allow_lock_conflict),
     )
     append_event(
@@ -4134,6 +4350,49 @@ def command_dispatch(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
     require_task(layout, args.task)
     task = load_task(layout, args.task)
+    base_project = load_project(layout)
+    repository_registry = _repository_registry(layout, base_project)
+    workstream_registry = _workstream_registry(layout, repository_registry)
+    project = _project_for_task(layout, base_project, task)
+    if layout.production_boundary_json.exists():
+        try:
+            production_boundary = validate_production_boundary(
+                read_json(layout.production_boundary_json, {})
+            )
+            if production_boundary.get("mode") == "enforced":
+                boundary_status = production_status(
+                    boundary=production_boundary,
+                    artifact_rows=read_jsonl(layout.artifacts_jsonl),
+                    sqlite_authoritative=control_store_enabled(layout),
+                    worker_isolation=base_project.get("worker_isolation") or {},
+                )
+                if boundary_status.get("status") != "ready":
+                    failed = [
+                        check["name"]
+                        for check in boundary_status.get("checks") or []
+                        if check.get("passed") is not True
+                    ]
+                    raise LargeProjectError(
+                        "enforced production boundary is blocked: "
+                        + ", ".join(failed)
+                    )
+        except LargeProjectError as exc:
+            raise SystemExit(f"Production boundary blocked dispatch: {exc}") from exc
+    try:
+        workstream_blockers = workstream_dispatch_blockers(
+            task=task,
+            tasks=task_rows(layout),
+            workstream_registry=workstream_registry,
+            repository_registry=repository_registry,
+            accepted_gate_workstream_ids=_accepted_integration_workstreams(layout),
+        )
+    except LargeProjectError as exc:
+        raise SystemExit(f"Workstream dispatch gate failed: {exc}") from exc
+    if workstream_blockers:
+        raise SystemExit(
+            "Task is not ready for workstream dispatch:\n"
+            + "\n".join(f"- {blocker}" for blocker in workstream_blockers)
+        )
     command_id = getattr(args, "command_id", None)
     if command_id:
         existing_attempt = next((row for row in task.get("attempts") or [] if row.get("dispatch_command_id") == command_id), None)
@@ -4167,7 +4426,9 @@ def command_dispatch(args: Any) -> None:
             f"Task already has an active attempt: {existing_attempts[-1].get('attempt_id')}; "
             "use the fenced escalation workflow"
         )
-    conflicts = active_lock_conflicts(layout, args.task, task.get("claimed_paths") or [])
+    conflicts = active_lock_conflicts(
+        layout, args.task, _task_lock_claim_paths(task)
+    )
     if conflicts:
         raise SystemExit(
             "Path claim conflict while dispatching:\n"
@@ -4176,8 +4437,18 @@ def command_dispatch(args: Any) -> None:
                 for claim in conflicts
             )
         )
-    project = load_project(layout)
-    governance = project.get("governance") or {"mode": "off"}
+    governance = base_project.get("governance") or {"mode": "off"}
+    if (
+        task.get("repository_id") not in {None, "default"}
+        and (
+            governance.get("mode") == "required"
+            or governance.get("ready") is True
+        )
+    ):
+        raise SystemExit(
+            "ArchMarshal governance is bound to the primary workspace; "
+            "non-default repository dispatch requires a separately reviewed governance design"
+        )
     try:
         governance_contract = enforce_governance_contract(
             governance,
@@ -4461,6 +4732,29 @@ def command_dispatch(args: Any) -> None:
         incremental_commitment = _money_from_units(incremental_commitment_units)
     except ValueError as exc:
         raise SystemExit(f"Task budget reconciliation failed closed: {exc}") from exc
+    try:
+        all_task_rows = task_rows(layout)
+        same_workstream_rows = [
+            row
+            for row in all_task_rows
+            if task.get("workstream_id") is not None
+            and row.get("workstream_id") == task.get("workstream_id")
+            and row.get("id") != task.get("id")
+        ]
+        enforce_workstream_budget(
+            task=task,
+            tasks=all_task_rows,
+            workstream_registry=workstream_registry,
+            repository_registry=repository_registry,
+            task_commitment_cny={
+                str(row.get("id")): task_budget_commitment(row)
+                for row in same_workstream_rows
+                if row.get("id")
+            },
+            projected_task_commitment_cny=projected_task_commitment,
+        )
+    except (LargeProjectError, ValueError) as exc:
+        raise SystemExit(f"Workstream budget gate failed: {exc}") from exc
     if max_cost_units is not None and projected_task_commitment_units > max_cost_units:
         raise SystemExit(
             f"Task budget exceeded: committed={round(current_task_commitment, 6)} "
@@ -4608,6 +4902,11 @@ def command_dispatch(args: Any) -> None:
         launch_token=launch_token,
     )
     actor["profile_binding"] = profile_binding
+    actor["workspace"] = project["workspace"]
+    actor["repository_id"] = task.get("repository_id")
+    actor["repository_binding_sha256"] = task.get(
+        "repository_binding_sha256"
+    )
     isolation = preflight_worker_isolation(
         layout,
         project,
@@ -7180,8 +7479,8 @@ def command_preview_changes(args: Any) -> None:
     if not isinstance(command_id, str) or not command_id.strip():
         raise SystemExit("preview-changes requires --command-id")
     command_id = command_id.strip()
-    project = load_project(layout)
     task = load_task(layout, args.task)
+    project = _project_for_task(layout, load_project(layout), task)
     attempts = task.get("attempts") or []
     requested_attempt = getattr(args, "attempt", None)
     attempt = (
@@ -7307,8 +7606,8 @@ def command_apply_changes(args: Any) -> None:
 
     layout = resolve_project(args.root, args.project)
     require_task(layout, args.task)
-    project = load_project(layout)
     task = load_task(layout, args.task)
+    project = _project_for_task(layout, load_project(layout), task)
     attempts = task.get("attempts") or []
     requested_attempt = getattr(args, "attempt", None)
     attempt = (
@@ -7860,7 +8159,7 @@ def command_record_result(args: Any) -> None:
     if int(args.quality_score) not in {1, 2, 3, 4, 5}:
         raise SystemExit("quality-score must be 1-5")
     task = load_task(layout, args.task)
-    project = load_project(layout)
+    project = _project_for_task(layout, load_project(layout), task)
     teaching_graph = (task.get("teaching") or {}).get("execution_graph")
     teaching_run_id = str(getattr(args, "teaching_run", None) or "").strip()
     if teaching_graph is not None:
@@ -7954,14 +8253,6 @@ def command_record_result(args: Any) -> None:
     handoff_text = _load_result_handoff_argument(args)
     args.handoff = handoff_text
     handoff_policy = project.get("handoff_policy") or {}
-    if (
-        handoff_text
-        and handoff_policy.get("write_schema") == "structured-handoff-v2"
-        and not isinstance(handoff_text, dict)
-    ):
-        raise SystemExit(
-            "new projects require --handoff-file with a structured-handoff-v2 JSON object"
-        )
     admitted_successor = _attempt_has_admitted_successor(task, attempt)
     if (
         attempt_output_boundary == "sealed-required"
@@ -7971,6 +8262,14 @@ def command_record_result(args: Any) -> None:
         raise SystemExit(
             "A sealed required attempt with an admitted successor must use "
             "--status escalate; failed is terminal"
+        )
+    if (
+        handoff_text
+        and handoff_policy.get("write_schema") == "structured-handoff-v2"
+        and not isinstance(handoff_text, dict)
+    ):
+        raise SystemExit(
+            "new projects require --handoff-file with a structured-handoff-v2 JSON object"
         )
     if (
         attempt_output_boundary == "sealed-required"
@@ -10574,6 +10873,11 @@ def task_rows(layout: ProjectLayout) -> list[dict[str, Any]]:
                 "risk": task.get("risk"),
                 "difficulty": task.get("difficulty"),
                 "role": task.get("role") or "builder",
+                "workstream_id": task.get("workstream_id"),
+                "repository_id": task.get("repository_id"),
+                "repository_binding_sha256": task.get(
+                    "repository_binding_sha256"
+                ),
                 "dependencies": list(task.get("dependencies") or []),
                 "deliverables": list(task.get("deliverables") or []),
                 "gates": task.get("gates"),
@@ -10607,6 +10911,22 @@ def task_rows(layout: ProjectLayout) -> list[dict[str, Any]]:
     return rows
 
 
+def _observable_task_commitments(
+    tasks: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    commitments: dict[str, Any] = {}
+    errors: list[dict[str, str]] = []
+    for task in tasks:
+        task_id = str(task.get("id") or "")
+        if not task_id:
+            continue
+        try:
+            commitments[task_id] = task_budget_commitment(task)
+        except ValueError as exc:
+            errors.append({"task_id": task_id, "error": str(exc)})
+    return commitments, errors
+
+
 def status_payload(layout: ProjectLayout) -> dict[str, Any]:
     project = load_project(layout)
     session = load_session(layout)
@@ -10625,6 +10945,64 @@ def status_payload(layout: ProjectLayout) -> dict[str, Any]:
     for task in tasks:
         state = task.get("status") or "unknown"
         task_counts[state] = task_counts.get(state, 0) + 1
+    task_commitments, task_commitment_errors = _observable_task_commitments(
+        tasks
+    )
+    try:
+        repository_registry = _repository_registry(layout, project)
+        workstream_registry = _workstream_registry(
+            layout, repository_registry
+        )
+        repository_inspections = [
+            verify_repository_binding(repository)
+            for repository in repository_registry["repositories"].values()
+        ]
+        large_project_status: dict[str, Any] = {
+            "status": "ok",
+            "repository_count": len(repository_registry["repositories"]),
+            "repositories": repository_inspections,
+            "workstream_count": len(workstream_registry["workstreams"]),
+            "workstreams": workstream_statuses(
+                workstream_registry,
+                repository_registry=repository_registry,
+                tasks=tasks,
+                accepted_gate_workstream_ids=_accepted_integration_workstreams(
+                    layout
+                ),
+                task_commitment_cny=task_commitments,
+            ),
+            "task_commitment_errors": task_commitment_errors,
+            "integration_plan_count": len(
+                read_jsonl(layout.integration_plans_jsonl)
+            ),
+            "integration_gate_count": len(
+                read_jsonl(layout.integration_gates_jsonl)
+            ),
+        }
+    except (LargeProjectError, SystemExit) as exc:
+        large_project_status = {
+            "status": "invalid",
+            "error": str(exc),
+        }
+    boundary = (
+        read_json(layout.production_boundary_json, None)
+        if layout.production_boundary_json.exists()
+        else None
+    )
+    try:
+        production_boundary_status = production_status(
+            boundary=boundary,
+            artifact_rows=artifacts,
+            sqlite_authoritative=control_store_enabled(layout),
+            worker_isolation=project.get("worker_isolation") or {},
+        )
+    except LargeProjectError as exc:
+        production_boundary_status = {
+            "schema_version": "costmarshal-production-status-v1",
+            "status": "invalid",
+            "external_certification": False,
+            "error": str(exc),
+        }
     return {
         "project": project,
         "session": session,
@@ -10663,6 +11041,8 @@ def status_payload(layout: ProjectLayout) -> dict[str, Any]:
         "relay_cursors": load_relay_cursors(layout),
         "active_locks": active_lock_rows(layout),
         "control_store": control_store_status(layout),
+        "large_project": large_project_status,
+        "production_boundary": production_boundary_status,
     }
 
 
@@ -10746,7 +11126,7 @@ def render_dashboard(payload: dict[str, Any]) -> str:
     backend = payload.get("backend") or {}
     scheduler = payload.get("scheduler") or {}
     lines = [
-        f"# CostMarshal v3 Dashboard: {project.get('name')}",
+        f"# CostMarshal v4 Dashboard: {project.get('name')}",
         "",
         f"Project id: `{project.get('project_id')}`",
         f"Objective: {compact_text(project.get('objective') or '', 120)}",
@@ -10845,6 +11225,14 @@ def command_register_artifact(args: Any) -> None:
 
     layout = resolve_project(args.root, args.project)
     project = load_project(layout)
+    repository_registry = _repository_registry(layout, project)
+    project = {
+        **project,
+        "additional_artifact_roots": [
+            row["path"]
+            for row in repository_registry["repositories"].values()
+        ],
+    }
     command_id = str(getattr(args, "command_id", None) or new_id("CMD"))
     metadata: dict[str, Any] = {}
     raw_metadata = getattr(args, "metadata_json", None)
@@ -11450,7 +11838,7 @@ def command_batch_acceptance(args: Any) -> None:
 
 def _print_status_markdown(payload: dict[str, Any]) -> None:
     lines = [
-        f"# CostMarshal v3 Status: {payload['project'].get('name')}",
+        f"# CostMarshal v4 Status: {payload['project'].get('name')}",
         "",
         f"Project id: `{payload['project'].get('project_id')}`",
         f"Backend: `{(payload.get('backend') or {}).get('kind')}`",
@@ -11535,6 +11923,30 @@ def _print_status_markdown(payload: dict[str, Any]) -> None:
             f"- Project knowledge: {evolution['knowledge_count']}; project-local Skill candidates: {evolution['skill_candidate_count']}",
         ]
     )
+    large_project = payload.get("large_project") or {}
+    production_boundary = payload.get("production_boundary") or {}
+    lines.extend(
+        [
+            "",
+            "## Large-project Coordination",
+            (
+                f"- State: {large_project.get('status')}; repositories: "
+                f"{large_project.get('repository_count', 0)}; workstreams: "
+                f"{large_project.get('workstream_count', 0)}"
+            ),
+            (
+                f"- Integration plans: {large_project.get('integration_plan_count', 0)}; "
+                f"Gates: {large_project.get('integration_gate_count', 0)}"
+            ),
+            (
+                "- Production boundary: "
+                f"{production_boundary.get('status')}; external certification: "
+                f"{production_boundary.get('external_certification') is True}"
+            ),
+        ]
+    )
+    if large_project.get("error"):
+        lines.append(f"- Coordination error: {large_project['error']}")
     lines.extend(["", "## Active Write Claims"])
     if payload["active_locks"]:
         lines.append("| Path | Task | Actor | Agent |")
@@ -11655,6 +12067,329 @@ def command_record_teaching_run(args: Any) -> None:
     except TeachingError as exc:
         raise SystemExit(f"Teaching run rejected: {exc}") from exc
     print_json({"status": "ok", "recorded": recorded, "teaching_run": row})
+
+
+def command_register_repository(args: Any) -> None:
+    """Register one explicit repository identity without mutating its source."""
+
+    layout = resolve_project(args.root, args.project)
+    project = load_project(layout)
+    registry = _repository_registry(layout, project)
+    try:
+        repository = build_repository(
+            repository_id=str(args.repository_id),
+            path=str(args.path),
+            role=str(args.role),
+            require_git=True,
+            is_default=bool(getattr(args, "default", False)),
+        )
+        existing = registry["repositories"].get(repository["repository_id"])
+        if existing is not None:
+            if (
+                existing.get("path") != repository.get("path")
+                or existing.get("role") != repository.get("role")
+                or existing.get("default") != repository.get("default")
+            ):
+                raise LargeProjectError(
+                    "repository id is already bound to a different path or role"
+                )
+            print_json(
+                {
+                    "status": "ok",
+                    "recorded": False,
+                    "repository": existing,
+                }
+            )
+            return
+        if repository["default"] and any(
+            row.get("default") is True
+            for row in registry["repositories"].values()
+        ):
+            raise LargeProjectError(
+                "a default repository already exists; explicit rebinding is unsupported"
+            )
+        updated = upsert_repository(registry, repository)
+    except LargeProjectError as exc:
+        raise SystemExit(f"Repository registration rejected: {exc}") from exc
+    atomic_write_json(layout.repositories_json, updated)
+    append_event(
+        layout,
+        "repository_registered",
+        repository_id=repository["repository_id"],
+        binding_sha256=repository["binding_sha256"],
+        source_mutation=False,
+    )
+    print_json({"status": "ok", "recorded": True, "repository": repository})
+
+
+def command_repositories(args: Any) -> None:
+    layout = resolve_project(args.root, args.project)
+    registry = _repository_registry(layout, load_project(layout))
+    inspections: list[dict[str, Any]] = []
+    for repository in registry["repositories"].values():
+        try:
+            inspections.append(verify_repository_binding(repository))
+        except LargeProjectError as exc:
+            inspections.append(
+                {
+                    "repository_id": repository.get("repository_id"),
+                    "status": "invalid",
+                    "error": str(exc),
+                }
+            )
+    print_json(
+        {
+            "status": "ok",
+            "registry": registry,
+            "inspections": inspections,
+        }
+    )
+
+
+def command_create_workstream(args: Any) -> None:
+    layout = resolve_project(args.root, args.project)
+    project = load_project(layout)
+    repositories = _repository_registry(layout, project)
+    _persist_repository_registry_if_missing(layout, repositories)
+    registry = _workstream_registry(layout, repositories)
+    try:
+        stream = build_workstream(
+            workstream_id=str(args.workstream_id),
+            name=str(args.name),
+            objective=str(args.objective),
+            repository_ids=list(args.repository or []),
+            depends_on=list(args.depends_on or []),
+            budget_cny=getattr(args, "budget_cny", None),
+            concurrency_limit=int(args.concurrency_limit),
+            registry=repositories,
+            existing=registry,
+            project_budget_cny=(project.get("routing_policy") or {}).get(
+                "project_budget_cny"
+            ),
+        )
+        updated = append_workstream(
+            registry,
+            stream,
+            repository_registry=repositories,
+        )
+    except LargeProjectError as exc:
+        raise SystemExit(f"Workstream creation rejected: {exc}") from exc
+    atomic_write_json(layout.workstreams_json, updated)
+    append_event(
+        layout,
+        "workstream_created",
+        workstream_id=stream["workstream_id"],
+        repository_ids=stream["repository_ids"],
+        budget_cny=stream["budget_cny"],
+        concurrency_limit=stream["concurrency_limit"],
+    )
+    print_json({"status": "ok", "workstream": stream})
+
+
+def command_workstreams(args: Any) -> None:
+    layout = resolve_project(args.root, args.project)
+    project = load_project(layout)
+    repositories = _repository_registry(layout, project)
+    registry = _workstream_registry(layout, repositories)
+    tasks = task_rows(layout)
+    task_commitments, task_commitment_errors = _observable_task_commitments(
+        tasks
+    )
+    try:
+        statuses = workstream_statuses(
+            registry,
+            repository_registry=repositories,
+            tasks=tasks,
+            accepted_gate_workstream_ids=_accepted_integration_workstreams(
+                layout
+            ),
+            task_commitment_cny=task_commitments,
+        )
+    except LargeProjectError as exc:
+        raise SystemExit(f"Workstream status is invalid: {exc}") from exc
+    print_json(
+        {
+            "status": "ok",
+            "registry": registry,
+            "statuses": statuses,
+            "task_commitment_errors": task_commitment_errors,
+        }
+    )
+
+
+def _key_value_bindings(
+    values: list[str],
+    *,
+    label: str,
+) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for raw in values:
+        key, separator, value = str(raw).partition("=")
+        key = key.strip().lower()
+        value = value.strip()
+        if not separator or not key or not value or key in result:
+            raise LargeProjectError(f"{label} must use unique ID=VALUE entries")
+        result[key] = value
+    return result
+
+
+def command_create_integration_plan(args: Any) -> None:
+    layout = resolve_project(args.root, args.project)
+    project = load_project(layout)
+    repositories = _repository_registry(layout, project)
+    workstreams = _workstream_registry(layout, repositories)
+    command_id = str(getattr(args, "command_id", None) or "").strip()
+    if not command_id:
+        raise SystemExit("create-integration-plan requires --command-id")
+    try:
+        plan = build_integration_plan(
+            project_id=str(project.get("project_id") or ""),
+            command_id=command_id,
+            milestone=str(args.milestone),
+            workstream_ids=list(args.workstream or []),
+            task_ids=list(args.task or []),
+            repository_ids=list(args.repository or []),
+            interface_artifact_ids=list(args.interface_artifact or []),
+            rollback_refs=_key_value_bindings(
+                list(args.rollback_ref or []), label="rollback ref"
+            ),
+            repository_registry=repositories,
+            workstream_registry=workstreams,
+            tasks=task_rows(layout),
+            artifact_rows=read_jsonl(layout.artifacts_jsonl),
+        )
+        existing = read_jsonl(layout.integration_plans_jsonl)
+        command_collision = next(
+            (
+                row
+                for row in existing
+                if row.get("command_id") == command_id
+                and row.get("plan_id") != plan["plan_id"]
+            ),
+            None,
+        )
+        if command_collision is not None:
+            raise LargeProjectError(
+                "command id is already bound to a different integration plan"
+            )
+        recorded = not any(
+            row.get("plan_id") == plan["plan_id"] for row in existing
+        )
+        if recorded:
+            append_jsonl(layout.integration_plans_jsonl, plan)
+    except LargeProjectError as exc:
+        raise SystemExit(f"Integration plan rejected: {exc}") from exc
+    print_json({"status": "ok", "recorded": recorded, "plan": plan})
+
+
+def command_integration_gate(args: Any) -> None:
+    layout = resolve_project(args.root, args.project)
+    plans = read_jsonl(layout.integration_plans_jsonl)
+    plan = next(
+        (row for row in plans if row.get("plan_id") == args.plan),
+        None,
+    )
+    if plan is None:
+        raise SystemExit(f"Integration plan not found: {args.plan}")
+    project = load_project(layout)
+    repositories = _repository_registry(layout, project)
+    command_id = str(getattr(args, "command_id", None) or "").strip()
+    if not command_id:
+        raise SystemExit("integration-gate requires --command-id")
+    try:
+        gate = build_integration_gate(
+            plan=plan,
+            command_id=command_id,
+            tasks=task_rows(layout),
+            artifact_rows=read_jsonl(layout.artifacts_jsonl),
+            repository_registry=repositories,
+            approved_by=str(args.approved_by),
+        )
+        existing = read_jsonl(layout.integration_gates_jsonl)
+        command_collision = next(
+            (
+                row
+                for row in existing
+                if row.get("command_id") == command_id
+                and row.get("gate_id") != gate["gate_id"]
+            ),
+            None,
+        )
+        if command_collision is not None:
+            raise LargeProjectError(
+                "command id is already bound to a different integration Gate"
+            )
+        recorded = not any(
+            row.get("gate_id") == gate["gate_id"] for row in existing
+        )
+        if recorded:
+            append_jsonl(layout.integration_gates_jsonl, gate)
+    except LargeProjectError as exc:
+        raise SystemExit(f"Integration Gate rejected: {exc}") from exc
+    print_json({"status": "ok", "recorded": recorded, "gate": gate})
+
+
+def command_configure_production_boundary(args: Any) -> None:
+    layout = resolve_project(args.root, args.project)
+    try:
+        boundary = build_production_boundary(
+            mode=str(args.mode),
+            broker_endpoint=str(args.broker_endpoint),
+            broker_identity=str(args.broker_identity),
+            provider_proxy_endpoint=str(args.provider_proxy_endpoint),
+            hard_budget_enforced=bool(args.hard_budget_enforced),
+            evidence_artifact_ids=_key_value_bindings(
+                list(args.evidence_artifact or []),
+                label="production evidence Artifact",
+            ),
+        )
+    except LargeProjectError as exc:
+        raise SystemExit(f"Production boundary rejected: {exc}") from exc
+    payload = {
+        "status": "ok",
+        "mode": "apply" if args.apply else "preview",
+        "boundary": boundary,
+        "warning": (
+            "This configures a fail-closed external contract; it is not "
+            "production certification or a broker runtime adapter."
+        ),
+    }
+    if not args.apply:
+        print_json(payload)
+        return
+    if not str(getattr(args, "command_id", None) or "").strip():
+        raise SystemExit(
+            "configure-production-boundary --apply requires --command-id"
+        )
+    atomic_write_json(layout.production_boundary_json, boundary)
+    append_event(
+        layout,
+        "production_boundary_configured",
+        boundary_sha256=boundary["boundary_sha256"],
+        mode=boundary["mode"],
+        external_certification=False,
+    )
+    print_json(payload)
+
+
+def command_production_status(args: Any) -> None:
+    layout = resolve_project(args.root, args.project)
+    project = load_project(layout)
+    boundary = (
+        read_json(layout.production_boundary_json, None)
+        if layout.production_boundary_json.exists()
+        else None
+    )
+    try:
+        payload = production_status(
+            boundary=boundary,
+            artifact_rows=read_jsonl(layout.artifacts_jsonl),
+            sqlite_authoritative=control_store_enabled(layout),
+            worker_isolation=project.get("worker_isolation") or {},
+        )
+    except LargeProjectError as exc:
+        raise SystemExit(f"Production boundary is invalid: {exc}") from exc
+    print_json(payload)
 
 
 def command_policy_status(args: Any) -> None:
@@ -12040,6 +12775,39 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
     if project.get("schema_version") != SCHEMA_VERSION:
         issues.append("project schema_version is not 2")
     try:
+        repository_registry = validate_repository_registry(
+            read_json(layout.repositories_json, empty_repository_registry())
+        )
+        if not repository_registry["repositories"]:
+            repository_registry = _repository_registry(layout, project)
+        project = {
+            **project,
+            "additional_artifact_roots": [
+                row["path"]
+                for row in repository_registry["repositories"].values()
+            ],
+        }
+        for repository_id, repository in repository_registry[
+            "repositories"
+        ].items():
+            try:
+                verify_repository_binding(repository)
+            except LargeProjectError as exc:
+                issues.append(
+                    f"repository {repository_id} is unavailable: {exc}"
+                )
+    except (LargeProjectError, SystemExit) as exc:
+        repository_registry = empty_repository_registry()
+        issues.append(f"invalid repository registry: {exc}")
+    try:
+        workstream_registry = validate_workstream_registry(
+            read_json(layout.workstreams_json, empty_workstream_registry()),
+            repository_registry=repository_registry,
+        )
+    except LargeProjectError as exc:
+        workstream_registry = empty_workstream_registry()
+        issues.append(f"invalid workstream registry: {exc}")
+    try:
         catalog = project_provider_catalog(project)
     except RoutingValidationError as exc:
         catalog = None
@@ -12090,7 +12858,93 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
         if counts["inbox"] < 0 or counts["outbox"] < 0:
             issues.append(f"invalid mailbox for {actor['id']}")
     actor_ids = {actor["id"] for actor in actor_rows(layout)}
-    task_ids = {task["id"] for task in task_rows(layout)}
+    validation_tasks = task_rows(layout)
+    task_ids = {task["id"] for task in validation_tasks}
+    validation_task_index = {
+        str(task["id"]): task
+        for task in validation_tasks
+        if task.get("id")
+    }
+    integration_plans: dict[str, dict[str, Any]] = {}
+    for index, raw_plan in enumerate(read_jsonl(layout.integration_plans_jsonl)):
+        try:
+            plan = validate_integration_plan(raw_plan)
+            plan_id = str(plan["plan_id"])
+            if plan_id in integration_plans:
+                raise LargeProjectError(f"duplicate integration plan {plan_id}")
+            if plan.get("project_id") != project.get("project_id"):
+                raise LargeProjectError(
+                    f"integration plan {plan_id} belongs to another project"
+                )
+            if any(
+                item not in workstream_registry["workstreams"]
+                for item in plan.get("workstream_ids") or []
+            ):
+                raise LargeProjectError(
+                    f"integration plan {plan_id} references a missing workstream"
+                )
+            if any(
+                item not in repository_registry["repositories"]
+                for item in (plan.get("repository_bindings") or {})
+            ):
+                raise LargeProjectError(
+                    f"integration plan {plan_id} references a missing repository"
+                )
+            if any(
+                repository_registry["repositories"][repository_id].get(
+                    "binding_sha256"
+                )
+                != binding.get("binding_sha256")
+                for repository_id, binding in (
+                    plan.get("repository_bindings") or {}
+                ).items()
+                if repository_id in repository_registry["repositories"]
+            ):
+                raise LargeProjectError(
+                    f"integration plan {plan_id} repository identity has drifted"
+                )
+            if any(item not in task_ids for item in plan.get("task_ids") or []):
+                raise LargeProjectError(
+                    f"integration plan {plan_id} references a missing task"
+                )
+            for task_id in plan.get("task_ids") or []:
+                task = validation_task_index.get(str(task_id)) or {}
+                if (
+                    task.get("workstream_id")
+                    not in (plan.get("workstream_ids") or [])
+                    or task.get("repository_id")
+                    not in (plan.get("repository_bindings") or {})
+                ):
+                    raise LargeProjectError(
+                        f"integration plan {plan_id} task {task_id} "
+                        "is outside its frozen ownership scope"
+                    )
+            integration_plans[plan_id] = plan
+        except LargeProjectError as exc:
+            issues.append(f"integration plan row {index} is invalid: {exc}")
+    integration_gate_ids: set[str] = set()
+    for index, raw_gate in enumerate(read_jsonl(layout.integration_gates_jsonl)):
+        try:
+            plan = integration_plans.get(str(raw_gate.get("plan_id") or ""))
+            if plan is None:
+                raise LargeProjectError(
+                    "integration Gate references a missing or invalid plan"
+                )
+            gate = validate_integration_gate(raw_gate, plan=plan)
+            gate_id = str(gate["gate_id"])
+            if gate_id in integration_gate_ids:
+                raise LargeProjectError(f"duplicate integration Gate {gate_id}")
+            integration_gate_ids.add(gate_id)
+        except LargeProjectError as exc:
+            issues.append(f"integration Gate row {index} is invalid: {exc}")
+    if layout.production_boundary_json.exists():
+        try:
+            validate_production_boundary(
+                read_json(layout.production_boundary_json, {})
+            )
+        except LargeProjectError as exc:
+            issues.append(f"invalid production boundary: {exc}")
+    graph: dict[str, Any] | None = None
     if layout.work_graph_json.exists():
         try:
             graph = load_work_graph(layout)
@@ -12135,6 +12989,42 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
                 validate_gate_spec(task["gates"])
             except GateError as exc:
                 issues.append(f"{task['id']} has invalid gates: {exc}")
+        repository_id = task.get("repository_id")
+        if repository_id is not None:
+            repository = repository_registry["repositories"].get(
+                str(repository_id)
+            )
+            if repository is None:
+                issues.append(
+                    f"{task['id']} references missing repository {repository_id}"
+                )
+            elif task.get("repository_binding_sha256") != repository.get(
+                "binding_sha256"
+            ):
+                issues.append(f"{task['id']} repository binding has drifted")
+        workstream_id = task.get("workstream_id")
+        if workstream_id is not None:
+            stream = workstream_registry["workstreams"].get(str(workstream_id))
+            if stream is None:
+                issues.append(
+                    f"{task['id']} references missing workstream {workstream_id}"
+                )
+            elif repository_id not in stream.get("repository_ids", []):
+                issues.append(
+                    f"{task['id']} repository is outside workstream {workstream_id}"
+                )
+        graph_node = (
+            (graph.get("nodes") or {}).get(str(task.get("id")))
+            if isinstance(graph, dict)
+            else None
+        )
+        if isinstance(graph_node, dict) and (
+            graph_node.get("repository_id") != repository_id
+            or graph_node.get("workstream_id") != workstream_id
+        ):
+            issues.append(
+                f"{task['id']} large-project metadata differs from the Work Graph"
+            )
         teaching_graph = (task.get("teaching") or {}).get("execution_graph")
         if teaching_graph is not None:
             try:
@@ -12963,6 +13853,11 @@ for _command_name in (
     "command_record_usage",
     "command_cost_report",
     "command_record_teaching_run",
+    "command_register_repository",
+    "command_create_workstream",
+    "command_create_integration_plan",
+    "command_integration_gate",
+    "command_configure_production_boundary",
     "command_policy_transition",
     "command_governance_rebind",
     "command_recover",

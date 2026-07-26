@@ -1,4 +1,4 @@
-# CostMarshal v3.5 Storage
+# CostMarshal v4.0 Storage
 
 The runtime root defaults to `$COSTMARSHAL_V2_HOME`, then `$CODEX_HOME/costmarshal-v2`, then `~/.codex/costmarshal-v2`.
 
@@ -16,6 +16,9 @@ The runtime root defaults to `$COSTMARSHAL_V2_HOME`, then `$CODEX_HOME/costmarsh
       events.jsonl
       relay-cursors.json
       work-graph.json
+      repositories.json
+      workstreams.json
+      production-boundary.json
       actors/
       mailboxes/
       state.db
@@ -43,6 +46,8 @@ The runtime root defaults to `$COSTMARSHAL_V2_HOME`, then `$CODEX_HOME/costmarsh
       skill-candidates.jsonl
       teaching-runs.jsonl
       cost-reports.jsonl
+      integration-plans.jsonl
+      integration-gates.jsonl
     knowledge/
     summaries/
     skill-candidates/
@@ -61,6 +66,10 @@ Before explicit cutover, the JSON/JSONL files below are the legacy sources of tr
 - actor JSON: runtime identity and process metadata.
 - `results.jsonl`: immutable leader judgments used by routing history.
 - `work-graph.json`: dependency, role, readiness, and accepted-join state.
+- `repositories.json`: immutable repository paths, roles, initial Git heads,
+  and task-binding identities. Registration never mutates source repositories.
+- `workstreams.json`: project-local Workstream dependencies, repository
+  membership, concurrency quotas, and optional CNY allocations.
 - `artifacts.jsonl`: task receipts plus `costmarshal-project-artifact-v1`
   metadata and `costmarshal-artifact-lineage-v1` provenance.
 - `leader-snapshots.jsonl`: immutable `leader-snapshot-v1` views bound to the
@@ -71,11 +80,20 @@ Before explicit cutover, the JSON/JSONL files below are the legacy sources of tr
   and passing Gate evidence.
 - `cost-reports.jsonl`: observable total-cost snapshots centered on accepted
   Artifacts; unknown monetary observations remain explicit.
+- `integration-plans.jsonl`: non-atomic staged integration plans bound to the
+  complete Workstream task set, accepted interface Artifacts, exact current
+  repository heads, and real rollback commits.
+- `integration-gates.jsonl`: Leader decisions over the frozen plan. Only a
+  hash-valid passed Gate unlocks a dependent Workstream.
 - `retrospectives.jsonl` and `policy-candidates.jsonl`: project summaries and staged, non-activating learning proposals.
 - `usage.jsonl`: immutable usage deltas.
 - `scheduler/events.jsonl`: audit events and completed scheduler command IDs.
 - `locks/claims.json`: active logical write claims.
 - `locks/project.lock`: OS advisory single-writer gate.
+
+`scheduler/production-boundary.json` is optional. It stores only secret-free
+external Broker/Proxy endpoints, workload identity, hard-budget posture, and
+Artifact IDs for external evidence. It never stores a provider credential.
 
 `status.json` is a materialized task status view and must match `task.json` under `validate`.
 

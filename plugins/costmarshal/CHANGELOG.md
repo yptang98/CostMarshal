@@ -1,5 +1,31 @@
 # Changelog
 
+## v4.0.0 - 2026-07-26
+
+### Added
+
+- Added immutable Git repository identities and per-task repository ownership
+  without moving, adopting, or modifying source repositories.
+- Added first-class Workstreams with repository membership, dependency Gates,
+  concurrency quotas, and bounded CNY allocations.
+- Added staged per-repository integration plans bound to the complete current
+  Workstream task set, accepted interface Artifacts, exact Git heads, and
+  verified rollback ancestors.
+- Added Leader-owned integration Gates and status/validation surfaces for
+  repository, Workstream, plan, and Gate state.
+- Added a secret-free production-boundary contract for external Credential
+  Broker and Provider Proxy evidence.
+
+### Safety
+
+- Cross-repository integration is explicitly non-atomic and never mutates
+  source repositories while planning or evaluating a Gate.
+- A passed Gate closes its Workstream to new tasks; downstream dispatch trusts
+  only hash-valid Gate/plan pairs.
+- The external Broker runtime adapter remains unimplemented. Production status
+  is honestly `blocked`, and enforced mode fails dispatch closed rather than
+  claiming deployment certification from local configuration.
+
 ## v3.5.0 - 2026-07-26
 
 ### Added

@@ -46,6 +46,7 @@ TREE_FILES = (
     "costmarshal_v2/governance.py",
     "costmarshal_v2/handoff_contract.py",
     "costmarshal_v2/leader_snapshot.py",
+    "costmarshal_v2/large_project.py",
     "costmarshal_v2/locking.py",
     "costmarshal_v2/mailbox.py",
     "costmarshal_v2/paths.py",
@@ -79,6 +80,7 @@ SCANNED_TREES = (
 INDIVIDUAL_FILES = (
     "references/migration-v3.md",
     "references/evolution.md",
+    "references/large-projects.md",
     "references/providers.md",
     "references/protocol.md",
     "references/storage.md",

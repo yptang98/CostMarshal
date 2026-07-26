@@ -52,6 +52,18 @@ class ProjectLayout:
         return self.scheduler_dir / "work-graph.json"
 
     @property
+    def repositories_json(self) -> Path:
+        return self.scheduler_dir / "repositories.json"
+
+    @property
+    def workstreams_json(self) -> Path:
+        return self.scheduler_dir / "workstreams.json"
+
+    @property
+    def production_boundary_json(self) -> Path:
+        return self.scheduler_dir / "production-boundary.json"
+
+    @property
     def actors_dir(self) -> Path:
         return self.scheduler_dir / "actors"
 
@@ -134,6 +146,14 @@ class ProjectLayout:
     @property
     def teaching_runs_jsonl(self) -> Path:
         return self.reports_dir / "teaching-runs.jsonl"
+
+    @property
+    def integration_plans_jsonl(self) -> Path:
+        return self.reports_dir / "integration-plans.jsonl"
+
+    @property
+    def integration_gates_jsonl(self) -> Path:
+        return self.reports_dir / "integration-gates.jsonl"
 
     @property
     def transcripts_dir(self) -> Path:

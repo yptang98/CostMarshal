@@ -8,7 +8,7 @@
 
   <p>
     <a href="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="VERSION"><img alt="Version 3.5.0" src="https://img.shields.io/badge/version-3.5.0-2bb3a3"></a>
+    <a href="VERSION"><img alt="Version 4.0.0" src="https://img.shields.io/badge/version-4.0.0-2bb3a3"></a>
     <a href="https://www.python.org/downloads/"><img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white"></a>
     <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-f0b94b"></a>
   </p>
@@ -86,6 +86,7 @@ runtime, recovery, automation, and diagnostics—not as a requirement for ordina
 | 🧠 | Evidence-backed evolution | Work graphs, artifact gates, six-dimensional scoring, model memory, and staged policy promotion improve later routing without self-authorizing changes. |
 | 📦 | Project continuity | Transcript-free Leader Snapshots, structured handoffs, atomic batch acceptance, and immutable artifact lineage keep long projects moving. |
 | 📚 | Accepted knowledge | Charter, architecture, ADR, interface, fact, risk, and milestone indexes can only come from accepted evidence or an explicit Leader decision. |
+| 🏗️ | Large-project coordination | Binds tasks to immutable repository identities and bounded Workstreams, then admits milestones through staged integration Gates. |
 
 Total-cost reports complement routing estimates with observable project
 economics: known monetary cost per accepted Artifact, execution and review
@@ -119,6 +120,14 @@ only current-project metadata: small local artifacts remain in place and are
 referenced by hash; large outputs remain on external storage; summaries and
 Skill candidates retain explicit lineage. CostMarshal never installs global
 Skills or moves source project files.
+
+Large projects can register multiple Git repository roots and group their work
+into Workstreams with dependency, concurrency, and CNY allocation limits.
+Repository registration is metadata-only: CostMarshal does not move, adopt, or
+reorganize source projects. Cross-repository integration is deliberately
+staged rather than described as atomic. A Leader-approved integration Gate
+checks the complete Workstream task set, accepted interface Artifacts, exact
+repository heads, and real rollback commits before it unlocks dependent work.
 
 Repeated successes can become a project-local Skill Candidate with explicit
 applicability, inputs, steps, verification, failure boundaries, and evidence.
@@ -237,6 +246,9 @@ The home directory resolution order is an explicit `--codex-home`, then non-empt
 - Writable changes are previewed in a detached Git worktree and verified by path, blob, and executable mode before explicit application.
 - Budget controls are admission and accounting limits over reviewed estimates—not a guarantee that an already-started external API call cannot exceed its forecast.
 - Real-provider backtests and live malicious-container evidence are still required for deployment-specific production certification. Local and mocked tests are not treated as that proof.
+- v4 defines a secret-free external Credential Broker/Provider Proxy contract
+  but does not implement its workload-identity runtime adapter. Consequently,
+  `production-status` remains blocked and enforced mode refuses dispatch.
 
 Read [`SECURITY.md`](SECURITY.md) before production use.
 
@@ -252,6 +264,8 @@ Read [`SECURITY.md`](SECURITY.md) before production use.
 | **Artifact & Gate Engine** | Registers content-addressed outputs and evaluates deterministic acceptance policy | Leader acceptance cannot override a failed configured gate |
 | **Evolution Engine** | Records scores/errors, rebuilds cross-project model profiles, chooses teaching policy, and proposes candidates | Observations never activate policy directly |
 | **Cost Engine** | Builds evidence-bound total-cost snapshots per accepted Artifact | Unknown monetary observations remain explicit; time and tokens are never assigned invented prices |
+| **Repository & Workstream Registry** | Binds task ownership, dependencies, concurrency, and budget allocations across project repositories | Registration never mutates or adopts source repositories |
+| **Integration Gate** | Freezes staged per-repository plans, interface evidence, exact heads, and rollback commits | Never claims atomic cross-repository commit |
 
 ### How self-evolution stays safe
 
@@ -285,11 +299,12 @@ CostMarshal stores project state under `$CODEX_HOME/costmarshal-v2` when `CODEX_
 | [`INSTALL_PROMPT.md`](INSTALL_PROMPT.md) | Commit-pinned install or update through Codex |
 | [`SKILL.md`](SKILL.md) | Canonical orchestration policy and operating contract |
 | [`SECURITY.md`](SECURITY.md) | Threat model, isolation guarantees, and limitations |
-| [`references/migration-v3.md`](references/migration-v3.md) | Migrating v2 projects and standalone Skill installs |
+| [`references/migration-v3.md`](references/migration-v3.md) | Migrating v2/v3 projects and standalone Skill installs |
 | [`references/protocol.md`](references/protocol.md) | Actor, mailbox, task, and acceptance protocol |
 | [`references/providers.md`](references/providers.md) | Provider presets, API/runtime capabilities, and multimodal input |
 | [`references/storage.md`](references/storage.md) | Durable state layout and storage semantics |
 | [`references/evolution.md`](references/evolution.md) | Work graph, evaluation memory, teaching triggers, and policy promotion |
+| [`references/large-projects.md`](references/large-projects.md) | Repository identities, Workstreams, staged integration, and production boundary |
 | [`references/backtest.md`](references/backtest.md) | Blind real-provider evaluation format and gates |
 | [`container/worker/README.md`](container/worker/README.md) | Building the digest-pinned worker image |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release history |
@@ -304,6 +319,9 @@ python scripts/costmarshal.py --help
 python scripts/costmarshal.py route --help
 python scripts/costmarshal.py dashboard --help
 python scripts/costmarshal.py work-graph --help
+python scripts/costmarshal.py workstreams --help
+python scripts/costmarshal.py create-integration-plan --help
+python scripts/costmarshal.py production-status --help
 python scripts/costmarshal.py model-memory --help
 python scripts/costmarshal.py record-teaching-run --help
 python scripts/costmarshal.py cost-report --help

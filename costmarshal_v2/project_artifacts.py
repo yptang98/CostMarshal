@@ -110,6 +110,9 @@ def _allowed_roots(layout: ProjectLayout, project: Mapping[str, Any]) -> list[Pa
         raw = project.get(field)
         if isinstance(raw, str) and raw.strip():
             roots.append(Path(raw).expanduser().resolve())
+    for raw in project.get("additional_artifact_roots") or []:
+        if isinstance(raw, str) and raw.strip():
+            roots.append(Path(raw).expanduser().resolve())
     return roots
 
 

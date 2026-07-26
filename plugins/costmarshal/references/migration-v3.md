@@ -1,4 +1,24 @@
-# CostMarshal v3 Migration
+# CostMarshal v3/v4 Migration
+
+## v4.0 repositories, Workstreams, and staged integration
+
+v4.0 adds `scheduler/repositories.json`, `scheduler/workstreams.json`,
+`reports/integration-plans.jsonl`, and `reports/integration-gates.jsonl`.
+Existing projects receive a compatible `default` repository identity for their
+current workspace and need no source-tree move or rewrite. Existing tasks
+without Workstream metadata remain standalone.
+
+Multi-repository use is opt-in. Register each committed Git root explicitly,
+create bounded Workstreams, and bind new tasks with `--repository` and
+`--workstream`. A passed integration Gate closes that Workstream to new tasks
+and may unlock dependent Workstreams. Cross-repository plans remain staged and
+non-atomic.
+
+The optional production-boundary document defines a fail-closed external
+Credential Broker and Provider Proxy contract. v4.0 does not implement or
+certify that external runtime adapter; `production-status` therefore reports
+`blocked`, and an `enforced` boundary blocks dispatch. This is intentional and
+prevents configuration metadata from being mistaken for deployment evidence.
 
 ## v3.5 total cost, model memory, and teaching graphs
 

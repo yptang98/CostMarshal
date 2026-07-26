@@ -124,6 +124,12 @@ def validate_work_graph(graph: dict[str, Any]) -> None:
             raise WorkGraphError(f"task {task_id} has invalid graph state")
         if node.get("role") not in WORK_ROLES:
             raise WorkGraphError(f"task {task_id} has invalid work role")
+        for field in ("workstream_id", "repository_id"):
+            value = node.get(field)
+            if value is not None and (
+                not isinstance(value, str) or not value
+            ):
+                raise WorkGraphError(f"task {task_id} has invalid {field}")
     _assert_acyclic(nodes)
 
 
@@ -168,6 +174,8 @@ def register_task(
             graph["nodes"][known_id] = {
                 "task_id": known_id,
                 "role": str(known.get("role") or "builder"),
+                "workstream_id": known.get("workstream_id"),
+                "repository_id": known.get("repository_id"),
                 "dependencies": _normalize_dependencies(
                     known.get("dependencies"), known_id
                 ),
@@ -179,6 +187,8 @@ def register_task(
     graph["nodes"][task_id] = {
         "task_id": task_id,
         "role": str(task.get("role") or "builder"),
+        "workstream_id": task.get("workstream_id"),
+        "repository_id": task.get("repository_id"),
         "dependencies": dependencies,
         "state": "blocked",
         "task_status": str(task.get("status") or "planned"),

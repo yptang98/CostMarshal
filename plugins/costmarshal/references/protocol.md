@@ -1,4 +1,4 @@
-# CostMarshal v3.5 Protocol
+# CostMarshal v4.0 Protocol
 
 This is the canonical v2 protocol. Legacy `scripts/mc.py` commands are not part of it.
 
@@ -76,6 +76,21 @@ records applicability, inputs, steps, verification, and failure boundaries.
 Candidate export is explicit, project-local, and separate from global Skill
 validation or installation.
 
+## Repositories, Workstreams, and integration
+
+Every new task binds an immutable registered repository identity; legacy and
+single-repository tasks use `default`. A Workstream constrains repository
+membership, predecessor Gates, concurrency, and optional CNY allocation.
+Explicit multi-repository write claims are repository-namespaced, while the
+default repository retains its legacy lock paths.
+
+Predecessor Workstreams are complete only after a hash-valid Leader integration
+Gate. A plan must include every current non-cancelled task in each selected
+Workstream, accepted interface Artifacts, exact current Git heads, and rollback
+commits that exist and are ancestors of those heads. Gate evaluation is
+read-only and detects task-set, Artifact, and HEAD drift. Integration is always
+staged per repository and never claims cross-repository atomicity.
+
 ## Routing
 
 Safety establishes a minimum tier. Complete, reviewed price and token inputs enable bounded provider-chain optimization. A mature plan contains one to three unique provider IDs with non-decreasing tiers; cold-start bootstrap remains one provider per available tier. New projects use completion-first and retain a strongest-compatible terminal fallback; explicit cost-only and legacy projects may terminate earlier. Every successor still requires leader rejection. Incomplete economic inputs fall back to the minimum safe available tier.
@@ -139,7 +154,10 @@ container. OCI boundaries keep that worker away from host files and other
 provider keys, but cannot stop a malicious in-container workload from encoding
 the selected key. Redaction is accidental-disclosure defense only. Hostile
 workloads require an out-of-process credential broker issuing scoped
-attempt/provider/budget/time capabilities; v3.0 does not include that broker.
+attempt/provider/budget/time capabilities. v4.0 defines the secret-free
+Broker/Provider Proxy evidence contract but does not implement its attested
+runtime adapter, so production status remains blocked and enforced mode refuses
+dispatch.
 
 ## Write isolation
 

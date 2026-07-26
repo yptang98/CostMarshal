@@ -30,7 +30,10 @@ from .scheduler import (
     command_artifacts,
     command_batch_acceptance,
     command_collect,
+    command_configure_production_boundary,
     command_cost_report,
+    command_create_integration_plan,
+    command_create_workstream,
     command_create_summary,
     command_dispatch,
     command_escalate,
@@ -44,6 +47,7 @@ from .scheduler import (
     command_governance_rebind,
     command_model_memory,
     command_knowledge,
+    command_integration_gate,
     command_policy_status,
     command_policy_transition,
     command_providers,
@@ -55,6 +59,9 @@ from .scheduler import (
     command_register_artifact,
     command_register_skill_candidate,
     command_promote_knowledge,
+    command_production_status,
+    command_register_repository,
+    command_repositories,
     command_record_usage,
     command_recover,
     command_relay,
@@ -66,6 +73,7 @@ from .scheduler import (
     command_status,
     command_leader_snapshot,
     command_work_graph,
+    command_workstreams,
     command_validate,
 )
 from .evolution import ERROR_ATTRIBUTIONS, TEACHING_MODES
@@ -109,7 +117,7 @@ def command_state_store_status(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="CostMarshal v3 scheduler")
+    parser = argparse.ArgumentParser(description="CostMarshal v4 scheduler")
     parser.add_argument("--root", type=Path, default=default_root(), help="CostMarshal runtime root (v2 path compatible)")
     parser.add_argument("--version", action="version", version=f"CostMarshal {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -158,7 +166,7 @@ def build_parser() -> argparse.ArgumentParser:
     configure_provider.add_argument("--dry-run", action="store_true")
     configure_provider.set_defaults(func=command_configure_provider)
 
-    init = sub.add_parser("init", help="Create a v3 project without touching compatible legacy state")
+    init = sub.add_parser("init", help="Create a v4 project without touching compatible legacy state")
     init.add_argument("--name", default="")
     init.add_argument("--objective", required=True)
     init.add_argument("--source-project", help="Optional existing project to reference read-only")
@@ -232,6 +240,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     new_task = sub.add_parser("new-task", help="Create a v2 bounded task")
     new_task.add_argument("--project", required=True)
+    new_task.add_argument(
+        "--repository",
+        help="Registered repository id; defaults to the project's primary repository",
+    )
+    new_task.add_argument(
+        "--workstream",
+        help="Optional large-project workstream id that owns this task",
+    )
     new_task.add_argument("--id")
     new_task.add_argument("--title", required=True)
     new_task.add_argument("--purpose", required=True)
@@ -794,6 +810,126 @@ def build_parser() -> argparse.ArgumentParser:
     )
     graph.add_argument("--project", required=True)
     graph.set_defaults(func=command_work_graph)
+
+    register_repository = sub.add_parser(
+        "register-repository",
+        help="Register an immutable Git repository identity without changing its source",
+    )
+    register_repository.add_argument("--project", required=True)
+    register_repository.add_argument("--repository-id", required=True)
+    register_repository.add_argument("--path", type=Path, required=True)
+    register_repository.add_argument("--role", default="component")
+    register_repository.add_argument(
+        "--default",
+        action="store_true",
+        help="Use this repository when new-task omits --repository",
+    )
+    _add_command_id(register_repository)
+    register_repository.set_defaults(func=command_register_repository)
+
+    repositories = sub.add_parser(
+        "repositories",
+        help="Inspect registered repository identities and current Git heads",
+    )
+    repositories.add_argument("--project", required=True)
+    repositories.set_defaults(func=command_repositories)
+
+    create_workstream = sub.add_parser(
+        "create-workstream",
+        help="Create a bounded multi-repository workstream with budget and concurrency quotas",
+    )
+    create_workstream.add_argument("--project", required=True)
+    create_workstream.add_argument("--workstream-id", required=True)
+    create_workstream.add_argument("--name", required=True)
+    create_workstream.add_argument("--objective", required=True)
+    create_workstream.add_argument(
+        "--repository",
+        action="append",
+        required=True,
+        help="Registered repository id; repeat when the workstream spans repositories",
+    )
+    create_workstream.add_argument(
+        "--depends-on",
+        action="append",
+        help="Predecessor workstream id whose integration Gate must pass",
+    )
+    create_workstream.add_argument("--budget-cny")
+    create_workstream.add_argument("--concurrency-limit", type=int, default=1)
+    _add_command_id(create_workstream)
+    create_workstream.set_defaults(func=command_create_workstream)
+
+    workstreams = sub.add_parser(
+        "workstreams",
+        help="Show workstream dependency, task, quota, and integration state",
+    )
+    workstreams.add_argument("--project", required=True)
+    workstreams.set_defaults(func=command_workstreams)
+
+    integration_plan = sub.add_parser(
+        "create-integration-plan",
+        help="Freeze a non-atomic staged integration plan with exact repository heads",
+    )
+    integration_plan.add_argument("--project", required=True)
+    integration_plan.add_argument("--milestone", required=True)
+    integration_plan.add_argument("--workstream", action="append", required=True)
+    integration_plan.add_argument("--task", action="append", required=True)
+    integration_plan.add_argument("--repository", action="append", required=True)
+    integration_plan.add_argument(
+        "--interface-artifact",
+        action="append",
+        help="Accepted interface Artifact id; repeat as needed",
+    )
+    integration_plan.add_argument(
+        "--rollback-ref",
+        action="append",
+        required=True,
+        metavar="REPOSITORY_ID=COMMIT",
+        help="Exact rollback commit for each selected repository",
+    )
+    _add_command_id(integration_plan)
+    integration_plan.set_defaults(func=command_create_integration_plan)
+
+    integration_gate = sub.add_parser(
+        "integration-gate",
+        help="Evaluate a frozen integration plan against accepted tasks, Artifacts, and Git heads",
+    )
+    integration_gate.add_argument("--project", required=True)
+    integration_gate.add_argument("--plan", required=True)
+    integration_gate.add_argument("--approved-by", required=True)
+    _add_command_id(integration_gate)
+    integration_gate.set_defaults(func=command_integration_gate)
+
+    production_boundary = sub.add_parser(
+        "configure-production-boundary",
+        help="Preview or store the fail-closed external Broker/Proxy contract",
+    )
+    production_boundary.add_argument("--project", required=True)
+    production_boundary.add_argument(
+        "--mode",
+        choices=["report-only", "enforced"],
+        default="report-only",
+    )
+    production_boundary.add_argument("--broker-endpoint", required=True)
+    production_boundary.add_argument("--broker-identity", required=True)
+    production_boundary.add_argument("--provider-proxy-endpoint", required=True)
+    production_boundary.add_argument("--hard-budget-enforced", action="store_true")
+    production_boundary.add_argument(
+        "--evidence-artifact",
+        action="append",
+        required=True,
+        metavar="TYPE=ARTIFACT_ID",
+        help="Bind every required external certification evidence type",
+    )
+    production_boundary.add_argument("--apply", action="store_true")
+    _add_command_id(production_boundary)
+    production_boundary.set_defaults(func=command_configure_production_boundary)
+
+    production_status = sub.add_parser(
+        "production-status",
+        help="Report production-boundary evidence and remaining fail-closed blockers",
+    )
+    production_status.add_argument("--project", required=True)
+    production_status.set_defaults(func=command_production_status)
 
     memory = sub.add_parser(
         "model-memory",

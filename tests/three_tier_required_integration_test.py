@@ -129,6 +129,33 @@ def cli_failure(temp: Path, *arguments: str) -> str:
     return result.stdout + result.stderr
 
 
+def structured_handoff_file(
+    temp: Path,
+    *,
+    name: str,
+    conclusion: str,
+) -> Path:
+    path = temp / f"{name}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "conclusion": conclusion,
+                "facts": [],
+                "evidence": [],
+                "unresolved": [],
+                "next_actions": [
+                    "Continue with the exact admitted successor."
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def git(repository: Path, *arguments: str) -> str:
     result = subprocess.run(
         ["git", "-C", str(repository), *arguments],
@@ -641,8 +668,17 @@ def main() -> int:
                         "failed",
                         "--quality-score",
                         "1",
-                        "--handoff",
-                        "A successor exists, so this must be an escalation decision.",
+                        "--handoff-file",
+                        str(
+                            structured_handoff_file(
+                                temp,
+                                name="terminal-mismatch-handoff",
+                                conclusion=(
+                                    "A successor exists, so this must be an "
+                                    "escalation decision."
+                                ),
+                            )
+                        ),
                     )
                     assert "must use --status escalate" in terminal_mismatch
                 cli(
@@ -662,8 +698,17 @@ def main() -> int:
                     "escalate",
                     "--quality-score",
                     "2",
-                    "--handoff",
-                    f"{expected_tier} completed bounded analysis; continue with stronger review.",
+                    "--handoff-file",
+                    str(
+                        structured_handoff_file(
+                            temp,
+                            name=f"three-tier-handoff-{index}",
+                            conclusion=(
+                                f"{expected_tier} completed bounded analysis; "
+                                "continue with stronger review."
+                            ),
+                        )
+                    ),
                 )
                 if index == 0:
                     before_replan = load_task(layout, task_id)
