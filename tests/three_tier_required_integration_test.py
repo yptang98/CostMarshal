@@ -287,7 +287,7 @@ class ThreeTierOciBackend(OciCliBackend):
         self.network_id = network_id
         key = str(spec.provider_env_key or "default")
         self.__class__.provider_calls.append(key)
-        status = "done" if key == "CODEX_API_KEY" else "escalate"
+        status = "done" if key == "OPENAI_API_KEY" else "escalate"
         return [
             sys.executable,
             "-c",
@@ -436,7 +436,7 @@ def main() -> int:
         secrets.write_text(
             "LONGCAT_API_KEY=low-secret\n"
             "DEEPSEEK_API_KEY=medium-secret\n"
-            "CODEX_API_KEY=high-secret\n",
+            "OPENAI_API_KEY=high-secret\n",
             encoding="utf-8",
         )
 
@@ -814,7 +814,7 @@ def main() -> int:
         assert ThreeTierOciBackend.provider_calls == [
             "LONGCAT_API_KEY",
             "DEEPSEEK_API_KEY",
-            "CODEX_API_KEY",
+            "OPENAI_API_KEY",
             "LONGCAT_API_KEY",
         ]
         assert cli(temp, "validate", "--project", str(project_dir))["status"] == "ok"

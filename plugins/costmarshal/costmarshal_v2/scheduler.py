@@ -1094,8 +1094,8 @@ def preflight_worker_isolation(
         and not str(actor.get("env_key") or "").strip()
     ):
         raise SystemExit(
-            "required worker preflight failed: built-in codex/high provider is missing env_key "
-            "(expected CODEX_API_KEY); update the explicit provider catalog before dispatch"
+            "required worker preflight failed: default codex/high provider is missing env_key "
+            "(expected OPENAI_API_KEY); update the explicit provider catalog before dispatch"
         )
     configured_image = config.get("image")
     if not configured_image and mode == "unsafe-native":

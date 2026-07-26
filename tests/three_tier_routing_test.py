@@ -361,7 +361,7 @@ class ThreeTierRoutingTest(unittest.TestCase):
         )
         self.assertEqual(
             [row["env_key"] for row in new["providers"]],
-            ["LONGCAT_API_KEY", "DEEPSEEK_API_KEY", "CODEX_API_KEY"],
+            ["LONGCAT_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY"],
         )
         legacy = project_provider_catalog({"project_id": "old-v2"})
         self.assertEqual(
@@ -371,6 +371,20 @@ class ThreeTierRoutingTest(unittest.TestCase):
         self.assertIsNone(legacy["providers"][1]["env_key"])
         explicit = project_provider_catalog({"provider_catalog": new})
         self.assertEqual(len(explicit["providers"]), 3)
+
+    def test_v310_builtin_codex_key_is_normalized_without_mutating_input(self) -> None:
+        catalog = default_provider_catalog()
+        codex = next(row for row in catalog["providers"] if row["provider_id"] == "codex")
+        codex["env_key"] = "CODEX_API_KEY"
+        original = deepcopy(catalog)
+
+        normalized = validate_provider_catalog(catalog)
+
+        normalized_codex = next(
+            row for row in normalized["providers"] if row["provider_id"] == "codex"
+        )
+        self.assertEqual(normalized_codex["env_key"], "OPENAI_API_KEY")
+        self.assertEqual(catalog, original)
 
     def test_catalog_validation_is_fail_closed_and_non_mutating(self) -> None:
         catalog = default_provider_catalog()

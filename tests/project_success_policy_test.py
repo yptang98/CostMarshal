@@ -620,7 +620,7 @@ def main() -> int:
                     "tier": "high",
                     "profile": None,
                     "model": "inherit",
-                    "env_key": "CODEX_API_KEY",
+                    "env_key": "OPENAI_API_KEY",
                     "enabled": True,
                     "priority": 100,
                     "input_cny_per_1m": 3.0,

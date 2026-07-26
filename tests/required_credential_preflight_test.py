@@ -44,7 +44,7 @@ class RequiredCredentialPreflightTest(unittest.TestCase):
                 "tier": "high",
                 "env_key": None,
             }
-            with self.assertRaisesRegex(SystemExit, "expected CODEX_API_KEY"):
+            with self.assertRaisesRegex(SystemExit, "expected OPENAI_API_KEY"):
                 preflight_worker_isolation(
                     layout,
                     project,

@@ -227,11 +227,11 @@ def default_provider_catalog() -> dict[str, Any]:
         "providers": [
             _provider("longcat", "low", profile="longcat", model="LongCat-2.0", env_key="LONGCAT_API_KEY"),
             _provider("deepseek", "medium", profile="deepseek", model="inherit", env_key="DEEPSEEK_API_KEY"),
-            # `CODEX_API_KEY` is scoped to one non-interactive `codex exec`
-            # invocation. Required OCI workers cannot and must not inherit the
-            # host's persisted auth.json, so new projects declare the selected
-            # high-tier credential explicitly.
-            _provider("codex", "high", profile=None, model="inherit", env_key="CODEX_API_KEY"),
+            # Native Codex execution may reuse the actor-private copy of the
+            # host's Codex login. Required OCI workers cannot inherit that
+            # persisted session, so their explicit API-key path uses Codex's
+            # standard OPENAI_API_KEY contract.
+            _provider("codex", "high", profile=None, model="inherit", env_key="OPENAI_API_KEY"),
         ],
     }
 
@@ -245,7 +245,7 @@ def legacy_provider_catalog() -> dict[str, Any]:
     ]
     # Projects that predate explicit catalogs inherited the host Codex login
     # for their high tier. Preserve that read behavior; only newly initialized
-    # catalogs opt into the single-run CODEX_API_KEY contract.
+    # catalogs opt into the single-run OPENAI_API_KEY contract.
     for row in catalog["providers"]:
         if row["provider_id"] == "codex":
             row["env_key"] = None
@@ -801,6 +801,17 @@ def validate_provider_catalog(catalog: Mapping[str, Any]) -> dict[str, Any]:
         profile = raw.get("profile")
         model = raw.get("model")
         env_key = raw.get("env_key")
+        # v3.1.0 briefly emitted a non-standard CODEX_API_KEY name for the
+        # default native Codex high tier. Normalize only that exact legacy
+        # signature;
+        # custom providers and custom profiles keep their declared contract.
+        if (
+            provider_id == "codex"
+            and tier == "high"
+            and profile is None
+            and env_key == "CODEX_API_KEY"
+        ):
+            env_key = "OPENAI_API_KEY"
         if profile is not None and (
             not isinstance(profile, str) or not _PROFILE_ID.fullmatch(profile)
         ):

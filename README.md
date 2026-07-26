@@ -8,7 +8,7 @@
 
   <p>
     <a href="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="VERSION"><img alt="Version 3.1.0" src="https://img.shields.io/badge/version-3.1.0-2bb3a3"></a>
+    <a href="VERSION"><img alt="Version 3.1.1" src="https://img.shields.io/badge/version-3.1.1-2bb3a3"></a>
     <a href="https://www.python.org/downloads/"><img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white"></a>
     <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-f0b94b"></a>
   </p>
@@ -144,11 +144,11 @@ For the complete routing and accounting contract, read the repository-level [`SK
 
 The default catalog establishes three replaceable capability tiers:
 
-| Provider ID | Tier | Default profile | Credential variable |
+| Provider ID | Tier | Execution profile | Authentication |
 | --- | :---: | --- | --- |
 | `longcat` | Low | `longcat` | `LONGCAT_API_KEY` |
 | `deepseek` | Medium | `deepseek` | `DEEPSEEK_API_KEY` |
-| `codex` | High | built-in Codex provider | `CODEX_API_KEY` |
+| `codex` | High | Native Codex CLI | Existing Codex sign-in; isolated workers use `OPENAI_API_KEY` |
 
 Ask Codex to configure a provider without exposing its key:
 
@@ -158,7 +158,13 @@ Keep credentials outside actor workspaces, never print secret values, and
 validate every profile and reviewed pricing snapshot before routing work.
 ```
 
-Provider identity is separate from capability tier, so the catalog can be replaced without changing routing policy. Credentials are supplied through the process environment or an external secrets file; they are not written into profiles, prompts, reports, or repository files.
+Provider identity is separate from capability tier, so the catalog can be
+replaced without changing routing policy. Native Codex execution reuses an
+actor-private copy of the existing Codex login. Because an isolated OCI worker
+must not inherit the host session, its explicit OpenAI API path uses the
+standard `OPENAI_API_KEY`. Other provider credentials are supplied through the
+process environment or an external secrets file. No credential is written into
+profiles, prompts, reports, or repository files.
 
 <details>
 <summary><strong>Provider profile and catalog setup</strong></summary>

@@ -1,5 +1,17 @@
 # CostMarshal v3.0 Migration
 
+## v3.1.1 Codex credential correction
+
+CostMarshal v3.1.1 corrects the built-in high-tier credential name from the
+non-standard `CODEX_API_KEY` to `OPENAI_API_KEY`. Native Codex runs continue to
+reuse the existing Codex sign-in. Required OCI workers cannot inherit that host
+session and therefore need `OPENAI_API_KEY` in the selected environment or
+external secrets file.
+
+An exact v3.1.0 built-in `codex`/`high`/default-profile catalog entry is
+normalized at read time. Custom provider IDs and custom Codex profiles retain
+their explicitly configured credential names.
+
 ## v3.1 work graph and evolution ledgers
 
 No destructive state rewrite is required. The first v3.1 task mutation lazily

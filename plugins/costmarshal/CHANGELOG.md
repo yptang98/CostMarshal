@@ -1,5 +1,17 @@
 # Changelog
 
+## v3.1.1 - 2026-07-26
+
+### Fixed
+
+- Replaced the non-standard `CODEX_API_KEY` contract with Codex CLI's standard
+  `OPENAI_API_KEY` for isolated OpenAI execution.
+- Clarified that native Codex execution reuses the existing Codex sign-in,
+  while required OCI workers use an explicitly scoped API key because they
+  cannot inherit the host session.
+- Added a narrow read-time normalization for v3.1.0's default Codex catalog
+  entry without changing custom provider credential contracts.
+
 ## v3.1.0 - 2026-07-25
 
 ### Added
