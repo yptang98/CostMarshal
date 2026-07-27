@@ -115,6 +115,29 @@ NATIVE_LAUNCH_BARRIER_READY_ENV = "COSTMARSHAL_NATIVE_LAUNCH_BARRIER_READY"
 NATIVE_LAUNCH_BARRIER_RELEASE_ENV = "COSTMARSHAL_NATIVE_LAUNCH_BARRIER_RELEASE"
 IMAGE_INPUT_SUFFIXES = frozenset({".gif", ".jpeg", ".jpg", ".png", ".webp"})
 MAX_IMAGE_INPUT_BYTES = 16 * 1024 * 1024
+ATTACHMENT_SUFFIXES = {
+    "image": IMAGE_INPUT_SUFFIXES,
+    "audio": frozenset(
+        {".aac", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav", ".webm"}
+    ),
+    "video": frozenset({".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm"}),
+    "document": frozenset(
+        {
+            ".csv",
+            ".doc",
+            ".docx",
+            ".html",
+            ".json",
+            ".md",
+            ".pdf",
+            ".pptx",
+            ".rtf",
+            ".txt",
+            ".xlsx",
+        }
+    ),
+}
+MAX_MULTIMODAL_ATTACHMENT_BYTES = 2 * 1024 * 1024
 _NANO_CNY = Decimal("1000000000")
 
 
@@ -1766,55 +1789,205 @@ def publish_task_report(layout: ProjectLayout, actor: dict[str, Any], attempt_re
         )
 
 
+def bound_input_attachments(
+    layout: ProjectLayout,
+    actor: dict[str, Any],
+    execution_workspace: Path,
+) -> dict[str, tuple[tuple[str, str], ...]]:
+    """Return verified host/container paths grouped by immutable modality."""
+
+    if actor.get("role") != "agent" or not actor.get("task_id"):
+        return {
+            modality: ()
+            for modality in ("image", "audio", "video", "document")
+        }
+    task = load_task(layout, str(actor["task_id"]))
+    task_execution_mode = str(task.get("execution_mode") or "agent")
+    actor_execution_mode = str(actor.get("execution_mode") or "agent")
+    if actor_execution_mode != task_execution_mode:
+        raise SystemExit(
+            "worker execution mode differs from the immutable task contract"
+        )
+    raw_attachments = task.get("input_attachments")
+    if raw_attachments is None:
+        try:
+            legacy_images = normalize_path_list(
+                task.get("input_images") or [],
+                kind="allowed",
+            )
+        except SecurityValidationError as exc:
+            raise SystemExit(f"worker image input paths are invalid: {exc}") from exc
+        attachments: list[dict[str, Any]] = [
+            {"modality": "image", "path": image}
+            for image in legacy_images
+        ]
+    elif not isinstance(raw_attachments, list):
+        raise SystemExit("worker input attachment ledger is invalid")
+    else:
+        attachments = []
+        seen: set[str] = set()
+        for index, raw in enumerate(raw_attachments):
+            if (
+                not isinstance(raw, dict)
+                or raw.get("schema_version")
+                != "costmarshal-input-attachment-v1"
+                or raw.get("modality") not in ATTACHMENT_SUFFIXES
+                or not isinstance(raw.get("path"), str)
+                or not isinstance(raw.get("media_type"), str)
+                or type(raw.get("size_bytes")) is not int
+                or raw["size_bytes"] < 0
+                or not re.fullmatch(
+                    r"sha256:[0-9a-f]{64}",
+                    str(raw.get("sha256") or ""),
+                )
+                or not re.fullmatch(
+                    r"[0-9a-f]{40}|[0-9a-f]{64}",
+                    str(raw.get("git_object") or ""),
+                )
+            ):
+                raise SystemExit(
+                    f"worker input attachment receipt {index} is invalid"
+                )
+            path_value = str(raw["path"])
+            if path_value in seen:
+                raise SystemExit("worker input attachment paths are duplicated")
+            seen.add(path_value)
+            attachments.append(dict(raw))
+    if not attachments:
+        return {
+            modality: ()
+            for modality in ("image", "audio", "video", "document")
+        }
+    required_capabilities = set(task.get("required_capabilities") or [])
+    for attachment in attachments:
+        capability = f"input:{attachment['modality']}"
+        if capability not in required_capabilities:
+            raise SystemExit(
+                f"worker {attachment['modality']} input is not bound to "
+                f"the {capability} routing capability"
+            )
+    contract = actor.get("collaboration_contract")
+    if isinstance(contract, dict):
+        attachment_rows = (
+            raw_attachments
+            if raw_attachments is not None
+            else [
+                {
+                    "modality": "image",
+                    "path": path,
+                    "legacy": True,
+                }
+                for path in task.get("input_images") or []
+            ]
+        )
+        attachment_bytes = json.dumps(
+            attachment_rows,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        expected_attachment_binding = {
+            "schema_version": "costmarshal-input-attachment-binding-v1",
+            "count": len(attachment_rows),
+            "sha256": "sha256:"
+            + hashlib.sha256(attachment_bytes).hexdigest(),
+        }
+        if contract.get("input_attachments") != expected_attachment_binding:
+            raise SystemExit(
+                "worker input attachment ledger differs from the frozen "
+                "collaboration contract"
+            )
+        admitted_context = set(contract.get("context_paths") or [])
+        missing = sorted(
+            {
+                str(attachment["path"])
+                for attachment in attachments
+            }
+            - admitted_context
+        )
+        if missing:
+            raise SystemExit(
+                "worker input attachments are outside the frozen context projection: "
+                + ", ".join(missing)
+            )
+    result: dict[str, list[tuple[str, str]]] = {
+        modality: []
+        for modality in ("image", "audio", "video", "document")
+    }
+    total_size = 0
+    for attachment in attachments:
+        modality = str(attachment["modality"])
+        relative = str(attachment["path"])
+        if Path(relative).suffix.casefold() not in ATTACHMENT_SUFFIXES[modality]:
+            raise SystemExit(
+                f"worker {modality} input extension is unsupported: {relative}"
+            )
+        try:
+            resolved = ensure_workspace_containment(
+                execution_workspace,
+                execution_workspace / relative,
+                must_exist=True,
+            )
+        except SecurityValidationError as exc:
+            raise SystemExit(
+                f"worker {modality} input is unavailable: {relative}: {exc}"
+            ) from exc
+        maximum = (
+            MAX_IMAGE_INPUT_BYTES
+            if modality == "image"
+            else MAX_MULTIMODAL_ATTACHMENT_BYTES
+        )
+        size = resolved.stat().st_size if resolved.is_file() else -1
+        if size < 0 or size > maximum:
+            raise SystemExit(
+                f"worker {modality} input exceeds its bounded file limit: {relative}"
+            )
+        expected_size = attachment.get("size_bytes")
+        expected_sha = attachment.get("sha256")
+        if expected_size is not None and size != expected_size:
+            raise SystemExit(
+                f"worker {modality} input size drifted: {relative}"
+            )
+        if expected_sha is not None:
+            observed_sha = "sha256:" + hashlib.sha256(
+                resolved.read_bytes()
+            ).hexdigest()
+            if not hmac.compare_digest(observed_sha, str(expected_sha)):
+                raise SystemExit(
+                    f"worker {modality} input content drifted: {relative}"
+                )
+        total_size += size
+        result[modality].append(
+            (str(resolved), "/workspace/" + relative)
+        )
+    if (
+        task_execution_mode == "multimodal-api"
+        and total_size > MAX_MULTIMODAL_ATTACHMENT_BYTES
+    ):
+        raise SystemExit(
+            "worker multimodal-api attachments exceed the 2 MiB request envelope"
+        )
+    return {
+        modality: tuple(paths)
+        for modality, paths in result.items()
+    }
+
+
 def bound_input_images(
     layout: ProjectLayout,
     actor: dict[str, Any],
     execution_workspace: Path,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Return verified host and container paths for immutable image inputs."""
+    """Compatibility view for Codex CLI image arguments."""
 
-    if actor.get("role") != "agent" or not actor.get("task_id"):
-        return (), ()
-    task = load_task(layout, str(actor["task_id"]))
-    try:
-        images = normalize_path_list(task.get("input_images") or [], kind="allowed")
-    except SecurityValidationError as exc:
-        raise SystemExit(f"worker image input paths are invalid: {exc}") from exc
-    if not images:
-        return (), ()
-    if "input:image" not in set(task.get("required_capabilities") or []):
-        raise SystemExit(
-            "worker image inputs are not bound to the input:image routing capability"
-        )
-    contract = actor.get("collaboration_contract")
-    if isinstance(contract, dict):
-        admitted_context = set(contract.get("context_paths") or [])
-        missing = sorted(set(images) - admitted_context)
-        if missing:
-            raise SystemExit(
-                "worker image inputs are outside the frozen context projection: "
-                + ", ".join(missing)
-            )
-    host_paths: list[str] = []
-    container_paths: list[str] = []
-    for image in images:
-        if Path(image).suffix.casefold() not in IMAGE_INPUT_SUFFIXES:
-            raise SystemExit(f"worker image input extension is unsupported: {image}")
-        try:
-            resolved = ensure_workspace_containment(
-                execution_workspace,
-                execution_workspace / image,
-                must_exist=True,
-            )
-        except SecurityValidationError as exc:
-            raise SystemExit(f"worker image input is unavailable: {image}: {exc}") from exc
-        if not resolved.is_file() or resolved.stat().st_size > MAX_IMAGE_INPUT_BYTES:
-            raise SystemExit(
-                f"worker image input must be a regular file no larger than 16 MiB: {image}"
-            )
-        host_paths.append(str(resolved))
-        container_paths.append("/workspace/" + image)
-    return tuple(host_paths), tuple(container_paths)
+    bindings = bound_input_attachments(layout, actor, execution_workspace)[
+        "image"
+    ]
+    return (
+        tuple(host for host, _ in bindings),
+        tuple(container for _, container in bindings),
+    )
 
 
 def build_codex_argv(
@@ -1826,6 +1999,10 @@ def build_codex_argv(
     execution_workspace: Path | None = None,
     sandbox: str | None = None,
 ) -> list[str]:
+    if str(actor.get("execution_mode") or "agent") != "agent":
+        raise SystemExit(
+            "multimodal-api tasks cannot use the native Codex execution path"
+        )
     runner = actor.get("runner") or {}
     workspace = execution_workspace or workspace_path(layout, project, actor)
     argv = resolve_codex_command(actor) + [
@@ -2560,13 +2737,42 @@ def _required_worker_bundle(
         with contextlib.suppress(IsolationError):
             cleanup_temporary_credential(spec)
         raise SystemExit(f"required worker execution spec is invalid [{exc.code}]: {exc}") from exc
+    execution_mode = str(actor.get("execution_mode") or "agent")
     command = ["costmarshal-worker", "--jsonl"]
+    if execution_mode != "agent":
+        command.extend(["--mode", execution_mode])
     model = actor.get("model")
     if model and model != "inherit":
         command.extend(["--model", str(model)])
-    _, container_images = bound_input_images(layout, actor, execution_workspace)
-    for image in container_images:
-        command.extend(["--image", image])
+    attachments = bound_input_attachments(
+        layout,
+        actor,
+        execution_workspace,
+    )
+    if execution_mode == "agent":
+        if any(attachments[modality] for modality in ("audio", "video", "document")):
+            raise SystemExit(
+                "Codex agent execution cannot transport audio, video, or document attachments"
+            )
+        for _, container_path in attachments["image"]:
+            command.extend(["--image", container_path])
+    elif execution_mode == "multimodal-api":
+        if gateway_boundary is None or gateway_lease is None:
+            raise SystemExit(
+                "multimodal-api execution requires an active production gateway lease"
+            )
+        task = load_task(layout, str(actor.get("task_id") or ""))
+        maximum_output = int(task.get("estimated_output_tokens") or 0)
+        if maximum_output <= 0:
+            raise SystemExit(
+                "multimodal-api execution requires a positive output-token envelope"
+            )
+        command.extend(["--max-output-tokens", str(maximum_output)])
+        for modality in ("image", "audio", "video", "document"):
+            for _, container_path in attachments[modality]:
+                command.extend([f"--{modality}", container_path])
+    else:
+        raise SystemExit("required worker execution mode is invalid")
     return spec, command, secret_values
 
 

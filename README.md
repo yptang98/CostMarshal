@@ -8,7 +8,7 @@
 
   <p>
     <a href="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="VERSION"><img alt="Version 4.2.0" src="https://img.shields.io/badge/version-4.2.0-2bb3a3"></a>
+    <a href="VERSION"><img alt="Version 4.3.0" src="https://img.shields.io/badge/version-4.3.0-2bb3a3"></a>
     <a href="https://www.python.org/downloads/"><img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white"></a>
     <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-f0b94b"></a>
   </p>
@@ -180,8 +180,8 @@ contains a key or an unreviewed price.
 | DeepSeek | V4 Flash / Pro | Text | Text through the production Chat adapter |
 | Kimi | K3 / K2.6 | Text, image; K2.6 also video | Text/image through the production Chat adapter |
 | LongCat | 2.0 | Text | Text |
-| Xiaomi MiMo | 2.5 / 2.5 Pro | 2.5: text, image, audio, video | Text, image |
-| Doubao Ark | Seed 2.0 Lite | Text, image, audio, video | Text, image |
+| Xiaomi MiMo | 2.5 / 2.5 Pro | 2.5: text, image, audio, video | Text/image Agent; image/audio/video report-only API |
+| Doubao Ark | Seed 2.0 Lite | Text, image, audio, video | Text/image Agent; image/audio/video report-only API |
 | Codex | Native signed-in model | Model-dependent | Text |
 
 Ask Codex to configure the providers and assign tiers without exposing keys:
@@ -195,7 +195,7 @@ input:image capability for tasks that include images.
 
 Modern Codex workers use the OpenAI Responses protocol. MiMo and Doubao expose
 it officially, and the current LongCat deployment uses it. For a reviewed
-DeepSeek or Kimi Chat endpoint, the v4.2 production Proxy can translate bounded
+DeepSeek or Kimi Chat endpoint, the v4.3 production Proxy can translate bounded
 Responses text/image/audio messages, function tools, completed JSON, and SSE
 events by setting `wire_api: chat-completions`. The adapter buffers the bounded
 upstream completion before emitting Responses SSE, so it is compatible but not
@@ -203,11 +203,20 @@ token-by-token realtime. Video and document input require a native Responses
 provider and are rejected by the Chat adapter.
 
 Multimodal is enforced end to end: routing uses the intersection of the model's
-documented API capabilities and what the current worker can actually transport.
-Local images are supported and are passed through the immutable task/context
-contract; audio and video remain visible as API facts but are not yet routable.
-See [`references/providers.md`](references/providers.md) for the exact models,
-capability vocabulary, limitations, and official documentation links.
+documented API capabilities and the selected execution adapter. Agent mode
+supports committed local images. Gateway-bound native Responses providers can
+instead use report-only `multimodal-api` mode for committed image, audio,
+video, and provider-supported document inputs. It runs only in strongly
+isolated OCI, has a 2 MiB total attachment envelope, cannot claim write paths
+or invoke tools, and accepts a result only when the hard-budget Proxy returns
+authoritative usage plus a settled receipt. The Chat adapter still excludes
+video and document. See [`references/providers.md`](references/providers.md)
+for exact models and commands.
+
+Provider metadata also has a fail-closed lifecycle. Bounded schema, pricing,
+capability, and behavior observations may automatically block or de-prioritize
+a route, but never grant new authority. A provider is restored or updated only
+through an expiring, human-reviewed catalog row bound to those observations.
 
 <details>
 <summary><strong>Provider profile and catalog setup</strong></summary>
@@ -267,6 +276,10 @@ The home directory resolution order is an explicit `--codex-home`, then non-empt
   commit, release, boundary, policy, Worker/gateway image digests, reviewed
   trust-root hash, and all five accepted production-evidence report hashes.
   Artifact IDs or self-asserted JSON can no longer certify a deployment.
+- v4.3 adds immutable non-image inputs, safety-only Provider drift guardrails,
+  and a preview-first production deployment preflight. These controls do not
+  replace deployment-specific real-provider, OCI, and external-signature
+  evidence.
 
 Read [`SECURITY.md`](SECURITY.md) before production use.
 
@@ -327,6 +340,7 @@ CostMarshal stores project state under `$CODEX_HOME/costmarshal-v2` when `CODEX_
 | [`container/worker/README.md`](container/worker/README.md) | Building the digest-pinned worker image |
 | [`deploy/production/README.md`](deploy/production/README.md) | Deploying the mTLS Broker and hard-budget Provider Proxy |
 | [`scripts/costmarshal_production_certification.py`](scripts/costmarshal_production_certification.py) | Creating and verifying the exact short-lived production claim |
+| [`scripts/costmarshal_production_deploy.py`](scripts/costmarshal_production_deploy.py) | Previewing and explicitly applying a fail-closed single-host deployment |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release history |
 
 <details>

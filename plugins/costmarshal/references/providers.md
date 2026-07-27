@@ -6,10 +6,12 @@ CostMarshal separates provider API facts from executable routing facts:
 - **Runtime capabilities** describe what the current CostMarshal Codex worker can transport.
 - **Effective capabilities** are the intersection. Only this set is written to a provider catalog and used for hard routing.
 
-This distinction is important for multimodal models. A model may accept audio
-or video through its native API while the current worker only transports text
-and committed local images. CostMarshal must not route an audio/video task to
-that model until the attachment protocol supports that modality end to end.
+This distinction is important for multimodal models. Agent mode transports text
+and committed local images through Codex. The separate `multimodal-api` mode
+transports bounded committed attachments directly through a gateway-bound
+native Responses endpoint and produces a report only. CostMarshal routes a
+modality only when the model fact, gateway policy, worker adapter, and immutable
+task receipt all agree.
 
 The built-in facts were reviewed against official provider documentation on
 2026-07-26. Model names and API behavior can change; inspect the preset and
@@ -25,9 +27,9 @@ from presets and still requires a separately reviewed, hash-bound snapshot.
 | `kimi-k3` | Chat Completions | Gateway required | `MOONSHOT_API_KEY` |
 | `kimi-k2.6` | Chat Completions | Gateway required | `MOONSHOT_API_KEY` |
 | `longcat-2.0` | Chat documented; Responses deployment-verified | Text | `LONGCAT_API_KEY` |
-| `mimo-v2.5` | Responses / Chat / Anthropic | Text, image | `MIMO_API_KEY` |
+| `mimo-v2.5` | Responses / Chat / Anthropic | Text, image, audio, video | `MIMO_API_KEY` |
 | `mimo-v2.5-pro` | Responses / Chat / Anthropic | Text | `MIMO_API_KEY` |
-| `doubao-seed-2.0-lite` | Responses / Chat | Text, image | `ARK_API_KEY` |
+| `doubao-seed-2.0-lite` | Responses / Chat | Text, image, audio, video | `ARK_API_KEY` |
 
 Short aliases `deepseek`, `kimi`, `longcat`, `mimo`, and `doubao` resolve to
 the recommended preset for that provider.
@@ -105,10 +107,14 @@ labels such as `vision` or `multimodal`.
 Capabilities remain case-sensitive because custom catalogs historically
 allowed arbitrary labels. Built-in presets use the canonical lowercase names.
 
-## Image tasks
+## Multimodal tasks
 
-The current end-to-end multimodal path supports local image input. An image
-must:
+Every attachment must be workspace-relative, exist as an exact committed Git
+blob, match an allowlisted extension/media type, and be projected read-only.
+The receipt binds path, modality, media type, byte length, SHA-256, and Git
+object ID into both the task and collaboration contract.
+
+Agent mode supports images up to 16 MiB:
 
 1. be a workspace-relative `.gif`, `.jpeg`, `.jpg`, `.png`, or `.webp`;
 2. be no larger than 16 MiB;
@@ -131,9 +137,60 @@ providers before any API call. The scheduler binds the image path into the
 task brief and immutable context contract; the native and OCI workers pass the
 projected file to `codex exec --image`.
 
-Audio, video, and generic document attachments are visible in API facts but are
-not yet effective capabilities. A custom catalog must not mark them effective
-until its execution adapter implements and verifies those transports.
+Audio, video, and document inputs automatically select `multimodal-api`. This
+mode:
+
+- requires `worker_isolation.mode=required`, an externally certified production
+  boundary, and a provider row using `costmarshal-gateway-v1`;
+- requires a native Responses upstream for video/document (the Chat adapter
+  permits only text/image/audio);
+- limits all attachments together to 2 MiB and the encoded request to 4 MiB;
+- rejects write claims, workspace mutations, custom commands, and tool use;
+- requires authoritative input/output usage and
+  `X-CostMarshal-Settlement: settled` from the hard-budget Proxy.
+
+Example:
+
+```powershell
+python scripts/costmarshal.py new-task `
+  --project <project-dir> `
+  --title "Review customer call" `
+  --purpose "Summarize the committed recording" `
+  --input-audio evidence/call.wav `
+  --estimated-output-tokens 1200
+```
+
+Document transport is implemented, but no built-in preset currently advertises
+`input:document`; a reviewed custom native-Responses provider row and matching
+gateway policy are therefore required. CostMarshal never infers document
+support from a broad “multimodal” label.
+
+## Provider metadata drift
+
+Automated probes can record four bounded dimensions: API schema, pricing,
+capabilities, and behavior. A `drift` result disables the provider; `unknown`
+lowers its confidence and adds a routing priority penalty. A `match` result does
+not add capability or restore a route.
+
+```powershell
+python scripts/costmarshal.py record-provider-observation `
+  --project <project-dir> --provider mimo `
+  --source https://mimo.mi.com/docs/en-US/api/chat/responses `
+  --evidence-sha256 sha256:<report-hash> `
+  --api-schema match --pricing drift --capabilities match --behavior match `
+  --apply --command-id <stable-id>
+
+python scripts/costmarshal.py review-provider-metadata `
+  --project <project-dir> --provider mimo `
+  --catalog reviewed-providers.json `
+  --observation <observation-id> `
+  --approved-by <reviewer> --expires-at <rfc3339-within-90-days> `
+  --apply --command-id <stable-id>
+```
+
+The review installs only the selected normalized provider row, expires within
+90 days, and must include every unresolved observation since the preceding
+review. Later drift can again only reduce authority.
 
 ## Official references
 

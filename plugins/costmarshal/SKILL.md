@@ -1,9 +1,9 @@
 ---
 name: costmarshal
-description: "CostMarshal v4.2 internal policy/runtime for the Codex plugin: scheduler-first, capability-aware and cost-aware low/medium/high provider orchestration across repository-bound Workstreams, with an mTLS workload-identity Broker, hard-budget Provider Proxy, short-lived signed production certification, staged integration Gates, total-cost reports, structured teaching execution graphs, recency-aware exact-version model memory, accepted project knowledge, project-local Skill candidates, Leader Snapshots, structured handoffs, atomic batch acceptance, project artifact lineage, reviewed API presets, image input, work graphs, artifact gates, recoverable effects, OCI worker isolation, durable attempts, budget reservations, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
+description: "CostMarshal v4.3 internal policy/runtime for the Codex plugin: scheduler-first, capability-aware and cost-aware low/medium/high provider orchestration across repository-bound Workstreams, with immutable multimodal inputs, reviewed Provider drift guardrails, an mTLS workload-identity Broker, hard-budget Provider Proxy, short-lived signed production certification, staged integration Gates, total-cost reports, structured teaching execution graphs, recency-aware exact-version model memory, accepted project knowledge, project-local Skill candidates, Leader Snapshots, structured handoffs, atomic batch acceptance, project artifact lineage, work graphs, artifact gates, recoverable effects, OCI worker isolation, durable attempts, budget reservations, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
 ---
 
-# CostMarshal v4.2
+# CostMarshal v4.3
 
 Use this skill for long or decomposable work where multiple API price/capability tiers should cooperate under explicit safety, cost, and recovery controls.
 
@@ -27,7 +27,11 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
 14. Every provider attempt is collected before continuation. A worker never authorizes more spend; a sealed required attempt with an admitted successor needs an explicit leader rejection with a bounded handoff before the next tier can start. A terminal rejection without a handoff cannot later continue that sealed route.
 15. A task may dispatch only when every Work Graph dependency is leader-accepted. Artifact, quality, error, dependency, and explicit teaching gates must all pass before acceptance.
 16. Attempt evaluations are immutable observations. Aggregate model memory is rebuildable and contains no raw prompts or artifacts; learned policy can advance only through reviewed replay, shadow, canary, and activation stages.
-17. Provider API capabilities and worker transport capabilities are separate. Route only on their reviewed intersection; a local image input must be committed, bound into allowed context, and require `input:image`.
+17. Provider API capabilities and worker transport capabilities are separate.
+    Route only on their reviewed intersection. Every attachment is a committed,
+    hash-bound context input. Agent mode is image-only; audio/video/document
+    require report-only `multimodal-api`, strong OCI, the certified gateway,
+    no write scope, and authoritative Proxy settlement.
 18. Model memory is isolated by exact provider/model/profile hash and task scope, reports 95% Wilson intervals, and decays aggregate confidence with a 90-day half-life. External/tool/dependency/budget/context failures remain auditable but must not penalize model capability.
 19. New non-off teaching tasks use a hash-bound execution graph. Enforced acceptance requires a validated teaching-run ID; review, paired comparison, and replay evidence must satisfy their distinct fixed topologies.
 20. Total-cost reports center on known cost per accepted Artifact and separately expose execution, verification, rework, handoff/context, Leader attention, and failure/recovery observations. Never invent a monetary price for unknown costs, time, tokens, or context.
@@ -49,6 +53,11 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
     Worker/gateway image digests, trust-root hash, signer, and five external
     report receipts. Any missing or drifting binding blocks dispatch; legacy
     raw-key workers and legacy production boundaries never satisfy this boundary.
+25. Provider probes are safety-only. Drift disables a provider and unknown
+    dimensions reduce its routing priority; observations never add capability,
+    lower price, or restore authority. A replacement row requires an explicit
+    human review bound to all unresolved observations and expires within 90
+    days.
 
 ## Standard workflow
 
@@ -91,6 +100,13 @@ python scripts/costmarshal.py new-task --project <project-dir> --title "<title>"
 
 # Attach a committed image; this also requires input:image and adds it to context.
 python scripts/costmarshal.py new-task --project <project-dir> --title "<title>" --purpose "<purpose>" --input-image assets/reference.png
+
+# Non-image input selects report-only multimodal-api and cannot claim writes.
+python scripts/costmarshal.py new-task --project <project-dir> --title "<title>" --purpose "<purpose>" --input-audio evidence/call.wav --estimated-output-tokens 1000
+
+# Provider probes can only restrict routing; reviewed recovery is explicit.
+python scripts/costmarshal.py record-provider-observation --project <project-dir> --provider mimo --source <secret-free-https-or-urn> --evidence-sha256 sha256:<hash> --api-schema match --pricing drift --capabilities match --behavior match --apply --command-id <stable-id>
+python scripts/costmarshal.py review-provider-metadata --project <project-dir> --provider mimo --catalog <reviewed-catalog.json> --observation <observation-id> --approved-by <reviewer> --expires-at <rfc3339-within-90-days> --apply --command-id <stable-id>
 
 # Explain without mutation.
 python scripts/costmarshal.py route --project <project-dir> --task-type implementation --risk medium --difficulty normal --estimated-input-tokens 100000 --estimated-output-tokens 10000

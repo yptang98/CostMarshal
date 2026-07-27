@@ -1,5 +1,26 @@
 # Changelog
 
+## v4.3.0 - 2026-07-27
+
+- Added immutable audio, video, and document attachment receipts. Every input
+  is bound to an exact committed Git blob, collaboration contract, routed
+  capability, projected file hash, Actor execution mode, and OCI command.
+- Added a report-only `multimodal-api` worker path for gateway-bound native
+  Responses providers. It supports bounded image/audio/video/document payloads,
+  authoritative usage, hard Proxy settlement, and no workspace writes or
+  tool execution; normal Codex Agent mode remains image-only.
+- Added Provider observation and review lifecycles. API schema, pricing,
+  capability, or behavior drift can only block or lower route confidence;
+  restoring or expanding a provider requires an expiring human-reviewed
+  catalog row bound to immutable observations.
+- Replaced the single LongCat Compose secret with a Proxy-only provider
+  credential directory so one deployment can serve reviewed DeepSeek, Kimi,
+  LongCat, MiMo, and Doubao policies without mounting keys into the Broker.
+- Added a preview-first production deployment entrypoint that validates the
+  clean release commit, gateway policy, digest-pinned image, Docker Compose,
+  bounded secret files, directory ownership, and exact running services before
+  writing a secret-free deployment receipt.
+
 ## v4.2.0 - 2026-07-27
 
 - Split live gateway readiness from external production certification. Healthy

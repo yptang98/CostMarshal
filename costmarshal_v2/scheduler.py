@@ -93,6 +93,18 @@ from .routing import (
     route_plan_fingerprint,
     validate_provider_catalog,
 )
+from .provider_governance import (
+    CHECK_NAMES as PROVIDER_CHECK_NAMES,
+    ProviderGovernanceError,
+    effective_provider_catalog,
+    load_metadata_document,
+    load_observations,
+    project_with_effective_provider_catalog,
+    provider_binding_sha256,
+    reviewed_provider_entry,
+    validate_metadata_document,
+    validate_observation,
+)
 from .governance import (
     GovernanceError,
     enforce_governance_contract,
@@ -282,6 +294,60 @@ RISKS = {"high", "medium", "low"}
 LEADER_WORK_TYPES = {"planning", "integration", "verification", "emergency-fix", "trivial-glue", "other"}
 IMAGE_INPUT_SUFFIXES = frozenset({".gif", ".jpeg", ".jpg", ".png", ".webp"})
 MAX_IMAGE_INPUT_BYTES = 16 * 1024 * 1024
+ATTACHMENT_SUFFIXES = {
+    "image": IMAGE_INPUT_SUFFIXES,
+    "audio": frozenset(
+        {".aac", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav", ".webm"}
+    ),
+    "video": frozenset({".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm"}),
+    "document": frozenset(
+        {
+            ".csv",
+            ".doc",
+            ".docx",
+            ".html",
+            ".json",
+            ".md",
+            ".pdf",
+            ".pptx",
+            ".rtf",
+            ".txt",
+            ".xlsx",
+        }
+    ),
+}
+ATTACHMENT_MEDIA_TYPES = {
+    ".aac": "audio/aac",
+    ".csv": "text/csv",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".flac": "audio/flac",
+    ".gif": "image/gif",
+    ".html": "text/html",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".json": "application/json",
+    ".m4a": "audio/mp4",
+    ".md": "text/markdown",
+    ".mkv": "video/x-matroska",
+    ".mov": "video/quicktime",
+    ".mp3": "audio/mpeg",
+    ".mp4": "video/mp4",
+    ".mpeg": "video/mpeg",
+    ".mpg": "video/mpeg",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".rtf": "application/rtf",
+    ".txt": "text/plain",
+    ".wav": "audio/wav",
+    ".webm": "application/octet-stream",
+    ".webp": "image/webp",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
+MAX_MULTIMODAL_ATTACHMENT_BYTES = 2 * 1024 * 1024
 SCHEDULER_COMMANDS = {
     "create_task",
     "dispatch_task",
@@ -3548,47 +3614,133 @@ def _required_context_paths(
     return normalize_path_list(normalized, kind="allowed")
 
 
-def _validated_input_images(
+def _validated_input_attachments(
     project: dict[str, Any],
-    raw_images: list[object],
-) -> tuple[str, ...]:
-    """Bind image attachments to committed, workspace-relative files."""
+    raw_by_modality: Mapping[str, list[object]],
+    *,
+    revision: str = "HEAD",
+) -> tuple[dict[str, Any], ...]:
+    """Bind attachment bytes to exact committed Git blobs."""
 
-    if not raw_images:
+    if not any(raw_by_modality.values()):
         return ()
     workspace = Path(str(project.get("workspace") or "")).expanduser().resolve()
     if not workspace.is_dir():
         raise SecurityValidationError(
-            "input images require an existing configured workspace"
+            "input attachments require an existing configured workspace"
         )
-    images = normalize_path_list(raw_images, kind="allowed")
-    for image in images:
-        if Path(image).suffix.casefold() not in IMAGE_INPUT_SUFFIXES:
-            raise SecurityValidationError(
-                f"input image has an unsupported extension: {image}"
+    receipts: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for modality in ("image", "audio", "video", "document"):
+        raw_paths = raw_by_modality.get(modality) or []
+        paths = normalize_path_list(raw_paths, kind="allowed")
+        for attachment_path in paths:
+            if attachment_path in seen_paths:
+                raise SecurityValidationError(
+                    f"input attachment path is repeated: {attachment_path}"
+                )
+            seen_paths.add(attachment_path)
+            suffix = Path(attachment_path).suffix.casefold()
+            if suffix not in ATTACHMENT_SUFFIXES[modality]:
+                raise SecurityValidationError(
+                    f"input {modality} has an unsupported extension: {attachment_path}"
+                )
+            maximum = (
+                MAX_IMAGE_INPUT_BYTES
+                if modality == "image"
+                else MAX_MULTIMODAL_ATTACHMENT_BYTES
             )
-        resolved = ensure_workspace_containment(
-            workspace,
-            workspace / image,
-            must_exist=True,
+            try:
+                object_id = subprocess.check_output(
+                    [
+                        "git",
+                        "-C",
+                        str(workspace),
+                        "rev-parse",
+                        "--verify",
+                        f"{revision}:{attachment_path}",
+                    ],
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    timeout=10,
+                ).strip()
+                raw_size = subprocess.check_output(
+                    [
+                        "git",
+                        "-C",
+                        str(workspace),
+                        "cat-file",
+                        "-s",
+                        object_id,
+                    ],
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    timeout=10,
+                ).strip()
+                size = int(raw_size)
+                if (
+                    not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", object_id)
+                    or size < 0
+                    or size > maximum
+                ):
+                    raise ValueError("committed attachment identity is invalid")
+                blob = subprocess.check_output(
+                    ["git", "-C", str(workspace), "cat-file", "blob", object_id],
+                    stderr=subprocess.STDOUT,
+                    timeout=30,
+                )
+            except (
+                FileNotFoundError,
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                ValueError,
+            ) as exc:
+                raise SecurityValidationError(
+                    f"input {modality} must be a bounded regular file in the workspace's committed HEAD: "
+                    f"{attachment_path}"
+                ) from exc
+            if len(blob) != size:
+                raise SecurityValidationError(
+                    f"input {modality} Git blob changed while being read: {attachment_path}"
+                )
+            receipts.append(
+                {
+                    "schema_version": "costmarshal-input-attachment-v1",
+                    "modality": modality,
+                    "path": attachment_path,
+                    "media_type": (
+                        (
+                            f"{modality}/webm"
+                            if suffix == ".webm" and modality in {"audio", "video"}
+                            else ATTACHMENT_MEDIA_TYPES[suffix]
+                        )
+                    ),
+                    "size_bytes": size,
+                    "sha256": "sha256:" + hashlib.sha256(blob).hexdigest(),
+                    "git_object": object_id,
+                }
+            )
+    return tuple(receipts)
+
+
+def _validated_input_images(
+    project: dict[str, Any],
+    raw_images: list[object],
+) -> tuple[str, ...]:
+    """Legacy path-only image view backed by immutable attachment receipts."""
+
+    return tuple(
+        row["path"]
+        for row in _validated_input_attachments(
+            project,
+            {
+                "image": raw_images,
+                "audio": [],
+                "video": [],
+                "document": [],
+            },
         )
-        if not resolved.is_file() or resolved.stat().st_size > MAX_IMAGE_INPUT_BYTES:
-            raise SecurityValidationError(
-                f"input image must be a regular file no larger than 16 MiB: {image}"
-            )
-        try:
-            subprocess.run(
-                ["git", "-C", str(workspace), "cat-file", "-e", f"HEAD:{image}"],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-        except (FileNotFoundError, subprocess.CalledProcessError) as exc:
-            raise SecurityValidationError(
-                f"input image must exist in the workspace's committed HEAD: {image}"
-            ) from exc
-    return images
+    )
 
 
 def _exact_workspace_base(workspace: Path, requested_base: str | None = None) -> str:
@@ -3650,6 +3802,23 @@ def prepare_collaboration_contract(
     if previous_base is not None and not isinstance(previous_base, str):
         raise SystemExit("stored collaboration contract has an invalid base_sha")
     base_sha = _exact_workspace_base(workspace, previous_base)
+    attachment_rows = task.get("input_attachments")
+    if attachment_rows is None:
+        attachment_rows = [
+            {
+                "modality": "image",
+                "path": path,
+                "legacy": True,
+            }
+            for path in task.get("input_images") or []
+        ]
+    attachment_bytes = json.dumps(
+        attachment_rows,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
     contract: dict[str, Any] = {
         "schema": COLLABORATION_CONTRACT_SCHEMA,
         "project_id": str(project.get("project_id") or ""),
@@ -3657,6 +3826,11 @@ def prepare_collaboration_contract(
         "base_sha": base_sha,
         "context_paths": list(context_paths),
         "write_scope": list(write_scope),
+        "input_attachments": {
+            "schema_version": "costmarshal-input-attachment-binding-v1",
+            "count": len(attachment_rows),
+            "sha256": "sha256:" + hashlib.sha256(attachment_bytes).hexdigest(),
+        },
         "projection": {
             "source": "tracked-git-objects-only",
             "workspace_mount": "/workspace",
@@ -3722,6 +3896,7 @@ def render_task_brief(task: dict[str, Any]) -> str:
             f"- Requested tier: {task.get('tier_request') or 'auto'}",
             f"- Preview route: {(task.get('route_preview') or {}).get('provider_id') or 'not evaluated'}",
             f"- Required capabilities: {', '.join(task.get('required_capabilities') or []) or 'none'}",
+            f"- Execution mode: {task.get('execution_mode') or 'agent'}",
             (
                 "- Estimated tokens (ordinary input / cached input / output): "
                 f"{int(task.get('estimated_input_tokens') or 0)} / "
@@ -3729,8 +3904,19 @@ def render_task_brief(task: dict[str, Any]) -> str:
                 f"{int(task.get('estimated_output_tokens') or 0)}"
             ),
             "",
-            "## Input Images",
-            "\n".join(f"- {item}" for item in task.get("input_images", []))
+            "## Input Attachments",
+            "\n".join(
+                (
+                    f"- {item.get('modality')}: {item.get('path')} "
+                    f"({item.get('media_type')}, {item.get('size_bytes')} bytes, "
+                    f"{item.get('sha256')})"
+                )
+                for item in task.get("input_attachments", [])
+                if isinstance(item, dict)
+            )
+            or "\n".join(
+                f"- image: {item}" for item in task.get("input_images", [])
+            )
             or "- None.",
             "",
             "## Acceptance Criteria",
@@ -3779,7 +3965,7 @@ def command_new_task(args: Any) -> None:
         raise SystemExit("title is required")
     if not str(args.purpose or "").strip():
         raise SystemExit("purpose is required")
-    project = load_project(layout)
+    project, _ = _load_effective_routing_project(layout)
     repository_registry = _repository_registry(layout, project)
     _persist_repository_registry_if_missing(layout, repository_registry)
     workstream_registry = _workstream_registry(layout, repository_registry)
@@ -3816,22 +4002,68 @@ def command_new_task(args: Any) -> None:
         project, repository, repository_registry
     )
     try:
-        input_images = list(
-            _validated_input_images(
+        input_attachments = list(
+            _validated_input_attachments(
                 task_project,
-                list(getattr(args, "input_images", None) or []),
+                {
+                    "image": list(getattr(args, "input_images", None) or []),
+                    "audio": list(getattr(args, "input_audio", None) or []),
+                    "video": list(getattr(args, "input_video", None) or []),
+                    "document": list(
+                        getattr(args, "input_documents", None) or []
+                    ),
+                },
             )
         )
     except SecurityValidationError as exc:
-        raise SystemExit(f"Task image input is invalid: {exc}") from exc
+        raise SystemExit(f"Task attachment input is invalid: {exc}") from exc
+    input_images = [
+        str(row["path"])
+        for row in input_attachments
+        if row["modality"] == "image"
+    ]
+    requested_execution_mode = str(
+        getattr(args, "execution_mode", None) or "auto"
+    )
+    has_non_image_attachment = any(
+        row["modality"] != "image" for row in input_attachments
+    )
+    execution_mode = (
+        "multimodal-api"
+        if requested_execution_mode == "auto" and has_non_image_attachment
+        else "agent"
+        if requested_execution_mode == "auto"
+        else requested_execution_mode
+    )
+    if execution_mode == "agent" and has_non_image_attachment:
+        raise SystemExit(
+            "audio, video, and document input requires --execution-mode multimodal-api"
+        )
+    if execution_mode == "multimodal-api":
+        total_attachment_bytes = sum(
+            int(row["size_bytes"]) for row in input_attachments
+        )
+        if total_attachment_bytes > MAX_MULTIMODAL_ATTACHMENT_BYTES:
+            raise SystemExit(
+                "multimodal-api attachments exceed the 2 MiB bounded gateway request envelope"
+            )
+        isolation = task_project.get("worker_isolation") or {}
+        if isolation.get("mode") != "required":
+            raise SystemExit(
+                "multimodal-api execution requires worker_isolation.mode=required"
+            )
     required_capabilities = list(
         dict.fromkeys(getattr(args, "required_capabilities", None) or [])
     )
-    if input_images and "input:image" not in required_capabilities:
-        required_capabilities.append("input:image")
+    for attachment in input_attachments:
+        capability = f"input:{attachment['modality']}"
+        if capability not in required_capabilities:
+            required_capabilities.append(capability)
     allowed_context = list(getattr(args, "allowed_context", None) or [])
     allowed_context.extend(
-        image for image in input_images if image not in allowed_context
+        str(row["path"])
+        for row in input_attachments
+        if row["path"] not in allowed_context
     )
     routing_objective, routing_objective_source = effective_routing_objective(
         project,
@@ -3897,6 +4129,16 @@ def command_new_task(args: Any) -> None:
         )
     except (ProfileBindingError, RoutingValidationError) as exc:
         raise SystemExit(f"Task routing is invalid: {exc}") from exc
+    if execution_mode == "multimodal-api":
+        routed_provider = provider_by_id(
+            project_provider_catalog(task_project),
+            route_preview.provider_id,
+        )
+        if routed_provider.get("runtime_adapter") != "costmarshal-gateway-v1":
+            raise SystemExit(
+                "multimodal-api execution requires a provider catalog row bound "
+                "to costmarshal-gateway-v1"
+            )
     task_id = args.id or next_task_id(layout)
     directory = task_dir(layout, task_id)
     if directory.exists():
@@ -3928,6 +4170,10 @@ def command_new_task(args: Any) -> None:
     if uncovered_allowed:
         raise SystemExit(
             "Every allowed write path must be covered by a write claim: " + ", ".join(uncovered_allowed)
+        )
+    if execution_mode == "multimodal-api" and (allowed_paths or claim_paths):
+        raise SystemExit(
+            "multimodal-api execution is report-only and cannot claim or write workspace paths"
         )
     lock_claim_paths = _task_lock_claim_paths(
         {"repository_id": repository_id},
@@ -4010,6 +4256,8 @@ def command_new_task(args: Any) -> None:
                 "dependencies": dependencies,
                 "deliverables": deliverables,
                 "required_capabilities": required_capabilities,
+                "execution_mode": execution_mode,
+                "input_attachments": input_attachments,
                 "gates": gates,
             },
         )
@@ -4047,6 +4295,8 @@ def command_new_task(args: Any) -> None:
         "max_cost_cny": max_cost_cny,
         "required_capabilities": required_capabilities,
         "input_images": input_images,
+        "input_attachments": input_attachments,
+        "execution_mode": execution_mode,
         "min_success_probability": effective_min_success,
         "min_success_probability_source": min_success_source,
         "routing_objective": routing_objective,
@@ -4095,15 +4345,251 @@ def command_new_task(args: Any) -> None:
         dependencies=dependencies,
         teaching_mode=teaching["mode"],
         input_image_count=len(input_images),
+        input_attachment_count=len(input_attachments),
+        execution_mode=execution_mode,
     )
     print_json({"status": "ok", "task_id": task_id, "task": str(directory)})
+
+
+def _load_effective_routing_project(
+    layout: ProjectLayout,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    project = load_project(layout)
+    try:
+        return project_with_effective_provider_catalog(layout, project)
+    except (ProviderGovernanceError, RoutingValidationError) as exc:
+        raise SystemExit(f"Provider metadata is invalid: {exc}") from exc
+
+
+def command_record_provider_observation(args: Any) -> None:
+    """Preview or append one bounded provider drift observation."""
+
+    layout = resolve_project(args.root, args.project)
+    command_id = str(getattr(args, "command_id", None) or "").strip()
+    if not command_id:
+        raise SystemExit("record-provider-observation requires --command-id")
+    try:
+        existing_rows = load_observations(layout)
+        existing = next(
+            (row for row in existing_rows if row["command_id"] == command_id),
+            None,
+        )
+        if existing is not None:
+            print_json(
+                {
+                    "status": "ok",
+                    "idempotent_replay": True,
+                    "observation": existing,
+                }
+            )
+            return
+        project, _ = _load_effective_routing_project(layout)
+        provider = provider_by_id(
+            project_provider_catalog(project),
+            str(args.provider),
+        )
+        checks = {
+            name: str(getattr(args, name))
+            for name in PROVIDER_CHECK_NAMES
+        }
+        recorded_at = now_iso()
+        observation = validate_observation(
+            {
+                "schema_version": "costmarshal-provider-observation-v1",
+                "observation_id": new_id("POBS"),
+                "provider_id": str(args.provider),
+                "observed_at": getattr(args, "observed_at", None) or recorded_at,
+                "recorded_at": recorded_at,
+                "source": str(args.source),
+                "evidence_sha256": str(args.evidence_sha256),
+                "provider_binding_sha256": provider_binding_sha256(provider),
+                "checks": checks,
+                "command_id": command_id,
+            }
+        )
+    except (ProviderGovernanceError, RoutingValidationError) as exc:
+        raise SystemExit(f"Invalid provider observation: {exc}") from exc
+    applied = bool(getattr(args, "apply", False))
+    if applied:
+        append_jsonl(layout.provider_observations_jsonl, observation)
+        append_event(
+            layout,
+            "provider_observation_recorded",
+            provider_id=observation["provider_id"],
+            observation_id=observation["observation_id"],
+            checks=observation["checks"],
+            command_id=command_id,
+        )
+    print_json(
+        {
+            "status": "ok",
+            "applied": applied,
+            "observation": observation,
+            "routing_effect": (
+                "drift blocks the provider; unknown checks reduce priority; "
+                "match never grants new authority"
+            ),
+        }
+    )
+
+
+def command_review_provider_metadata(args: Any) -> None:
+    """Preview or install one expiring, human-reviewed provider row."""
+
+    layout = resolve_project(args.root, args.project)
+    command_id = str(getattr(args, "command_id", None) or "").strip()
+    if not command_id:
+        raise SystemExit("review-provider-metadata requires --command-id")
+    try:
+        document = load_metadata_document(layout)
+        replay = next(
+            (
+                entry
+                for entry in document["providers"].values()
+                if entry.get("command_id") == command_id
+            ),
+            None,
+        )
+        if replay is not None:
+            print_json(
+                {
+                    "status": "ok",
+                    "idempotent_replay": True,
+                    "review": replay,
+                }
+            )
+            return
+        raw_catalog = json.loads(
+            Path(args.catalog).expanduser().read_text(encoding="utf-8"),
+            parse_float=str,
+        )
+        candidate_catalog = validate_provider_catalog(raw_catalog)
+        provider = provider_by_id(candidate_catalog, str(args.provider))
+        observations = load_observations(layout)
+        selected_ids = list(dict.fromkeys(args.observation or []))
+        if not selected_ids:
+            raise ProviderGovernanceError(
+                "a provider review must bind at least one observation"
+            )
+        observation_index = {
+            row["observation_id"]: row for row in observations
+        }
+        missing = sorted(set(selected_ids) - set(observation_index))
+        if missing:
+            raise ProviderGovernanceError(
+                "provider review references unknown observations: "
+                + ", ".join(missing)
+            )
+        wrong_provider = sorted(
+            observation_id
+            for observation_id in selected_ids
+            if observation_index[observation_id]["provider_id"] != args.provider
+        )
+        if wrong_provider:
+            raise ProviderGovernanceError(
+                "provider review references observations for another provider: "
+                + ", ".join(wrong_provider)
+            )
+        current = document["providers"].get(str(args.provider))
+        previously_bound_ids = list(
+            current.get("observation_ids") or []
+        ) if current else []
+        unresolved_observation_ids = {
+            row["observation_id"]
+            for row in observations
+            if row["provider_id"] == args.provider
+            and row["observation_id"] not in previously_bound_ids
+        }
+        omitted = sorted(unresolved_observation_ids - set(selected_ids))
+        if omitted:
+            raise ProviderGovernanceError(
+                "provider review omits unresolved observations: "
+                + ", ".join(omitted)
+            )
+        cumulative_observation_ids = list(
+            dict.fromkeys([*previously_bound_ids, *selected_ids])
+        )
+        reviewed_at = now_iso()
+        entry = reviewed_provider_entry(
+            provider=provider,
+            approved_by=str(args.approved_by).strip(),
+            reviewed_at=reviewed_at,
+            expires_at=str(args.expires_at),
+            observation_ids=cumulative_observation_ids,
+            review_id=new_id("PREV"),
+            command_id=command_id,
+        )
+        proposed_document = json.loads(
+            json.dumps(document, ensure_ascii=False, allow_nan=False)
+        )
+        proposed_document["revision"] += 1
+        proposed_document["providers"][str(args.provider)] = entry
+        proposed_document = validate_metadata_document(proposed_document)
+    except (
+        OSError,
+        json.JSONDecodeError,
+        ProviderGovernanceError,
+        RoutingValidationError,
+    ) as exc:
+        raise SystemExit(f"Invalid provider metadata review: {exc}") from exc
+    applied = bool(getattr(args, "apply", False))
+    if applied:
+        atomic_write_json(layout.provider_metadata_json, proposed_document)
+        append_event(
+            layout,
+            "provider_metadata_reviewed",
+            provider_id=str(args.provider),
+            review_id=entry["review_id"],
+            provider_binding_sha256=entry["provider_binding_sha256"],
+            expires_at=entry["expires_at"],
+            command_id=command_id,
+        )
+    print_json(
+        {
+            "status": "ok",
+            "applied": applied,
+            "review": entry,
+            "document_revision": proposed_document["revision"],
+        }
+    )
+
+
+def command_provider_metadata_status(args: Any) -> None:
+    layout = resolve_project(args.root, args.project)
+    try:
+        catalog, statuses = effective_provider_catalog(
+            layout,
+            load_project(layout),
+        )
+        observations = load_observations(layout)
+        document = load_metadata_document(layout)
+    except (ProviderGovernanceError, RoutingValidationError) as exc:
+        raise SystemExit(f"Provider metadata is invalid: {exc}") from exc
+    selected = str(getattr(args, "provider", None) or "")
+    if selected:
+        if selected not in statuses:
+            raise SystemExit(f"Unknown provider: {selected}")
+        statuses = {selected: statuses[selected]}
+        observations = [
+            row for row in observations if row["provider_id"] == selected
+        ]
+    print_json(
+        {
+            "status": "ok",
+            "project": str(layout.project_dir),
+            "metadata_revision": document["revision"],
+            "providers": statuses,
+            "observations": observations,
+            "effective_catalog": catalog,
+        }
+    )
 
 
 def command_route(args: Any) -> None:
     """Explain a three-tier route without mutating project state."""
 
     layout = resolve_project(args.root, args.project)
-    project = load_project(layout)
+    project, provider_statuses = _load_effective_routing_project(layout)
     routing_objective, routing_objective_source = effective_routing_objective(
         project,
         getattr(args, "routing_objective", None),
@@ -4167,14 +4653,23 @@ def command_route(args: Any) -> None:
             "task": task,
             "decision": decision.to_dict(),
             "catalog": catalog,
+            "provider_metadata": provider_statuses,
         }
     )
 
 
 def command_providers(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
-    catalog = project_provider_catalog(load_project(layout))
-    print_json({"status": "ok", "project": str(layout.project_dir), "catalog": catalog})
+    project, provider_statuses = _load_effective_routing_project(layout)
+    catalog = project_provider_catalog(project)
+    print_json(
+        {
+            "status": "ok",
+            "project": str(layout.project_dir),
+            "catalog": catalog,
+            "provider_metadata": provider_statuses,
+        }
+    )
 
 
 def command_budget_status(args: Any) -> None:
@@ -4464,7 +4959,7 @@ def command_dispatch(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
     require_task(layout, args.task)
     task = load_task(layout, args.task)
-    base_project = load_project(layout)
+    base_project, _ = _load_effective_routing_project(layout)
     repository_registry = _repository_registry(layout, base_project)
     workstream_registry = _workstream_registry(layout, repository_registry)
     project = _project_for_task(layout, base_project, task)
@@ -4670,6 +5165,20 @@ def command_dispatch(args: Any) -> None:
     except (ProfileBindingError, RoutingValidationError, ValueError) as exc:
         raise SystemExit(f"Unable to route task: {exc}") from exc
     provider_spec = provider_by_id(catalog, decision.provider_id)
+    execution_mode = str(task.get("execution_mode") or "agent")
+    if execution_mode not in {"agent", "multimodal-api"}:
+        raise SystemExit("Task execution_mode is invalid")
+    if execution_mode == "multimodal-api" and unsafe_native:
+        raise SystemExit(
+            "multimodal-api execution requires the strongly isolated OCI worker"
+        )
+    if (
+        execution_mode == "multimodal-api"
+        and provider_spec.get("runtime_adapter") != "costmarshal-gateway-v1"
+    ):
+        raise SystemExit(
+            "multimodal-api execution requires costmarshal-gateway-v1"
+        )
     if provider_spec.get("runtime_adapter") == "costmarshal-gateway-v1":
         if production_boundary is None:
             raise SystemExit(
@@ -5044,6 +5553,7 @@ def command_dispatch(args: Any) -> None:
         launch_token=launch_token,
     )
     actor["profile_binding"] = profile_binding
+    actor["execution_mode"] = execution_mode
     actor["workspace"] = project["workspace"]
     actor["repository_id"] = task.get("repository_id")
     actor["repository_binding_sha256"] = task.get(
@@ -5216,6 +5726,7 @@ def command_dispatch(args: Any) -> None:
                 json.dumps(execution_identity, ensure_ascii=False, allow_nan=False)
             ),
             "profile_binding": profile_binding,
+            "execution_mode": execution_mode,
             "status": "launch_pending" if deferred_start else "running" if args.start else "dispatched",
             "started_at": None if deferred_start else now_iso() if args.start else None,
             "finished_at": None,
@@ -5596,6 +6107,10 @@ def execute_scheduler_command(
             max_cost_cny=command_args.get("max_cost_cny"),
             required_capabilities=as_list(command_args.get("required_capabilities")),
             input_images=as_list(command_args.get("input_images")),
+            input_audio=as_list(command_args.get("input_audio")),
+            input_video=as_list(command_args.get("input_video")),
+            input_documents=as_list(command_args.get("input_documents")),
+            execution_mode=str(command_args.get("execution_mode") or "auto"),
             min_success_probability=command_args.get("min_success_probability"),
             routing_objective=command_args.get("routing_objective"),
             acceptance=as_list(command_args.get("acceptance")),
@@ -6467,7 +6982,7 @@ def command_escalate(args: Any) -> None:
             raise SystemExit(
                 f"Sealed required escalation handoff is invalid: {exc}"
             ) from exc
-    project = load_project(layout)
+    project, _ = _load_effective_routing_project(layout)
     try:
         catalog = project_provider_catalog(project)
         current_provider = str(attempts[-1].get("provider") or task.get("provider") or "")
@@ -12999,10 +13514,14 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
         workstream_registry = empty_workstream_registry()
         issues.append(f"invalid workstream registry: {exc}")
     try:
+        project, _provider_statuses = project_with_effective_provider_catalog(
+            layout,
+            project,
+        )
         catalog = project_provider_catalog(project)
-    except RoutingValidationError as exc:
+    except (ProviderGovernanceError, RoutingValidationError) as exc:
         catalog = None
-        issues.append(f"invalid provider catalog: {exc}")
+        issues.append(f"invalid provider metadata/catalog: {exc}")
     governance = project.get("governance")
     if governance is not None:
         if not isinstance(governance, dict) or governance.get("mode") not in {"off", "auto", "required"}:
@@ -13181,6 +13700,7 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
             except GateError as exc:
                 issues.append(f"{task['id']} has invalid gates: {exc}")
         repository_id = task.get("repository_id")
+        validation_project: dict[str, Any] | None = None
         if repository_id is not None:
             repository = repository_registry["repositories"].get(
                 str(repository_id)
@@ -13193,6 +13713,110 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
                 "binding_sha256"
             ):
                 issues.append(f"{task['id']} repository binding has drifted")
+            else:
+                validation_project = _project_for_repository(
+                    project,
+                    repository,
+                    repository_registry,
+                )
+        if validation_project is None and repository_id is None:
+            validation_project = project
+        raw_attachments = task.get("input_attachments")
+        if raw_attachments is not None:
+            if not isinstance(raw_attachments, list):
+                issues.append(f"{task['id']} input_attachments must be a list")
+            elif validation_project is not None:
+                raw_by_modality: dict[str, list[object]] = {
+                    modality: []
+                    for modality in ("image", "audio", "video", "document")
+                }
+                malformed = False
+                for attachment in raw_attachments:
+                    if (
+                        not isinstance(attachment, dict)
+                        or attachment.get("modality") not in raw_by_modality
+                        or not isinstance(attachment.get("path"), str)
+                    ):
+                        malformed = True
+                        break
+                    raw_by_modality[str(attachment["modality"])].append(
+                        attachment["path"]
+                    )
+                if malformed:
+                    issues.append(f"{task['id']} input attachment ledger is malformed")
+                else:
+                    frozen_base = (
+                        (task.get("collaboration_contract") or {}).get("base_sha")
+                        if isinstance(task.get("collaboration_contract"), dict)
+                        else "HEAD"
+                    )
+                    try:
+                        observed_attachments = list(
+                            _validated_input_attachments(
+                                validation_project,
+                                raw_by_modality,
+                                revision=str(frozen_base or "HEAD"),
+                            )
+                        )
+                        if observed_attachments != raw_attachments:
+                            issues.append(
+                                f"{task['id']} input attachment receipts drifted"
+                            )
+                    except SecurityValidationError as exc:
+                        issues.append(
+                            f"{task['id']} input attachments are invalid: {exc}"
+                        )
+            execution_mode = str(task.get("execution_mode") or "agent")
+            attachment_modalities = {
+                str(item.get("modality"))
+                for item in raw_attachments
+                if isinstance(item, dict)
+            }
+            required_capabilities = set(
+                task.get("required_capabilities") or []
+            )
+            missing_capabilities = sorted(
+                f"input:{modality}"
+                for modality in attachment_modalities
+                if f"input:{modality}" not in required_capabilities
+            )
+            if missing_capabilities:
+                issues.append(
+                    f"{task['id']} input attachments lack routing capabilities: "
+                    + ", ".join(missing_capabilities)
+                )
+            if (
+                execution_mode == "agent"
+                and attachment_modalities - {"image"}
+            ):
+                issues.append(
+                    f"{task['id']} agent execution cannot transport non-image attachments"
+                )
+            if execution_mode not in {"agent", "multimodal-api"}:
+                issues.append(f"{task['id']} execution_mode is invalid")
+            if execution_mode == "multimodal-api" and catalog is not None:
+                provider_id = str(
+                    (
+                        task.get("provider")
+                        if task.get("provider") not in {None, "", "auto"}
+                        else (task.get("route_preview") or {}).get("provider_id")
+                    )
+                    or ""
+                )
+                try:
+                    provider_spec = provider_by_id(catalog, provider_id)
+                    if (
+                        provider_spec.get("runtime_adapter")
+                        != "costmarshal-gateway-v1"
+                    ):
+                        issues.append(
+                            f"{task['id']} multimodal-api route is not bound "
+                            "to costmarshal-gateway-v1"
+                        )
+                except RoutingValidationError as exc:
+                    issues.append(
+                        f"{task['id']} multimodal-api route is invalid: {exc}"
+                    )
         workstream_id = task.get("workstream_id")
         if workstream_id is not None:
             stream = workstream_registry["workstreams"].get(str(workstream_id))
@@ -14049,6 +14673,8 @@ for _command_name in (
     "command_create_integration_plan",
     "command_integration_gate",
     "command_configure_production_boundary",
+    "command_record_provider_observation",
+    "command_review_provider_metadata",
     "command_policy_transition",
     "command_governance_rebind",
     "command_recover",

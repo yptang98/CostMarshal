@@ -255,6 +255,70 @@ class ProductionActorGatewayContractTest(unittest.TestCase):
         self.assertNotIn(LEASE_TOKEN, serialized)
         self.assertNotIn(RAW_PROVIDER_SECRET, serialized)
 
+    def test_multimodal_api_worker_receives_only_bound_container_attachments(self) -> None:
+        media = self.execution_workspace / "sample.wav"
+        media.write_bytes(b"RIFF" + b"\x00" * 64)
+        payload = media.read_bytes()
+        task = load_task(self.layout, "V2-0001")
+        task["execution_mode"] = "multimodal-api"
+        task["required_capabilities"] = ["input:text", "input:audio"]
+        task["input_attachments"] = [
+            {
+                "schema_version": "costmarshal-input-attachment-v1",
+                "modality": "audio",
+                "path": "sample.wav",
+                "media_type": "audio/wav",
+                "size_bytes": len(payload),
+                "sha256": "sha256:" + hashlib.sha256(payload).hexdigest(),
+                "git_object": "e" * 40,
+            }
+        ]
+        save_task(self.layout, task)
+        self.actor["execution_mode"] = "multimodal-api"
+        save_actor(self.layout, self.actor)
+        lease = {
+            "schema_version": "costmarshal-provider-lease-v1",
+            "lease_token": LEASE_TOKEN,
+            "token_type": "Bearer",
+            "expires_at": 2_000_000_000,
+            "lease_id": "LSE-fixture-00000002",
+            "provider": "longcat",
+            "model": "LongCat-2.0",
+            "budget_nano_cny": 1_000_000_000,
+            "replayed": False,
+        }
+        environment = {
+            "COSTMARSHAL_BROKER_CLIENT_CERT_FILE": str(self.cert),
+            "COSTMARSHAL_BROKER_CLIENT_KEY_FILE": str(self.key),
+            "COSTMARSHAL_BROKER_CA_FILE": str(self.ca),
+        }
+        with patch.dict(os.environ, environment, clear=False), patch(
+            "costmarshal_v2.actor_runner.request_provider_lease",
+            return_value=lease,
+        ):
+            _, command, _ = _required_worker_bundle(
+                self.layout,
+                self.project,
+                self.actor,
+                execution_workspace=self.execution_workspace,
+                workspace_mode="read-only",
+            )
+        self.assertEqual(
+            command,
+            [
+                "costmarshal-worker",
+                "--jsonl",
+                "--mode",
+                "multimodal-api",
+                "--model",
+                "LongCat-2.0",
+                "--max-output-tokens",
+                "10000",
+                "--audio",
+                "/workspace/sample.wav",
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

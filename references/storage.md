@@ -1,4 +1,4 @@
-# CostMarshal v4.2 Storage
+# CostMarshal v4.3 Storage
 
 The runtime root defaults to `$COSTMARSHAL_V2_HOME`, then `$CODEX_HOME/costmarshal-v2`, then `~/.codex/costmarshal-v2`.
 
@@ -19,6 +19,7 @@ The runtime root defaults to `$COSTMARSHAL_V2_HOME`, then `$CODEX_HOME/costmarsh
       repositories.json
       workstreams.json
       production-boundary.json
+      provider-metadata.json
       actors/
       mailboxes/
       state.db
@@ -48,6 +49,7 @@ The runtime root defaults to `$COSTMARSHAL_V2_HOME`, then `$CODEX_HOME/costmarsh
       cost-reports.jsonl
       integration-plans.jsonl
       integration-gates.jsonl
+      provider-observations.jsonl
     knowledge/
     summaries/
     skill-candidates/
@@ -62,7 +64,8 @@ Before explicit cutover, the JSON/JSONL files below are the legacy sources of tr
 
 - `project.json`: provider catalog, routing/budget policy, workspace, and governance binding.
 - `task.json`: task and attempt state, route decisions, required capabilities,
-  immutable image-input paths, reservations, actual cost, and leader result.
+  immutable multimodal attachment receipts, execution mode, reservations,
+  actual cost, and leader result.
 - actor JSON: runtime identity and process metadata.
 - `results.jsonl`: immutable leader judgments used by routing history.
 - `work-graph.json`: dependency, role, readiness, and accepted-join state.
@@ -85,6 +88,10 @@ Before explicit cutover, the JSON/JSONL files below are the legacy sources of tr
   repository heads, and real rollback commits.
 - `integration-gates.jsonl`: Leader decisions over the frozen plan. Only a
   hash-valid passed Gate unlocks a dependent Workstream.
+- `provider-observations.jsonl`: immutable, bounded schema/pricing/capability/
+  behavior observations. These rows can only restrict routing.
+- `scheduler/provider-metadata.json`: expiring human-reviewed provider
+  overrides bound to observation IDs and canonical provider-row hashes.
 - `retrospectives.jsonl` and `policy-candidates.jsonl`: project summaries and staged, non-activating learning proposals.
 - `usage.jsonl`: immutable usage deltas.
 - `scheduler/events.jsonl`: audit events and completed scheduler command IDs.

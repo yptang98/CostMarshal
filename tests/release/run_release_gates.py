@@ -98,6 +98,7 @@ REQUIRED_LOCAL_TESTS = (
     "tests/archmarshal_compat_test.py",
     "tests/profile_config_test.py",
     "tests/provider_capability_contract_test.py",
+    "tests/provider_metadata_lifecycle_test.py",
     "tests/concurrency_contract_test.py",
     "tests/ci_contract_test.py",
     "scripts/install_smoke_test.py",

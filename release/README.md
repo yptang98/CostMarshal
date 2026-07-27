@@ -22,7 +22,7 @@ response reached from the worker through that proxy. Any policy update is a norm
 variables can locate local artifacts but cannot override these values.
 
 Release evidence and deployment certification are related but distinct.
-`evidence-policy.json` governs the source release gate. A deployed v4.2 project
+`evidence-policy.json` governs the source release gate. A deployed v4.3 project
 also stores a v3 production boundary with its own reviewed `allowed_signers`
 SHA-256, signer identities, exact commit/release, and gateway image digest. The
 external reviewer signs the canonical, short-lived

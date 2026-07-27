@@ -64,6 +64,10 @@ class ProjectLayout:
         return self.scheduler_dir / "production-boundary.json"
 
     @property
+    def provider_metadata_json(self) -> Path:
+        return self.scheduler_dir / "provider-metadata.json"
+
+    @property
     def actors_dir(self) -> Path:
         return self.scheduler_dir / "actors"
 
@@ -154,6 +158,10 @@ class ProjectLayout:
     @property
     def integration_gates_jsonl(self) -> Path:
         return self.reports_dir / "integration-gates.jsonl"
+
+    @property
+    def provider_observations_jsonl(self) -> Path:
+        return self.reports_dir / "provider-observations.jsonl"
 
     @property
     def transcripts_dir(self) -> Path:

@@ -50,9 +50,11 @@ from .scheduler import (
     command_integration_gate,
     command_policy_status,
     command_policy_transition,
+    command_provider_metadata_status,
     command_providers,
     command_preview_changes,
     command_record_leader_work,
+    command_record_provider_observation,
     command_record_decision,
     command_record_result,
     command_record_teaching_run,
@@ -65,6 +67,7 @@ from .scheduler import (
     command_record_usage,
     command_recover,
     command_relay,
+    command_review_provider_metadata,
     command_route,
     command_run_scheduler,
     command_send,
@@ -170,6 +173,70 @@ def build_parser() -> argparse.ArgumentParser:
     configure_provider.add_argument("--force", action="store_true")
     configure_provider.add_argument("--dry-run", action="store_true")
     configure_provider.set_defaults(func=command_configure_provider)
+
+    provider_observation = sub.add_parser(
+        "record-provider-observation",
+        help="Preview or record a bounded API/pricing/capability/behavior probe",
+    )
+    provider_observation.add_argument("--project", required=True)
+    provider_observation.add_argument("--provider", required=True)
+    provider_observation.add_argument("--observed-at")
+    provider_observation.add_argument(
+        "--source",
+        required=True,
+        help="Secret-free HTTPS or urn:costmarshal provenance reference",
+    )
+    provider_observation.add_argument(
+        "--evidence-sha256",
+        required=True,
+        help="SHA-256 of the external probe/report bytes",
+    )
+    for check_name in ("api-schema", "pricing", "capabilities", "behavior"):
+        provider_observation.add_argument(
+            f"--{check_name}",
+            dest=check_name.replace("-", "_"),
+            required=True,
+            choices=["match", "drift", "unknown", "not-applicable"],
+        )
+    provider_observation.add_argument("--apply", action="store_true")
+    _add_command_id(provider_observation)
+    provider_observation.set_defaults(func=command_record_provider_observation)
+
+    review_provider = sub.add_parser(
+        "review-provider-metadata",
+        help="Preview or install one expiring, human-reviewed provider catalog row",
+    )
+    review_provider.add_argument("--project", required=True)
+    review_provider.add_argument("--provider", required=True)
+    review_provider.add_argument(
+        "--catalog",
+        type=Path,
+        required=True,
+        help="Reviewed complete provider catalog JSON containing the selected row",
+    )
+    review_provider.add_argument(
+        "--observation",
+        action="append",
+        required=True,
+        help="Bound provider observation id; repeat as needed",
+    )
+    review_provider.add_argument("--approved-by", required=True)
+    review_provider.add_argument(
+        "--expires-at",
+        required=True,
+        help="RFC3339 expiry, at most 90 days after review",
+    )
+    review_provider.add_argument("--apply", action="store_true")
+    _add_command_id(review_provider)
+    review_provider.set_defaults(func=command_review_provider_metadata)
+
+    provider_metadata_status = sub.add_parser(
+        "provider-metadata-status",
+        help="Show reviewed overrides, drift confidence, and effective routing rows",
+    )
+    provider_metadata_status.add_argument("--project", required=True)
+    provider_metadata_status.add_argument("--provider")
+    provider_metadata_status.set_defaults(func=command_provider_metadata_status)
 
     init = sub.add_parser("init", help="Create a v4 project without touching compatible legacy state")
     init.add_argument("--name", default="")
@@ -305,6 +372,30 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         dest="input_images",
         help="Tracked workspace-relative image to attach; repeat for multiple images",
+    )
+    new_task.add_argument(
+        "--input-audio",
+        action="append",
+        dest="input_audio",
+        help="Tracked workspace-relative audio file for multimodal-api execution",
+    )
+    new_task.add_argument(
+        "--input-video",
+        action="append",
+        dest="input_video",
+        help="Tracked workspace-relative video file for native Responses multimodal-api execution",
+    )
+    new_task.add_argument(
+        "--input-document",
+        action="append",
+        dest="input_documents",
+        help="Tracked workspace-relative document for native Responses multimodal-api execution",
+    )
+    new_task.add_argument(
+        "--execution-mode",
+        choices=["auto", "agent", "multimodal-api"],
+        default="auto",
+        help="Auto selects multimodal-api for audio/video/document input and agent otherwise",
     )
     new_task.add_argument("--min-success-probability", type=float)
     new_task.add_argument(
@@ -924,7 +1015,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     production_boundary.add_argument(
         "--release-version",
-        help="Exact CostMarshal release version, for example v4.2.0",
+        help="Exact CostMarshal release version, for example v4.3.0",
     )
     production_boundary.add_argument(
         "--gateway-image",

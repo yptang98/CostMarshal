@@ -39,8 +39,9 @@ class ProductionDeploymentContractTest(unittest.TestCase):
         self.assertIn("internal: true", compose)
         broker, proxy = compose.split("  provider-proxy:", 1)
         proxy_service = proxy.split("\nnetworks:\n", 1)[0]
-        self.assertNotIn("longcat_api_key", broker)
-        self.assertIn("longcat_api_key", proxy_service)
+        self.assertNotIn("/run/provider-credentials", broker)
+        self.assertIn("/run/provider-credentials:ro", proxy_service)
+        self.assertIn("COSTMARSHAL_PROVIDER_CREDENTIALS_DIR", proxy_service)
         self.assertNotIn("workload_client_ca", proxy_service)
         self.assertNotRegex(compose, r"(?i)(api[_-]?key|secret)\s*:\s*[\"']?[A-Za-z0-9_-]{16,}")
 
@@ -107,6 +108,22 @@ class ProductionDeploymentContractTest(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertRegex(result["policy_sha256"], r"^sha256:[0-9a-f]{64}$")
         self.assertEqual(result["providers"], ["longcat"])
+
+    def test_deployment_entrypoint_is_preview_first_and_secret_safe(self) -> None:
+        script = (
+            ROOT / "scripts" / "costmarshal_production_deploy.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"--apply"', script)
+        self.assertIn('"status": "ready-to-deploy"', script)
+        self.assertIn('receipt["status"] = "deployed"', script)
+        self.assertIn('"status": "blocked"', script)
+        self.assertIn('"config", "--quiet"', script)
+        self.assertIn('"up",', script)
+        self.assertIn('"--wait"', script)
+        self.assertIn("source checkout is dirty", script)
+        self.assertIn("credential_present", script)
+        self.assertNotIn("credential_sha256", script)
+        self.assertNotIn("LONGCAT_API_KEY", script)
 
 
 if __name__ == "__main__":

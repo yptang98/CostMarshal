@@ -139,13 +139,17 @@ def main() -> int:
         layout = ProjectLayout(root=temp / "runtime", project_dir=project_dir)
         task = load_task(layout, "V2-0001")
         assert task["input_images"] == ["assets/reference.png"]
+        assert task["input_attachments"][0]["modality"] == "image"
+        assert task["input_attachments"][0]["path"] == "assets/reference.png"
+        assert task["input_attachments"][0]["sha256"].startswith("sha256:")
+        assert task["execution_mode"] == "agent"
         assert task["allowed_context"] == ["assets/reference.png"]
         assert "input:image" in task["required_capabilities"]
         assert task["route_preview"]["provider_id"] == "mimo"
         brief = (project_dir / "tasks" / "V2-0001" / "brief.md").read_text(
             encoding="utf-8"
         )
-        assert "## Input Images" in brief
+        assert "## Input Attachments" in brief
         assert "assets/reference.png" in brief
 
         actor = {
@@ -184,6 +188,105 @@ def main() -> int:
             ok=False,
         )
         assert "committed HEAD" in rejected.stderr
+        untracked.unlink()
+
+        audio = assets / "sample.wav"
+        video = assets / "sample.mp4"
+        audio.write_bytes(b"RIFF" + b"\x00" * 64)
+        video.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 64)
+        subprocess.run(["git", "-C", str(workspace), "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", str(workspace), "commit", "-qm", "media fixtures"],
+            check=True,
+        )
+        gateway_catalog = {
+            "schema_version": 1,
+            "providers": [
+                resolve_provider_preset("mimo-v2.5").catalog_provider(
+                    tier="medium",
+                    profile="mimo-gateway",
+                    via_production_gateway=True,
+                )
+            ],
+        }
+        gateway_catalog_path = temp / "gateway-providers.json"
+        gateway_catalog_path.write_text(
+            json.dumps(gateway_catalog, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        gateway_init = json.loads(
+            run(
+                temp,
+                "init",
+                "--name",
+                "multimodal-gateway",
+                "--objective",
+                "route immutable audio and video through the production gateway",
+                "--workspace",
+                str(workspace),
+                "--provider-catalog",
+                str(gateway_catalog_path),
+                "--routing-objective",
+                "cost-only",
+                "--backend",
+                "local",
+                "--governance",
+                "off",
+                "--worker-image",
+                "ghcr.io/example/costmarshal-worker@sha256:" + "7" * 64,
+            ).stdout
+        )
+        gateway_project = Path(gateway_init["project"])
+        media_created = json.loads(
+            run(
+                temp,
+                "new-task",
+                "--project",
+                str(gateway_project),
+                "--title",
+                "Inspect media",
+                "--purpose",
+                "Verify direct multimodal Responses transport",
+                "--input-audio",
+                "assets/sample.wav",
+                "--input-video",
+                "assets/sample.mp4",
+                "--estimated-input-tokens",
+                "256",
+                "--estimated-output-tokens",
+                "64",
+            ).stdout
+        )
+        media_layout = ProjectLayout(
+            root=temp / "runtime",
+            project_dir=gateway_project,
+        )
+        media_task = load_task(media_layout, media_created["task_id"])
+        assert media_task["execution_mode"] == "multimodal-api"
+        assert {
+            row["modality"] for row in media_task["input_attachments"]
+        } == {"audio", "video"}
+        assert {"input:audio", "input:video"}.issubset(
+            set(media_task["required_capabilities"])
+        )
+        assert media_task["route_preview"]["provider_id"] == "mimo"
+
+        rejected_agent_media = run(
+            temp,
+            "new-task",
+            "--project",
+            str(gateway_project),
+            "--title",
+            "Reject fake agent media",
+            "--purpose",
+            "Do not claim Codex CLI audio support",
+            "--input-audio",
+            "assets/sample.wav",
+            "--execution-mode",
+            "agent",
+            ok=False,
+        )
+        assert "requires --execution-mode multimodal-api" in rejected_agent_media.stderr
 
     print("provider capability contract ok")
     return 0

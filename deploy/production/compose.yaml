@@ -68,11 +68,11 @@ services:
       - ./gateway-policy.json:/etc/costmarshal/gateway-policy.json:ro
       - ${COSTMARSHAL_GATEWAY_STATE_DIR:?set pre-created uid-65532 state directory}:/var/lib/costmarshal
       - ${COSTMARSHAL_GATEWAY_AUDIT_DIR:?set pre-created uid-65532 audit directory}:/var/log/costmarshal
+      - ${COSTMARSHAL_PROVIDER_CREDENTIALS_DIR:?set provider credential directory}:/run/provider-credentials:ro
     secrets:
       - lease_signing_key
       - proxy_tls_cert
       - proxy_tls_key
-      - longcat_api_key
     networks:
       - provider-proxy
       - provider-egress
@@ -98,5 +98,3 @@ secrets:
     file: ${COSTMARSHAL_PROXY_TLS_CERT_FILE:?set proxy TLS certificate}
   proxy_tls_key:
     file: ${COSTMARSHAL_PROXY_TLS_KEY_FILE:?set proxy TLS key}
-  longcat_api_key:
-    file: ${LONGCAT_API_KEY_FILE:?set LongCat key file}

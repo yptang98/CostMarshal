@@ -7,9 +7,9 @@ Report suspected vulnerabilities through a private GitHub security advisory for
 private prompts, or customer data in a public issue. Revoke an exposed provider
 credential before collecting diagnostics.
 
-## v4.2 trust boundaries
+## v4.3 trust boundaries
 
-CostMarshal v4.2's OCI controls isolate worker processes from
+CostMarshal v4.3's OCI controls isolate worker processes from
 the host workspace, other provider credentials, mutable profiles, and scheduler
 authority. They do not make the selected provider client hostile-safe.
 
@@ -47,6 +47,19 @@ days, rejects expired/future claims, and matches the commit, release, boundary,
 gateway policy, Worker/gateway image digests, and five accepted
 `production-evidence` report receipts. Private signing keys remain external and
 are never read by CostMarshal.
+
+Non-image inputs never enter the native Codex Agent path. The report-only
+`multimodal-api` path requires strong OCI isolation and the certified gateway,
+binds each attachment to a committed Git object and SHA-256, rejects write
+scope and tools, caps aggregate attachments and encoded request bytes, and
+requires authoritative usage plus Proxy settlement. Provider-specific
+interpretation of audio/video/document payloads is still certified by live
+schema and behavior evidence, not assumed from the generic adapter.
+
+Provider probes are safety-only authority: drift disables a route and unknown
+dimensions reduce its priority. They cannot add capabilities, lower reviewed
+prices, or re-enable a provider. Recovery requires an explicit human-reviewed
+row with bounded validity and all unresolved drift evidence attached.
 
 Native worker mode is development compatibility only and is not a host security
 boundary. ArchMarshal integration is read-only governance checking and does not

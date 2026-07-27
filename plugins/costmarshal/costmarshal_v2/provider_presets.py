@@ -33,10 +33,10 @@ CAPABILITY_DESCRIPTIONS = {
     "web-search": "Offers a provider-side web-search tool.",
 }
 
-# The current worker sends text, optional local images, tool definitions, and
-# structured text output through Codex.  Audio/video/document attachment
-# transport is deliberately excluded until each is bound into the immutable
-# task and worker protocols.  Web search is excluded because generated profiles
+# Agent mode sends text, optional local images, tool definitions, and structured
+# output through Codex.  The separate report-only multimodal-api mode can send
+# immutable audio/video/document inputs only through a gateway-bound native
+# Responses provider. Web search remains excluded because generated profiles
 # explicitly disable it.
 RUNTIME_CAPABILITIES = frozenset(
     {
@@ -65,6 +65,14 @@ CHAT_GATEWAY_CAPABILITIES = frozenset(
         "context-caching",
         "long-context",
         "code",
+    }
+)
+MULTIMODAL_API_CAPABILITIES = frozenset(
+    {
+        *RUNTIME_CAPABILITIES,
+        "input:audio",
+        "input:video",
+        "input:document",
     }
 )
 NON_TEXT_INPUT_CAPABILITIES = frozenset(
@@ -110,7 +118,7 @@ class ProviderPreset:
         if not self.gateway_compatible:
             return ()
         supported = (
-            RUNTIME_CAPABILITIES
+            MULTIMODAL_API_CAPABILITIES
             if self.wire_api == "responses"
             else CHAT_GATEWAY_CAPABILITIES
         )
@@ -378,7 +386,7 @@ PROVIDER_PRESETS: dict[str, ProviderPreset] = {
             "web-search",
         ),
         docs_url="https://mimo.mi.com/docs/en-US/api/chat/responses",
-        note="Native full-modal model; CostMarshal currently transports text and images only.",
+        note="Native full-modal model; gateway-bound multimodal-api mode can transport reviewed image, audio, and video capabilities.",
     ),
     "mimo-v2.5-pro": ProviderPreset(
         preset_id="mimo-v2.5-pro",
@@ -473,6 +481,10 @@ def provider_presets_payload(preset: str | None = None) -> dict[str, Any]:
             "worker_wire_api": "responses",
             "upstream_wire_apis": ["responses", "chat-completions"],
             "chat_capabilities": sorted(CHAT_GATEWAY_CAPABILITIES),
+            "native_responses_capabilities": sorted(
+                MULTIMODAL_API_CAPABILITIES
+            ),
+            "non_image_mode": "report-only-multimodal-api",
             "routing_rule": "gateway capabilities are the API/adapter/runtime intersection",
         },
         "capability_vocabulary": dict(sorted(CAPABILITY_DESCRIPTIONS.items())),
@@ -485,6 +497,7 @@ __all__ = [
     "CAPABILITY_DESCRIPTIONS",
     "CHAT_GATEWAY_CAPABILITIES",
     "NON_TEXT_INPUT_CAPABILITIES",
+    "MULTIMODAL_API_CAPABILITIES",
     "PRESET_ALIASES",
     "PROVIDER_PRESETS",
     "ProviderPreset",

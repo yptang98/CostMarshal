@@ -3,7 +3,13 @@
 This image is the trusted bootstrap for `worker_isolation.mode=required`. It contains two fixed commands:
 
 - `costmarshal-isolation-canary --json` proves the non-root, read-only-rootfs, capability, mount, and engine-socket boundary before dispatch.
-- `costmarshal-worker --jsonl [--model MODEL]` accepts the bounded task prompt on stdin, runs `codex exec --json`, and writes only `/out/final.md`.
+- `costmarshal-worker --jsonl [--model MODEL]` accepts the bounded task prompt
+  on stdin, runs `codex exec --json`, and writes only `/out/final.md`.
+- `costmarshal-worker --jsonl --mode multimodal-api
+  --max-output-tokens N [--image/--audio/--video/--document PATH]` is a
+  report-only path for a gateway-bound native Responses provider. It cannot
+  write the workspace or invoke tools, limits aggregate attachments to 2 MiB,
+  and requires authoritative usage plus a settled hard-budget Proxy response.
 - `costmarshal-escape-probe` is a test-only hostile workload used by the full
   source checkout's `tests/oci_live_evidence.py`; normal dispatch never selects
   it and the installed runtime snapshot does not ship that maintainer harness.

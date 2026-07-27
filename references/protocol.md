@@ -1,4 +1,4 @@
-# CostMarshal v4.2 Protocol
+# CostMarshal v4.3 Protocol
 
 This is the canonical v2 protocol. Legacy `scripts/mc.py` commands are not part of it.
 
@@ -97,11 +97,14 @@ Safety establishes a minimum tier. Complete, reviewed price and token inputs ena
 
 Required capabilities are hard constraints evaluated before price or acceptance
 history. Built-in provider presets publish only the intersection of documented
-API capability and worker transport capability. `--input-image` accepts a
-committed workspace-relative image, adds it to allowed context, and adds
-`input:image`; the scheduler rejects text-only routes before provider launch.
-Audio/video/document API support is informational until the worker protocol can
-bind and transport that modality end to end.
+API capability and the selected transport. `--input-image`, `--input-audio`,
+`--input-video`, and `--input-document` accept committed workspace-relative
+files, add exact modality capabilities, and bind path/media type/size/SHA/Git
+object receipts into the collaboration contract. Agent mode remains
+image-only. Any non-image input selects report-only `multimodal-api`, which
+requires strong OCI isolation, a gateway-bound native Responses provider,
+bounded attachments and output tokens, no write scope, and authoritative Proxy
+settlement.
 
 Each route step binds its own ordinary/cached/output forecast. Cached input is portable only with a proven exact provider/model/profile/profile-hash origin; a missing origin or different successor identity reclassifies it as ordinary input. Route-plan v2, budget-envelope v3, and collaboration-contract v2 bind this forecast. Missing usage cannot settle a reservation, while an explicit all-zero final observation can settle the immutable per-attempt fixed fee.
 
@@ -113,6 +116,14 @@ gates pass, quality is at least three, and error severity is at most one.
 Audited sibling-project evidence under the same runtime root may contribute to
 the prior; invalid peer evidence is skipped and never weakens the active
 project's audit.
+
+Provider metadata observations are a separate safety overlay. Schema, pricing,
+capability, and behavior probes are immutable ledger rows bound to the exact
+provider configuration they observed. Drift disables the provider and unknown
+dimensions de-prioritize it. Observations cannot add capabilities, lower
+prices, or restore routing; only an explicit, expiring human review can install
+a normalized replacement row, and every unresolved observation since the
+preceding review must be bound into that review.
 
 ## Evolution and teaching
 

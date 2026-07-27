@@ -1,5 +1,17 @@
 # CostMarshal v3/v4 Migration
 
+## v4.3 multimodal and Provider metadata
+
+v4.3 remains read-compatible with tasks that have only `input_images`. New
+tasks store `input_attachments` receipts and an explicit execution mode.
+Audio/video/document inputs require the report-only gateway path and never fall
+back to Agent mode.
+
+New projects initialize `scheduler/provider-metadata.json` and
+`reports/provider-observations.jsonl`. Existing projects may omit both until
+their first Provider metadata operation; missing files retain the reviewed
+project catalog as the baseline and do not fabricate probe evidence.
+
 ## v4.2 signed production certification
 
 v4.2 reads v1/v2 production-boundary documents but they remain blocked for

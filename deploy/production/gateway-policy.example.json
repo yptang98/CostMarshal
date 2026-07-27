@@ -7,7 +7,7 @@
   "providers": {
     "longcat": {
       "base_url": "https://api.longcat.chat/openai/v1",
-      "credential_file": "/run/secrets/longcat_api_key",
+      "credential_file": "/run/provider-credentials/longcat",
       "auth_header": "Authorization",
       "auth_scheme": "Bearer",
       "wire_api": "responses",

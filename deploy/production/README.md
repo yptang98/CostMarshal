@@ -17,7 +17,8 @@ Keep all material outside the repository:
 - broker and proxy TLS certificates and private keys;
 - a client CA plus an mTLS worker certificate containing exactly one SPIFFE
   URI SAN matching the policy;
-- one least-privilege, spend-capped provider-key file per enabled provider; and
+- one least-privilege, spend-capped provider-key file per enabled provider,
+  stored as a direct child of a Proxy-only credential directory; and
 - a digest-pinned gateway image built from
   [`container/gateway/Dockerfile`](../../container/gateway/Dockerfile);
 - an external Ed25519 production-certification signing key; and
@@ -55,12 +56,23 @@ client private key. The Worker receives only the short-lived lease token.
    modalities verified for the exact deployed endpoint.
 2. Build and publish the gateway image from a digest-pinned Python base image.
 3. Export the file-path variables required by `compose.yaml`; never put secret
-   contents in the Compose file or project state. Pre-create the state and
-   audit directories owned by uid/gid `65532`; the services run read-only and
-   non-root and will not repair unsafe host permissions.
-4. Set `COSTMARSHAL_GATEWAY_IMAGE` to the published image digest and run:
+   contents in the Compose file or project state. Set
+   `COSTMARSHAL_PROVIDER_CREDENTIALS_DIR` to a non-symlink directory containing
+   the exact credential basenames referenced as
+   `/run/provider-credentials/<name>` in policy. Only the Proxy mounts this
+   directory. Pre-create the state and audit directories owned by uid/gid
+   `65532`; the services run read-only and non-root and will not repair unsafe
+   host permissions.
+4. Set `COSTMARSHAL_GATEWAY_IMAGE` to the published image digest. Run the
+   read-only preflight first; it validates the clean release commit, policy,
+   image digest, Docker/Compose, secret file bounds, credential mapping, and
+   directory ownership without printing secret contents:
 
-   `docker compose -f deploy/production/compose.yaml up -d`
+   `python scripts/costmarshal_production_deploy.py --output artifacts/deployment-preflight.json`
+
+   After reviewing the receipt, explicitly deploy:
+
+   `python scripts/costmarshal_production_deploy.py --apply --output artifacts/deployment-preflight.json`
 
 5. Restrict the broker bind address to the scheduler host. Attach only managed
    Worker containers to the internal `costmarshal-provider-proxy` network.
@@ -71,7 +83,7 @@ client private key. The Worker receives only the short-lived lease token.
    certification bindings:
 
    - `--deployment-commit <40-hex>`
-   - `--release-version v4.2.0`
+   - `--release-version v4.3.0`
    - `--gateway-image name@sha256:<64-hex>`
    - `--allowed-signers-sha256 sha256:<64-hex>`
    - `--signer-identity <reviewed-identity>` (repeatable)

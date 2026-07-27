@@ -211,6 +211,17 @@ def ensure_runtime_dirs(layout: ProjectLayout) -> None:
         layout.integration_plans_jsonl.touch()
     if not layout.integration_gates_jsonl.exists():
         layout.integration_gates_jsonl.touch()
+    if not layout.provider_observations_jsonl.exists():
+        layout.provider_observations_jsonl.touch()
+    if not layout.provider_metadata_json.exists():
+        atomic_write_json(
+            layout.provider_metadata_json,
+            {
+                "schema_version": "costmarshal-provider-metadata-v1",
+                "revision": 0,
+                "providers": {},
+            },
+        )
     if not layout.work_graph_json.exists():
         atomic_write_json(
             layout.work_graph_json,
