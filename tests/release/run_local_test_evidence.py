@@ -26,6 +26,27 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def github_command_escape(value: object) -> str:
+    return (
+        str(value)
+        .replace("%", "%25")
+        .replace("\r", "%0D")
+        .replace("\n", "%0A")
+    )
+
+
+def emit_github_failure_annotation(relative: str, output_tail: str) -> None:
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    detail = output_tail.strip() or "test exited without diagnostic output"
+    print(
+        "::error file="
+        + github_command_escape(relative)
+        + "::"
+        + github_command_escape(detail)
+    )
+
+
 def _create_windows_kill_job(process: subprocess.Popen[bytes]) -> int | None:
     if os.name != "nt":
         return None
@@ -244,6 +265,7 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
             if returncode != 0:
+                emit_github_failure_annotation(relative, output_tail)
                 break
 
     passed = sum(row["returncode"] == 0 for row in results)

@@ -40,6 +40,12 @@ from runtime_evidence_contract import (  # noqa: E402
 
 
 class ReleaseGateTest(unittest.TestCase):
+    def test_local_evidence_github_annotation_escapes_control_characters(self) -> None:
+        self.assertEqual(
+            local_evidence.github_command_escape("failure 100%\r\nnext"),
+            "failure 100%25%0D%0Anext",
+        )
+
     def test_local_evidence_timeout_terminates_descendant_pipe_holders(self) -> None:
         child = (
             "import subprocess,sys,time; "
