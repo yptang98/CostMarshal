@@ -14,13 +14,19 @@ This image is the trusted bootstrap for `worker_isolation.mode=required`. It con
   source checkout's `tests/oci_live_evidence.py`; normal dispatch never selects
   it and the installed runtime snapshot does not ship that maintainer harness.
 
-Builds are intentionally fail-closed unless both the base image digest and Codex CLI version are explicit. A production build must be pushed to a reviewed registry so it receives a repository digest:
+Builds are intentionally fail-closed unless the base image digest, Codex CLI
+version, and top-level npm integrity match the reviewed build inputs. The
+committed `package-lock.json` additionally pins the platform binary and every
+optional package tarball; installation uses `npm ci --ignore-scripts`. A
+production build must be pushed to a reviewed registry so it receives a
+repository digest:
 
 ```powershell
 docker buildx build container/worker `
   --platform linux/amd64 `
   --build-arg NODE_BASE_IMAGE=node@sha256:<reviewed-linux-image-digest> `
   --build-arg CODEX_NPM_VERSION=<reviewed-version> `
+  --build-arg CODEX_NPM_INTEGRITY=<reviewed-sha512-integrity> `
   --tag registry.example/costmarshal-worker:<reviewed-version> `
   --push
 docker pull registry.example/costmarshal-worker:<reviewed-version>

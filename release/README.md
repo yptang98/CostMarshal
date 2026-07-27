@@ -7,6 +7,16 @@ image, endpoint, or environment variable to become release evidence. A real
 release candidate must fill and review these fields through the two-commit
 procedure below; an unmodified template remains intentionally blocked.
 
+`production-build-inputs.json` is the separate, expiring trust input for the
+repository's Gateway and Worker image builds. It pins the official Python and
+Node OCI indexes, the exact linux/amd64 child manifests and runtime versions,
+the Codex CLI package integrity, and the SHA-256 of the complete committed npm
+lockfile. `scripts/validate_production_build_inputs.py` rejects unknown fields,
+mutable or non-official image references, non-linux/amd64 targets, lockfile
+drift, and review windows longer than 31 days. Both normal CI and the manual
+production-image workflow validate it; the latter additionally requires its
+`source_sha` to equal the exact checked-out commit.
+
 Backtest preregistration is two-step:
 
 1. Before collection/review, commit the approved `allowed_signers` SHA-256,

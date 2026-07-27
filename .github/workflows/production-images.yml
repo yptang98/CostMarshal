@@ -3,18 +3,9 @@ name: Build production images
 on:
   workflow_dispatch:
     inputs:
-      python_base_image:
-        description: "Reviewed Python image as name@sha256:<digest>"
+      source_sha:
+        description: "Exact reviewed 40-hex commit selected by this workflow run"
         required: true
-        type: string
-      node_base_image:
-        description: "Reviewed Node image as name@sha256:<digest>"
-        required: true
-        type: string
-      codex_npm_version:
-        description: "Reviewed exact @openai/codex version"
-        required: true
-        default: "0.144.1"
         type: string
 
 permissions:
@@ -30,9 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      PYTHON_BASE_IMAGE: ${{ inputs.python_base_image }}
-      NODE_BASE_IMAGE: ${{ inputs.node_base_image }}
-      CODEX_NPM_VERSION: ${{ inputs.codex_npm_version }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
     steps:
       - name: Check out the exact revision
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -42,16 +31,54 @@ jobs:
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.11"
+      - name: Validate reviewed production build inputs
+        id: build-inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/validate_production_build_inputs.py \
+            --github-output "$GITHUB_OUTPUT"
+      - name: Verify reviewed linux-amd64 base manifests
+        shell: bash
+        env:
+          PYTHON_BASE_IMAGE: ${{ steps.build-inputs.outputs.python_base_image }}
+          PYTHON_AMD64_MANIFEST: ${{ steps.build-inputs.outputs.python_linux_amd64_manifest }}
+          NODE_BASE_IMAGE: ${{ steps.build-inputs.outputs.node_base_image }}
+          NODE_AMD64_MANIFEST: ${{ steps.build-inputs.outputs.node_linux_amd64_manifest }}
+        run: |
+          set -euo pipefail
+          verify_manifest() {
+            local image="$1"
+            local expected="$2"
+            local actual
+            actual="$(
+              docker buildx imagetools inspect --raw "$image" |
+                jq -er '
+                  [
+                    .manifests[]
+                    | select(
+                        .platform.os == "linux"
+                        and .platform.architecture == "amd64"
+                        and ((.platform.variant // "") == "")
+                      )
+                    | .digest
+                  ]
+                  | if length == 1 then .[0]
+                    else error("expected exactly one linux/amd64 manifest")
+                    end
+                '
+            )"
+            test "$actual" = "$expected"
+          }
+          verify_manifest "$PYTHON_BASE_IMAGE" "$PYTHON_AMD64_MANIFEST"
+          verify_manifest "$NODE_BASE_IMAGE" "$NODE_AMD64_MANIFEST"
       - name: Validate immutable build inputs and release ref
         shell: bash
         run: |
           set -euo pipefail
-          image_pattern='^[^[:space:]@]+@sha256:[0-9a-f]{64}$'
-          version_pattern='^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'
           release_pattern='^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'
-          [[ "$PYTHON_BASE_IMAGE" =~ $image_pattern ]]
-          [[ "$NODE_BASE_IMAGE" =~ $image_pattern ]]
-          [[ "$CODEX_NPM_VERSION" =~ $version_pattern ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$SOURCE_SHA" = "$GITHUB_SHA"
           [[ "$GITHUB_REF" == "refs/heads/v4" || "$GITHUB_REF" == refs/tags/v* ]]
           release_version="$(cat VERSION)"
           [[ "$release_version" =~ $release_pattern ]]
@@ -60,12 +87,22 @@ jobs:
           fi
       - name: Verify the release source
         shell: bash
+        env:
+          CODEX_NPM_VERSION: ${{ steps.build-inputs.outputs.codex_npm_version }}
+          CODEX_NPM_INTEGRITY: ${{ steps.build-inputs.outputs.codex_npm_integrity }}
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends tmux
           python -m pip install --disable-pip-version-check -r requirements.txt
-          npm install --global "@openai/codex@$CODEX_NPM_VERSION"
+          test "$(
+            node -p 'require("./container/worker/package.json").dependencies["@openai/codex"]'
+          )" = "$CODEX_NPM_VERSION"
+          test "$(
+            node -p 'require("./container/worker/package-lock.json").packages["node_modules/@openai/codex"].integrity'
+          )" = "$CODEX_NPM_INTEGRITY"
+          npm ci --prefix container/worker --ignore-scripts --include=optional
+          export PATH="$PWD/container/worker/node_modules/.bin:$PATH"
           python scripts/sync_plugin_package.py
           python tests/release/run_local_test_evidence.py
       - name: Authenticate to GHCR
@@ -77,6 +114,17 @@ jobs:
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
       - name: Build and publish immutable images
         shell: bash
+        env:
+          PYTHON_BASE_IMAGE: ${{ steps.build-inputs.outputs.python_base_image }}
+          PYTHON_AMD64_MANIFEST: ${{ steps.build-inputs.outputs.python_linux_amd64_manifest }}
+          PYTHON_VERSION: ${{ steps.build-inputs.outputs.python_version }}
+          NODE_BASE_IMAGE: ${{ steps.build-inputs.outputs.node_base_image }}
+          NODE_AMD64_MANIFEST: ${{ steps.build-inputs.outputs.node_linux_amd64_manifest }}
+          NODE_VERSION: ${{ steps.build-inputs.outputs.node_version }}
+          CODEX_NPM_VERSION: ${{ steps.build-inputs.outputs.codex_npm_version }}
+          CODEX_NPM_INTEGRITY: ${{ steps.build-inputs.outputs.codex_npm_integrity }}
+          CODEX_NPM_LOCK_SHA256: ${{ steps.build-inputs.outputs.codex_npm_lock_sha256 }}
+          BUILD_INPUTS_SHA256: ${{ steps.build-inputs.outputs.build_inputs_sha256 }}
         run: |
           set -euo pipefail
           repository="${GITHUB_REPOSITORY,,}"
@@ -100,6 +148,7 @@ jobs:
             --platform linux/amd64 \
             --build-arg "NODE_BASE_IMAGE=$NODE_BASE_IMAGE" \
             --build-arg "CODEX_NPM_VERSION=$CODEX_NPM_VERSION" \
+            --build-arg "CODEX_NPM_INTEGRITY=$CODEX_NPM_INTEGRITY" \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
             --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
             --tag "$worker_tag" \
@@ -112,8 +161,32 @@ jobs:
           digest_pattern='^sha256:[0-9a-f]{64}$'
           [[ "$gateway_digest" =~ $digest_pattern ]]
           [[ "$worker_digest" =~ $digest_pattern ]]
-          GATEWAY_IMAGE="${gateway_tag%:*}@$gateway_digest" \
-          WORKER_IMAGE="${worker_tag%:*}@$worker_digest" \
+          gateway_image="${gateway_tag%:*}@$gateway_digest"
+          worker_image="${worker_tag%:*}@$worker_digest"
+          docker pull "$gateway_image"
+          docker pull "$worker_image"
+          test "$(docker image inspect "$gateway_image" --format '{{.Config.User}}')" = "65532:65532"
+          test "$(docker image inspect "$worker_image" --format '{{.Config.User}}')" = "65532:65532"
+          test "$(docker image inspect "$gateway_image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$GITHUB_SHA"
+          test "$(docker image inspect "$worker_image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$GITHUB_SHA"
+          observed_python="$(
+            docker run --rm --network none --entrypoint python "$gateway_image" \
+              -c 'import platform; print(platform.python_version())'
+          )"
+          observed_node="$(
+            docker run --rm --network none --entrypoint node "$worker_image" --version
+          )"
+          observed_codex="$(
+            docker run --rm --network none "$worker_image" codex --version
+          )"
+          test "$observed_python" = "$PYTHON_VERSION"
+          test "$observed_node" = "v$NODE_VERSION"
+          grep -F "$CODEX_NPM_VERSION" <<<"$observed_codex"
+          GATEWAY_IMAGE="$gateway_image" \
+          WORKER_IMAGE="$worker_image" \
+          OBSERVED_PYTHON="$observed_python" \
+          OBSERVED_NODE="$observed_node" \
+          OBSERVED_CODEX="$observed_codex" \
           python - <<'PY'
           import json
           import os
@@ -126,8 +199,18 @@ jobs:
               "gateway_image": os.environ["GATEWAY_IMAGE"],
               "worker_image": os.environ["WORKER_IMAGE"],
               "python_base_image": os.environ["PYTHON_BASE_IMAGE"],
+              "python_linux_amd64_manifest": os.environ["PYTHON_AMD64_MANIFEST"],
+              "python_version": os.environ["PYTHON_VERSION"],
               "node_base_image": os.environ["NODE_BASE_IMAGE"],
+              "node_linux_amd64_manifest": os.environ["NODE_AMD64_MANIFEST"],
+              "node_version": os.environ["NODE_VERSION"],
               "codex_npm_version": os.environ["CODEX_NPM_VERSION"],
+              "codex_npm_integrity": os.environ["CODEX_NPM_INTEGRITY"],
+              "codex_npm_lock_sha256": os.environ["CODEX_NPM_LOCK_SHA256"],
+              "build_inputs_sha256": os.environ["BUILD_INPUTS_SHA256"],
+              "observed_python_version": os.environ["OBSERVED_PYTHON"],
+              "observed_node_version": os.environ["OBSERVED_NODE"],
+              "observed_codex_version": os.environ["OBSERVED_CODEX"].strip(),
           }
           Path("production-images.json").write_text(
               json.dumps(receipt, indent=2, sort_keys=True) + "\n",

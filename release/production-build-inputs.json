@@ -1,0 +1,17 @@
+{
+  "schema_version": "costmarshal-production-build-inputs-v1",
+  "reviewed_at": "2026-07-28",
+  "review_expires_on": "2026-08-27",
+  "platforms": [
+    "linux/amd64"
+  ],
+  "python_base_image": "python:3.11-slim-bookworm@sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba",
+  "python_linux_amd64_manifest": "sha256:28255a3ace7eb4c48bc1b57b90af29e1bc82b4fd6c60614a8e3dce61b87ff941",
+  "python_version": "3.11.15",
+  "node_base_image": "node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3",
+  "node_linux_amd64_manifest": "sha256:8607a9064d4a571140998ae9e52a3b3fcf9cff361d04642d5971e6cd76d39e27",
+  "node_version": "22.23.1",
+  "codex_npm_version": "0.144.1",
+  "codex_npm_integrity": "sha512-Xir1zqPfpenhdoAoshN53uonzbBXj18COyzRkFlVZpSNyEl5XtkuYu9oddELePFN7K/0sXUcSO34Ad5IeCXPbw==",
+  "codex_npm_lock_sha256": "sha256:25327c134cabb84b9ab9d25805e579ea6c999ca7c613cdc4c78056a6c2559f61"
+}

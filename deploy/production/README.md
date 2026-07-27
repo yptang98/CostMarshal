@@ -70,9 +70,16 @@ client private key. The Worker receives only the short-lived lease token.
    **Build production images** GitHub workflow runs the full local evidence
    suite, publishes commit-only tags to GHCR with BuildKit provenance and
    SBOM attestations, and retains `production-images.json` containing the
-   immutable repository digests. It accepts only the `v4` branch or a `v*`
-   tag and never creates a mutable `latest` tag. A private GHCR package
-   requires an authenticated `docker pull` on the target host.
+   immutable repository digests. Enter the exact 40-hex commit shown by the
+   workflow run as `source_sha`; any mismatch fails before publication. Base
+   image indexes, their linux/amd64 manifests, runtime versions, the Codex npm
+   package graph, and the review expiry come from
+   [`release/production-build-inputs.json`](../../release/production-build-inputs.json),
+   not dispatch-time input. CI verifies those manifests and builds and starts
+   the same Dockerfiles before release. The workflow accepts only the `v4`
+   branch or a matching `v*` tag and never creates a mutable `latest` tag. A
+   private GHCR package requires an authenticated `docker pull` on the target
+   host.
 3. Copy [`production.env.example`](production.env.example) to a root-owned
    file outside Git, replace every `REPLACE_*` value, and pass it to the
    deployment command with `--env-file`. It contains paths and immutable
@@ -118,7 +125,7 @@ client private key. The Worker receives only the short-lived lease token.
    certification bindings:
 
    - `--deployment-commit <40-hex>`
-   - `--release-version v4.3.2`
+   - `--release-version v4.3.3`
    - `--gateway-image name@sha256:<64-hex>`
    - `--allowed-signers-sha256 sha256:<64-hex>`
    - `--signer-identity <reviewed-identity>` (repeatable)

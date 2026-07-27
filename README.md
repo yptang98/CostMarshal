@@ -8,7 +8,7 @@
 
   <p>
     <a href="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="VERSION"><img alt="Version 4.3.2" src="https://img.shields.io/badge/version-4.3.2-2bb3a3"></a>
+    <a href="VERSION"><img alt="Version 4.3.3" src="https://img.shields.io/badge/version-4.3.3-2bb3a3"></a>
     <a href="https://www.python.org/downloads/"><img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white"></a>
     <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-f0b94b"></a>
   </p>
@@ -298,6 +298,9 @@ The home directory resolution order is an explicit `--codex-home`, then non-empt
 - v4.3.2 binds the Compose Proxy network to the OCI Worker trust contract and
   makes deployment success require certificate/key validation, immutable
   network attestation, and live policy-hash TLS health from both services.
+- v4.3.3 commits an expiring production-build review, pins the complete Codex
+  npm dependency graph, verifies the selected linux/amd64 base manifests, and
+  makes CI build and exercise the actual hardened Gateway and Worker images.
 
 Read [`SECURITY.md`](SECURITY.md) before production use.
 
@@ -396,7 +399,11 @@ Required OCI actors must cut over before `dispatch --start`, ensuring every prod
 <details>
 <summary><strong>Development verification</strong></summary>
 
-CI runs the complete SHA-bound local evidence suite on Windows and Linux with Python 3.11 and 3.13:
+CI runs the complete SHA-bound local evidence suite on Windows and Linux with
+Python 3.11 and 3.13. A separate Linux job resolves the reviewed OCI manifests,
+builds both production Dockerfiles, validates the Gateway policy inside the
+image, and runs the Worker isolation canary under the production security
+options:
 
 ```powershell
 python scripts/sync_plugin_package.py

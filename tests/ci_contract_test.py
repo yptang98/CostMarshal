@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
+from datetime import date
+import json
 import re
 from pathlib import Path
+import sys
+import tempfile
 import unittest
 
-
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.validate_production_build_inputs import BuildInputError, validate  # noqa: E402
+
+
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+BUILD_INPUTS = ROOT / "release" / "production-build-inputs.json"
 
 
 class CiContractTest(unittest.TestCase):
@@ -28,6 +38,18 @@ class CiContractTest(unittest.TestCase):
         self.assertIn("if: runner.os == 'Linux'", text)
         self.assertIn("artifacts/local-test-report.json", text)
         self.assertIn("if-no-files-found: error", text)
+        self.assertIn("linux-amd64 production container packaging", text)
+        self.assertIn("scripts/validate_production_build_inputs.py", text)
+        self.assertIn("container/gateway/Dockerfile", text)
+        self.assertIn("container/worker/Dockerfile", text)
+        self.assertIn("costmarshal-isolation-canary", text)
+        self.assertIn("container-packaging-report.json", text)
+        self.assertIn("Verify reviewed linux-amd64 base manifests", text)
+        self.assertIn("docker buildx imagetools inspect --raw", text)
+        self.assertIn("npm ci --prefix container/worker", text)
+        self.assertNotIn("npm install --global @openai/codex", text)
+        self.assertIn('test "$observed_python" = "$PYTHON_VERSION"', text)
+        self.assertIn('test "$observed_node" = "v$NODE_VERSION"', text)
 
     def test_actions_are_sha_pinned_and_job_has_read_only_repository_access(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
@@ -48,7 +70,7 @@ class CiContractTest(unittest.TestCase):
         self.assertIn("refs/heads/v4", text)
         self.assertIn('refs/tags/$release_version', text)
         self.assertNotIn('test "$(cat VERSION)" = "v', text)
-        self.assertIn("@sha256:[0-9a-f]{64}", text)
+        self.assertIn("validate_production_build_inputs.py", text)
         self.assertIn("--provenance=mode=max", text)
         self.assertIn("--sbom=true", text)
         self.assertEqual(text.count("--push"), 2)
@@ -56,10 +78,71 @@ class CiContractTest(unittest.TestCase):
         self.assertIn("source_commit", text)
         self.assertIn("gateway_image", text)
         self.assertIn("worker_image", text)
+        self.assertIn("source_sha", text)
+        self.assertIn('test "$SOURCE_SHA" = "$GITHUB_SHA"', text)
+        self.assertIn("scripts/validate_production_build_inputs.py", text)
+        self.assertIn("build_inputs_sha256", text)
+        self.assertIn("python_linux_amd64_manifest", text)
+        self.assertIn("node_linux_amd64_manifest", text)
+        self.assertIn("codex_npm_integrity", text)
+        self.assertIn("Verify reviewed linux-amd64 base manifests", text)
+        self.assertIn("docker buildx imagetools inspect --raw", text)
+        self.assertIn("package-lock.json", text)
+        self.assertIn("npm ci --prefix container/worker", text)
+        self.assertNotIn("npm install --global", text)
+        self.assertIn("observed_python_version", text)
+        self.assertIn("observed_node_version", text)
+        self.assertIn("observed_codex_version", text)
+        self.assertNotIn("inputs.python_base_image", text)
+        self.assertNotIn("inputs.node_base_image", text)
+        self.assertNotIn("inputs.codex_npm_version", text)
         uses = re.findall(r"^\s*uses:\s*([^\s#]+)", text, flags=re.MULTILINE)
         self.assertTrue(uses)
         for action in uses:
             self.assertRegex(action, r"^[^@]+@[0-9a-f]{40}$")
+
+    def test_production_build_inputs_are_pinned_reviewed_and_expiring(self) -> None:
+        result = validate(BUILD_INPUTS, today=date(2026, 7, 28))
+        self.assertEqual(result["platforms"], ["linux/amd64"])
+        self.assertRegex(
+            result["python_base_image"],
+            r"^python:[^@]+@sha256:[0-9a-f]{64}$",
+        )
+        self.assertRegex(
+            result["node_base_image"],
+            r"^node:[^@]+@sha256:[0-9a-f]{64}$",
+        )
+        self.assertEqual(result["python_version"], "3.11.15")
+        self.assertEqual(result["node_version"], "22.23.1")
+        self.assertEqual(result["codex_npm_version"], "0.144.1")
+        self.assertRegex(
+            result["codex_npm_lock_sha256"],
+            r"^sha256:[0-9a-f]{64}$",
+        )
+        self.assertRegex(
+            result["build_inputs_sha256"],
+            r"^sha256:[0-9a-f]{64}$",
+        )
+        original = json.loads(BUILD_INPUTS.read_text(encoding="utf-8"))
+        mutations = (
+            {"python_base_image": "python:latest"},
+            {"review_expires_on": "2026-07-27"},
+            {"review_expires_on": "2027-07-28"},
+            {"codex_npm_integrity": "sha512-not-base64"},
+            {"codex_npm_lock_sha256": "sha256:" + "0" * 64},
+            {"platforms": ["linux/amd64", "linux/arm64"]},
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "inputs.json"
+            for mutation in mutations:
+                with self.subTest(mutation=mutation):
+                    value = {**original, **mutation}
+                    path.write_text(
+                        json.dumps(value),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaises(BuildInputError):
+                        validate(path, today=date(2026, 7, 28))
 
     def test_gateway_build_context_is_allowlisted(self) -> None:
         dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8")

@@ -49,10 +49,16 @@ jobs:
         run: python -m pip install --disable-pip-version-check -r requirements.txt
       - name: Install pinned Codex plugin test surface
         if: runner.os != 'Windows'
-        run: npm install --global @openai/codex@0.144.1
+        run: |
+          npm ci --prefix container/worker --ignore-scripts --include=optional
+          echo "$PWD/container/worker/node_modules/.bin" >> "$GITHUB_PATH"
       - name: Install pinned Codex plugin test surface on Windows
         if: runner.os == 'Windows'
-        run: npm.cmd install --global @openai/codex@0.144.1
+        shell: pwsh
+        run: |
+          npm.cmd ci --prefix container/worker --ignore-scripts --include=optional
+          "$PWD\container\worker\node_modules\.bin" |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Verify the curated plugin snapshot
         run: python scripts/sync_plugin_package.py
       - name: Run the complete SHA-bound local evidence suite
@@ -66,5 +72,243 @@ jobs:
         with:
           name: local-test-report-${{ matrix.os }}-py${{ matrix.python }}
           path: artifacts/local-test-report.json
+          if-no-files-found: error
+          retention-days: 14
+
+  container-packaging:
+    name: linux-amd64 production container packaging
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Select Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+      - name: Validate reviewed production build inputs
+        id: build-inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/validate_production_build_inputs.py \
+            --github-output "$GITHUB_OUTPUT"
+      - name: Verify reviewed linux-amd64 base manifests
+        shell: bash
+        env:
+          PYTHON_BASE_IMAGE: ${{ steps.build-inputs.outputs.python_base_image }}
+          PYTHON_AMD64_MANIFEST: ${{ steps.build-inputs.outputs.python_linux_amd64_manifest }}
+          NODE_BASE_IMAGE: ${{ steps.build-inputs.outputs.node_base_image }}
+          NODE_AMD64_MANIFEST: ${{ steps.build-inputs.outputs.node_linux_amd64_manifest }}
+        run: |
+          set -euo pipefail
+          verify_manifest() {
+            local image="$1"
+            local expected="$2"
+            local actual
+            actual="$(
+              docker buildx imagetools inspect --raw "$image" |
+                jq -er '
+                  [
+                    .manifests[]
+                    | select(
+                        .platform.os == "linux"
+                        and .platform.architecture == "amd64"
+                        and ((.platform.variant // "") == "")
+                      )
+                    | .digest
+                  ]
+                  | if length == 1 then .[0]
+                    else error("expected exactly one linux/amd64 manifest")
+                    end
+                '
+            )"
+            test "$actual" = "$expected"
+          }
+          verify_manifest "$PYTHON_BASE_IMAGE" "$PYTHON_AMD64_MANIFEST"
+          verify_manifest "$NODE_BASE_IMAGE" "$NODE_AMD64_MANIFEST"
+      - name: Build the exact production Dockerfiles
+        shell: bash
+        env:
+          PYTHON_BASE_IMAGE: ${{ steps.build-inputs.outputs.python_base_image }}
+          NODE_BASE_IMAGE: ${{ steps.build-inputs.outputs.node_base_image }}
+          CODEX_NPM_VERSION: ${{ steps.build-inputs.outputs.codex_npm_version }}
+          CODEX_NPM_INTEGRITY: ${{ steps.build-inputs.outputs.codex_npm_integrity }}
+        run: |
+          set -euo pipefail
+          gateway_image="costmarshal-gateway-ci:${GITHUB_SHA}"
+          worker_image="costmarshal-worker-ci:${GITHUB_SHA}"
+          docker build . \
+            --file container/gateway/Dockerfile \
+            --platform linux/amd64 \
+            --build-arg "PYTHON_BASE_IMAGE=$PYTHON_BASE_IMAGE" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$gateway_image"
+          docker build container/worker \
+            --file container/worker/Dockerfile \
+            --platform linux/amd64 \
+            --build-arg "NODE_BASE_IMAGE=$NODE_BASE_IMAGE" \
+            --build-arg "CODEX_NPM_VERSION=$CODEX_NPM_VERSION" \
+            --build-arg "CODEX_NPM_INTEGRITY=$CODEX_NPM_INTEGRITY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$worker_image"
+          test "$(docker image inspect "$gateway_image" --format '{{.Config.User}}')" = "65532:65532"
+          test "$(docker image inspect "$worker_image" --format '{{.Config.User}}')" = "65532:65532"
+          test "$(docker image inspect "$gateway_image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$GITHUB_SHA"
+          test "$(docker image inspect "$worker_image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$GITHUB_SHA"
+      - name: Exercise the built Gateway and Worker images
+        shell: bash
+        env:
+          CODEX_NPM_VERSION: ${{ steps.build-inputs.outputs.codex_npm_version }}
+          BUILD_INPUTS_SHA256: ${{ steps.build-inputs.outputs.build_inputs_sha256 }}
+          CODEX_NPM_LOCK_SHA256: ${{ steps.build-inputs.outputs.codex_npm_lock_sha256 }}
+          PYTHON_VERSION: ${{ steps.build-inputs.outputs.python_version }}
+          NODE_VERSION: ${{ steps.build-inputs.outputs.node_version }}
+        run: |
+          set -euo pipefail
+          gateway_image="costmarshal-gateway-ci:${GITHUB_SHA}"
+          worker_image="costmarshal-worker-ci:${GITHUB_SHA}"
+          observed_python="$(
+            docker run --rm --network none --entrypoint python "$gateway_image" \
+              -c 'import platform; print(platform.python_version())'
+          )"
+          observed_node="$(
+            docker run --rm --network none --entrypoint node "$worker_image" --version
+          )"
+          test "$observed_python" = "$PYTHON_VERSION"
+          test "$observed_node" = "v$NODE_VERSION"
+          policy_dir="$RUNNER_TEMP/costmarshal-policy"
+          workspace_dir="$RUNNER_TEMP/costmarshal-workspace"
+          output_dir="$RUNNER_TEMP/costmarshal-output"
+          install -d -m 0755 "$policy_dir" "$workspace_dir"
+          install -d -m 0777 "$output_dir"
+          POLICY_PATH="$policy_dir/gateway-policy.json" python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          policy = {
+              "schema_version": "costmarshal-production-gateway-policy-v1",
+              "issuer": "costmarshal-broker",
+              "audience": "costmarshal-provider-proxy",
+              "lease_ttl_seconds": 300,
+              "database_path": "/tmp/gateway.db",
+              "providers": {
+                  "fixture": {
+                      "base_url": "https://provider.example.invalid/v1",
+                      "credential_file": "/run/provider-credentials/fixture",
+                      "auth_header": "Authorization",
+                      "auth_scheme": "Bearer",
+                      "wire_api": "responses",
+                      "input_modalities": ["text"],
+                      "models": {
+                          "fixture-model": {
+                              "input_nano_cny_per_million": 1,
+                              "output_nano_cny_per_million": 1,
+                              "fixed_nano_cny_per_request": 1,
+                              "billing_safety_ppm": 1200000,
+                              "request_overhead_tokens": 1,
+                              "max_output_tokens": 64,
+                          }
+                      },
+                  }
+              },
+              "workloads": {
+                  "spiffe://ci.example/costmarshal/worker": {
+                      "providers": ["fixture"],
+                      "max_lease_budget_nano_cny": 1000000,
+                      "max_lease_ttl_seconds": 300,
+                  }
+              },
+          }
+          Path(os.environ["POLICY_PATH"]).write_text(
+              json.dumps(policy, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          gateway_receipt="$(
+            docker run --rm \
+              --read-only \
+              --user 65532:65532 \
+              --cap-drop ALL \
+              --security-opt no-new-privileges:true \
+              --network none \
+              --tmpfs /tmp:rw,noexec,nosuid,nodev,size=32m \
+              --mount "type=bind,source=$policy_dir/gateway-policy.json,target=/policy.json,readonly" \
+              "$gateway_image" validate-policy --config /policy.json
+          )"
+          codex_version="$(
+            docker run --rm --network none "$worker_image" codex --version
+          )"
+          grep -F "$CODEX_NPM_VERSION" <<<"$codex_version"
+          canary="$(
+            docker run --rm \
+              --read-only \
+              --user 65532:65532 \
+              --cap-drop ALL \
+              --security-opt no-new-privileges:true \
+              --network none \
+              --tmpfs /tmp:rw,noexec,nosuid,nodev,size=32m \
+              --mount "type=bind,source=$workspace_dir,target=/workspace,readonly" \
+              --mount "type=bind,source=$output_dir,target=/out" \
+              "$worker_image" node /usr/local/bin/costmarshal-isolation-canary --json
+          )"
+          GATEWAY_RECEIPT="$gateway_receipt" \
+          CANARY_RECEIPT="$canary" \
+          CODEX_VERSION_RECEIPT="$codex_version" \
+          PYTHON_VERSION_RECEIPT="$observed_python" \
+          NODE_VERSION_RECEIPT="$observed_node" \
+          BUILD_INPUTS_SHA256="$BUILD_INPUTS_SHA256" \
+          CODEX_NPM_LOCK_SHA256="$CODEX_NPM_LOCK_SHA256" \
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          gateway = json.loads(os.environ["GATEWAY_RECEIPT"])
+          canary = json.loads(os.environ["CANARY_RECEIPT"])
+          assert gateway["status"] == "ok"
+          assert gateway["policy_sha256"].startswith("sha256:")
+          expected = {
+              "schema": "costmarshal-worker-isolation-canary-v1",
+              "uid": 65532,
+              "cap_eff": "0000000000000000",
+              "no_new_privileges": True,
+              "rootfs_write_blocked": True,
+              "workspace_readable": True,
+              "workspace_writable": False,
+              "output_writable": True,
+              "runtime_visible": False,
+              "aggregate_secrets_visible": False,
+              "engine_socket_visible": False,
+          }
+          assert canary == expected, (canary, expected)
+          receipt = {
+              "schema_version": "costmarshal-container-packaging-ci-v1",
+              "status": "pass",
+              "source_commit": os.environ["GITHUB_SHA"],
+              "build_inputs_sha256": os.environ["BUILD_INPUTS_SHA256"],
+              "codex_npm_lock_sha256": os.environ["CODEX_NPM_LOCK_SHA256"],
+              "gateway_policy_sha256": gateway["policy_sha256"],
+              "worker_canary": canary,
+              "codex_version": os.environ["CODEX_VERSION_RECEIPT"].strip(),
+              "python_version": os.environ["PYTHON_VERSION_RECEIPT"],
+              "node_version": os.environ["NODE_VERSION_RECEIPT"],
+          }
+          target = Path("artifacts/container-packaging-report.json")
+          target.parent.mkdir(parents=True, exist_ok=True)
+          target.write_text(
+              json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+      - name: Retain the container packaging evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: container-packaging-${{ github.sha }}
+          path: artifacts/container-packaging-report.json
           if-no-files-found: error
           retention-days: 14

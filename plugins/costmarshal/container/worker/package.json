@@ -1,0 +1,10 @@
+{
+  "name": "costmarshal-production-worker-runtime",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Locked runtime dependency graph for the CostMarshal production worker image.",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@openai/codex": "0.144.1"
+  }
+}

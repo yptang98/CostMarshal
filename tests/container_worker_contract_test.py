@@ -114,15 +114,19 @@ def main() -> int:
     assert dockerignore.splitlines() == [
         "*",
         "!Dockerfile",
+        "!package.json",
+        "!package-lock.json",
         "!costmarshal-worker.js",
         "!costmarshal-isolation-canary.js",
         "!costmarshal-escape-probe.js",
     ]
     for required in (
         "container/worker/*.js text eol=lf",
+        "container/worker/*.json text eol=lf",
         "container/worker/Dockerfile text eol=lf",
         "container/worker/.dockerignore text eol=lf",
         "plugins/costmarshal/container/worker/*.js text eol=lf",
+        "plugins/costmarshal/container/worker/*.json text eol=lf",
         "plugins/costmarshal/container/worker/Dockerfile text eol=lf",
         "plugins/costmarshal/container/worker/.dockerignore text eol=lf",
     ):
@@ -164,11 +168,30 @@ def main() -> int:
     assert "# syntax=" not in dockerfile
     assert "FROM ${NODE_BASE_IMAGE}" in dockerfile
     assert "ARG CODEX_NPM_VERSION" in dockerfile
+    assert "ARG CODEX_NPM_INTEGRITY" in dockerfile
+    assert "COPY package.json package-lock.json ./" in dockerfile
     assert "COPY costmarshal-escape-probe.js" in dockerfile
-    assert '@openai/codex@${CODEX_NPM_VERSION}' in dockerfile
+    assert "npm ci --omit=dev --ignore-scripts" in dockerfile
+    assert "npm install --global" not in dockerfile
+    assert 'dependencies["@openai/codex"]' in dockerfile
+    assert 'installed.integrity !== process.env.CODEX_NPM_INTEGRITY' in dockerfile
     assert "USER 65532:65532" in dockerfile
     assert "ENTRYPOINT []" in dockerfile
     assert ":latest" not in dockerfile
+
+    package = json.loads(
+        (DOCKERFILE.parent / "package.json").read_text(encoding="utf-8")
+    )
+    lock = json.loads(
+        (DOCKERFILE.parent / "package-lock.json").read_text(encoding="utf-8")
+    )
+    version = package["dependencies"]["@openai/codex"]
+    installed = lock["packages"]["node_modules/@openai/codex"]
+    linux_x64 = lock["packages"]["node_modules/@openai/codex-linux-x64"]
+    assert installed["version"] == version
+    assert installed["integrity"].startswith("sha512-")
+    assert linux_x64["version"] == f"{version}-linux-x64"
+    assert linux_x64["integrity"].startswith("sha512-")
     harness = LIVE_HARNESS.read_text(encoding="utf-8")
     for required in (
         "artifacts\" / \"oci-attestation.json",

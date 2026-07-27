@@ -1,5 +1,7 @@
 *
 !Dockerfile
+!package.json
+!package-lock.json
 !costmarshal-worker.js
 !costmarshal-isolation-canary.js
 !costmarshal-escape-probe.js

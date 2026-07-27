@@ -1,5 +1,23 @@
 # Changelog
 
+## v4.3.3 - 2026-07-28
+
+- Added an expiring, committed production-build input review that pins the
+  official Python and Node OCI indexes, their exact linux/amd64 manifests, and
+  the observed runtime versions.
+- Replaced mutable global Codex installation with a committed npm lockfile,
+  verified top-level integrity, platform-binary integrity, and
+  `npm ci --ignore-scripts`.
+- Added a Linux CI packaging gate that builds the exact production Gateway and
+  Worker Dockerfiles, checks immutable revision labels and non-root users,
+  validates a policy inside the Gateway, and executes the Worker isolation
+  canary with read-only rootfs, dropped capabilities, no network, and bounded
+  mounts.
+- Restricted the manual production-image workflow to its exact checked-out
+  source SHA and committed build inputs. It independently verifies the selected
+  base manifests and records the build-input and lockfile identities alongside
+  the published image digests, provenance, and SBOMs.
+
 ## v4.3.2 - 2026-07-28
 
 - Fixed the single-host production Compose network contract by labelling the

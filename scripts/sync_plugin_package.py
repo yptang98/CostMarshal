@@ -35,6 +35,8 @@ TREE_FILES = (
     "container/worker/costmarshal-escape-probe.js",
     "container/worker/costmarshal-isolation-canary.js",
     "container/worker/costmarshal-worker.js",
+    "container/worker/package-lock.json",
+    "container/worker/package.json",
     "container/gateway/.dockerignore",
     "container/gateway/Dockerfile",
     "costmarshal_v2/__init__.py",
@@ -94,7 +96,13 @@ INDIVIDUAL_FILES = (
     "scripts/costmarshal_gateway.py",
     "scripts/costmarshal_production_certification.py",
 )
-IGNORED_NAMES = {"__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache"}
+IGNORED_NAMES = {
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "node_modules",
+}
 IGNORED_SUFFIXES = {".pyc", ".pyo"}
 FORBIDDEN_NAMES = {
     ".agents",
@@ -109,7 +117,7 @@ FORBIDDEN_NAMES = {
     "thumbs.db",
 }
 FORBIDDEN_ROOTS = {"plugins", "release", "tests"}
-MAX_PACKAGE_FILES = 64
+MAX_PACKAGE_FILES = 66
 MAX_FILE_BYTES = 1024 * 1024
 MAX_TOTAL_BYTES = 4 * 1024 * 1024
 MAX_RELATIVE_PATH_BYTES = 240
