@@ -346,8 +346,13 @@ class V4LargeProjectContractTest(unittest.TestCase):
             evidence_artifact_ids=evidence,
             runtime_adapter="costmarshal-gateway-v1",
             gateway_policy_sha256="sha256:" + "b" * 64,
+            deployment_commit="c" * 40,
+            release_version="v4.2.0",
+            gateway_image="example/gateway@sha256:" + "d" * 64,
+            allowed_signers_sha256="sha256:" + "e" * 64,
+            signer_identities=["release@example.test"],
         )
-        ready = production_status(
+        runtime_only = production_status(
             boundary=gateway_boundary,
             artifact_rows=artifacts,
             sqlite_authoritative=True,
@@ -366,8 +371,10 @@ class V4LargeProjectContractTest(unittest.TestCase):
                 },
             },
         )
-        self.assertEqual(ready["status"], "ready")
-        self.assertTrue(ready["external_certification"])
+        self.assertEqual(runtime_only["runtime_status"], "ready")
+        self.assertEqual(runtime_only["status"], "blocked")
+        self.assertEqual(runtime_only["certification_status"], "blocked")
+        self.assertFalse(runtime_only["external_certification"])
 
     def test_cli_exposes_v4_commands_and_task_ownership(self) -> None:
         parser = build_parser()

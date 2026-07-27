@@ -10,6 +10,8 @@
       "credential_file": "/run/secrets/longcat_api_key",
       "auth_header": "Authorization",
       "auth_scheme": "Bearer",
+      "wire_api": "responses",
+      "input_modalities": ["text"],
       "models": {
         "LongCat-2.0": {
           "input_nano_cny_per_million": 0,

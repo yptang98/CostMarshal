@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from .production_evidence import VerifiedProductionCertification
 from .quality import canonical_sha256
 from .state import now_iso
 
@@ -20,9 +21,10 @@ REPOSITORY_REGISTRY_SCHEMA = "costmarshal-repository-registry-v1"
 WORKSTREAM_REGISTRY_SCHEMA = "costmarshal-workstream-registry-v1"
 INTEGRATION_PLAN_SCHEMA = "costmarshal-staged-integration-plan-v1"
 INTEGRATION_GATE_SCHEMA = "costmarshal-integration-gate-v1"
-PRODUCTION_BOUNDARY_SCHEMA = "costmarshal-production-boundary-v2"
-LEGACY_PRODUCTION_BOUNDARY_SCHEMA = "costmarshal-production-boundary-v1"
-PRODUCTION_STATUS_SCHEMA = "costmarshal-production-status-v1"
+PRODUCTION_BOUNDARY_SCHEMA = "costmarshal-production-boundary-v3"
+LEGACY_PRODUCTION_BOUNDARY_SCHEMA = "costmarshal-production-boundary-v2"
+EARLIEST_PRODUCTION_BOUNDARY_SCHEMA = "costmarshal-production-boundary-v1"
+PRODUCTION_STATUS_SCHEMA = "costmarshal-production-status-v2"
 _SAFE_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 _FULL_COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
@@ -1049,6 +1051,11 @@ def build_production_boundary(
     evidence_artifact_ids: Mapping[str, str],
     runtime_adapter: str = "external-contract-required",
     gateway_policy_sha256: str | None = None,
+    deployment_commit: str | None = None,
+    release_version: str | None = None,
+    gateway_image: str | None = None,
+    allowed_signers_sha256: str | None = None,
+    signer_identities: Iterable[str] = (),
 ) -> dict[str, Any]:
     if mode not in {"report-only", "enforced"}:
         raise LargeProjectError("production boundary mode must be report-only or enforced")
@@ -1092,6 +1099,45 @@ def build_production_boundary(
             raise LargeProjectError(
                 "CostMarshal gateway runtime requires an exact policy sha256"
             )
+        if not re.fullmatch(r"[0-9a-f]{40}", str(deployment_commit or "")):
+            raise LargeProjectError(
+                "CostMarshal gateway runtime requires an exact 40-hex deployment commit"
+            )
+        if not re.fullmatch(
+            r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?",
+            str(release_version or ""),
+        ):
+            raise LargeProjectError(
+                "CostMarshal gateway runtime requires an exact release version"
+            )
+        if not re.fullmatch(
+            r"[^\s@]+@sha256:[0-9a-f]{64}",
+            str(gateway_image or ""),
+        ):
+            raise LargeProjectError(
+                "CostMarshal gateway runtime requires a digest-pinned gateway image"
+            )
+        if not re.fullmatch(
+            r"sha256:[0-9a-f]{64}",
+            str(allowed_signers_sha256 or ""),
+        ):
+            raise LargeProjectError(
+                "CostMarshal gateway runtime requires the reviewed allowed_signers sha256"
+            )
+        trusted_identities = list(
+            dict.fromkeys(
+                str(item or "").strip() for item in signer_identities
+            )
+        )
+        if not trusted_identities or any(
+            not re.fullmatch(r"[^\s\x00-\x1f]{1,256}", item)
+            for item in trusted_identities
+        ):
+            raise LargeProjectError(
+                "CostMarshal gateway runtime requires bounded trusted signer identities"
+            )
+    else:
+        trusted_identities = []
     body = {
         "schema_version": PRODUCTION_BOUNDARY_SCHEMA,
         "mode": mode,
@@ -1112,7 +1158,21 @@ def build_production_boundary(
         "evidence_artifact_ids": dict(sorted(evidence_artifact_ids.items())),
         "runtime_adapter": runtime_adapter,
         "runtime_adapter_config": (
-            {"policy_sha256": gateway_policy_sha256}
+            {
+                "policy_sha256": gateway_policy_sha256,
+                "deployment_commit": deployment_commit,
+                "release_version": release_version,
+                "gateway_image": gateway_image,
+            }
+            if runtime_adapter == "costmarshal-gateway-v1"
+            else None
+        ),
+        "certification_trust": (
+            {
+                "namespace": "costmarshal-production-certification-v1",
+                "allowed_signers_sha256": allowed_signers_sha256,
+                "signer_identities": trusted_identities,
+            }
             if runtime_adapter == "costmarshal-gateway-v1"
             else None
         ),
@@ -1130,10 +1190,14 @@ def build_production_boundary(
 
 def validate_production_boundary(value: Mapping[str, Any]) -> dict[str, Any]:
     row = _copy(dict(value))
-    if row.get("schema_version") == LEGACY_PRODUCTION_BOUNDARY_SCHEMA:
+    schema = row.get("schema_version")
+    if schema == EARLIEST_PRODUCTION_BOUNDARY_SCHEMA:
         if row.get("runtime_adapter") != "external-contract-required":
             raise LargeProjectError("legacy production boundary runtime adapter is invalid")
-    elif row.get("schema_version") != PRODUCTION_BOUNDARY_SCHEMA:
+    elif schema not in {
+        LEGACY_PRODUCTION_BOUNDARY_SCHEMA,
+        PRODUCTION_BOUNDARY_SCHEMA,
+    }:
         raise LargeProjectError("invalid production boundary schema")
     body = {
         key: item
@@ -1149,6 +1213,10 @@ def validate_production_boundary(value: Mapping[str, Any]) -> dict[str, Any]:
         or (
             row.get("runtime_adapter") == "external-contract-required"
             and row.get("runtime_adapter_config") is not None
+        )
+        or (
+            row.get("runtime_adapter") == "external-contract-required"
+            and row.get("certification_trust") is not None
         )
         or not isinstance(
             (row.get("credential_broker") or {}).get("workload_identity"),
@@ -1183,8 +1251,14 @@ def validate_production_boundary(value: Mapping[str, Any]) -> dict[str, Any]:
     if row.get("runtime_adapter") == "costmarshal-gateway-v1":
         broker = row.get("credential_broker") or {}
         tls_env = broker.get("client_tls_path_env")
+        legacy_gateway = schema == LEGACY_PRODUCTION_BOUNDARY_SCHEMA
+        runtime_config = row.get("runtime_adapter_config") or {}
+        certification_trust = row.get("certification_trust")
         if (
-            row.get("schema_version") != PRODUCTION_BOUNDARY_SCHEMA
+            schema not in {
+                LEGACY_PRODUCTION_BOUNDARY_SCHEMA,
+                PRODUCTION_BOUNDARY_SCHEMA,
+            }
             or tls_env
             != {
                 "certificate": "COSTMARSHAL_BROKER_CLIENT_CERT_FILE",
@@ -1202,15 +1276,63 @@ def validate_production_boundary(value: Mapping[str, Any]) -> dict[str, Any]:
             or not re.fullmatch(
                 r"sha256:[0-9a-f]{64}",
                 str(
-                    (row.get("runtime_adapter_config") or {}).get(
-                        "policy_sha256"
-                    )
+                    runtime_config.get("policy_sha256")
                     or ""
                 ),
             )
         ):
             raise LargeProjectError(
                 "CostMarshal gateway production adapter binding is invalid"
+            )
+        if not legacy_gateway and (
+            set(runtime_config)
+            != {
+                "policy_sha256",
+                "deployment_commit",
+                "release_version",
+                "gateway_image",
+            }
+            or not re.fullmatch(
+                r"[0-9a-f]{40}",
+                str(runtime_config.get("deployment_commit") or ""),
+            )
+            or not re.fullmatch(
+                r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?",
+                str(runtime_config.get("release_version") or ""),
+            )
+            or not re.fullmatch(
+                r"[^\s@]+@sha256:[0-9a-f]{64}",
+                str(runtime_config.get("gateway_image") or ""),
+            )
+            or not isinstance(certification_trust, dict)
+            or set(certification_trust)
+            != {
+                "namespace",
+                "allowed_signers_sha256",
+                "signer_identities",
+            }
+            or certification_trust.get("namespace")
+            != "costmarshal-production-certification-v1"
+            or not re.fullmatch(
+                r"sha256:[0-9a-f]{64}",
+                str(certification_trust.get("allowed_signers_sha256") or ""),
+            )
+            or not isinstance(certification_trust.get("signer_identities"), list)
+            or not certification_trust.get("signer_identities")
+            or len(certification_trust["signer_identities"])
+            != len(set(certification_trust["signer_identities"]))
+            or any(
+                not isinstance(item, str)
+                or not re.fullmatch(r"[^\s\x00-\x1f]{1,256}", item)
+                for item in certification_trust["signer_identities"]
+            )
+        ):
+            raise LargeProjectError(
+                "CostMarshal gateway production certification trust is invalid"
+            )
+        if legacy_gateway and certification_trust is not None:
+            raise LargeProjectError(
+                "legacy CostMarshal gateway boundary cannot contain certification trust"
             )
     return row
 
@@ -1222,6 +1344,8 @@ def production_status(
     sqlite_authoritative: bool,
     worker_isolation: Mapping[str, Any],
     runtime_probes: Mapping[str, Mapping[str, Any]] | None = None,
+    certification: VerifiedProductionCertification | None = None,
+    certification_error: str | None = None,
 ) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
 
@@ -1240,6 +1364,8 @@ def production_status(
         return {
             "schema_version": PRODUCTION_STATUS_SCHEMA,
             "status": "blocked",
+            "runtime_status": "blocked",
+            "certification_status": "blocked",
             "external_certification": False,
             "checks": checks,
             "warning": "No deployment is certified by local configuration alone.",
@@ -1312,11 +1438,61 @@ def production_status(
                     "policy_sha256": expected_policy,
                 },
             )
-    ready = all(row["passed"] is True for row in checks)
+    runtime_ready = all(row["passed"] is True for row in checks)
+    expected_policy = str(
+        (configured.get("runtime_adapter_config") or {}).get("policy_sha256")
+        or ""
+    )
+    receipt = (
+        certification.public_receipt()
+        if isinstance(certification, VerifiedProductionCertification)
+        else None
+    )
+    certified = (
+        configured.get("schema_version") == PRODUCTION_BOUNDARY_SCHEMA
+        and isinstance(receipt, dict)
+        and receipt.get("boundary_sha256") == configured.get("boundary_sha256")
+        and receipt.get("gateway_policy_sha256") == expected_policy
+        and receipt.get("worker_image") == image
+        and receipt.get("gateway_image")
+        == (configured.get("runtime_adapter_config") or {}).get("gateway_image")
+        and receipt.get("git_sha")
+        == (configured.get("runtime_adapter_config") or {}).get(
+            "deployment_commit"
+        )
+        and receipt.get("release_version")
+        == (configured.get("runtime_adapter_config") or {}).get(
+            "release_version"
+        )
+        and receipt.get("allowed_signers_sha256")
+        == (configured.get("certification_trust") or {}).get(
+            "allowed_signers_sha256"
+        )
+        and receipt.get("signer_identity")
+        in (
+            (configured.get("certification_trust") or {}).get(
+                "signer_identities"
+            )
+            or []
+        )
+    )
+    check(
+        "signed-external-certification",
+        certified,
+        receipt if receipt is not None else {"error": certification_error},
+        {
+            "schema_version": "costmarshal-production-certification-receipt-v1",
+            "boundary_sha256": configured.get("boundary_sha256"),
+            "gateway_policy_sha256": expected_policy,
+        },
+    )
+    ready = runtime_ready and certified
     return {
         "schema_version": PRODUCTION_STATUS_SCHEMA,
         "status": "ready" if ready else "blocked",
-        "external_certification": ready,
+        "runtime_status": "ready" if runtime_ready else "blocked",
+        "certification_status": "certified" if certified else "blocked",
+        "external_certification": certified,
         "checks": checks,
         "warning": (
             "Ready means the configured deployment evidence and runtime "

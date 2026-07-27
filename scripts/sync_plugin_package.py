@@ -53,6 +53,7 @@ TREE_FILES = (
     "costmarshal_v2/mailbox.py",
     "costmarshal_v2/paths.py",
     "costmarshal_v2/profile_binding.py",
+    "costmarshal_v2/production_evidence.py",
     "costmarshal_v2/production_gateway.py",
     "costmarshal_v2/project_artifacts.py",
     "costmarshal_v2/project_knowledge.py",
@@ -90,6 +91,7 @@ INDIVIDUAL_FILES = (
     "scripts/costmarshal.py",
     "scripts/costmarshal_actor.py",
     "scripts/costmarshal_gateway.py",
+    "scripts/costmarshal_production_certification.py",
 )
 IGNORED_NAMES = {"__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache"}
 IGNORED_SUFFIXES = {".pyc", ".pyo"}

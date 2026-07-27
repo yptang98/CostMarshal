@@ -2134,7 +2134,10 @@ def _gateway_profile(
             base_url=proxy_endpoint,
             model=str(profile_data.get("model") or ""),
             env_key=str(provider_row.get("env_key") or ""),
-            wire_api=str(provider_row.get("wire_api") or "responses"),
+            # Workers always speak Responses to the CostMarshal Proxy.  The
+            # reviewed gateway policy, never the worker profile, selects and
+            # translates the upstream provider protocol.
+            wire_api="responses",
             reasoning_effort=(
                 str(profile_data["model_reasoning_effort"])
                 if profile_data.get("model_reasoning_effort")

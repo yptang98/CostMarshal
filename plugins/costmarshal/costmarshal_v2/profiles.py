@@ -26,6 +26,7 @@ WINDOWS_RESERVED_PROFILE_NAMES = {
 PROVIDER_ID_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*")
 ENV_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 RESERVED_PROVIDER_IDS = {"openai", "ollama", "lmstudio"}
+PRODUCTION_GATEWAY_PLACEHOLDER = "https://costmarshal-gateway.invalid/v1"
 
 
 def codex_home(path: str | os.PathLike[str] | None = None) -> Path:
@@ -135,24 +136,33 @@ def provider_preset_profile_text(
     *,
     model: str | None = None,
     reasoning_effort: str | None = None,
+    via_production_gateway: bool = False,
 ) -> str:
     try:
         preset = resolve_provider_preset(preset_id)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
-    if preset.wire_api != "responses":
+    if preset.wire_api != "responses" and not via_production_gateway:
         raise SystemExit(
             f"{preset.preset_id} is not directly compatible with the current "
             "Responses-only Codex worker; use a reviewed Responses gateway "
             "and configure that gateway as a custom provider"
         )
+    if via_production_gateway and not preset.gateway_compatible:
+        raise SystemExit(
+            f"{preset.preset_id} has no protocol supported by the production gateway"
+        )
     return provider_profile_text(
         provider_id=preset.provider_id,
         display_name=preset.display_name,
-        base_url=preset.base_url,
+        base_url=(
+            PRODUCTION_GATEWAY_PLACEHOLDER
+            if via_production_gateway
+            else preset.base_url
+        ),
         model=model or preset.default_model,
         env_key=preset.env_key,
-        wire_api=preset.wire_api,
+        wire_api="responses" if via_production_gateway else preset.wire_api,
         reasoning_effort=reasoning_effort or preset.reasoning_effort,
     )
 
@@ -183,6 +193,9 @@ def command_configure_profiles(args: Any) -> None:
 
 def command_configure_provider(args: Any) -> None:
     preset_name = str(getattr(args, "preset", None) or "").strip()
+    via_production_gateway = bool(
+        getattr(args, "via_production_gateway", False)
+    )
     if preset_name:
         custom_fields = {
             "--provider-id": getattr(args, "provider_id", None),
@@ -209,10 +222,15 @@ def command_configure_provider(args: Any) -> None:
             reasoning_effort=(
                 str(args.reasoning_effort) if args.reasoning_effort else None
             ),
+            via_production_gateway=via_production_gateway,
         )
         provider_id = preset.provider_id
         env_key = preset.env_key
     else:
+        if via_production_gateway:
+            raise SystemExit(
+                "--via-production-gateway currently requires a reviewed --preset"
+            )
         required = {
             "--profile": getattr(args, "profile", None),
             "--provider-id": getattr(args, "provider_id", None),
@@ -250,15 +268,24 @@ def command_configure_provider(args: Any) -> None:
     payload["env_key"] = env_key
     if preset_name:
         payload["preset"] = preset.preset_id
+        payload["requires_production_gateway"] = via_production_gateway
+        effective_capabilities = (
+            preset.gateway_effective_capabilities
+            if via_production_gateway
+            else preset.effective_capabilities
+        )
         payload["capabilities"] = {
             "api": list(preset.api_capabilities),
-            "effective": list(preset.effective_capabilities),
-            "runtime_unavailable": list(preset.unavailable_runtime_capabilities),
+            "effective": list(effective_capabilities),
+            "runtime_unavailable": sorted(
+                set(preset.api_capabilities) - set(effective_capabilities)
+            ),
         }
         payload["catalog_provider"] = preset.catalog_provider(
             tier=str(getattr(args, "tier", None) or "medium"),
             profile=profile,
             model=model,
+            via_production_gateway=via_production_gateway,
         )
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 

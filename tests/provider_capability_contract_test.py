@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT))
 from costmarshal_v2.actor_runner import build_codex_argv  # noqa: E402
 from costmarshal_v2.paths import ProjectLayout  # noqa: E402
 from costmarshal_v2.provider_presets import resolve_provider_preset  # noqa: E402
+from costmarshal_v2.routing import validate_provider_catalog  # noqa: E402
 from costmarshal_v2.state import load_project, load_task  # noqa: E402
 
 
@@ -44,6 +45,17 @@ def run(temp: Path, *args: str, ok: bool = True) -> subprocess.CompletedProcess[
 
 
 def main() -> int:
+    gateway_provider = resolve_provider_preset("kimi-k3").catalog_provider(
+        tier="medium",
+        profile="kimi-gateway",
+        via_production_gateway=True,
+    )
+    normalized_gateway = validate_provider_catalog(
+        {"schema_version": 1, "providers": [gateway_provider]}
+    )["providers"][0]
+    assert normalized_gateway["runtime_adapter"] == "costmarshal-gateway-v1"
+    assert "input:image" in normalized_gateway["capabilities"]
+
     with tempfile.TemporaryDirectory(prefix="costmarshal-provider-capability-") as raw:
         temp = Path(raw)
         workspace = temp / "workspace"

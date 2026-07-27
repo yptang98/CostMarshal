@@ -4,10 +4,14 @@
 from __future__ import annotations
 
 import contextlib
+import http.client
+import io
 import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -26,6 +30,7 @@ from costmarshal_v2.production_gateway import (
     GatewayPolicy,
     LeaseSigner,
     ProviderProxyCore,
+    build_gateway,
     probe_gateway_health,
     workload_identity_from_peer,
 )
@@ -167,6 +172,13 @@ class ProductionGatewayContractTest(unittest.TestCase):
             credential_file.resolve(),
         )
 
+        raw = policy_mapping(self.root / "wire.db")
+        provider = raw["providers"]["provider-a"]
+        provider["wire_api"] = "chat-completions"
+        provider["input_modalities"] = ["text", "video"]
+        with self.assertRaisesRegex(GatewayError, "cannot transport"):
+            GatewayPolicy.from_mapping(raw)
+
     def test_mtls_identity_requires_one_spiffe_uri(self) -> None:
         peer = SimpleNamespace(
             getpeercert=lambda: {
@@ -244,7 +256,7 @@ class ProductionGatewayContractTest(unittest.TestCase):
             token=lease["lease_token"],
             request_id="request-00000002",
             path="/v1/responses",
-            payload=b'{"model":"model-a"}',
+            payload=b'{"model":"model-a","input":"hello"}',
             now=1_700_000_001,
         )
         self.assertIn(b'"max_output_tokens":100', prepared.payload)
@@ -264,6 +276,262 @@ class ProductionGatewayContractTest(unittest.TestCase):
         forged = ".".join(token_parts)
         with self.assertRaisesRegex(GatewayError, "signature"):
             self.prepare(forged, "request-00000004")
+
+    def test_chat_provider_adapts_responses_text_image_tools_and_stream(self) -> None:
+        raw = policy_mapping(self.root / "chat-adapter.db")
+        raw_provider = raw["providers"]["provider-a"]
+        raw_provider["wire_api"] = "chat-completions"
+        raw_provider["input_modalities"] = ["text", "image", "audio"]
+        policy = GatewayPolicy.from_mapping(raw)
+        signer = LeaseSigner(KEY, issuer=policy.issuer, audience=policy.audience)
+        ledger = GatewayLedger(policy.database_path)
+        broker = BrokerCore(policy, signer, ledger, self.audit)
+        proxy = ProviderProxyCore(policy, signer, ledger, self.audit)
+        lease = broker.issue(
+            IDENTITY,
+            {
+                "provider": "provider-a",
+                "model": "model-a",
+                "budget_nano_cny": 100_000,
+                "max_input_tokens": 20_000,
+                "max_output_tokens": 100,
+                "ttl_seconds": 120,
+                "idempotency_key": "chat-adapter-lease",
+            },
+            now=1_700_000_000,
+        )
+        request = {
+            "model": "model-a",
+            "instructions": "Be concise.",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Describe this."},
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,iVBORw0KGgo=",
+                            "detail": "low",
+                        },
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": "UklGRg==",
+                                "format": "wav",
+                            },
+                        },
+                    ],
+                }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "Look up one value",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"id": {"type": "string"}},
+                    },
+                }
+            ],
+            "tool_choice": "auto",
+            "max_output_tokens": 50,
+            "stream": True,
+            "store": False,
+        }
+        prepared = proxy.prepare(
+            token=lease["lease_token"],
+            request_id="request-chat-adapter-0001",
+            path="/v1/responses",
+            payload=json.dumps(request).encode(),
+            now=1_700_000_001,
+        )
+        self.assertEqual(prepared.upstream_path, "/v1/chat/completions")
+        self.assertEqual(prepared.response_adapter, "chat-to-responses-v1")
+        upstream = json.loads(prepared.upstream_payload)
+        self.assertFalse(upstream["stream"])
+        self.assertEqual(upstream["max_tokens"], 50)
+        self.assertEqual(upstream["messages"][0]["role"], "system")
+        self.assertEqual(
+            upstream["messages"][1]["content"][1]["type"],
+            "image_url",
+        )
+        self.assertEqual(
+            upstream["messages"][1]["content"][2],
+            {
+                "type": "input_audio",
+                "input_audio": {"data": "UklGRg==", "format": "wav"},
+            },
+        )
+        self.assertEqual(upstream["tools"][0]["function"]["name"], "lookup")
+
+        chat_response = json.dumps(
+            {
+                "id": "chatcmpl-test",
+                "created": 1_700_000_002,
+                "model": "model-a",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "COSTMARSHAL_GATEWAY_CANARY_OK",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 4,
+                    "total_tokens": 24,
+                },
+            }
+        ).encode()
+        adapted, content_type, streaming = proxy.adapt_response(
+            prepared,
+            status=200,
+            content_type="application/json",
+            payload=chat_response,
+        )
+        self.assertTrue(streaming)
+        self.assertEqual(content_type, "text/event-stream")
+        self.assertIn(b"event: response.output_text.delta", adapted)
+        self.assertIn(b"event: response.completed", adapted)
+        self.assertIn(b"COSTMARSHAL_GATEWAY_CANARY_OK", adapted)
+        _, input_tokens, output_tokens = proxy.actual_cost(
+            prepared,
+            chat_response,
+        )
+        self.assertEqual((input_tokens, output_tokens), (20, 4))
+
+        request["input"][0]["content"] = [
+            {"type": "input_file", "file_url": "https://example.test/doc.pdf"}
+        ]
+        with self.assertRaisesRegex(GatewayError, "modalities"):
+            proxy.prepare(
+                token=lease["lease_token"],
+                request_id="request-chat-adapter-0002",
+                path="/v1/responses",
+                payload=json.dumps(request).encode(),
+                now=1_700_000_001,
+            )
+
+    def test_http_proxy_emits_responses_sse_for_chat_upstream(self) -> None:
+        raw = policy_mapping(self.root / "chat-http.db")
+        raw_provider = raw["providers"]["provider-a"]
+        raw_provider["wire_api"] = "chat-completions"
+        raw_provider["input_modalities"] = ["text"]
+        policy = GatewayPolicy.from_mapping(raw)
+        signer = LeaseSigner(KEY, issuer=policy.issuer, audience=policy.audience)
+        ledger = GatewayLedger(policy.database_path)
+        broker = BrokerCore(policy, signer, ledger, self.audit)
+        lease = broker.issue(
+            IDENTITY,
+            {
+                "provider": "provider-a",
+                "model": "model-a",
+                "budget_nano_cny": 100_000,
+                "max_input_tokens": 10_000,
+                "max_output_tokens": 100,
+                "ttl_seconds": 120,
+                "idempotency_key": "chat-http-lease",
+            },
+            now=int(time.time()),
+        )
+        upstream_body = json.dumps(
+            {
+                "id": "chatcmpl-http",
+                "created": int(time.time()),
+                "model": "model-a",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "translated",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 2,
+                },
+            }
+        ).encode()
+
+        class FakeUpstream:
+            status = 200
+            headers = {"Content-Type": "application/json"}
+
+            def __init__(self, payload: bytes) -> None:
+                self.stream = io.BytesIO(payload)
+
+            def read(self, size: int = -1) -> bytes:
+                return self.stream.read(size)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        server = build_gateway(
+            service="proxy",
+            policy=policy,
+            signing_key=KEY,
+            audit_log=self.root / "http-audit.jsonl",
+            listen_host="127.0.0.1",
+            listen_port=0,
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        connection: http.client.HTTPConnection | None = None
+        with patch.dict(os.environ, {"PROVIDER_A_API_KEY": "proxy-secret"}):
+            with patch(
+                "costmarshal_v2.production_gateway.urllib.request.urlopen",
+                return_value=FakeUpstream(upstream_body),
+            ):
+                thread.start()
+                try:
+                    connection = http.client.HTTPConnection(
+                        "127.0.0.1",
+                        server.server_address[1],
+                        timeout=10,
+                    )
+                    payload = json.dumps(
+                        {
+                            "model": "model-a",
+                            "input": "hello",
+                            "max_output_tokens": 20,
+                            "stream": True,
+                            "store": False,
+                        }
+                    ).encode()
+                    connection.request(
+                        "POST",
+                        "/v1/responses",
+                        body=payload,
+                        headers={
+                            "Authorization": f"Bearer {lease['lease_token']}",
+                            "Content-Type": "application/json",
+                            "X-CostMarshal-Request-Id": "request-chat-http-0001",
+                        },
+                    )
+                    response = connection.getresponse()
+                    body = response.read()
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(
+                        response.getheader("Content-Type"),
+                        "text/event-stream",
+                    )
+                    self.assertIn(b"event: response.completed", body)
+                    self.assertIn(b"translated", body)
+                finally:
+                    if connection is not None:
+                        connection.close()
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=5)
 
     def test_atomic_budget_admission_and_request_replay(self) -> None:
         lease = self.issue(

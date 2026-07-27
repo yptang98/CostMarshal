@@ -155,6 +155,11 @@ def build_parser() -> argparse.ArgumentParser:
     configure_provider.add_argument("--model")
     configure_provider.add_argument("--env-key")
     configure_provider.add_argument("--wire-api", choices=["responses"])
+    configure_provider.add_argument(
+        "--via-production-gateway",
+        action="store_true",
+        help="Bind a reviewed preset to the enforced CostMarshal production gateway; required for Chat Completions-only presets",
+    )
     configure_provider.add_argument("--reasoning-effort", choices=["minimal", "low", "medium", "high", "xhigh"])
     configure_provider.add_argument(
         "--tier",
@@ -913,6 +918,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--gateway-policy-sha256",
         help="Exact sha256:<64 hex> of the reviewed gateway policy",
     )
+    production_boundary.add_argument(
+        "--deployment-commit",
+        help="Exact 40-hex source commit deployed by the gateway",
+    )
+    production_boundary.add_argument(
+        "--release-version",
+        help="Exact CostMarshal release version, for example v4.2.0",
+    )
+    production_boundary.add_argument(
+        "--gateway-image",
+        help="Digest-pinned gateway image name@sha256:<64 hex>",
+    )
+    production_boundary.add_argument(
+        "--allowed-signers-sha256",
+        help="Reviewed sha256:<64 hex> of the OpenSSH allowed_signers trust root",
+    )
+    production_boundary.add_argument(
+        "--signer-identity",
+        action="append",
+        help="Trusted OpenSSH certification signer identity; repeat as needed",
+    )
     production_boundary.add_argument("--broker-endpoint", required=True)
     production_boundary.add_argument("--broker-identity", required=True)
     production_boundary.add_argument("--provider-proxy-endpoint", required=True)
@@ -939,6 +965,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Report production-boundary evidence and remaining fail-closed blockers",
     )
     production_status.add_argument("--project", required=True)
+    production_status.add_argument(
+        "--certification-manifest",
+        help="Canonical signed production certification JSON",
+    )
+    production_status.add_argument(
+        "--certification-signature",
+        help="Detached OpenSSH signature for the certification JSON",
+    )
+    production_status.add_argument(
+        "--allowed-signers",
+        help="OpenSSH allowed_signers file matching the reviewed trust-root hash",
+    )
     production_status.set_defaults(func=command_production_status)
 
     memory = sub.add_parser(

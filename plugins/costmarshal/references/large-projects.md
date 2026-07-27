@@ -1,4 +1,4 @@
-# CostMarshal v4.1 Large-project Coordination
+# CostMarshal v4.2 Large-project Coordination
 
 CostMarshal's project layer exists to make one current project easier to
 execute, review, resume, and reuse. It is not a global project manager, does
@@ -70,7 +70,7 @@ URLs with credentials, query strings, fragments, or non-HTTPS schemes are
 rejected. No provider secret is stored in the document.
 
 With `--runtime-adapter costmarshal-gateway-v1`, the contract activates the
-deployable v4.1 runtime:
+deployable gateway runtime:
 
 - the Broker requires a client certificate with exactly one allowlisted SPIFFE
   URI SAN and issues a signed attempt-scoped lease;
@@ -84,10 +84,20 @@ deployable v4.1 runtime:
   the lease plus a read-only CA bundle; and
 - dispatch probes both live TLS services and checks the exact policy hash.
 
-`production-status` remains `blocked` unless the live runtime, digest-pinned
-Worker, internal Proxy network, SQLite authority, hard-budget setting, and all
-accepted external evidence bindings pass. Legacy raw-key mode cannot satisfy an
-enforced production boundary.
+The v4.2 boundary additionally pins:
+
+- the exact 40-hex deployed commit and release version;
+- the digest-pinned gateway image;
+- the SHA-256 of an external OpenSSH `allowed_signers` file; and
+- one or more trusted signer identities.
+
+`production-status` reports `runtime_status` and `certification_status`
+separately. The final status remains `blocked` unless both are ready. A valid
+certification is an at-most-seven-day canonical manifest signed in the
+`costmarshal-production-certification-v1` namespace. It binds the exact
+boundary/policy/commit/release/image values and the report SHA-256 in each
+accepted `production-evidence` Artifact receipt. Legacy raw-key mode and legacy
+v1/v2 production boundaries cannot satisfy an enforced production boundary.
 
 The included Compose topology is a hardened single-host deployment. It is not
 multi-host HA and its SQLite ledger must not be placed on NFS. See

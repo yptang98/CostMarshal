@@ -8,7 +8,7 @@
 
   <p>
     <a href="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="VERSION"><img alt="Version 4.1.0" src="https://img.shields.io/badge/version-4.1.0-2bb3a3"></a>
+    <a href="VERSION"><img alt="Version 4.2.0" src="https://img.shields.io/badge/version-4.2.0-2bb3a3"></a>
     <a href="https://www.python.org/downloads/"><img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white"></a>
     <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-f0b94b"></a>
   </p>
@@ -177,8 +177,8 @@ contains a key or an unreviewed price.
 
 | Provider | Included models | API input | CostMarshal input |
 | --- | --- | --- | --- |
-| DeepSeek | V4 Flash / Pro | Text | Responses gateway required |
-| Kimi | K3 / K2.6 | Text, image; K2.6 also video | Responses gateway required |
+| DeepSeek | V4 Flash / Pro | Text | Text through the production Chat adapter |
+| Kimi | K3 / K2.6 | Text, image; K2.6 also video | Text/image through the production Chat adapter |
 | LongCat | 2.0 | Text | Text |
 | Xiaomi MiMo | 2.5 / 2.5 Pro | 2.5: text, image, audio, video | Text, image |
 | Doubao Ark | Seed 2.0 Lite | Text, image, audio, video | Text, image |
@@ -194,10 +194,13 @@ input:image capability for tasks that include images.
 ```
 
 Modern Codex workers use the OpenAI Responses protocol. MiMo and Doubao expose
-it officially; this LongCat deployment is live-verified with it. DeepSeek and
-Kimi currently document Chat Completions/Anthropic APIs, so CostMarshal reports
-their capabilities but refuses to generate a misleading direct Codex profile;
-use a separately reviewed Responses gateway for those two.
+it officially, and the current LongCat deployment uses it. For a reviewed
+DeepSeek or Kimi Chat endpoint, the v4.2 production Proxy can translate bounded
+Responses text/image/audio messages, function tools, completed JSON, and SSE
+events by setting `wire_api: chat-completions`. The adapter buffers the bounded
+upstream completion before emitting Responses SSE, so it is compatible but not
+token-by-token realtime. Video and document input require a native Responses
+provider and are rejected by the Chat adapter.
 
 Multimodal is enforced end to end: routing uses the intersection of the model's
 documented API capabilities and what the current worker can actually transport.
@@ -220,6 +223,13 @@ python scripts/costmarshal.py configure-provider `
   --preset mimo-v2.5 `
   --profile mimo `
   --tier medium
+
+# Chat-only providers are bound to the enforced CostMarshal gateway:
+python scripts/costmarshal.py configure-provider `
+  --preset kimi-k2.6 `
+  --profile kimi-gateway `
+  --tier high `
+  --via-production-gateway
 ```
 
 Budgeted routing requires a hash-bound pricing snapshot for each enabled provider. Use `costmarshal_v2.routing.build_pricing_snapshot(...)` to canonicalize reviewed CNY rates and timestamps; do not hand-edit snapshot hashes. Expired, future-effective, mixed-currency, malformed, or incomplete pricing fails closed.
@@ -228,8 +238,11 @@ Provider identity is separate from capability tier, so the catalog can be
 replaced without changing routing policy. Native Codex execution reuses an
 actor-private copy of the existing Codex login. Because an isolated OCI worker
 must not inherit the host session, its explicit OpenAI API path uses the
-standard `OPENAI_API_KEY`. Other provider credentials are supplied through the
-process environment or an external secrets file. No credential is written into
+standard `OPENAI_API_KEY`. Direct-provider credentials are supplied through the
+process environment or an external secrets file. Gateway-bound catalog rows
+carry `runtime_adapter: costmarshal-gateway-v1`; dispatch fails closed unless
+the project has a ready, enforced, externally certified production boundary.
+Workers then receive only a scoped lease. No credential is written into
 profiles, prompts, reports, or repository files.
 
 The home directory resolution order is an explicit `--codex-home`, then non-empty `CODEX_HOME`, then `~/.codex`. Service and container launches should use an absolute `CODEX_HOME`.
@@ -248,9 +261,12 @@ The home directory resolution order is an explicit `--codex-home`, then non-empt
 - Real-provider backtests and live malicious-container evidence are still required for deployment-specific production certification. Local and mocked tests are not treated as that proof.
 - v4.1 includes an mTLS SPIFFE Credential Broker, signed short-lived leases,
   a provider-key-isolating hard-budget Proxy, live policy-hash health probes,
-  and an OCI Actor adapter. Enforced dispatch still fails closed until the
-  exact deployment policy, live services, worker digest, and accepted external
-  evidence all pass.
+  and an OCI Actor adapter.
+- v4.2 separates runtime readiness from certification. Enforced dispatch also
+  requires a short-lived OpenSSH-signed canonical claim bound to the exact
+  commit, release, boundary, policy, Worker/gateway image digests, reviewed
+  trust-root hash, and all five accepted production-evidence report hashes.
+  Artifact IDs or self-asserted JSON can no longer certify a deployment.
 
 Read [`SECURITY.md`](SECURITY.md) before production use.
 
@@ -310,6 +326,7 @@ CostMarshal stores project state under `$CODEX_HOME/costmarshal-v2` when `CODEX_
 | [`references/backtest.md`](references/backtest.md) | Blind real-provider evaluation format and gates |
 | [`container/worker/README.md`](container/worker/README.md) | Building the digest-pinned worker image |
 | [`deploy/production/README.md`](deploy/production/README.md) | Deploying the mTLS Broker and hard-budget Provider Proxy |
+| [`scripts/costmarshal_production_certification.py`](scripts/costmarshal_production_certification.py) | Creating and verifying the exact short-lived production claim |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release history |
 
 <details>

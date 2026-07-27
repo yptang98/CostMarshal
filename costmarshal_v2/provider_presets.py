@@ -52,9 +52,25 @@ RUNTIME_CAPABILITIES = frozenset(
         "code",
     }
 )
+CHAT_GATEWAY_CAPABILITIES = frozenset(
+    {
+        "input:text",
+        "input:image",
+        "input:audio",
+        "output:text",
+        "streaming",
+        "reasoning",
+        "tool-calling",
+        "structured-output",
+        "context-caching",
+        "long-context",
+        "code",
+    }
+)
 NON_TEXT_INPUT_CAPABILITIES = frozenset(
     {"input:image", "input:audio", "input:video", "input:document"}
 )
+PRODUCTION_GATEWAY_RUNTIME_ADAPTER = "costmarshal-gateway-v1"
 
 
 @dataclass(frozen=True)
@@ -81,6 +97,27 @@ class ProviderPreset:
             capability
             for capability in self.api_capabilities
             if capability in RUNTIME_CAPABILITIES
+        )
+
+    @property
+    def gateway_compatible(self) -> bool:
+        return self.wire_api == "responses" or (
+            "openai-chat-completions" in self.documented_protocols
+        )
+
+    @property
+    def gateway_effective_capabilities(self) -> tuple[str, ...]:
+        if not self.gateway_compatible:
+            return ()
+        supported = (
+            RUNTIME_CAPABILITIES
+            if self.wire_api == "responses"
+            else CHAT_GATEWAY_CAPABILITIES
+        )
+        return tuple(
+            capability
+            for capability in self.api_capabilities
+            if capability in supported
         )
 
     @property
@@ -126,9 +163,13 @@ class ProviderPreset:
             "wire_api": self.wire_api,
             "documented_protocols": list(self.documented_protocols),
             "codex_compatible": self.wire_api == "responses",
+            "gateway_compatible": self.gateway_compatible,
             "reasoning_effort": self.reasoning_effort,
             "api_capabilities": list(self.api_capabilities),
             "effective_capabilities": list(self.effective_capabilities),
+            "gateway_effective_capabilities": list(
+                self.gateway_effective_capabilities
+            ),
             "api_multimodal": self.is_api_multimodal,
             "runtime_multimodal": self.is_runtime_multimodal,
             "runtime_limitations": limitations,
@@ -144,15 +185,20 @@ class ProviderPreset:
         profile: str,
         model: str | None = None,
         priority: int = 100,
+        via_production_gateway: bool = False,
     ) -> dict[str, Any]:
-        if self.wire_api != "responses":
+        if via_production_gateway and not self.gateway_compatible:
+            raise ValueError(
+                f"{self.preset_id} has no protocol supported by the production gateway"
+            )
+        if not via_production_gateway and self.wire_api != "responses":
             raise ValueError(
                 f"{self.preset_id} is not directly compatible with the current "
                 "Responses-only Codex worker; use a reviewed Responses gateway"
             )
         if tier not in {"low", "medium", "high"}:
             raise ValueError("tier must be low, medium, or high")
-        return {
+        provider = {
             "provider_id": self.provider_id,
             "tier": tier,
             "profile": profile,
@@ -163,8 +209,15 @@ class ProviderPreset:
             "input_cny_per_1m": None,
             "output_cny_per_1m": None,
             # Only end-to-end capabilities are eligible for hard routing.
-            "capabilities": list(self.effective_capabilities),
+            "capabilities": list(
+                self.gateway_effective_capabilities
+                if via_production_gateway
+                else self.effective_capabilities
+            ),
         }
+        if via_production_gateway:
+            provider["runtime_adapter"] = PRODUCTION_GATEWAY_RUNTIME_ADAPTER
+        return provider
 
 
 def _caps(*values: str) -> tuple[str, ...]:
@@ -415,6 +468,13 @@ def provider_presets_payload(preset: str | None = None) -> dict[str, Any]:
             "capabilities": sorted(RUNTIME_CAPABILITIES),
             "routing_rule": "provider capabilities are the API/runtime intersection",
         },
+        "production_gateway_adapter": {
+            "name": PRODUCTION_GATEWAY_RUNTIME_ADAPTER,
+            "worker_wire_api": "responses",
+            "upstream_wire_apis": ["responses", "chat-completions"],
+            "chat_capabilities": sorted(CHAT_GATEWAY_CAPABILITIES),
+            "routing_rule": "gateway capabilities are the API/adapter/runtime intersection",
+        },
         "capability_vocabulary": dict(sorted(CAPABILITY_DESCRIPTIONS.items())),
         "aliases": dict(sorted(PRESET_ALIASES.items())),
         "presets": [item.to_dict() for item in selected],
@@ -423,10 +483,12 @@ def provider_presets_payload(preset: str | None = None) -> dict[str, Any]:
 
 __all__ = [
     "CAPABILITY_DESCRIPTIONS",
+    "CHAT_GATEWAY_CAPABILITIES",
     "NON_TEXT_INPUT_CAPABILITIES",
     "PRESET_ALIASES",
     "PROVIDER_PRESETS",
     "ProviderPreset",
+    "PRODUCTION_GATEWAY_RUNTIME_ADAPTER",
     "RUNTIME_CAPABILITIES",
     "provider_presets_payload",
     "resolve_provider_preset",

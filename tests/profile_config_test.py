@@ -57,6 +57,13 @@ def main() -> int:
         assert by_id["kimi-k2.6"]["runtime_multimodal"] is False
         assert by_id["kimi-k2.6"]["effective_capabilities"] == []
         assert by_id["kimi-k2.6"]["codex_compatible"] is False
+        assert by_id["kimi-k2.6"]["gateway_compatible"] is True
+        assert "input:image" in by_id["kimi-k2.6"][
+            "gateway_effective_capabilities"
+        ]
+        assert "input:video" not in by_id["kimi-k2.6"][
+            "gateway_effective_capabilities"
+        ]
         assert "input:video" not in by_id["kimi-k2.6"]["effective_capabilities"]
         assert "input:audio" in by_id["mimo-v2.5"]["api_capabilities"]
         assert "input:audio" not in by_id["mimo-v2.5"]["effective_capabilities"]
@@ -95,6 +102,47 @@ def main() -> int:
             expect=1,
         )
         assert "Responses-only Codex worker" in unsupported.stderr
+
+        gateway_kimi = json.loads(
+            run(
+                "configure-provider",
+                "--codex-home",
+                str(home),
+                "--preset",
+                "kimi-k2.6",
+                "--profile",
+                "kimi-gateway",
+                "--via-production-gateway",
+                "--dry-run",
+            ).stdout
+        )
+        assert gateway_kimi["requires_production_gateway"] is True
+        assert gateway_kimi["catalog_provider"]["runtime_adapter"] == (
+            "costmarshal-gateway-v1"
+        )
+        assert "input:image" in gateway_kimi["catalog_provider"]["capabilities"]
+        assert "input:video" not in gateway_kimi["catalog_provider"]["capabilities"]
+        assert gateway_kimi["dry_run"] is True
+
+        custom_gateway = run(
+            "configure-provider",
+            "--codex-home",
+            str(home),
+            "--profile",
+            "custom-gateway",
+            "--provider-id",
+            "custom",
+            "--base-url",
+            "https://example.test/v1",
+            "--model",
+            "model",
+            "--env-key",
+            "API_KEY",
+            "--via-production-gateway",
+            "--dry-run",
+            expect=1,
+        )
+        assert "requires a reviewed --preset" in custom_gateway.stderr
 
         conflict = run(
             "configure-provider",

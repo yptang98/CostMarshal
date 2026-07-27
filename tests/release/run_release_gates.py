@@ -83,6 +83,7 @@ REQUIRED_LOCAL_TESTS = (
     "tests/production_gateway_contract_test.py",
     "tests/production_deployment_contract_test.py",
     "tests/production_actor_gateway_contract_test.py",
+    "tests/production_certification_contract_test.py",
     "tests/change_apply_test.py",
     "tests/change_workflow_test.py",
     "tests/reliability_contract_test.py",
@@ -104,6 +105,8 @@ REQUIRED_LOCAL_TESTS = (
 REQUIRED_TESTS = REQUIRED_LOCAL_TESTS + (
     "tests/release/run_local_test_evidence.py",
     "tests/release/run_runtime_effect_evidence.py",
+    "tests/release/run_gateway_evidence.py",
+    "tests/release/run_provider_drift_evidence.py",
     "tests/oci_live_evidence.py",
     "tests/release/run_release_gates.py",
 )
@@ -116,6 +119,8 @@ REPRODUCED_ARTIFACTS = {
     "local_test_suite": "artifacts/local-test-report.json",
     "transactional_runtime_effects": "artifacts/runtime-effect-report.json",
     "real_provider_backtest": "artifacts/backtest-report.json",
+    "production_gateway_runtime": "artifacts/gateway-runtime-report.json",
+    "provider_schema_drift": "artifacts/provider-schema-drift-report.json",
     "oci_execution_adapter": "artifacts/oci-attestation.json",
 }
 
@@ -537,6 +542,146 @@ def validate_backtest(payload: dict[str, Any]) -> list[str]:
     return blockers
 
 
+def validate_gateway_runtime(payload: dict[str, Any]) -> list[str]:
+    blockers: list[str] = []
+    if payload.get("schema_version") != "costmarshal-gateway-live-evidence-v1":
+        blockers.append("gateway evidence schema is invalid")
+    if payload.get("status") != "pass":
+        blockers.append("gateway evidence status must be pass")
+    if payload.get("git_sha") != current_git_sha():
+        blockers.append("gateway evidence is not bound to the current git commit")
+    if payload.get("real_provider_call") is not True:
+        blockers.append("gateway evidence did not complete a real provider call")
+    for field in (
+        "policy_sha256",
+        "broker_endpoint_sha256",
+        "proxy_endpoint_sha256",
+        "provider_response_sha256",
+    ):
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(payload.get(field) or "")):
+            blockers.append(f"gateway evidence {field} is invalid")
+    if not isinstance(payload.get("provider"), str) or not payload.get("provider"):
+        blockers.append("gateway evidence provider is missing")
+    if not isinstance(payload.get("model"), str) or not payload.get("model"):
+        blockers.append("gateway evidence model is missing")
+    if payload.get("settlement") != "settled":
+        blockers.append("gateway evidence did not produce a settled request")
+    usage = payload.get("usage")
+    if (
+        not isinstance(usage, dict)
+        or type(usage.get("input_tokens")) is not int
+        or usage["input_tokens"] < 0
+        or type(usage.get("output_tokens")) is not int
+        or usage["output_tokens"] < 0
+    ):
+        blockers.append("gateway evidence provider usage is missing or invalid")
+    required_checks = {
+        "broker_health_policy_bound",
+        "proxy_health_policy_bound",
+        "broker_idempotent_attempt_lease",
+        "real_provider_success",
+        "provider_usage_reported",
+        "proxy_settlement",
+        "proxy_request_replay_rejected",
+        "lease_output_cap_rejected_before_provider",
+    }
+    checks = payload.get("checks")
+    if not isinstance(checks, list):
+        blockers.append("gateway evidence checks are missing")
+    else:
+        names = [
+            item.get("name")
+            for item in checks
+            if isinstance(item, dict)
+        ]
+        if set(names) != required_checks or len(names) != len(required_checks):
+            blockers.append("gateway evidence checks are incomplete or duplicated")
+        if any(
+            not isinstance(item, dict) or item.get("status") != "pass"
+            for item in checks
+        ):
+            blockers.append("gateway evidence contains a failed check")
+    serialized = json.dumps(payload, sort_keys=True)
+    if re.search(
+        r"(?i)(lease_token|api[_-]?key|authorization|provider_secret)",
+        serialized,
+    ):
+        blockers.append("gateway evidence contains a secret-bearing field")
+    return blockers
+
+
+def validate_provider_schema_drift(payload: dict[str, Any]) -> list[str]:
+    blockers: list[str] = []
+    if payload.get("schema_version") != "costmarshal-provider-schema-drift-v1":
+        blockers.append("provider schema drift evidence schema is invalid")
+    if payload.get("status") != "pass":
+        blockers.append("provider schema drift evidence status must be pass")
+    if payload.get("git_sha") != current_git_sha():
+        blockers.append(
+            "provider schema drift evidence is not bound to the current git commit"
+        )
+    if payload.get("real_provider_call") is not True:
+        blockers.append("provider schema drift evidence did not call a real provider")
+    for field in (
+        "policy_sha256",
+        "broker_endpoint_sha256",
+        "proxy_endpoint_sha256",
+        "provider_response_sha256",
+    ):
+        if not re.fullmatch(
+            r"sha256:[0-9a-f]{64}",
+            str(payload.get(field) or ""),
+        ):
+            blockers.append(f"provider schema drift evidence {field} is invalid")
+    schema = payload.get("schema")
+    if (
+        not isinstance(schema, dict)
+        or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}",
+            str(schema.get("schema_sha256") or ""),
+        )
+        or not isinstance(schema.get("top_level_keys"), list)
+        or not isinstance(schema.get("top_level_types"), dict)
+        or not isinstance(schema.get("usage_keys"), list)
+        or not isinstance(schema.get("usage_types"), dict)
+        or not isinstance(schema.get("output_shapes"), list)
+    ):
+        blockers.append("provider schema fingerprint receipt is invalid")
+    required_checks = {
+        "proxy_health_policy_bound",
+        "responses_http_contract",
+        "responses_content_type",
+        "responses_json_object",
+        "responses_usage_contract",
+        "responses_output_contract",
+    }
+    checks = payload.get("checks")
+    if not isinstance(checks, list):
+        blockers.append("provider schema drift checks are missing")
+    else:
+        names = [
+            item.get("name")
+            for item in checks
+            if isinstance(item, dict)
+        ]
+        if set(names) != required_checks or len(names) != len(required_checks):
+            blockers.append(
+                "provider schema drift checks are incomplete or duplicated"
+            )
+        if any(
+            not isinstance(item, dict) or item.get("status") != "pass"
+            for item in checks
+        ):
+            blockers.append("provider schema drift evidence contains a failed check")
+    serialized = json.dumps(payload, sort_keys=True)
+    if re.search(
+        r"(?i)(api[_-]?key|authorization|lease[_-]?token|client[_-]?key)",
+        serialized,
+    ):
+        blockers.append("provider schema drift evidence contains a secret-bearing field")
+    return blockers
+
+
 def validate_oci(payload: dict[str, Any]) -> list[str]:
     blockers: list[str] = []
     if payload.get("schema_version") != 1:
@@ -805,6 +950,29 @@ def reproduce_evidence() -> dict[str, Any]:
         ("real_provider_backtest", backtest_command, {0, 1, 2}, "artifacts/backtest-report.json")
     )
 
+    commands.append(
+        (
+            "production_gateway_runtime",
+            [
+                sys.executable,
+                str(ROOT / "tests/release/run_gateway_evidence.py"),
+            ],
+            {0, 1, 2},
+            "artifacts/gateway-runtime-report.json",
+        )
+    )
+    commands.append(
+        (
+            "provider_schema_drift",
+            [
+                sys.executable,
+                str(ROOT / "tests/release/run_provider_drift_evidence.py"),
+            ],
+            {0, 1, 2},
+            "artifacts/provider-schema-drift-report.json",
+        )
+    )
+
     oci_command = [sys.executable, str(ROOT / "tests/oci_live_evidence.py")]
     image = os.environ.get("COSTMARSHAL_OCI_IMAGE")
     if image:
@@ -961,6 +1129,28 @@ def build_report(reproduction: dict[str, Any] | None = None) -> dict[str, Any]:
             validate_oci,
             "Enabled digest-pinned OCI execution passes malicious isolation tests.",
             expected_sha256=reproduced_hashes.get("artifacts/oci-attestation.json"),
+        )
+    )
+    gates.append(
+        external_evidence_gate(
+            "production_gateway_runtime",
+            "artifacts/gateway-runtime-report.json",
+            validate_gateway_runtime,
+            "Live mTLS Broker/Proxy execution enforces lease scope, replay fencing, usage, and settlement.",
+            expected_sha256=reproduced_hashes.get(
+                "artifacts/gateway-runtime-report.json"
+            ),
+        )
+    )
+    gates.append(
+        external_evidence_gate(
+            "provider_schema_drift",
+            "artifacts/provider-schema-drift-report.json",
+            validate_provider_schema_drift,
+            "A live real-provider Responses canary preserves the reviewed response, usage, and output schema.",
+            expected_sha256=reproduced_hashes.get(
+                "artifacts/provider-schema-drift-report.json"
+            ),
         )
     )
     gates.append(

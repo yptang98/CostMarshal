@@ -36,6 +36,8 @@ HEALTH_SCHEMA = "costmarshal-production-gateway-health-v1"
 _SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 _REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}\Z")
 _ALLOWED_PATHS = {"/v1/responses", "/v1/chat/completions"}
+_WIRE_APIS = {"responses", "chat-completions", "both"}
+_INPUT_MODALITIES = {"text", "image", "audio", "video", "document"}
 _MAX_JSON_BYTES = 4 * 1024 * 1024
 _MAX_UPSTREAM_RESPONSE_BYTES = 64 * 1024 * 1024
 
@@ -172,6 +174,8 @@ class ProviderPolicy:
     credential_file: Path | None
     auth_header: str
     auth_scheme: str
+    wire_api: str
+    input_modalities: tuple[str, ...]
     models: Mapping[str, ModelPrice]
 
 
@@ -276,6 +280,8 @@ def _parse_providers(
             "credential_file",
             "auth_header",
             "auth_scheme",
+            "wire_api",
+            "input_modalities",
             "models",
         }:
             raise GatewayError("policy_invalid", f"provider {provider_id} is invalid")
@@ -312,6 +318,32 @@ def _parse_providers(
         auth_scheme = str(raw.get("auth_scheme") or "Bearer").strip()
         if "\r" in auth_scheme or "\n" in auth_scheme or len(auth_scheme) > 32:
             raise GatewayError("policy_invalid", f"provider {provider_id} auth_scheme is invalid")
+        wire_api = str(raw.get("wire_api") or "both").strip()
+        if wire_api not in _WIRE_APIS:
+            raise GatewayError(
+                "policy_invalid",
+                f"provider {provider_id} wire_api is unsupported",
+            )
+        raw_modalities = raw.get("input_modalities", ["text"])
+        if (
+            not isinstance(raw_modalities, list)
+            or not raw_modalities
+            or any(item not in _INPUT_MODALITIES for item in raw_modalities)
+            or len(raw_modalities) != len(set(raw_modalities))
+            or "text" not in raw_modalities
+        ):
+            raise GatewayError(
+                "policy_invalid",
+                f"provider {provider_id} input_modalities are invalid",
+            )
+        if wire_api == "chat-completions" and any(
+            item not in {"text", "image", "audio"}
+            for item in raw_modalities
+        ):
+            raise GatewayError(
+                "policy_invalid",
+                f"provider {provider_id} chat adapter cannot transport video or document input",
+            )
         raw_models = raw.get("models")
         if not isinstance(raw_models, dict) or not raw_models:
             raise GatewayError("policy_invalid", f"provider {provider_id} models are required")
@@ -368,6 +400,8 @@ def _parse_providers(
             credential_file=credential_file,
             auth_header=auth_header,
             auth_scheme=auth_scheme,
+            wire_api=wire_api,
+            input_modalities=tuple(sorted(raw_modalities)),
             models=models,
         )
     return providers
@@ -917,6 +951,615 @@ class BrokerCore:
         }
 
 
+def _safe_remote_or_data_url(value: Any, *, media: str) -> str:
+    text = str(value or "")
+    if len(text.encode("utf-8")) > _MAX_JSON_BYTES:
+        raise GatewayError("request_invalid", f"{media} input exceeds the request limit")
+    parsed = urllib.parse.urlsplit(text)
+    if parsed.scheme == "https" and parsed.netloc and not parsed.username and not parsed.password:
+        return text
+    if text.startswith(f"data:{media}/") and ";base64," in text:
+        encoded = text.split(",", 1)[1]
+        try:
+            base64.b64decode(encoded, validate=True)
+        except ValueError as exc:
+            raise GatewayError("request_invalid", f"{media} data URL is invalid") from exc
+        return text
+    raise GatewayError(
+        "request_invalid",
+        f"{media} input must be a credential-free HTTPS URL or base64 data URL",
+    )
+
+
+def _responses_content_to_chat(
+    value: Any,
+    *,
+    modalities: tuple[str, ...],
+) -> str | list[dict[str, Any]]:
+    if isinstance(value, str):
+        if "text" not in modalities:
+            raise GatewayError("modality_not_supported", "text input is not allowed")
+        return value
+    if not isinstance(value, list) or not value:
+        raise GatewayError("request_invalid", "Responses message content is invalid")
+    result: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise GatewayError("request_invalid", "Responses content item is invalid")
+        kind = item.get("type")
+        if kind in {"input_text", "text", "output_text"}:
+            if "text" not in modalities or not isinstance(item.get("text"), str):
+                raise GatewayError("modality_not_supported", "text input is not allowed")
+            result.append({"type": "text", "text": item["text"]})
+        elif kind in {"input_image", "image_url"}:
+            if "image" not in modalities:
+                raise GatewayError("modality_not_supported", "image input is not allowed")
+            raw_url = item.get("image_url")
+            if isinstance(raw_url, dict):
+                raw_url = raw_url.get("url")
+            url = _safe_remote_or_data_url(raw_url, media="image")
+            image: dict[str, Any] = {"url": url}
+            detail = item.get("detail")
+            if detail in {"auto", "low", "high"}:
+                image["detail"] = detail
+            result.append({"type": "image_url", "image_url": image})
+        elif kind == "input_audio":
+            if "audio" not in modalities:
+                raise GatewayError("modality_not_supported", "audio input is not allowed")
+            audio = item.get("input_audio")
+            if not isinstance(audio, dict):
+                audio = {
+                    "data": item.get("data"),
+                    "format": item.get("format"),
+                }
+            data = str(audio.get("data") or "")
+            audio_format = str(audio.get("format") or "")
+            if (
+                not data
+                or len(data.encode("ascii", errors="ignore")) != len(data)
+                or len(data) > _MAX_JSON_BYTES
+                or audio_format not in {"wav", "mp3", "flac", "m4a", "ogg"}
+            ):
+                raise GatewayError("request_invalid", "audio input is invalid")
+            try:
+                base64.b64decode(data, validate=True)
+            except ValueError as exc:
+                raise GatewayError("request_invalid", "audio input is not base64") from exc
+            result.append(
+                {
+                    "type": "input_audio",
+                    "input_audio": {"data": data, "format": audio_format},
+                }
+            )
+        elif kind in {"input_file", "input_video", "file", "video"}:
+            modality = "video" if "video" in str(kind) else "document"
+            raise GatewayError(
+                "modality_not_supported",
+                f"{modality} input requires a native Responses provider",
+            )
+        else:
+            raise GatewayError(
+                "request_invalid",
+                f"Responses content type {kind!r} is unsupported",
+            )
+    return result
+
+
+def _responses_modalities(value: Any) -> set[str]:
+    modalities: set[str] = set()
+    if isinstance(value, str):
+        return {"text"}
+    if not isinstance(value, list) or not value:
+        raise GatewayError("request_invalid", "Responses input is invalid")
+    for item in value:
+        if not isinstance(item, dict):
+            raise GatewayError("request_invalid", "Responses input item is invalid")
+        kind = item.get("type")
+        if kind in {"function_call", "function_call_output"}:
+            modalities.add("text")
+            continue
+        if kind not in {None, "message"}:
+            raise GatewayError(
+                "request_invalid",
+                f"Responses input type {kind!r} is unsupported",
+            )
+        content = item.get("content")
+        if isinstance(content, str):
+            modalities.add("text")
+            continue
+        if not isinstance(content, list) or not content:
+            raise GatewayError("request_invalid", "Responses message content is invalid")
+        for part in content:
+            if not isinstance(part, dict):
+                raise GatewayError("request_invalid", "Responses content item is invalid")
+            part_type = part.get("type")
+            if part_type in {"input_text", "text", "output_text"}:
+                if not isinstance(part.get("text"), str):
+                    raise GatewayError("request_invalid", "text input is invalid")
+                modalities.add("text")
+            elif part_type in {"input_image", "image_url"}:
+                raw_url = part.get("image_url")
+                if isinstance(raw_url, dict):
+                    raw_url = raw_url.get("url")
+                _safe_remote_or_data_url(raw_url, media="image")
+                modalities.add("image")
+            elif part_type == "input_audio":
+                modalities.add("audio")
+            elif part_type in {"input_video", "video"}:
+                raw_url = part.get("video_url", part.get("url"))
+                _safe_remote_or_data_url(raw_url, media="video")
+                modalities.add("video")
+            elif part_type in {"input_file", "file"}:
+                if not any(
+                    isinstance(part.get(field), str) and part.get(field)
+                    for field in ("file_id", "file_url", "file_data")
+                ):
+                    raise GatewayError("request_invalid", "document input is invalid")
+                file_url = part.get("file_url")
+                if file_url is not None:
+                    _safe_remote_or_data_url(file_url, media="application")
+                modalities.add("document")
+            else:
+                raise GatewayError(
+                    "request_invalid",
+                    f"Responses content type {part_type!r} is unsupported",
+                )
+    return modalities or {"text"}
+
+
+def _chat_modalities(value: Any) -> set[str]:
+    messages = value.get("messages") if isinstance(value, Mapping) else None
+    if not isinstance(messages, list) or not messages:
+        raise GatewayError("request_invalid", "Chat messages are required")
+    modalities: set[str] = set()
+    for message in messages:
+        if not isinstance(message, dict):
+            raise GatewayError("request_invalid", "Chat message is invalid")
+        content = message.get("content")
+        if isinstance(content, str) or content is None:
+            modalities.add("text")
+            continue
+        if not isinstance(content, list) or not content:
+            raise GatewayError("request_invalid", "Chat message content is invalid")
+        for part in content:
+            if not isinstance(part, dict):
+                raise GatewayError("request_invalid", "Chat content item is invalid")
+            kind = part.get("type")
+            if kind == "text":
+                modalities.add("text")
+            elif kind == "image_url":
+                image = part.get("image_url")
+                raw_url = image.get("url") if isinstance(image, dict) else image
+                _safe_remote_or_data_url(raw_url, media="image")
+                modalities.add("image")
+            elif kind == "input_audio":
+                modalities.add("audio")
+            else:
+                raise GatewayError(
+                    "request_invalid",
+                    f"Chat content type {kind!r} is unsupported",
+                )
+    return modalities or {"text"}
+
+
+def _responses_input_to_messages(
+    value: Any,
+    *,
+    modalities: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    if isinstance(value, str):
+        return [{"role": "user", "content": value}]
+    if not isinstance(value, list) or not value:
+        raise GatewayError("request_invalid", "Responses input is invalid")
+    messages: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise GatewayError("request_invalid", "Responses input item is invalid")
+        kind = item.get("type")
+        if kind in {None, "message"}:
+            role = str(item.get("role") or "")
+            if role not in {"user", "assistant", "system", "developer"}:
+                raise GatewayError("request_invalid", "Responses message role is invalid")
+            messages.append(
+                {
+                    "role": "system" if role == "developer" else role,
+                    "content": _responses_content_to_chat(
+                        item.get("content"),
+                        modalities=modalities,
+                    ),
+                }
+            )
+        elif kind == "function_call_output":
+            call_id = str(item.get("call_id") or "")
+            output = item.get("output")
+            if not call_id or not isinstance(output, (str, list, dict)):
+                raise GatewayError("request_invalid", "function_call_output is invalid")
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": (
+                        output
+                        if isinstance(output, str)
+                        else json.dumps(output, ensure_ascii=False, separators=(",", ":"))
+                    ),
+                }
+            )
+        elif kind == "function_call":
+            call_id = str(item.get("call_id") or item.get("id") or "")
+            name = str(item.get("name") or "")
+            arguments = item.get("arguments")
+            if not call_id or not name or not isinstance(arguments, str):
+                raise GatewayError("request_invalid", "function_call input is invalid")
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": arguments,
+                            },
+                        }
+                    ],
+                }
+            )
+        else:
+            raise GatewayError(
+                "request_invalid",
+                f"Responses input type {kind!r} is unsupported",
+            )
+    return messages
+
+
+def _responses_tools_to_chat(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise GatewayError("request_invalid", "Responses tools must be a list")
+    result: list[dict[str, Any]] = []
+    for tool in value:
+        if (
+            not isinstance(tool, dict)
+            or tool.get("type") != "function"
+            or not isinstance(tool.get("name"), str)
+            or not tool.get("name")
+            or not isinstance(tool.get("parameters", {}), dict)
+        ):
+            raise GatewayError(
+                "tool_not_supported",
+                "Chat translation supports function tools only",
+            )
+        function = {
+            "name": tool["name"],
+            "parameters": tool.get("parameters", {}),
+        }
+        if isinstance(tool.get("description"), str):
+            function["description"] = tool["description"]
+        result.append({"type": "function", "function": function})
+    return result
+
+
+def _responses_tool_choice_to_chat(value: Any) -> Any:
+    if value in {"auto", "none", "required"}:
+        return value
+    if (
+        isinstance(value, dict)
+        and value.get("type") == "function"
+        and isinstance(value.get("name"), str)
+        and value.get("name")
+    ):
+        return {
+            "type": "function",
+            "function": {"name": value["name"]},
+        }
+    raise GatewayError("tool_not_supported", "Responses tool_choice is unsupported")
+
+
+def _responses_request_to_chat(
+    body: Mapping[str, Any],
+    *,
+    modalities: tuple[str, ...],
+) -> dict[str, Any]:
+    if body.get("store") not in {None, False}:
+        raise GatewayError("request_invalid", "translated Responses storage is forbidden")
+    if body.get("previous_response_id") is not None:
+        raise GatewayError(
+            "request_invalid",
+            "previous_response_id requires a native Responses provider",
+        )
+    messages = _responses_input_to_messages(
+        body.get("input"),
+        modalities=modalities,
+    )
+    instructions = body.get("instructions")
+    if instructions is not None:
+        if not isinstance(instructions, str):
+            raise GatewayError("request_invalid", "Responses instructions must be text")
+        messages.insert(0, {"role": "system", "content": instructions})
+    result: dict[str, Any] = {
+        "model": body["model"],
+        "messages": messages,
+        "max_tokens": body["max_output_tokens"],
+        # Buffer one bounded upstream response, then emit Responses JSON/SSE.
+        "stream": False,
+    }
+    for field in ("temperature", "top_p", "seed", "stop", "parallel_tool_calls"):
+        if field in body:
+            result[field] = body[field]
+    if "tools" in body:
+        result["tools"] = _responses_tools_to_chat(body["tools"])
+    if "tool_choice" in body:
+        result["tool_choice"] = _responses_tool_choice_to_chat(body["tool_choice"])
+    text = body.get("text")
+    if isinstance(text, dict) and text.get("format") is not None:
+        format_row = text.get("format")
+        if (
+            isinstance(format_row, dict)
+            and format_row.get("type") == "json_object"
+        ):
+            result["response_format"] = {"type": "json_object"}
+        elif (
+            isinstance(format_row, dict)
+            and format_row.get("type") == "json_schema"
+            and isinstance(format_row.get("name"), str)
+            and isinstance(format_row.get("schema"), dict)
+        ):
+            result["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": format_row["name"],
+                    "schema": format_row["schema"],
+                    "strict": bool(format_row.get("strict", False)),
+                },
+            }
+        else:
+            raise GatewayError(
+                "request_invalid",
+                "Responses text format is unsupported by the Chat adapter",
+            )
+    return result
+
+
+def _response_item_id(prefix: str, value: str) -> str:
+    return prefix + hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
+
+
+def _chat_response_to_responses(payload: bytes, *, requested_model: str) -> dict[str, Any]:
+    try:
+        row = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise GatewayError(
+            "upstream_response_invalid",
+            "Chat provider returned invalid JSON",
+            status=502,
+        ) from exc
+    if not isinstance(row, dict):
+        raise GatewayError(
+            "upstream_response_invalid",
+            "Chat provider response must be an object",
+            status=502,
+        )
+    choices = row.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise GatewayError(
+            "upstream_response_invalid",
+            "Chat provider response has no choices",
+            status=502,
+        )
+    response_id = str(row.get("id") or _response_item_id("resp_", _sha256(payload)))
+    output: list[dict[str, Any]] = []
+    incomplete = False
+    for index, choice in enumerate(choices):
+        if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+            raise GatewayError(
+                "upstream_response_invalid",
+                "Chat provider choice is invalid",
+                status=502,
+            )
+        message = choice["message"]
+        content = message.get("content")
+        content_items: list[dict[str, Any]] = []
+        if isinstance(content, str):
+            content_items.append(
+                {
+                    "type": "output_text",
+                    "text": content,
+                    "annotations": [],
+                }
+            )
+        elif content is not None and content != "":
+            raise GatewayError(
+                "upstream_response_invalid",
+                "Chat provider message content is invalid",
+                status=502,
+            )
+        if content_items:
+            output.append(
+                {
+                    "id": _response_item_id(
+                        "msg_",
+                        f"{response_id}:{index}:message",
+                    ),
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": content_items,
+                }
+            )
+        tool_calls = message.get("tool_calls") or []
+        if not isinstance(tool_calls, list):
+            raise GatewayError(
+                "upstream_response_invalid",
+                "Chat provider tool_calls are invalid",
+                status=502,
+            )
+        for tool_index, tool in enumerate(tool_calls):
+            function = tool.get("function") if isinstance(tool, dict) else None
+            if (
+                not isinstance(function, dict)
+                or not isinstance(function.get("name"), str)
+                or not isinstance(function.get("arguments"), str)
+            ):
+                raise GatewayError(
+                    "upstream_response_invalid",
+                    "Chat provider function call is invalid",
+                    status=502,
+                )
+            call_id = str(
+                tool.get("id")
+                or _response_item_id(
+                    "call_",
+                    f"{response_id}:{index}:{tool_index}",
+                )
+            )
+            output.append(
+                {
+                    "id": _response_item_id("fc_", call_id),
+                    "type": "function_call",
+                    "status": "completed",
+                    "call_id": call_id,
+                    "name": function["name"],
+                    "arguments": function["arguments"],
+                }
+            )
+        if choice.get("finish_reason") in {"length", "max_tokens"}:
+            incomplete = True
+    usage = row.get("usage")
+    input_tokens = 0
+    output_tokens = 0
+    if isinstance(usage, dict):
+        input_value = usage.get("prompt_tokens", usage.get("input_tokens"))
+        output_value = usage.get("completion_tokens", usage.get("output_tokens"))
+        if type(input_value) is int and input_value >= 0:
+            input_tokens = input_value
+        if type(output_value) is int and output_value >= 0:
+            output_tokens = output_value
+    created = row.get("created")
+    created_at = created if type(created) is int and created >= 0 else int(time.time())
+    status = "incomplete" if incomplete else "completed"
+    return {
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "status": status,
+        "completed_at": int(time.time()) if status == "completed" else None,
+        "error": None,
+        "incomplete_details": (
+            {"reason": "max_output_tokens"} if incomplete else None
+        ),
+        "instructions": None,
+        "max_output_tokens": None,
+        "model": str(row.get("model") or requested_model),
+        "output": output,
+        "parallel_tool_calls": True,
+        "previous_response_id": None,
+        "reasoning": None,
+        "store": False,
+        "temperature": None,
+        "text": {"format": {"type": "text"}},
+        "tool_choice": "auto",
+        "tools": [],
+        "top_p": None,
+        "truncation": "disabled",
+        "usage": {
+            "input_tokens": input_tokens,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": output_tokens,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": input_tokens + output_tokens,
+        },
+        "user": None,
+        "metadata": {},
+    }
+
+
+def _responses_sse(response: Mapping[str, Any]) -> bytes:
+    sequence = 0
+    events: list[dict[str, Any]] = []
+
+    def add(event_type: str, **fields: Any) -> None:
+        nonlocal sequence
+        sequence += 1
+        events.append({"type": event_type, "sequence_number": sequence, **fields})
+
+    created = dict(response)
+    created["status"] = "in_progress"
+    created["output"] = []
+    add("response.created", response=created)
+    for output_index, item in enumerate(response.get("output") or []):
+        added_item = dict(item)
+        added_item["status"] = "in_progress"
+        if item.get("type") == "message":
+            added_item["content"] = []
+        add(
+            "response.output_item.added",
+            output_index=output_index,
+            item=added_item,
+        )
+        if item.get("type") == "message":
+            for content_index, content in enumerate(item.get("content") or []):
+                pending = dict(content)
+                if content.get("type") == "output_text":
+                    pending["text"] = ""
+                add(
+                    "response.content_part.added",
+                    item_id=item["id"],
+                    output_index=output_index,
+                    content_index=content_index,
+                    part=pending,
+                )
+                if content.get("type") == "output_text":
+                    add(
+                        "response.output_text.delta",
+                        item_id=item["id"],
+                        output_index=output_index,
+                        content_index=content_index,
+                        delta=content["text"],
+                    )
+                    add(
+                        "response.output_text.done",
+                        item_id=item["id"],
+                        output_index=output_index,
+                        content_index=content_index,
+                        text=content["text"],
+                    )
+                add(
+                    "response.content_part.done",
+                    item_id=item["id"],
+                    output_index=output_index,
+                    content_index=content_index,
+                    part=content,
+                )
+        elif item.get("type") == "function_call":
+            add(
+                "response.function_call_arguments.done",
+                item_id=item["id"],
+                output_index=output_index,
+                arguments=item["arguments"],
+            )
+        add(
+            "response.output_item.done",
+            output_index=output_index,
+            item=item,
+        )
+    add("response.completed", response=response)
+    return b"".join(
+        (
+            f"event: {event['type']}\n"
+            + "data: "
+            + json.dumps(
+                event,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\n\n"
+        ).encode("utf-8")
+        for event in events
+    )
+
+
 @dataclass(frozen=True)
 class PreparedProxyRequest:
     request_id: str
@@ -929,6 +1572,9 @@ class PreparedProxyRequest:
     reserved_nano_cny: int
     max_output_tokens: int
     streaming: bool
+    upstream_path: str
+    upstream_payload: bytes
+    response_adapter: str | None
 
 
 class ProviderProxyCore:
@@ -976,6 +1622,21 @@ class ProviderProxyCore:
             raise GatewayError("lease_scope_invalid", "lease provider or model is unavailable", status=401)
         if body.get("model") != model_id:
             raise GatewayError("model_scope_violation", "request model does not match the lease", status=403)
+        observed_modalities = (
+            _responses_modalities(body.get("input"))
+            if path == "/v1/responses"
+            else _chat_modalities(body)
+        )
+        if isinstance(body.get("instructions"), str):
+            observed_modalities.add("text")
+        unsupported_modalities = observed_modalities - set(provider.input_modalities)
+        if unsupported_modalities:
+            raise GatewayError(
+                "modality_not_supported",
+                "request modalities are not allowed by the reviewed provider policy: "
+                + ", ".join(sorted(unsupported_modalities)),
+                status=403,
+            )
         output_field = "max_output_tokens" if path == "/v1/responses" else "max_tokens"
         if output_field not in body:
             body[output_field] = int(claims.get("max_output_tokens") or 0)
@@ -1000,9 +1661,33 @@ class ProviderProxyCore:
             max_output > configured_price.max_output_tokens
             or max_output > int(claims.get("max_output_tokens") or 0)
         ):
-            raise GatewayError("output_cap_exceeded", "requested output cap exceeds the reviewed policy")
+            raise GatewayError(
+                "output_cap_exceeded",
+                "requested output cap exceeds the reviewed policy",
+                status=403,
+            )
         canonical_payload = _canonical_bytes(body)
-        input_upper_bound = len(canonical_payload) + configured_price.request_overhead_tokens
+        upstream_path = path
+        upstream_payload = canonical_payload
+        response_adapter: str | None = None
+        if path == "/v1/responses" and provider.wire_api == "chat-completions":
+            translated = _responses_request_to_chat(
+                body,
+                modalities=provider.input_modalities,
+            )
+            upstream_path = "/v1/chat/completions"
+            upstream_payload = _canonical_bytes(translated)
+            response_adapter = "chat-to-responses-v1"
+        elif path == "/v1/chat/completions" and provider.wire_api == "responses":
+            raise GatewayError(
+                "wire_api_not_supported",
+                "provider requires the Responses API",
+                status=404,
+            )
+        input_upper_bound = (
+            max(len(canonical_payload), len(upstream_payload))
+            + configured_price.request_overhead_tokens
+        )
         if input_upper_bound > int(claims.get("max_input_tokens") or 0):
             raise GatewayError(
                 "input_cap_exceeded",
@@ -1038,6 +1723,8 @@ class ProviderProxyCore:
             input_token_upper_bound=input_upper_bound,
             max_output_tokens=max_output,
             streaming=body.get("stream") is True,
+            wire_api=provider.wire_api,
+            response_adapter=response_adapter,
         )
         return PreparedProxyRequest(
             request_id=request_id,
@@ -1050,6 +1737,9 @@ class ProviderProxyCore:
             reserved_nano_cny=reservation,
             max_output_tokens=max_output,
             streaming=body.get("stream") is True,
+            upstream_path=upstream_path,
+            upstream_payload=upstream_payload,
+            response_adapter=response_adapter,
         )
 
     def credential_header(self, prepared: PreparedProxyRequest) -> tuple[str, str]:
@@ -1097,7 +1787,29 @@ class ProviderProxyCore:
         return prepared.provider.auth_header, value
 
     def upstream_url(self, prepared: PreparedProxyRequest) -> str:
-        return prepared.provider.base_url + prepared.path
+        return prepared.provider.base_url + prepared.upstream_path
+
+    def adapt_response(
+        self,
+        prepared: PreparedProxyRequest,
+        *,
+        status: int,
+        content_type: str,
+        payload: bytes,
+    ) -> tuple[bytes, str, bool]:
+        if (
+            prepared.response_adapter != "chat-to-responses-v1"
+            or status < 200
+            or status >= 300
+        ):
+            return payload, content_type, prepared.streaming
+        response = _chat_response_to_responses(
+            payload,
+            requested_model=str(prepared.claims.get("model") or ""),
+        )
+        if prepared.streaming:
+            return _responses_sse(response), "text/event-stream", True
+        return _canonical_bytes(response), "application/json", False
 
     def actual_cost(
         self,
@@ -1521,7 +2233,7 @@ class ProxyHandler(_BaseHandler):
             }
             request = urllib.request.Request(
                 core.upstream_url(prepared),
-                data=prepared.payload,
+                data=prepared.upstream_payload,
                 headers=upstream_headers,
                 method="POST",
             )
@@ -1534,7 +2246,7 @@ class ProxyHandler(_BaseHandler):
             with response:
                 status = int(getattr(response, "status", 502))
                 content_type = str(response.headers.get("Content-Type") or "application/json")
-                if prepared.streaming:
+                if prepared.streaming and prepared.response_adapter is None:
                     self.send_response(status)
                     self.send_header("Content-Type", content_type)
                     self.send_header("Cache-Control", "no-store")
@@ -1596,7 +2308,47 @@ class ProxyHandler(_BaseHandler):
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
             )
-            if prepared.streaming:
+            downstream_payload = response_payload
+            downstream_content_type = content_type
+            downstream_streaming = prepared.streaming
+            if not response_started:
+                (
+                    downstream_payload,
+                    downstream_content_type,
+                    downstream_streaming,
+                ) = core.adapt_response(
+                    prepared,
+                    status=status,
+                    content_type=content_type,
+                    payload=response_payload,
+                )
+            if response_started:
+                self.wfile.write(b"0\r\n")
+                self.wfile.write(
+                    (
+                        "X-CostMarshal-Settlement: "
+                        + settlement["state"]
+                        + "\r\n\r\n"
+                    ).encode("ascii")
+                )
+                self.wfile.flush()
+            elif downstream_streaming:
+                self.send_response(status)
+                self.send_header("Content-Type", downstream_content_type)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header(
+                    "X-CostMarshal-Request-Id",
+                    prepared.request_id,
+                )
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Trailer", "X-CostMarshal-Settlement")
+                self.end_headers()
+                if downstream_payload:
+                    self.wfile.write(
+                        f"{len(downstream_payload):X}\r\n".encode("ascii")
+                    )
+                    self.wfile.write(downstream_payload)
+                    self.wfile.write(b"\r\n")
                 self.wfile.write(b"0\r\n")
                 self.wfile.write(
                     (
@@ -1608,13 +2360,13 @@ class ProxyHandler(_BaseHandler):
                 self.wfile.flush()
             else:
                 self.send_response(status)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(response_payload)))
+                self.send_header("Content-Type", downstream_content_type)
+                self.send_header("Content-Length", str(len(downstream_payload)))
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("X-CostMarshal-Request-Id", prepared.request_id)
                 self.send_header("X-CostMarshal-Settlement", settlement["state"])
                 self.end_headers()
-                self.wfile.write(response_payload)
+                self.wfile.write(downstream_payload)
         except GatewayError as exc:
             if prepared is not None and dispatched:
                 with contextlib.suppress(GatewayError):

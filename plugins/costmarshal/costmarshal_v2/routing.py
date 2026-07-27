@@ -65,6 +65,7 @@ _PROVIDER_FIELDS = {
     "output_cny_per_1m",
     "pricing",
     "capabilities",
+    "runtime_adapter",
 }
 
 _PRICING_FIELDS = {
@@ -901,6 +902,11 @@ def validate_provider_catalog(catalog: Mapping[str, Any]) -> dict[str, Any]:
             raise RoutingValidationError(f"{label}.capabilities must be a list of non-empty strings")
         if len(capabilities) != len(set(capabilities)):
             raise RoutingValidationError(f"{label}.capabilities must not contain duplicates")
+        runtime_adapter = raw.get("runtime_adapter", "direct")
+        if runtime_adapter not in {"direct", "costmarshal-gateway-v1"}:
+            raise RoutingValidationError(
+                f"{label}.runtime_adapter must be direct or costmarshal-gateway-v1"
+            )
         normalized_provider = {
                 "provider_id": provider_id,
                 "tier": tier,
@@ -917,6 +923,8 @@ def validate_provider_catalog(catalog: Mapping[str, Any]) -> dict[str, Any]:
             normalized_provider.pop("input_cny_per_1m")
             normalized_provider.pop("output_cny_per_1m")
             normalized_provider["pricing"] = pricing
+        if runtime_adapter != "direct":
+            normalized_provider["runtime_adapter"] = runtime_adapter
         normalized.append(normalized_provider)
     return {"schema_version": CATALOG_SCHEMA_VERSION, "providers": normalized}
 

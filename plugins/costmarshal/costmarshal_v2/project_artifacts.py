@@ -36,6 +36,7 @@ PROJECT_ARTIFACT_KINDS = frozenset(
         "accepted-fact",
         "risk",
         "milestone-summary",
+        "production-evidence",
     }
 )
 LOCAL_ARTIFACT_MAX_BYTES = 16 * 1024 * 1024

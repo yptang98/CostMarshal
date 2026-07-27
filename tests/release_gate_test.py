@@ -26,6 +26,8 @@ from run_release_gates import (  # noqa: E402
     reproduction_contract,
     validate_backtest,
     validate_effect_worker,
+    validate_gateway_runtime,
+    validate_provider_schema_drift,
     validate_local_tests,
     validate_oci,
 )
@@ -37,6 +39,85 @@ from runtime_evidence_contract import (  # noqa: E402
 
 
 class ReleaseGateTest(unittest.TestCase):
+    def test_gateway_runtime_requires_live_secret_free_exact_checks(self) -> None:
+        required_checks = {
+            "broker_health_policy_bound",
+            "proxy_health_policy_bound",
+            "broker_idempotent_attempt_lease",
+            "real_provider_success",
+            "provider_usage_reported",
+            "proxy_settlement",
+            "proxy_request_replay_rejected",
+            "lease_output_cap_rejected_before_provider",
+        }
+        payload = {
+            "schema_version": "costmarshal-gateway-live-evidence-v1",
+            "status": "pass",
+            "git_sha": current_git_sha(),
+            "real_provider_call": True,
+            "policy_sha256": "sha256:" + "a" * 64,
+            "broker_endpoint_sha256": "sha256:" + "b" * 64,
+            "proxy_endpoint_sha256": "sha256:" + "c" * 64,
+            "provider_response_sha256": "sha256:" + "d" * 64,
+            "provider": "longcat",
+            "model": "LongCat-2.0",
+            "settlement": "settled",
+            "usage": {"input_tokens": 12, "output_tokens": 3},
+            "checks": [
+                {"name": name, "status": "pass"}
+                for name in sorted(required_checks)
+            ],
+        }
+        self.assertEqual(validate_gateway_runtime(payload), [])
+        payload["lease_token"] = "must-never-be-evidence"
+        self.assertIn(
+            "gateway evidence contains a secret-bearing field",
+            validate_gateway_runtime(payload),
+        )
+
+    def test_provider_schema_drift_requires_live_secret_free_schema_receipt(self) -> None:
+        required_checks = {
+            "proxy_health_policy_bound",
+            "responses_http_contract",
+            "responses_content_type",
+            "responses_json_object",
+            "responses_usage_contract",
+            "responses_output_contract",
+        }
+        payload = {
+            "schema_version": "costmarshal-provider-schema-drift-v1",
+            "status": "pass",
+            "git_sha": current_git_sha(),
+            "real_provider_call": True,
+            "policy_sha256": "sha256:" + "a" * 64,
+            "broker_endpoint_sha256": "sha256:" + "b" * 64,
+            "proxy_endpoint_sha256": "sha256:" + "c" * 64,
+            "provider_response_sha256": "sha256:" + "d" * 64,
+            "provider": "longcat",
+            "model": "LongCat-2.0",
+            "schema": {
+                "schema_sha256": "sha256:" + "e" * 64,
+                "top_level_keys": ["output", "usage"],
+                "top_level_types": {"output": "array", "usage": "object"},
+                "usage_keys": ["input_tokens", "output_tokens"],
+                "usage_types": {
+                    "input_tokens": "integer",
+                    "output_tokens": "integer",
+                },
+                "output_shapes": [],
+            },
+            "checks": [
+                {"name": name, "status": "pass"}
+                for name in sorted(required_checks)
+            ],
+        }
+        self.assertEqual(validate_provider_schema_drift(payload), [])
+        payload["lease_token"] = "must-never-be-evidence"
+        self.assertIn(
+            "provider schema drift evidence contains a secret-bearing field",
+            validate_provider_schema_drift(payload),
+        )
+
     def test_malformed_numeric_evidence_blocks_instead_of_crashing(self) -> None:
         sha = current_git_sha()
         backtest = {

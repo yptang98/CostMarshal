@@ -7,9 +7,9 @@ Report suspected vulnerabilities through a private GitHub security advisory for
 private prompts, or customer data in a public issue. Revoke an exposed provider
 credential before collecting diagnostics.
 
-## v4.1 trust boundaries
+## v4.2 trust boundaries
 
-CostMarshal v4.1's OCI controls isolate worker processes from
+CostMarshal v4.2's OCI controls isolate worker processes from
 the host workspace, other provider credentials, mutable profiles, and scheduler
 authority. They do not make the selected provider client hostile-safe.
 
@@ -24,7 +24,7 @@ It is not admitted by an enforced production boundary. If legacy mode is used:
 - do not use the raw-key worker path for hostile workloads requiring credential
   confidentiality.
 
-The v4.1 production gateway implements that stronger boundary. The Broker
+The production gateway implements that stronger boundary. The Broker
 authenticates an exact SPIFFE URI from an mTLS client certificate and issues a
 signed, short-lived lease bound to provider, model, input/output token envelope,
 budget, expiry, and reviewed policy hash. The Proxy alone reads the provider
@@ -37,6 +37,16 @@ responses to the reviewed policy hash. Enforced dispatch remains blocked when
 the Broker/Proxy, worker digest/network, hard budget, SQLite authority, or
 external evidence is absent. The single-host SQLite deployment must not be
 placed on NFS or presented as multi-host HA.
+
+Runtime health is not external certification. v4.2 requires a canonical claim
+signed with the `costmarshal-production-certification-v1` OpenSSH namespace.
+The configured boundary pins the `allowed_signers` file hash and accepted
+signer identities. Verification freezes the trust file and signature, checks
+the detached signature over the exact manifest bytes, limits validity to seven
+days, rejects expired/future claims, and matches the commit, release, boundary,
+gateway policy, Worker/gateway image digests, and five accepted
+`production-evidence` report receipts. Private signing keys remain external and
+are never read by CostMarshal.
 
 Native worker mode is development compatibility only and is not a host security
 boundary. ArchMarshal integration is read-only governance checking and does not

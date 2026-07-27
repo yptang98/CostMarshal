@@ -1,4 +1,4 @@
-# CostMarshal v4.1 Protocol
+# CostMarshal v4.2 Protocol
 
 This is the canonical v2 protocol. Legacy `scripts/mc.py` commands are not part of it.
 
@@ -153,12 +153,19 @@ Legacy raw-key mode places the selected provider client and credential in one
 container trust domain and cannot stop an in-container workload from encoding
 that key. Redaction is accidental-disclosure defense only.
 
-The v4.1 production path instead uses `costmarshal-gateway-v1`. The host Actor
+The production path uses `costmarshal-gateway-v1`. The host Actor
 authenticates to the Broker with an mTLS certificate containing one exact
 SPIFFE URI, receives a signed provider/model/token/budget/expiry-scoped lease,
 rewrites the verified profile to the Proxy endpoint, and mounts only that lease
 and a public CA bundle. The Proxy alone reads the provider key. Enforced
 dispatch probes both TLS services and rejects policy-hash drift.
+
+Gateway health establishes runtime readiness only. External certification
+requires a currently valid OpenSSH-signed canonical claim. The claim and
+reviewed trust root are bound to the v3 production boundary, exact release
+commit, Worker/gateway image digests, and all external report receipts.
+Accepted Artifact IDs without this signature never authorize production
+dispatch.
 
 ## Write isolation
 

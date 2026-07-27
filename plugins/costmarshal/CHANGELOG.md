@@ -1,5 +1,30 @@
 # Changelog
 
+## v4.2.0 - 2026-07-27
+
+- Split live gateway readiness from external production certification. Healthy
+  Broker/Proxy probes and accepted Artifact IDs can no longer certify a
+  deployment on their own.
+- Added canonical, at-most-seven-day production claims verified with an
+  OpenSSH detached signature and a hash-pinned `allowed_signers` trust root.
+- Bound certification to the exact source commit, release version, production
+  boundary, gateway policy, Worker and gateway image digests, and report
+  SHA-256 receipts for all five required external evidence types.
+- Added `production-evidence` project Artifacts and a create/verify helper that
+  never reads or stores the external signing private key.
+- Enforced production dispatch now requires both live gateway readiness and a
+  currently valid signed certification; legacy v1/v2 boundaries remain
+  readable but cannot claim external certification.
+- Added bounded OpenAI Responses-to-Chat Completions translation for text,
+  image, audio, function tools, structured output, completed JSON, and buffered
+  SSE. Native Responses remains the required path for video and document input.
+- DeepSeek and Kimi presets can now emit executable gateway-bound catalog rows
+  with `--via-production-gateway`; direct execution remains rejected, and
+  dispatch requires a ready enforced production boundary.
+- Added a live, secret-free Provider schema-drift probe that binds a real
+  Responses canary and normalized response-shape fingerprint to the exact
+  commit and gateway policy.
+
 ## v4.1.0 - 2026-07-27
 
 - Added a deployable mTLS Credential Broker with exact SPIFFE workload

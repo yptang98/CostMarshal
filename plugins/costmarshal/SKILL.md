@@ -1,9 +1,9 @@
 ---
 name: costmarshal
-description: "CostMarshal v4.1 internal policy/runtime for the Codex plugin: scheduler-first, capability-aware and cost-aware low/medium/high provider orchestration across repository-bound Workstreams, with an mTLS workload-identity Broker, hard-budget Provider Proxy, staged integration Gates, total-cost reports, structured teaching execution graphs, recency-aware exact-version model memory, accepted project knowledge, project-local Skill candidates, Leader Snapshots, structured handoffs, atomic batch acceptance, project artifact lineage, reviewed API presets, image input, work graphs, artifact gates, recoverable effects, OCI worker isolation, durable attempts, budget reservations, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
+description: "CostMarshal v4.2 internal policy/runtime for the Codex plugin: scheduler-first, capability-aware and cost-aware low/medium/high provider orchestration across repository-bound Workstreams, with an mTLS workload-identity Broker, hard-budget Provider Proxy, short-lived signed production certification, staged integration Gates, total-cost reports, structured teaching execution graphs, recency-aware exact-version model memory, accepted project knowledge, project-local Skill candidates, Leader Snapshots, structured handoffs, atomic batch acceptance, project artifact lineage, reviewed API presets, image input, work graphs, artifact gates, recoverable effects, OCI worker isolation, durable attempts, budget reservations, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
 ---
 
-# CostMarshal v4.1
+# CostMarshal v4.2
 
 Use this skill for long or decomposable work where multiple API price/capability tiers should cooperate under explicit safety, cost, and recovery controls.
 
@@ -43,13 +43,17 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
 24. An enforced production boundary requires `costmarshal-gateway-v1`: mTLS
     SPIFFE identity, signed short-lived leases, a live policy-hash-bound Broker
     and hard-budget Proxy, digest-pinned OCI isolation, SQLite authority, and
-    accepted external evidence. Any missing or drifting binding blocks dispatch;
-    legacy raw-key workers never satisfy this boundary.
+    accepted external evidence. Runtime health and Artifact IDs are insufficient
+    by themselves: v4.2 also requires an unexpired OpenSSH-signed canonical
+    certification bound to the exact commit, release, boundary, policy,
+    Worker/gateway image digests, trust-root hash, signer, and five external
+    report receipts. Any missing or drifting binding blocks dispatch; legacy
+    raw-key workers and legacy production boundaries never satisfy this boundary.
 
 ## Standard workflow
 
 1. Confirm the writable workspace, provider catalog, budget, and governance mode.
-2. Inspect `provider-presets`, then configure required Codex profiles with `configure-provider --preset`; never store API keys in profile files.
+2. Inspect `provider-presets`, then configure required Codex profiles with `configure-provider --preset`; add `--via-production-gateway` for Chat-only providers and never store API keys in profile files.
 3. Initialize the project.
 4. For a large project, register each Git root and create bounded Workstreams
    before creating tasks. Otherwise use the default repository and standalone

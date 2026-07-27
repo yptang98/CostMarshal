@@ -39,8 +39,8 @@ python scripts/costmarshal.py provider-presets
 python scripts/costmarshal.py provider-presets --preset kimi
 ```
 
-Generate a Codex provider profile and a matching catalog row without storing
-the secret:
+Generate a direct Responses provider profile and a matching catalog row without
+storing the secret:
 
 ```powershell
 python scripts/costmarshal.py configure-provider `
@@ -53,12 +53,32 @@ For a Responses-compatible preset, the command returns `catalog_provider` in JSO
 contains only effective capabilities and its prices are `null`; review and add
 pricing before budgeted routing.
 
-Current Codex releases reject `wire_api = "chat"`. DeepSeek and Kimi therefore
-remain queryable capability records but are not emitted as executable profiles.
-For either provider, deploy a separately reviewed Chat-to-Responses gateway,
-then configure the gateway as a custom provider. Do not label the provider
-effective until the gateway passes text, tools, usage, error, and multimodal
-contract tests.
+Current Codex releases reject `wire_api = "chat"`. DeepSeek and Kimi can instead
+be emitted as gateway-bound executable profiles:
+
+```powershell
+python scripts/costmarshal.py configure-provider `
+  --preset deepseek-v4-flash `
+  --profile deepseek-gateway `
+  --tier low `
+  --via-production-gateway
+
+python scripts/costmarshal.py configure-provider `
+  --preset kimi-k2.6 `
+  --profile kimi-gateway `
+  --tier high `
+  --via-production-gateway
+```
+
+The generated worker profile uses a non-routable `.invalid` placeholder and
+the Responses protocol; the production Actor rewrites it to the exact reviewed
+Proxy endpoint. The returned catalog row is marked
+`runtime_adapter: costmarshal-gateway-v1`. Dispatch refuses that row unless an
+enforced production boundary is runtime-ready and externally certified. The
+Proxy selects the upstream Chat endpoint from its hash-bound policy and
+translates bounded text/image/audio, tools, JSON, usage, errors, and buffered
+SSE. Video and document input are deliberately excluded from Chat adapter
+capabilities.
 
 ## Capability vocabulary
 

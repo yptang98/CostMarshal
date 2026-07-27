@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -157,6 +158,11 @@ from .large_project import (
     verify_repository_binding,
     workstream_dispatch_blockers,
     workstream_statuses,
+)
+from .production_evidence import (
+    ProductionEvidenceError,
+    VerifiedProductionCertification,
+    verify_production_certification,
 )
 from .quality import (
     ARTIFACT_SCHEMA,
@@ -4402,6 +4408,58 @@ def _production_gateway_probes(
         }
 
 
+def _production_certification(
+    boundary: Mapping[str, Any],
+    *,
+    artifact_rows: list[dict[str, Any]],
+    worker_isolation: Mapping[str, Any],
+    manifest_path: str | None = None,
+    signature_path: str | None = None,
+    allowed_signers_path: str | None = None,
+) -> tuple[VerifiedProductionCertification | None, str | None]:
+    if boundary.get("schema_version") != "costmarshal-production-boundary-v3":
+        return None, "production boundary must be upgraded to v3 certification trust"
+    runtime = boundary.get("runtime_adapter_config") or {}
+    trust = boundary.get("certification_trust") or {}
+    raw_manifest = manifest_path or os.environ.get(
+        "COSTMARSHAL_PRODUCTION_CERTIFICATION_FILE"
+    )
+    raw_signature = signature_path or os.environ.get(
+        "COSTMARSHAL_PRODUCTION_CERTIFICATION_SIGNATURE_FILE"
+    )
+    raw_allowed = allowed_signers_path or os.environ.get(
+        "COSTMARSHAL_PRODUCTION_ALLOWED_SIGNERS_FILE"
+    )
+    if not raw_manifest or not raw_signature or not raw_allowed:
+        return (
+            None,
+            "signed certification files are not configured; set the three "
+            "COSTMARSHAL_PRODUCTION_*_FILE variables or production-status options",
+        )
+    try:
+        receipt = verify_production_certification(
+            manifest_path=Path(raw_manifest).expanduser(),
+            signature_path=Path(raw_signature).expanduser(),
+            allowed_signers_path=Path(raw_allowed).expanduser(),
+            signer_identities=trust.get("signer_identities") or [],
+            expected_allowed_signers_sha256=str(
+                trust.get("allowed_signers_sha256") or ""
+            ),
+            expected_git_sha=str(runtime.get("deployment_commit") or ""),
+            expected_release_version=str(runtime.get("release_version") or ""),
+            expected_boundary_sha256=str(boundary.get("boundary_sha256") or ""),
+            expected_gateway_policy_sha256=str(
+                runtime.get("policy_sha256") or ""
+            ),
+            expected_worker_image=str(worker_isolation.get("image") or ""),
+            expected_gateway_image=str(runtime.get("gateway_image") or ""),
+            artifact_rows=artifact_rows,
+        )
+    except ProductionEvidenceError as exc:
+        return None, str(exc)
+    return receipt, None
+
+
 def command_dispatch(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
     require_task(layout, args.task)
@@ -4410,20 +4468,30 @@ def command_dispatch(args: Any) -> None:
     repository_registry = _repository_registry(layout, base_project)
     workstream_registry = _workstream_registry(layout, repository_registry)
     project = _project_for_task(layout, base_project, task)
+    production_boundary: dict[str, Any] | None = None
+    boundary_status: dict[str, Any] | None = None
     if layout.production_boundary_json.exists():
         try:
             production_boundary = validate_production_boundary(
                 read_json(layout.production_boundary_json, {})
             )
             if production_boundary.get("mode") == "enforced":
+                production_artifacts = read_jsonl(layout.artifacts_jsonl)
+                certification, certification_error = _production_certification(
+                    production_boundary,
+                    artifact_rows=production_artifacts,
+                    worker_isolation=base_project.get("worker_isolation") or {},
+                )
                 boundary_status = production_status(
                     boundary=production_boundary,
-                    artifact_rows=read_jsonl(layout.artifacts_jsonl),
+                    artifact_rows=production_artifacts,
                     sqlite_authoritative=control_store_enabled(layout),
                     worker_isolation=base_project.get("worker_isolation") or {},
                     runtime_probes=_production_gateway_probes(
                         production_boundary
                     ),
+                    certification=certification,
+                    certification_error=certification_error,
                 )
                 if boundary_status.get("status") != "ready":
                     failed = [
@@ -4602,6 +4670,21 @@ def command_dispatch(args: Any) -> None:
     except (ProfileBindingError, RoutingValidationError, ValueError) as exc:
         raise SystemExit(f"Unable to route task: {exc}") from exc
     provider_spec = provider_by_id(catalog, decision.provider_id)
+    if provider_spec.get("runtime_adapter") == "costmarshal-gateway-v1":
+        if production_boundary is None:
+            raise SystemExit(
+                "Provider requires the CostMarshal production gateway, but no "
+                "production boundary is configured"
+            )
+        if production_boundary.get("mode") != "enforced":
+            raise SystemExit(
+                "Provider requires an enforced CostMarshal production boundary"
+            )
+        if boundary_status is None or boundary_status.get("status") != "ready":
+            raise SystemExit(
+                "Provider requires a ready, externally certified CostMarshal "
+                "production gateway"
+            )
     semantic_trace_exists = task.get("handoff_contract") is not None or any(
         isinstance(previous_attempt, dict)
         and any(
@@ -11057,7 +11140,7 @@ def status_payload(layout: ProjectLayout) -> dict[str, Any]:
         )
     except LargeProjectError as exc:
         production_boundary_status = {
-            "schema_version": "costmarshal-production-status-v1",
+            "schema_version": "costmarshal-production-status-v2",
             "status": "invalid",
             "external_certification": False,
             "error": str(exc),
@@ -12403,6 +12486,17 @@ def command_configure_production_boundary(args: Any) -> None:
                 "gateway_policy_sha256",
                 None,
             ),
+            deployment_commit=getattr(args, "deployment_commit", None),
+            release_version=getattr(args, "release_version", None),
+            gateway_image=getattr(args, "gateway_image", None),
+            allowed_signers_sha256=getattr(
+                args,
+                "allowed_signers_sha256",
+                None,
+            ),
+            signer_identities=list(
+                getattr(args, "signer_identity", None) or []
+            ),
             evidence_artifact_ids=_key_value_bindings(
                 list(args.evidence_artifact or []),
                 label="production evidence Artifact",
@@ -12447,9 +12541,33 @@ def command_production_status(args: Any) -> None:
         else None
     )
     try:
+        artifact_rows = read_jsonl(layout.artifacts_jsonl)
+        certification: VerifiedProductionCertification | None = None
+        certification_error: str | None = None
+        if isinstance(boundary, dict):
+            certification, certification_error = _production_certification(
+                boundary,
+                artifact_rows=artifact_rows,
+                worker_isolation=project.get("worker_isolation") or {},
+                manifest_path=getattr(
+                    args,
+                    "certification_manifest",
+                    None,
+                ),
+                signature_path=getattr(
+                    args,
+                    "certification_signature",
+                    None,
+                ),
+                allowed_signers_path=getattr(
+                    args,
+                    "allowed_signers",
+                    None,
+                ),
+            )
         payload = production_status(
             boundary=boundary,
-            artifact_rows=read_jsonl(layout.artifacts_jsonl),
+            artifact_rows=artifact_rows,
             sqlite_authoritative=control_store_enabled(layout),
             worker_isolation=project.get("worker_isolation") or {},
             runtime_probes=(
@@ -12457,6 +12575,8 @@ def command_production_status(args: Any) -> None:
                 if isinstance(boundary, dict)
                 else None
             ),
+            certification=certification,
+            certification_error=certification_error,
         )
     except LargeProjectError as exc:
         raise SystemExit(f"Production boundary is invalid: {exc}") from exc

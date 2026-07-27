@@ -183,6 +183,11 @@ class ProductionActorGatewayContractTest(unittest.TestCase):
             evidence_artifact_ids=evidence,
             runtime_adapter="costmarshal-gateway-v1",
             gateway_policy_sha256="sha256:" + "b" * 64,
+            deployment_commit="a" * 40,
+            release_version="v4.2.0",
+            gateway_image="example/gateway@sha256:" + "c" * 64,
+            allowed_signers_sha256="sha256:" + "d" * 64,
+            signer_identities=["release@example.test"],
         )
         atomic_write_json(self.layout.production_boundary_json, boundary)
         self.cert = self.temp / "client-cert.pem"
