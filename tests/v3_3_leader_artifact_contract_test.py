@@ -81,8 +81,21 @@ class V33LeaderArtifactContractTest(unittest.TestCase):
         validate_project_artifact(
             summary, known_artifact_ids={base["artifact_id"], summary["artifact_id"]}
         )
+        # The persisted JSONL sequence remains authoritative when multiple
+        # events share the second-resolution timestamp.  Event ids are
+        # content/path-derived and therefore must not reorder the ledger.
+        query_base = {
+            **base,
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "event_id": "PAEV-z",
+        }
+        query_summary = {
+            **summary,
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "event_id": "PAEV-a",
+        }
         rows = query_project_artifacts(
-            iter([base, summary]), lifecycle="accepted"
+            iter([query_base, query_summary]), lifecycle="accepted"
         )
         self.assertEqual([row["name"] for row in rows], ["report", "summary"])
 

@@ -458,7 +458,10 @@ def query_project_artifacts(
         if model is not None and row["metadata"].get("model") != model:
             continue
         result.append(row)
-    return sorted(result, key=lambda item: (item["timestamp"], item["event_id"]))
+    # JSONL append order is the authoritative event order.  Timestamps have
+    # second-level precision, so preserve the iterable's stable order for ties
+    # instead of using a content/path-derived event id as a pseudo-sequence.
+    return sorted(result, key=lambda item: item["timestamp"])
 
 
 __all__ = [
