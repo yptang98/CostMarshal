@@ -119,6 +119,7 @@ class WorkerExecutionSpec:
     profile_size_bytes: int | None = None
     credential_path: Path | None = None
     provider_env_key: str | None = None
+    provider_ca_path: Path | None = None
     credential_cleanup: Literal["preserve", "delete-after-use"] = "preserve"
     credential_temp_root: Path | None = None
     isolation_mode: Literal["required", "unsafe-native"] = "required"
@@ -143,7 +144,7 @@ class WorkerExecutionSpec:
 class MountAttestation:
     target: str
     mode: Literal["ro", "rw"]
-    source_kind: Literal["workspace", "profile", "credential", "output"]
+    source_kind: Literal["workspace", "profile", "credential", "provider-ca", "output"]
 
 
 @dataclass(frozen=True)
@@ -340,6 +341,11 @@ def validate_execution_spec(
     profile = _assert_no_link_components(spec.profile_path, "profile")
     output = _assert_no_link_components(spec.output_exchange, "output exchange")
     credential = _assert_no_link_components(spec.credential_path, "credential") if spec.credential_path else None
+    provider_ca = (
+        _assert_no_link_components(spec.provider_ca_path, "provider CA")
+        if spec.provider_ca_path
+        else None
+    )
     credential_temp_root = (
         _assert_no_link_components(spec.credential_temp_root, "credential temp root")
         if spec.credential_temp_root
@@ -359,6 +365,17 @@ def validate_execution_spec(
         raise IsolationValidationError("output_not_empty", "worker output exchange must be empty before launch")
     if credential is not None and not credential.is_file():
         raise IsolationValidationError("credential_invalid", "worker credential must be a regular file")
+    if provider_ca is not None:
+        if not provider_ca.is_file():
+            raise IsolationValidationError(
+                "provider_ca_invalid",
+                "provider CA bundle must be a regular file",
+            )
+        if provider_ca.stat().st_size > 1024 * 1024:
+            raise IsolationValidationError(
+                "provider_ca_invalid",
+                "provider CA bundle exceeds 1 MiB",
+            )
     if credential_temp_root is not None:
         if not credential_temp_root.is_dir():
             raise IsolationValidationError("credential_cleanup_invalid", "credential temp root must be a directory")
@@ -373,6 +390,8 @@ def validate_execution_spec(
     sources = [("workspace", workspace), ("profile", profile), ("output", output)]
     if credential is not None:
         sources.append(("credential", credential))
+    if provider_ca is not None:
+        sources.append(("provider CA", provider_ca))
     for index, (label, path) in enumerate(sources):
         for other_label, other in sources[index + 1 :]:
             if _overlap(path, other):
@@ -388,7 +407,13 @@ def validate_execution_spec(
                     "forbidden_mount_overlap",
                     f"{label} overlaps a forbidden host root",
                 )
-    return {"workspace": workspace, "profile": profile, "output": output, "credential": credential}
+    return {
+        "workspace": workspace,
+        "profile": profile,
+        "output": output,
+        "credential": credential,
+        "provider_ca": provider_ca,
+    }
 
 
 class OciCliBackend:
@@ -708,6 +733,17 @@ class OciCliBackend:
             argv.extend(["--mount", _mount_arg(paths["credential"], "/run/secrets/provider", "ro")])
             argv.extend(["--env", f"COSTMARSHAL_PROVIDER_ENV_KEY={spec.provider_env_key}"])
             argv.extend(["--env", "COSTMARSHAL_PROVIDER_SECRET_FILE=/run/secrets/provider"])
+        if paths["provider_ca"] is not None:
+            argv.extend(
+                [
+                    "--mount",
+                    _mount_arg(paths["provider_ca"], "/run/secrets/provider-ca.pem", "ro"),
+                    "--env",
+                    "SSL_CERT_FILE=/run/secrets/provider-ca.pem",
+                    "--env",
+                    "NODE_EXTRA_CA_CERTS=/run/secrets/provider-ca.pem",
+                ]
+            )
         argv.extend(
             [
                 "--env",
@@ -818,6 +854,14 @@ class OciCliBackend:
         ]
         if paths["credential"] is not None:
             mounts.append(MountAttestation("/run/secrets/provider", "ro", "credential"))
+        if paths["provider_ca"] is not None:
+            mounts.append(
+                MountAttestation(
+                    "/run/secrets/provider-ca.pem",
+                    "ro",
+                    "provider-ca",
+                )
+            )
         return IsolationAttestation(
             schema="costmarshal-worker-isolation-attestation-v1",
             backend=self.kind,
@@ -1485,8 +1529,15 @@ class OciWorkerExecutionAdapter:
         if handle.spec.credential_path is not None:
             expected_env["COSTMARSHAL_PROVIDER_ENV_KEY"] = str(handle.spec.provider_env_key)
             expected_env["COSTMARSHAL_PROVIDER_SECRET_FILE"] = "/run/secrets/provider"
+        if handle.spec.provider_ca_path is not None:
+            expected_env["SSL_CERT_FILE"] = "/run/secrets/provider-ca.pem"
+            expected_env["NODE_EXTRA_CA_CERTS"] = "/run/secrets/provider-ca.pem"
         managed_keys = {
-            key for key in actual_env if key == "CODEX_HOME" or key.startswith("COSTMARSHAL_")
+            key
+            for key in actual_env
+            if key == "CODEX_HOME"
+            or key.startswith("COSTMARSHAL_")
+            or key in {"SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"}
         }
         if managed_keys != set(expected_env) or any(actual_env.get(key) != value for key, value in expected_env.items()):
             raise WorkerExecutionError(
@@ -1594,6 +1645,8 @@ class OciWorkerExecutionAdapter:
         }
         if paths["credential"] is not None:
             expected_mounts["/run/secrets/provider"] = (paths["credential"], False)  # type: ignore[dict-item]
+        if paths["provider_ca"] is not None:
+            expected_mounts["/run/secrets/provider-ca.pem"] = (paths["provider_ca"], False)  # type: ignore[dict-item]
         actual_mounts: dict[str, Mapping[str, Any]] = {}
         for row in payload.get("Mounts") or []:
             if not isinstance(row, dict):

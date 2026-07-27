@@ -16,6 +16,7 @@ import tempfile
 import time
 import tomllib
 from dataclasses import replace
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit
@@ -46,6 +47,10 @@ from .handoff_contract import (
     validate_collaboration_contract as validate_semantic_collaboration_contract,
 )
 from .mailbox import send_message
+from .large_project import (
+    LargeProjectError,
+    validate_production_boundary,
+)
 from .locking import ProjectLockTimeout, advisory_file_lock, project_write_lock
 from .paths import ProjectLayout, resolve_project, slugify
 from .profile_binding import (
@@ -55,6 +60,8 @@ from .profile_binding import (
     validate_profile_binding,
     verify_profile_snapshot,
 )
+from .production_gateway import GatewayError, request_provider_lease
+from .profiles import provider_profile_text
 from .security import (
     SecurityValidationError,
     ensure_workspace_containment,
@@ -94,6 +101,7 @@ from .state import (
     load_project,
     load_task,
     now_iso,
+    read_json,
     save_actor,
     save_task,
     task_dir,
@@ -107,6 +115,7 @@ NATIVE_LAUNCH_BARRIER_READY_ENV = "COSTMARSHAL_NATIVE_LAUNCH_BARRIER_READY"
 NATIVE_LAUNCH_BARRIER_RELEASE_ENV = "COSTMARSHAL_NATIVE_LAUNCH_BARRIER_RELEASE"
 IMAGE_INPUT_SUFFIXES = frozenset({".gif", ".jpeg", ".jpg", ".png", ".webp"})
 MAX_IMAGE_INPUT_BYTES = 16 * 1024 * 1024
+_NANO_CNY = Decimal("1000000000")
 
 
 def _actor_fault(name: str) -> None:
@@ -2051,6 +2060,128 @@ def _completion_scheduler_command(
     return "collect_task", command_args, body
 
 
+def _gateway_boundary(layout: ProjectLayout) -> dict[str, Any] | None:
+    if not layout.production_boundary_json.exists():
+        return None
+    try:
+        boundary = validate_production_boundary(
+            read_json(layout.production_boundary_json, {})
+        )
+    except LargeProjectError as exc:
+        raise SystemExit(f"production gateway boundary is invalid: {exc}") from exc
+    if boundary.get("runtime_adapter") != "costmarshal-gateway-v1":
+        return None
+    if boundary.get("mode") != "enforced":
+        raise SystemExit(
+            "CostMarshal gateway runtime adapter requires an enforced production boundary"
+        )
+    return boundary
+
+
+def _gateway_attempt_envelope(
+    layout: ProjectLayout,
+    actor: dict[str, Any],
+) -> tuple[int, int, int]:
+    task_id = str(actor.get("task_id") or "")
+    attempt_id = str(actor.get("attempt_id") or "")
+    if not task_id or not attempt_id:
+        raise SystemExit("production gateway requires a bound task and attempt")
+    task = load_task(layout, task_id)
+    attempt = next(
+        (
+            row
+            for row in task.get("attempts") or []
+            if row.get("attempt_id") == attempt_id
+        ),
+        None,
+    )
+    if not isinstance(attempt, dict):
+        raise SystemExit("production gateway cannot find the authoritative attempt")
+    raw_budget = attempt.get("reserved_cost_cny")
+    try:
+        budget = Decimal(str(raw_budget))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise SystemExit(
+            "production gateway requires an exact positive reserved attempt cost"
+        ) from exc
+    if not budget.is_finite() or budget <= 0:
+        raise SystemExit(
+            "production gateway requires an exact positive reserved attempt cost"
+        )
+    budget_nano_cny = int(
+        (budget * _NANO_CNY).to_integral_value(rounding=ROUND_CEILING)
+    )
+    input_tokens = int(task.get("estimated_input_tokens") or 0)
+    output_tokens = int(task.get("estimated_output_tokens") or 0)
+    if input_tokens <= 0 or output_tokens <= 0:
+        raise SystemExit(
+            "production gateway requires positive task input/output token envelopes"
+        )
+    return budget_nano_cny, input_tokens, output_tokens
+
+
+def _gateway_profile(
+    *,
+    profile_data: dict[str, Any],
+    provider_id: str,
+    provider_row: dict[str, Any],
+    proxy_endpoint: str,
+) -> bytes:
+    try:
+        text = provider_profile_text(
+            provider_id=provider_id,
+            display_name=str(provider_row.get("name") or provider_id),
+            base_url=proxy_endpoint,
+            model=str(profile_data.get("model") or ""),
+            env_key=str(provider_row.get("env_key") or ""),
+            wire_api=str(provider_row.get("wire_api") or "responses"),
+            reasoning_effort=(
+                str(profile_data["model_reasoning_effort"])
+                if profile_data.get("model_reasoning_effort")
+                else None
+            ),
+        )
+    except SystemExit as exc:
+        raise SystemExit(f"production gateway profile rewrite failed: {exc}") from exc
+    return text.encode("utf-8")
+
+
+def _install_runtime_profile(path: Path, payload: bytes) -> None:
+    if path.exists():
+        if path.is_symlink() or not path.is_file():
+            raise SystemExit("production gateway runtime profile path is unsafe")
+        try:
+            existing = path.read_bytes()
+        except OSError as exc:
+            raise SystemExit("production gateway runtime profile cannot be read") from exc
+        if existing != payload:
+            raise SystemExit(
+                "production gateway runtime profile changed for the same attempt"
+            )
+        return
+    atomic_write_bytes(path, payload)
+
+
+def _gateway_tls_paths(boundary: dict[str, Any]) -> tuple[Path, Path, Path]:
+    broker = boundary.get("credential_broker") or {}
+    names = broker.get("client_tls_path_env") or {}
+    values: list[Path] = []
+    for label in ("certificate", "private_key", "ca_bundle"):
+        env_name = str(names.get(label) or "")
+        raw = os.environ.get(env_name)
+        if not raw:
+            raise SystemExit(
+                f"production gateway TLS path environment is unavailable: {env_name}"
+            )
+        path = Path(raw).expanduser().resolve()
+        if not path.is_file():
+            raise SystemExit(
+                f"production gateway TLS file is unavailable for {label}"
+            )
+        values.append(path)
+    return values[0], values[1], values[2]
+
+
 def _required_worker_bundle(
     layout: ProjectLayout,
     project: dict[str, Any],
@@ -2115,10 +2246,15 @@ def _required_worker_bundle(
 
     profile = actor.get("profile")
     profile_binding = actor.get("profile_binding")
+    gateway_boundary = _gateway_boundary(layout)
+    gateway_tls_files: tuple[Path, Path, Path] | None = None
     if profile_binding is None:
         raise SystemExit("required worker profile binding is required")
     profile_payload = b"# CostMarshal isolated default profile\n"
     profile_text = profile_payload.decode("utf-8")
+    profile_data: dict[str, Any] | None = None
+    provider_id: str | None = None
+    provider_row: dict[str, Any] | None = None
     try:
         validate_profile_binding(profile_binding, require_available=True)
         profile_payload = verify_profile_snapshot(layout.root, profile_binding)
@@ -2161,10 +2297,33 @@ def _required_worker_bundle(
             or (parsed_url.scheme == "http" and network_mode != "provider-proxy")
         ):
             raise SystemExit("required worker profile base_url is invalid")
-    try:
-        install_bound_copy(profile_path, profile_payload, profile_binding)
-    except ProfileBindingError as exc:
-        raise SystemExit(f"required worker profile snapshot failed closed: {exc}") from exc
+    if gateway_boundary is not None:
+        if (
+            not profile
+            or not isinstance(profile_data, dict)
+            or not isinstance(provider_id, str)
+            or not isinstance(provider_row, dict)
+        ):
+            raise SystemExit(
+                "production gateway requires an explicit bound provider profile"
+            )
+        profile_payload = _gateway_profile(
+            profile_data=profile_data,
+            provider_id=provider_id,
+            provider_row=provider_row,
+            proxy_endpoint=str(
+                (gateway_boundary.get("provider_proxy") or {}).get("endpoint")
+                or ""
+            ),
+        )
+        profile_text = profile_payload.decode("utf-8")
+        gateway_tls_files = _gateway_tls_paths(gateway_boundary)
+        _install_runtime_profile(profile_path, profile_payload)
+    else:
+        try:
+            install_bound_copy(profile_path, profile_payload, profile_binding)
+        except ProfileBindingError as exc:
+            raise SystemExit(f"required worker profile snapshot failed closed: {exc}") from exc
 
     limits_row = execution.get("limits") or {}
     try:
@@ -2199,20 +2358,17 @@ def _required_worker_bundle(
         workspace_mode="rw" if workspace_mode == "workspace-write" else "ro",
         profile_path=profile_path,
         output_exchange=output_exchange,
-        profile_sha256=(
-            str(profile_binding.get("sha256") or "").removeprefix("sha256:")
-            if profile_binding is not None
-            else None
-        ),
-        profile_size_bytes=(
-            int(profile_binding["size_bytes"])
-            if profile_binding is not None
-            else None
-        ),
+        profile_sha256=hashlib.sha256(profile_payload).hexdigest(),
+        profile_size_bytes=len(profile_payload),
         isolation_mode="required",
         engine=engine,
         network_mode=network_mode,
         network_name=execution.get("network_name"),
+        provider_ca_path=(
+            gateway_tls_files[2]
+            if gateway_tls_files is not None
+            else None
+        ),
         forbidden_mount_roots=tuple(forbidden_mount_roots),
         limits=limits,
     )
@@ -2227,12 +2383,61 @@ def _required_worker_bundle(
     # No provider secret is materialized until every credential-free execution
     # invariant has passed.  From this point onward cleanup is part of the
     # persisted OCI lifecycle contract.
-    isolated_env, secret_values = (
-        ({}, ())
-        if finalize_only
-        else isolated_actor_env(project, actor, layout=layout)
-    )
     env_key = provider_env_key(actor)
+    gateway_lease: dict[str, Any] | None = None
+    if finalize_only:
+        isolated_env, secret_values = {}, ()
+    elif gateway_boundary is not None:
+        if not env_key:
+            raise SystemExit(
+                "production gateway requires a provider environment binding"
+            )
+        budget_nano_cny, max_input_tokens, max_output_tokens = (
+            _gateway_attempt_envelope(layout, actor)
+        )
+        if gateway_tls_files is None:
+            raise SystemExit("production gateway TLS files were not admitted")
+        cert_file, key_file, ca_file = gateway_tls_files
+        selected_model = str(actor.get("model") or "")
+        if selected_model in {"", "inherit"} and isinstance(profile_data, dict):
+            selected_model = str(profile_data.get("model") or "")
+        generation = int(runtime.get("credential_generation") or 0)
+        idempotency_key = (
+            "lease-"
+            + slugify(str(actor.get("attempt_id") or "attempt"), "attempt")
+            + f"-{generation:08d}"
+        )
+        try:
+            gateway_lease = request_provider_lease(
+                endpoint=str(
+                    (gateway_boundary.get("credential_broker") or {}).get(
+                        "endpoint"
+                    )
+                    or ""
+                ),
+                client_cert_file=cert_file,
+                client_key_file=key_file,
+                ca_file=ca_file,
+                provider=str(provider_id or actor.get("provider") or ""),
+                model=selected_model,
+                budget_nano_cny=budget_nano_cny,
+                max_input_tokens=max_input_tokens,
+                max_output_tokens=max_output_tokens,
+                idempotency_key=idempotency_key,
+                ttl_seconds=300,
+            )
+        except GatewayError as exc:
+            raise SystemExit(
+                f"production gateway lease failed closed [{exc.code}]: {exc}"
+            ) from exc
+        isolated_env = {env_key: str(gateway_lease["lease_token"])}
+        secret_values = (str(gateway_lease["lease_token"]),)
+    else:
+        isolated_env, secret_values = isolated_actor_env(
+            project,
+            actor,
+            layout=layout,
+        )
     credential_path: Path | None = None
     durable_credential = runtime.get("credential_cleanup") or {}
     if finalize_only and durable_credential.get("path"):
@@ -2284,6 +2489,22 @@ def _required_worker_bundle(
                     "path": str(credential_path),
                     "status": "creating",
                 }
+                if gateway_lease is not None:
+                    current_actor.setdefault("runtime", {})["provider_lease"] = {
+                        "schema_version": gateway_lease["schema_version"],
+                        "lease_id": gateway_lease["lease_id"],
+                        "provider": gateway_lease["provider"],
+                        "model": gateway_lease["model"],
+                        "budget_nano_cny": gateway_lease[
+                            "budget_nano_cny"
+                        ],
+                        "expires_at": gateway_lease["expires_at"],
+                        "token_sha256": "sha256:"
+                        + hashlib.sha256(
+                            str(gateway_lease["lease_token"]).encode("utf-8")
+                        ).hexdigest(),
+                        "runtime_adapter": "costmarshal-gateway-v1",
+                    }
                 save_actor(layout, current_actor)
 
             _control_mutation(
@@ -2300,6 +2521,11 @@ def _required_worker_bundle(
                     "credential_identifier": hashlib.sha256(
                         os.fsencode(credential_path)
                     ).hexdigest(),
+                    "provider_lease_id": (
+                        gateway_lease.get("lease_id")
+                        if gateway_lease is not None
+                        else None
+                    ),
                 },
                 mutate=prepare_credential_cleanup,
             )

@@ -1,4 +1,4 @@
-# CostMarshal v4.0 Protocol
+# CostMarshal v4.1 Protocol
 
 This is the canonical v2 protocol. Legacy `scripts/mc.py` commands are not part of it.
 
@@ -149,15 +149,16 @@ Production worker dispatch uses `required` isolation and may select only an atte
 
 The v3 OCI contract validates mounts, rootfs, UID, capabilities, no-new-privileges, engine locality, image digest, resources, and canary output before state or budget reservation. Required execution uses a bounded JSONL worker adapter with one selected credential, a sanitized profile, stdin-only prompts, a strict output exchange, immutable container identity, and cleanup receipts. Unrestricted bridge networking is forbidden. A `provider-proxy` network must be engine-attested as internal, carry the CostMarshal trust label, and be paired with a separately reviewed dual-homed proxy for controlled egress.
 
-The selected provider client and credential share one trust domain inside the
-container. OCI boundaries keep that worker away from host files and other
-provider keys, but cannot stop a malicious in-container workload from encoding
-the selected key. Redaction is accidental-disclosure defense only. Hostile
-workloads require an out-of-process credential broker issuing scoped
-attempt/provider/budget/time capabilities. v4.0 defines the secret-free
-Broker/Provider Proxy evidence contract but does not implement its attested
-runtime adapter, so production status remains blocked and enforced mode refuses
-dispatch.
+Legacy raw-key mode places the selected provider client and credential in one
+container trust domain and cannot stop an in-container workload from encoding
+that key. Redaction is accidental-disclosure defense only.
+
+The v4.1 production path instead uses `costmarshal-gateway-v1`. The host Actor
+authenticates to the Broker with an mTLS certificate containing one exact
+SPIFFE URI, receives a signed provider/model/token/budget/expiry-scoped lease,
+rewrites the verified profile to the Proxy endpoint, and mounts only that lease
+and a public CA bundle. The Proxy alone reads the provider key. Enforced
+dispatch probes both TLS services and rejects policy-hash drift.
 
 ## Write isolation
 
@@ -170,7 +171,11 @@ Claims coordinate leaders; worktrees enforce workers.
 
 ## Secrets
 
-Low/medium actors receive a minimal environment, one provider key, and a per-actor Codex home containing only the selected profile. The runner removes the secrets-file path and redacts all parsed provider values from stdout and reports.
+Actors receive a minimal environment and a per-actor Codex home containing only
+the selected profile. In production gateway mode they receive one short-lived
+lease token instead of a provider key. The runner removes aggregate
+secrets-file paths and redacts admitted secret or lease values from stdout and
+reports.
 
 ## Budget
 

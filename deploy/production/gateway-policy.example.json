@@ -1,0 +1,32 @@
+{
+  "schema_version": "costmarshal-production-gateway-policy-v1",
+  "issuer": "costmarshal-broker",
+  "audience": "costmarshal-provider-proxy",
+  "lease_ttl_seconds": 300,
+  "database_path": "/var/lib/costmarshal/gateway.db",
+  "providers": {
+    "longcat": {
+      "base_url": "https://api.longcat.chat/openai/v1",
+      "credential_file": "/run/secrets/longcat_api_key",
+      "auth_header": "Authorization",
+      "auth_scheme": "Bearer",
+      "models": {
+        "LongCat-2.0": {
+          "input_nano_cny_per_million": 0,
+          "output_nano_cny_per_million": 0,
+          "fixed_nano_cny_per_request": 0,
+          "billing_safety_ppm": 1200000,
+          "request_overhead_tokens": 1024,
+          "max_output_tokens": 32768
+        }
+      }
+    }
+  },
+  "workloads": {
+    "spiffe://REPLACE_WITH_TRUST_DOMAIN/costmarshal/worker": {
+      "providers": ["longcat"],
+      "max_lease_budget_nano_cny": 0,
+      "max_lease_ttl_seconds": 300
+    }
+  }
+}

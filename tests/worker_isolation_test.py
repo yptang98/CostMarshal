@@ -136,6 +136,11 @@ class WorkerIsolationTest(unittest.TestCase):
         self.output.mkdir()
         self.credential = self.temp / "selected-provider.secret"
         self.credential.write_text(SECRET_VALUE, encoding="utf-8")
+        self.provider_ca = self.temp / "provider-ca.pem"
+        self.provider_ca.write_text(
+            "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n",
+            encoding="utf-8",
+        )
 
     def tearDown(self) -> None:
         shutil.rmtree(self.temp, ignore_errors=True)
@@ -231,6 +236,33 @@ class WorkerIsolationTest(unittest.TestCase):
         )
         for call in runner.calls[context_inspect_index + 1 :]:
             self.assertEqual(call[:3], ("docker", "--host", "unix:///var/run/docker.sock"))
+
+    def test_private_provider_ca_is_read_only_and_bound_to_tls_environment(self) -> None:
+        runner = FakeRunner("docker")
+        backend = OciCliBackend("docker", runner=runner, host_system="Linux")
+        spec = self.spec(
+            engine="docker",
+            provider_ca_path=self.provider_ca,
+        )
+        attestation = backend.preflight(spec)
+        self.assertTrue(
+            any(
+                mount.target == "/run/secrets/provider-ca.pem"
+                and mount.mode == "ro"
+                and mount.source_kind == "provider-ca"
+                for mount in attestation.mounts
+            )
+        )
+        argv = backend.build_run_argv(spec, ["costmarshal-worker", "--jsonl"])
+        rendered = "\n".join(argv)
+        self.assertIn(
+            "SSL_CERT_FILE=/run/secrets/provider-ca.pem",
+            rendered,
+        )
+        self.assertIn(
+            "NODE_EXTRA_CA_CERTS=/run/secrets/provider-ca.pem",
+            rendered,
+        )
 
     def test_remote_docker_context_is_rejected(self) -> None:
         backend = OciCliBackend(

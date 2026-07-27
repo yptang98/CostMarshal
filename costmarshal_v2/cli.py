@@ -909,10 +909,20 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["report-only", "enforced"],
         default="report-only",
     )
+    production_boundary.add_argument(
+        "--gateway-policy-sha256",
+        help="Exact sha256:<64 hex> of the reviewed gateway policy",
+    )
     production_boundary.add_argument("--broker-endpoint", required=True)
     production_boundary.add_argument("--broker-identity", required=True)
     production_boundary.add_argument("--provider-proxy-endpoint", required=True)
     production_boundary.add_argument("--hard-budget-enforced", action="store_true")
+    production_boundary.add_argument(
+        "--runtime-adapter",
+        choices=["external-contract-required", "costmarshal-gateway-v1"],
+        default="external-contract-required",
+        help="Select the deployable CostMarshal mTLS Broker/Proxy adapter",
+    )
     production_boundary.add_argument(
         "--evidence-artifact",
         action="append",

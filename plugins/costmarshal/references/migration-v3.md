@@ -1,5 +1,23 @@
 # CostMarshal v3/v4 Migration
 
+## v4.1 production gateway
+
+v4.1 adds `costmarshal-gateway-v1`, but does not silently change existing
+projects. A v4.0 `costmarshal-production-boundary-v1` document remains readable
+as a blocked external contract. Reconfigure explicitly with:
+
+- an enforced boundary;
+- Broker endpoint ending in `/v1/leases`;
+- Proxy endpoint ending in `/v1`;
+- `--runtime-adapter costmarshal-gateway-v1`;
+- the exact validated gateway-policy SHA-256; and
+- all five accepted external evidence Artifact IDs.
+
+Set the three mTLS client path variables only in the scheduler service
+environment. Existing raw provider keys may remain for legacy projects, but an
+enforced v4.1 boundary never copies them into a Worker. Do not edit the stored
+boundary JSON manually.
+
 ## v4.0 repositories, Workstreams, and staged integration
 
 v4.0 adds `scheduler/repositories.json`, `scheduler/workstreams.json`,
@@ -14,11 +32,10 @@ create bounded Workstreams, and bind new tasks with `--repository` and
 and may unlock dependent Workstreams. Cross-repository plans remain staged and
 non-atomic.
 
-The optional production-boundary document defines a fail-closed external
-Credential Broker and Provider Proxy contract. v4.0 does not implement or
-certify that external runtime adapter; `production-status` therefore reports
-`blocked`, and an `enforced` boundary blocks dispatch. This is intentional and
-prevents configuration metadata from being mistaken for deployment evidence.
+The original v4.0 production-boundary document defines a fail-closed external
+Credential Broker and Provider Proxy contract. It remains blocked until it is
+explicitly migrated to the v4.1 gateway runtime and satisfies live probes and
+evidence checks.
 
 ## v3.5 total cost, model memory, and teaching graphs
 

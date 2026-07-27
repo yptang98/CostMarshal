@@ -20,7 +20,8 @@ REPOSITORY_REGISTRY_SCHEMA = "costmarshal-repository-registry-v1"
 WORKSTREAM_REGISTRY_SCHEMA = "costmarshal-workstream-registry-v1"
 INTEGRATION_PLAN_SCHEMA = "costmarshal-staged-integration-plan-v1"
 INTEGRATION_GATE_SCHEMA = "costmarshal-integration-gate-v1"
-PRODUCTION_BOUNDARY_SCHEMA = "costmarshal-production-boundary-v1"
+PRODUCTION_BOUNDARY_SCHEMA = "costmarshal-production-boundary-v2"
+LEGACY_PRODUCTION_BOUNDARY_SCHEMA = "costmarshal-production-boundary-v1"
 PRODUCTION_STATUS_SCHEMA = "costmarshal-production-status-v1"
 _SAFE_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 _FULL_COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
@@ -1046,6 +1047,8 @@ def build_production_boundary(
     provider_proxy_endpoint: str,
     hard_budget_enforced: bool,
     evidence_artifact_ids: Mapping[str, str],
+    runtime_adapter: str = "external-contract-required",
+    gateway_policy_sha256: str | None = None,
 ) -> dict[str, Any]:
     if mode not in {"report-only", "enforced"}:
         raise LargeProjectError("production boundary mode must be report-only or enforced")
@@ -1063,22 +1066,56 @@ def build_production_boundary(
         raise LargeProjectError(
             "production boundary requires all five external evidence Artifact ids"
         )
+    if runtime_adapter not in {
+        "external-contract-required",
+        "costmarshal-gateway-v1",
+    }:
+        raise LargeProjectError("production runtime adapter is unsupported")
+    broker_url = _safe_endpoint(broker_endpoint, "broker endpoint")
+    proxy_url = _safe_endpoint(
+        provider_proxy_endpoint, "provider proxy endpoint"
+    )
+    if runtime_adapter == "costmarshal-gateway-v1":
+        if urlsplit(broker_url).path.rstrip("/") != "/v1/leases":
+            raise LargeProjectError(
+                "CostMarshal gateway broker endpoint must end with /v1/leases"
+            )
+        if urlsplit(proxy_url).path.rstrip("/") != "/v1":
+            raise LargeProjectError(
+                "CostMarshal gateway proxy endpoint must end with /v1"
+            )
+        if hard_budget_enforced is not True:
+            raise LargeProjectError(
+                "CostMarshal gateway runtime requires hard-budget enforcement"
+            )
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(gateway_policy_sha256 or "")):
+            raise LargeProjectError(
+                "CostMarshal gateway runtime requires an exact policy sha256"
+            )
     body = {
         "schema_version": PRODUCTION_BOUNDARY_SCHEMA,
         "mode": mode,
         "credential_broker": {
-            "endpoint": _safe_endpoint(broker_endpoint, "broker endpoint"),
+            "endpoint": broker_url,
             "workload_identity": str(broker_identity or "").strip(),
             "provider_secret_in_costmarshal": False,
+            "client_tls_path_env": {
+                "certificate": "COSTMARSHAL_BROKER_CLIENT_CERT_FILE",
+                "private_key": "COSTMARSHAL_BROKER_CLIENT_KEY_FILE",
+                "ca_bundle": "COSTMARSHAL_BROKER_CA_FILE",
+            },
         },
         "provider_proxy": {
-            "endpoint": _safe_endpoint(
-                provider_proxy_endpoint, "provider proxy endpoint"
-            ),
+            "endpoint": proxy_url,
             "hard_budget_enforced": bool(hard_budget_enforced),
         },
         "evidence_artifact_ids": dict(sorted(evidence_artifact_ids.items())),
-        "runtime_adapter": "external-contract-required",
+        "runtime_adapter": runtime_adapter,
+        "runtime_adapter_config": (
+            {"policy_sha256": gateway_policy_sha256}
+            if runtime_adapter == "costmarshal-gateway-v1"
+            else None
+        ),
         "external_certification": False,
     }
     if not body["credential_broker"]["workload_identity"]:
@@ -1093,7 +1130,10 @@ def build_production_boundary(
 
 def validate_production_boundary(value: Mapping[str, Any]) -> dict[str, Any]:
     row = _copy(dict(value))
-    if row.get("schema_version") != PRODUCTION_BOUNDARY_SCHEMA:
+    if row.get("schema_version") == LEGACY_PRODUCTION_BOUNDARY_SCHEMA:
+        if row.get("runtime_adapter") != "external-contract-required":
+            raise LargeProjectError("legacy production boundary runtime adapter is invalid")
+    elif row.get("schema_version") != PRODUCTION_BOUNDARY_SCHEMA:
         raise LargeProjectError("invalid production boundary schema")
     body = {
         key: item
@@ -1104,7 +1144,12 @@ def validate_production_boundary(value: Mapping[str, Any]) -> dict[str, Any]:
         row.get("boundary_sha256") != canonical_sha256(body)
         or row.get("mode") not in {"report-only", "enforced"}
         or row.get("external_certification") is not False
-        or row.get("runtime_adapter") != "external-contract-required"
+        or row.get("runtime_adapter")
+        not in {"external-contract-required", "costmarshal-gateway-v1"}
+        or (
+            row.get("runtime_adapter") == "external-contract-required"
+            and row.get("runtime_adapter_config") is not None
+        )
         or not isinstance(
             (row.get("credential_broker") or {}).get("workload_identity"),
             str,
@@ -1135,6 +1180,38 @@ def validate_production_boundary(value: Mapping[str, Any]) -> dict[str, Any]:
         str((row.get("provider_proxy") or {}).get("endpoint") or ""),
         "provider proxy endpoint",
     )
+    if row.get("runtime_adapter") == "costmarshal-gateway-v1":
+        broker = row.get("credential_broker") or {}
+        tls_env = broker.get("client_tls_path_env")
+        if (
+            row.get("schema_version") != PRODUCTION_BOUNDARY_SCHEMA
+            or tls_env
+            != {
+                "certificate": "COSTMARSHAL_BROKER_CLIENT_CERT_FILE",
+                "private_key": "COSTMARSHAL_BROKER_CLIENT_KEY_FILE",
+                "ca_bundle": "COSTMARSHAL_BROKER_CA_FILE",
+            }
+            or urlsplit(str(broker.get("endpoint") or "")).path.rstrip("/")
+            != "/v1/leases"
+            or urlsplit(
+                str((row.get("provider_proxy") or {}).get("endpoint") or "")
+            ).path.rstrip("/")
+            != "/v1"
+            or (row.get("provider_proxy") or {}).get("hard_budget_enforced")
+            is not True
+            or not re.fullmatch(
+                r"sha256:[0-9a-f]{64}",
+                str(
+                    (row.get("runtime_adapter_config") or {}).get(
+                        "policy_sha256"
+                    )
+                    or ""
+                ),
+            )
+        ):
+            raise LargeProjectError(
+                "CostMarshal gateway production adapter binding is invalid"
+            )
     return row
 
 
@@ -1144,6 +1221,7 @@ def production_status(
     artifact_rows: Iterable[Mapping[str, Any]],
     sqlite_authoritative: bool,
     worker_isolation: Mapping[str, Any],
+    runtime_probes: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
 
@@ -1197,22 +1275,56 @@ def production_status(
             artifact_id in accepted,
             True,
         )
-    # v4 defines the fail-closed external contract but intentionally does not
-    # pretend the current raw-key runner is a broker adapter.
     check(
         "external-broker-runtime-adapter",
-        False,
-        "not-implemented",
-        "attested external workload-identity adapter",
+        configured.get("runtime_adapter") == "costmarshal-gateway-v1",
+        configured.get("runtime_adapter"),
+        "costmarshal-gateway-v1",
     )
+    if configured.get("runtime_adapter") == "costmarshal-gateway-v1":
+        expected_policy = str(
+            (configured.get("runtime_adapter_config") or {}).get(
+                "policy_sha256"
+            )
+            or ""
+        )
+        for service in ("broker", "proxy"):
+            probe = (
+                (runtime_probes or {}).get(service)
+                if isinstance(runtime_probes, Mapping)
+                else None
+            )
+            check(
+                f"gateway-health:{service}",
+                isinstance(probe, Mapping)
+                and probe.get("status") == "pass"
+                and probe.get("policy_sha256") == expected_policy,
+                (
+                    {
+                        "status": probe.get("status"),
+                        "policy_sha256": probe.get("policy_sha256"),
+                    }
+                    if isinstance(probe, Mapping)
+                    else None
+                ),
+                {
+                    "status": "pass",
+                    "policy_sha256": expected_policy,
+                },
+            )
+    ready = all(row["passed"] is True for row in checks)
     return {
         "schema_version": PRODUCTION_STATUS_SCHEMA,
-        "status": "blocked",
-        "external_certification": False,
+        "status": "ready" if ready else "blocked",
+        "external_certification": ready,
         "checks": checks,
         "warning": (
-            "The external broker runtime adapter is not implemented; raw-key "
-            "workers remain outside the production-certified boundary."
+            "Ready means the configured deployment evidence and runtime "
+            "bindings passed; release evidence must still be reproduced for "
+            "the exact deployed commit."
+            if ready
+            else "The production boundary remains fail-closed until every "
+            "runtime and evidence binding passes."
         ),
     }
 

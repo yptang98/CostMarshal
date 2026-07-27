@@ -35,6 +35,8 @@ TREE_FILES = (
     "container/worker/costmarshal-escape-probe.js",
     "container/worker/costmarshal-isolation-canary.js",
     "container/worker/costmarshal-worker.js",
+    "container/gateway/.dockerignore",
+    "container/gateway/Dockerfile",
     "costmarshal_v2/__init__.py",
     "costmarshal_v2/actor_runner.py",
     "costmarshal_v2/change_apply.py",
@@ -51,6 +53,7 @@ TREE_FILES = (
     "costmarshal_v2/mailbox.py",
     "costmarshal_v2/paths.py",
     "costmarshal_v2/profile_binding.py",
+    "costmarshal_v2/production_gateway.py",
     "costmarshal_v2/project_artifacts.py",
     "costmarshal_v2/project_knowledge.py",
     "costmarshal_v2/profiles.py",
@@ -86,6 +89,7 @@ INDIVIDUAL_FILES = (
     "references/storage.md",
     "scripts/costmarshal.py",
     "scripts/costmarshal_actor.py",
+    "scripts/costmarshal_gateway.py",
 )
 IGNORED_NAMES = {"__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache"}
 IGNORED_SUFFIXES = {".pyc", ".pyo"}

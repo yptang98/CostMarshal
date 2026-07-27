@@ -201,6 +201,7 @@ from .project_knowledge import (
     validate_skill_candidate,
     require_accepted_artifacts,
 )
+from .production_gateway import GatewayError, probe_gateway_health
 from .work_graph import (
     WorkGraphError,
     dispatch_blockers,
@@ -4346,6 +4347,61 @@ def command_governance_rebind(args: Any) -> None:
     print_json(payload)
 
 
+def _production_gateway_probes(
+    boundary: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    if boundary.get("runtime_adapter") != "costmarshal-gateway-v1":
+        return {}
+    broker = boundary.get("credential_broker") or {}
+    names = broker.get("client_tls_path_env") or {}
+    expected_policy = str(
+        (boundary.get("runtime_adapter_config") or {}).get("policy_sha256")
+        or ""
+    )
+    try:
+        cert_file = Path(
+            os.environ[str(names["certificate"])]
+        ).expanduser().resolve()
+        key_file = Path(
+            os.environ[str(names["private_key"])]
+        ).expanduser().resolve()
+        ca_file = Path(
+            os.environ[str(names["ca_bundle"])]
+        ).expanduser().resolve()
+        broker_probe = probe_gateway_health(
+            endpoint=str(broker.get("endpoint") or ""),
+            expected_policy_sha256=expected_policy,
+            ca_file=ca_file,
+            client_cert_file=cert_file,
+            client_key_file=key_file,
+        )
+        proxy_probe = probe_gateway_health(
+            endpoint=str(
+                (boundary.get("provider_proxy") or {}).get("endpoint") or ""
+            ),
+            expected_policy_sha256=expected_policy,
+            ca_file=ca_file,
+        )
+        return {
+            "broker": broker_probe,
+            "proxy": proxy_probe,
+        }
+    except (KeyError, OSError, GatewayError) as exc:
+        code = exc.code if isinstance(exc, GatewayError) else "gateway_tls_unavailable"
+        return {
+            "broker": {
+                "status": "fail",
+                "policy_sha256": expected_policy,
+                "error_code": code,
+            },
+            "proxy": {
+                "status": "fail",
+                "policy_sha256": expected_policy,
+                "error_code": code,
+            },
+        }
+
+
 def command_dispatch(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
     require_task(layout, args.task)
@@ -4365,6 +4421,9 @@ def command_dispatch(args: Any) -> None:
                     artifact_rows=read_jsonl(layout.artifacts_jsonl),
                     sqlite_authoritative=control_store_enabled(layout),
                     worker_isolation=base_project.get("worker_isolation") or {},
+                    runtime_probes=_production_gateway_probes(
+                        production_boundary
+                    ),
                 )
                 if boundary_status.get("status") != "ready":
                     failed = [
@@ -12338,6 +12397,12 @@ def command_configure_production_boundary(args: Any) -> None:
             broker_identity=str(args.broker_identity),
             provider_proxy_endpoint=str(args.provider_proxy_endpoint),
             hard_budget_enforced=bool(args.hard_budget_enforced),
+            runtime_adapter=str(args.runtime_adapter),
+            gateway_policy_sha256=getattr(
+                args,
+                "gateway_policy_sha256",
+                None,
+            ),
             evidence_artifact_ids=_key_value_bindings(
                 list(args.evidence_artifact or []),
                 label="production evidence Artifact",
@@ -12350,8 +12415,9 @@ def command_configure_production_boundary(args: Any) -> None:
         "mode": "apply" if args.apply else "preview",
         "boundary": boundary,
         "warning": (
-            "This configures a fail-closed external contract; it is not "
-            "production certification or a broker runtime adapter."
+            "This stores a fail-closed runtime/evidence contract. Production "
+            "readiness still requires accepted external evidence and a live "
+            "deployment probe."
         ),
     }
     if not args.apply:
@@ -12367,7 +12433,7 @@ def command_configure_production_boundary(args: Any) -> None:
         "production_boundary_configured",
         boundary_sha256=boundary["boundary_sha256"],
         mode=boundary["mode"],
-        external_certification=False,
+        external_certification=boundary.get("external_certification") is True,
     )
     print_json(payload)
 
@@ -12386,6 +12452,11 @@ def command_production_status(args: Any) -> None:
             artifact_rows=read_jsonl(layout.artifacts_jsonl),
             sqlite_authoritative=control_store_enabled(layout),
             worker_isolation=project.get("worker_isolation") or {},
+            runtime_probes=(
+                _production_gateway_probes(boundary)
+                if isinstance(boundary, dict)
+                else None
+            ),
         )
     except LargeProjectError as exc:
         raise SystemExit(f"Production boundary is invalid: {exc}") from exc

@@ -8,7 +8,7 @@
 
   <p>
     <a href="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="VERSION"><img alt="Version 4.0.0" src="https://img.shields.io/badge/version-4.0.0-2bb3a3"></a>
+    <a href="VERSION"><img alt="Version 4.1.0" src="https://img.shields.io/badge/version-4.1.0-2bb3a3"></a>
     <a href="https://www.python.org/downloads/"><img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white"></a>
     <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-f0b94b"></a>
   </p>
@@ -239,16 +239,18 @@ The home directory resolution order is an explicit `--codex-home`, then non-empt
 ## Safety and trust boundary
 
 > [!IMPORTANT]
-> OCI isolation protects the host workspace and keeps non-selected provider keys out of a worker. It cannot hide the selected provider credential from the provider client inside that same container. Use dedicated, least-privilege, spend-capped, revocable keys and a reviewed digest-pinned worker image.
+> In production gateway mode, Workers receive only a short-lived provider/model/token/budget-scoped lease; the Provider Proxy alone holds the real provider key. Legacy raw-key OCI mode remains available only outside an enforced production boundary.
 
 - Production workers require an attested Docker/Podman Linux-container boundary and never silently fall back to a native process.
 - Workers cannot accept results, authorize additional provider spend, broaden their write scope, or apply their own changes.
 - Writable changes are previewed in a detached Git worktree and verified by path, blob, and executable mode before explicit application.
-- Budget controls are admission and accounting limits over reviewed estimates—not a guarantee that an already-started external API call cannot exceed its forecast.
+- The production proxy atomically reserves a conservative request envelope before every upstream call, requires explicit token caps, treats unknown usage as fully spent, and disables an overrun lease. Legacy scheduler-only estimates are not a hard external cap.
 - Real-provider backtests and live malicious-container evidence are still required for deployment-specific production certification. Local and mocked tests are not treated as that proof.
-- v4 defines a secret-free external Credential Broker/Provider Proxy contract
-  but does not implement its workload-identity runtime adapter. Consequently,
-  `production-status` remains blocked and enforced mode refuses dispatch.
+- v4.1 includes an mTLS SPIFFE Credential Broker, signed short-lived leases,
+  a provider-key-isolating hard-budget Proxy, live policy-hash health probes,
+  and an OCI Actor adapter. Enforced dispatch still fails closed until the
+  exact deployment policy, live services, worker digest, and accepted external
+  evidence all pass.
 
 Read [`SECURITY.md`](SECURITY.md) before production use.
 
@@ -307,6 +309,7 @@ CostMarshal stores project state under `$CODEX_HOME/costmarshal-v2` when `CODEX_
 | [`references/large-projects.md`](references/large-projects.md) | Repository identities, Workstreams, staged integration, and production boundary |
 | [`references/backtest.md`](references/backtest.md) | Blind real-provider evaluation format and gates |
 | [`container/worker/README.md`](container/worker/README.md) | Building the digest-pinned worker image |
+| [`deploy/production/README.md`](deploy/production/README.md) | Deploying the mTLS Broker and hard-budget Provider Proxy |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release history |
 
 <details>

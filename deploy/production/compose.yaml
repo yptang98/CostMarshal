@@ -1,0 +1,102 @@
+name: costmarshal-production
+
+x-gateway-image: &gateway-image
+  image: ${COSTMARSHAL_GATEWAY_IMAGE:?set a reviewed digest-pinned gateway image}
+  read_only: true
+  user: "65532:65532"
+  restart: unless-stopped
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+
+services:
+  credential-broker:
+    <<: *gateway-image
+    command:
+      - broker
+      - --config
+      - /etc/costmarshal/gateway-policy.json
+      - --signing-key-file
+      - /run/secrets/lease_signing_key
+      - --cert-file
+      - /run/secrets/broker_tls_cert
+      - --key-file
+      - /run/secrets/broker_tls_key
+      - --client-ca
+      - /run/secrets/workload_client_ca
+      - --audit-log
+      - /var/log/costmarshal/broker-audit.jsonl
+      - --listen
+      - 0.0.0.0
+      - --port
+      - "8443"
+    ports:
+      - "${COSTMARSHAL_BROKER_BIND_IP:-127.0.0.1}:8443:8443"
+    volumes:
+      - ./gateway-policy.json:/etc/costmarshal/gateway-policy.json:ro
+      - ${COSTMARSHAL_GATEWAY_STATE_DIR:?set pre-created uid-65532 state directory}:/var/lib/costmarshal
+      - ${COSTMARSHAL_GATEWAY_AUDIT_DIR:?set pre-created uid-65532 audit directory}:/var/log/costmarshal
+    secrets:
+      - lease_signing_key
+      - broker_tls_cert
+      - broker_tls_key
+      - workload_client_ca
+    networks:
+      - control
+
+  provider-proxy:
+    <<: *gateway-image
+    command:
+      - proxy
+      - --config
+      - /etc/costmarshal/gateway-policy.json
+      - --signing-key-file
+      - /run/secrets/lease_signing_key
+      - --cert-file
+      - /run/secrets/proxy_tls_cert
+      - --key-file
+      - /run/secrets/proxy_tls_key
+      - --audit-log
+      - /var/log/costmarshal/proxy-audit.jsonl
+      - --listen
+      - 0.0.0.0
+      - --port
+      - "9443"
+    volumes:
+      - ./gateway-policy.json:/etc/costmarshal/gateway-policy.json:ro
+      - ${COSTMARSHAL_GATEWAY_STATE_DIR:?set pre-created uid-65532 state directory}:/var/lib/costmarshal
+      - ${COSTMARSHAL_GATEWAY_AUDIT_DIR:?set pre-created uid-65532 audit directory}:/var/log/costmarshal
+    secrets:
+      - lease_signing_key
+      - proxy_tls_cert
+      - proxy_tls_key
+      - longcat_api_key
+    networks:
+      - provider-proxy
+      - provider-egress
+
+networks:
+  control:
+    internal: true
+  provider-proxy:
+    name: costmarshal-provider-proxy
+    internal: true
+  provider-egress:
+
+secrets:
+  lease_signing_key:
+    file: ${COSTMARSHAL_LEASE_SIGNING_KEY_FILE:?set signing key file}
+  broker_tls_cert:
+    file: ${COSTMARSHAL_BROKER_TLS_CERT_FILE:?set broker TLS certificate}
+  broker_tls_key:
+    file: ${COSTMARSHAL_BROKER_TLS_KEY_FILE:?set broker TLS key}
+  workload_client_ca:
+    file: ${COSTMARSHAL_WORKLOAD_CLIENT_CA_FILE:?set workload client CA}
+  proxy_tls_cert:
+    file: ${COSTMARSHAL_PROXY_TLS_CERT_FILE:?set proxy TLS certificate}
+  proxy_tls_key:
+    file: ${COSTMARSHAL_PROXY_TLS_KEY_FILE:?set proxy TLS key}
+  longcat_api_key:
+    file: ${LONGCAT_API_KEY_FILE:?set LongCat key file}

@@ -1,5 +1,18 @@
 # Changelog
 
+## v4.1.0 - 2026-07-27
+
+- Added a deployable mTLS Credential Broker with exact SPIFFE workload
+  allowlists and signed provider/model/token/budget/expiry-scoped leases.
+- Added a provider-key-isolating Proxy with SQLite-atomic nano-CNY reservation,
+  request idempotency, conservative settlement, and overrun lease revocation.
+- Added live TLS health probes bound to the reviewed gateway-policy SHA-256;
+  enforced dispatch fails closed when either service is unavailable or drifts.
+- Required OCI Actors can rewrite a verified provider profile to the Proxy,
+  mount only the short-lived lease, and trust a read-only private CA bundle.
+- Added hardened single-host Compose/container deployment templates and
+  production gateway/Actor/deployment contract tests.
+
 ## v4.0.0 - 2026-07-26
 
 ### Added

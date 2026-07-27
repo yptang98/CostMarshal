@@ -1,4 +1,4 @@
-# CostMarshal v4.0 Large-project Coordination
+# CostMarshal v4.1 Large-project Coordination
 
 CostMarshal's project layer exists to make one current project easier to
 execute, review, resume, and reuse. It is not a global project manager, does
@@ -69,12 +69,29 @@ separately reviewed integration actions.
 URLs with credentials, query strings, fragments, or non-HTTPS schemes are
 rejected. No provider secret is stored in the document.
 
-This contract is not the external runtime. CostMarshal v4.0 still has a raw-key
-worker path and does not implement an attested workload-identity Broker adapter.
-Therefore `production-status` reports `blocked` and
-`external_certification=false` even when all local checks and Artifact IDs are
-present. Setting the boundary to `enforced` makes dispatch fail closed until a
-future reviewed adapter fulfills that contract.
+With `--runtime-adapter costmarshal-gateway-v1`, the contract activates the
+deployable v4.1 runtime:
+
+- the Broker requires a client certificate with exactly one allowlisted SPIFFE
+  URI SAN and issues a signed attempt-scoped lease;
+- the lease binds provider, model, token envelope, integer nano-CNY budget,
+  expiry, and reviewed gateway-policy hash;
+- the Proxy is the only service that mounts the real provider key;
+- SQLite reserves budget atomically before an upstream call, request IDs cannot
+  repeat a call, unknown usage consumes the reservation, and overrun disables
+  the lease;
+- the OCI Actor rewrites its verified profile to the Proxy URL and mounts only
+  the lease plus a read-only CA bundle; and
+- dispatch probes both live TLS services and checks the exact policy hash.
+
+`production-status` remains `blocked` unless the live runtime, digest-pinned
+Worker, internal Proxy network, SQLite authority, hard-budget setting, and all
+accepted external evidence bindings pass. Legacy raw-key mode cannot satisfy an
+enforced production boundary.
+
+The included Compose topology is a hardened single-host deployment. It is not
+multi-host HA and its SQLite ledger must not be placed on NFS. See
+[`deploy/production/README.md`](../deploy/production/README.md).
 
 ## Minimal command sequence
 

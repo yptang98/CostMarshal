@@ -1,9 +1,9 @@
 ---
 name: costmarshal
-description: "CostMarshal v4.0 internal policy/runtime for the Codex plugin: scheduler-first, capability-aware and cost-aware low/medium/high provider orchestration across repository-bound Workstreams, with staged integration Gates, total-cost reports, structured teaching execution graphs, recency-aware exact-version model memory, accepted project knowledge, project-local Skill candidates, Leader Snapshots, structured handoffs, atomic batch acceptance, project artifact lineage, reviewed API presets, image input, work graphs, artifact gates, per-step cache-safe pricing, recoverable effects, OCI worker isolation, durable attempts, budget reservations, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
+description: "CostMarshal v4.1 internal policy/runtime for the Codex plugin: scheduler-first, capability-aware and cost-aware low/medium/high provider orchestration across repository-bound Workstreams, with an mTLS workload-identity Broker, hard-budget Provider Proxy, staged integration Gates, total-cost reports, structured teaching execution graphs, recency-aware exact-version model memory, accepted project knowledge, project-local Skill candidates, Leader Snapshots, structured handoffs, atomic batch acceptance, project artifact lineage, reviewed API presets, image input, work graphs, artifact gates, recoverable effects, OCI worker isolation, durable attempts, budget reservations, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
 ---
 
-# CostMarshal v4.0
+# CostMarshal v4.1
 
 Use this skill for long or decomposable work where multiple API price/capability tiers should cooperate under explicit safety, cost, and recovery controls.
 
@@ -40,9 +40,11 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
 23. Cross-repository integration is staged, never atomic. Freeze the complete
     current Workstream task set, accepted interface Artifacts, exact Git heads,
     and verified rollback ancestors before Leader Gate review.
-24. Production-boundary configuration is not production certification. Until
-    an attested external workload-identity Broker adapter exists,
-    `production-status` remains blocked and enforced mode must block dispatch.
+24. An enforced production boundary requires `costmarshal-gateway-v1`: mTLS
+    SPIFFE identity, signed short-lived leases, a live policy-hash-bound Broker
+    and hard-budget Proxy, digest-pinned OCI isolation, SQLite authority, and
+    accepted external evidence. Any missing or drifting binding blocks dispatch;
+    legacy raw-key workers never satisfy this boundary.
 
 ## Standard workflow
 

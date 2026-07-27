@@ -337,6 +337,37 @@ class V4LargeProjectContractTest(unittest.TestCase):
             if check["name"] == "external-broker-runtime-adapter"
         )
         self.assertFalse(adapter["passed"])
+        gateway_boundary = build_production_boundary(
+            mode="enforced",
+            broker_endpoint="https://broker.example/v1/leases",
+            broker_identity="spiffe://example/costmarshal",
+            provider_proxy_endpoint="https://proxy.example/v1",
+            hard_budget_enforced=True,
+            evidence_artifact_ids=evidence,
+            runtime_adapter="costmarshal-gateway-v1",
+            gateway_policy_sha256="sha256:" + "b" * 64,
+        )
+        ready = production_status(
+            boundary=gateway_boundary,
+            artifact_rows=artifacts,
+            sqlite_authoritative=True,
+            worker_isolation={
+                "image": "example/worker@sha256:" + "a" * 64,
+                "network_mode": "provider-proxy",
+            },
+            runtime_probes={
+                "broker": {
+                    "status": "pass",
+                    "policy_sha256": "sha256:" + "b" * 64,
+                },
+                "proxy": {
+                    "status": "pass",
+                    "policy_sha256": "sha256:" + "b" * 64,
+                },
+            },
+        )
+        self.assertEqual(ready["status"], "ready")
+        self.assertTrue(ready["external_certification"])
 
     def test_cli_exposes_v4_commands_and_task_ownership(self) -> None:
         parser = build_parser()
