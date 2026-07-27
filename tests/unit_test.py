@@ -148,6 +148,42 @@ def main() -> int:
             else:
                 raise AssertionError("Windows batch command reached process launch")
 
+        local_modules = shim_root / "project" / "node_modules"
+        local_shim = local_modules / ".bin" / "codex.cmd"
+        local_javascript = local_modules / "@openai" / "codex" / "bin" / "codex.js"
+        local_node = shim_root / "node-on-path.exe"
+        local_shim.parent.mkdir(parents=True)
+        local_javascript.parent.mkdir(parents=True)
+        local_shim.write_text("@echo off\n", encoding="utf-8")
+        local_javascript.write_text("// locked fixture\n", encoding="utf-8")
+        local_node.write_bytes(b"fixture")
+        with (
+            patch(
+                "costmarshal_v2.actor_runner.os",
+                SimpleNamespace(name="nt"),
+            ),
+            patch(
+                "costmarshal_v2.actor_runner.shutil.which",
+                side_effect=lambda name: (
+                    str(local_node) if name == "node.exe" else None
+                ),
+            ),
+        ):
+            resolved_local = _resolve_windows_codex_shim(
+                [str(local_shim), "--model", "gpt-safe", "-"]
+            )
+        assert_true(
+            resolved_local
+            == [
+                str(local_node.resolve()),
+                str(local_javascript.resolve()),
+                "--model",
+                "gpt-safe",
+                "-",
+            ],
+            "Windows local npm codex.cmd must resolve inside its node_modules tree",
+        )
+
     with (
         patch("costmarshal_v2.actor_runner.sys.platform", "linux"),
         patch("costmarshal_v2.actor_runner.pid_start_marker", return_value="linux-proc:boot:1"),

@@ -8,7 +8,9 @@
   is stable across runner timezones.
 - Replaced mutable global Codex installation with a committed npm lockfile,
   verified top-level integrity, platform-binary integrity, and
-  `npm ci --ignore-scripts`.
+  `npm ci --ignore-scripts`. The Windows native-process safety resolver now
+  recognizes both reviewed global npm shims and locked project-local
+  `node_modules/.bin` shims without invoking `cmd.exe`.
 - Added a Linux CI packaging gate that builds the exact production Gateway and
   Worker Dockerfiles, checks immutable revision labels and non-root users,
   validates a policy inside the Gateway, and executes the Worker isolation

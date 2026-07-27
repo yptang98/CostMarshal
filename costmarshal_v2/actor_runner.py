@@ -590,7 +590,14 @@ def _resolve_windows_codex_shim(command: list[str]) -> list[str]:
         raise SystemExit(
             "Windows batch actor commands are rejected; configure a native executable"
         )
-    javascript = resolved.parent / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
+    if (
+        resolved.parent.name.casefold() == ".bin"
+        and resolved.parent.parent.name.casefold() == "node_modules"
+    ):
+        node_modules = resolved.parent.parent
+    else:
+        node_modules = resolved.parent / "node_modules"
+    javascript = node_modules / "@openai" / "codex" / "bin" / "codex.js"
     local_node = resolved.parent / "node.exe"
     node_text = str(local_node) if local_node.is_file() else shutil.which("node.exe")
     if not javascript.is_file() or not node_text:
