@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests" / "release"))
 
 import run_release_gates as release_gates  # noqa: E402
+import run_local_test_evidence as local_evidence  # noqa: E402
 from run_release_gates import (  # noqa: E402
     REQUIRED_LOCAL_TESTS,
     build_report,
@@ -39,6 +40,36 @@ from runtime_evidence_contract import (  # noqa: E402
 
 
 class ReleaseGateTest(unittest.TestCase):
+    def test_local_evidence_timeout_terminates_descendant_pipe_holders(self) -> None:
+        child = (
+            "import subprocess,sys,time; "
+            "subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']); "
+            "print('descendant-started',flush=True); "
+            "time.sleep(60)"
+        )
+        returncode, output, elapsed = local_evidence.run_command(
+            [sys.executable, "-c", child],
+            timeout_seconds=0.5,
+        )
+        self.assertEqual(returncode, 124)
+        self.assertIn("descendant-started", output)
+        self.assertIn("process tree terminated", output)
+        self.assertLess(elapsed, 20.0)
+
+    def test_local_evidence_normal_exit_cleans_lingering_descendants(self) -> None:
+        child = (
+            "import subprocess,sys; "
+            "subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']); "
+            "print('parent-finished',flush=True)"
+        )
+        returncode, output, elapsed = local_evidence.run_command(
+            [sys.executable, "-c", child],
+            timeout_seconds=10.0,
+        )
+        self.assertEqual(returncode, 0)
+        self.assertIn("parent-finished", output)
+        self.assertLess(elapsed, 10.0)
+
     def test_gateway_runtime_requires_live_secret_free_exact_checks(self) -> None:
         required_checks = {
             "broker_health_policy_bound",

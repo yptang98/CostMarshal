@@ -927,7 +927,7 @@ def reproduce_evidence() -> dict[str, Any]:
         (
             "transactional_runtime_effects",
             [sys.executable, str(ROOT / "tests/release/run_runtime_effect_evidence.py")],
-            {0},
+            {0, 2},
             "artifacts/runtime-effect-report.json",
         ),
     ]

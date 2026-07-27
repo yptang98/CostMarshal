@@ -16,7 +16,7 @@ class CiContractTest(unittest.TestCase):
         text = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("pull_request:", text)
         self.assertIn("workflow_dispatch:", text)
-        self.assertRegex(text, r"branches:\s+- v2\s+- v3")
+        self.assertRegex(text, r"branches:\s+- v2\s+- v3\s+- v4")
         self.assertIn("ubuntu-latest", text)
         self.assertIn("windows-latest", text)
         self.assertIn('          - "3.11"', text)
@@ -38,6 +38,37 @@ class CiContractTest(unittest.TestCase):
             self.assertRegex(action, r"^[^@]+@[0-9a-f]{40}$")
         self.assertIn("persist-credentials: false", text)
         self.assertNotIn("secrets.", text)
+
+    def test_production_image_workflow_is_manual_immutable_and_digest_receipted(self) -> None:
+        workflow = ROOT / ".github" / "workflows" / "production-images.yml"
+        text = workflow.read_text(encoding="utf-8")
+        self.assertIn("workflow_dispatch:", text)
+        self.assertIn("packages: write", text)
+        self.assertIn("persist-credentials: false", text)
+        self.assertIn("refs/heads/v4", text)
+        self.assertIn('refs/tags/$release_version', text)
+        self.assertNotIn('test "$(cat VERSION)" = "v', text)
+        self.assertIn("@sha256:[0-9a-f]{64}", text)
+        self.assertIn("--provenance=mode=max", text)
+        self.assertIn("--sbom=true", text)
+        self.assertEqual(text.count("--push"), 2)
+        self.assertIn("production-images.json", text)
+        self.assertIn("source_commit", text)
+        self.assertIn("gateway_image", text)
+        self.assertIn("worker_image", text)
+        uses = re.findall(r"^\s*uses:\s*([^\s#]+)", text, flags=re.MULTILINE)
+        self.assertTrue(uses)
+        for action in uses:
+            self.assertRegex(action, r"^[^@]+@[0-9a-f]{40}$")
+
+    def test_gateway_build_context_is_allowlisted(self) -> None:
+        dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8")
+        self.assertTrue(dockerignore.startswith("*\n"))
+        self.assertIn("!costmarshal_v2/*.py", dockerignore)
+        self.assertNotIn("!costmarshal_v2/**", dockerignore)
+        self.assertIn("!scripts/costmarshal_gateway.py", dockerignore)
+        self.assertNotIn("!.git", dockerignore)
+        self.assertNotIn("!artifacts", dockerignore)
 
     def test_repository_only_metadata_is_not_copied_into_skill_install(self) -> None:
         installer = (ROOT / "scripts" / "install_smoke_test.py").read_text(

@@ -45,6 +45,16 @@ def run(temp: Path, *args: str, ok: bool = True) -> subprocess.CompletedProcess[
 
 
 def main() -> int:
+    longcat = resolve_provider_preset("longcat-2.0")
+    assert "input:text" in longcat.api_capabilities
+    assert "input:image" not in longcat.api_capabilities
+    assert "transport acceptance is not visual capability" in longcat.note
+    longcat_provider = longcat.catalog_provider(
+        tier="medium",
+        profile="longcat",
+    )
+    assert "input:image" not in longcat_provider["capabilities"]
+
     gateway_provider = resolve_provider_preset("kimi-k3").catalog_provider(
         tier="medium",
         profile="kimi-gateway",

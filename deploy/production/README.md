@@ -54,7 +54,19 @@ client private key. The Worker receives only the short-lived lease token.
    Do not copy capabilities between models. `provider-presets` records the
    reviewed model-specific API facts, while gateway policy must contain only
    modalities verified for the exact deployed endpoint.
-2. Build and publish the gateway image from a digest-pinned Python base image.
+   In particular, Codex `--image` support does not grant LongCat vision.
+   LongCat-2.0 accepted standard Responses/Chat image fields with HTTP 200 in
+   the 2026-07-27 probe but did not perceive either data-URI or public-URL
+   images. Keep `input_modalities: ["text"]` until a reviewed semantic image
+   challenge succeeds on the exact deployed model and endpoint.
+2. Build and publish the gateway and Worker images from reviewed,
+   digest-pinned base images. The repository's manual
+   **Build production images** GitHub workflow runs the full local evidence
+   suite, publishes commit-only tags to GHCR with BuildKit provenance and
+   SBOM attestations, and retains `production-images.json` containing the
+   immutable repository digests. It accepts only the `v4` branch or a `v*`
+   tag and never creates a mutable `latest` tag. A private GHCR package
+   requires an authenticated `docker pull` on the target host.
 3. Export the file-path variables required by `compose.yaml`; never put secret
    contents in the Compose file or project state. Set
    `COSTMARSHAL_PROVIDER_CREDENTIALS_DIR` to a non-symlink directory containing
@@ -65,12 +77,15 @@ client private key. The Worker receives only the short-lived lease token.
    host permissions.
 4. Set `COSTMARSHAL_GATEWAY_IMAGE` to the published image digest. Run the
    read-only preflight first; it validates the clean release commit, policy,
-   image digest, Docker/Compose, secret file bounds, credential mapping, and
-   directory ownership without printing secret contents:
+   image digest, Docker/Compose, secret file bounds, credential mapping,
+   shared database path, and directory ownership without printing secret
+   contents:
 
    `python scripts/costmarshal_production_deploy.py --output artifacts/deployment-preflight.json`
 
-   After reviewing the receipt, explicitly deploy:
+   After reviewing the receipt, explicitly deploy. Both the Broker and Proxy
+   must pass their non-root TCP readiness checks; a merely running container
+   does not produce a successful deployment receipt:
 
    `python scripts/costmarshal_production_deploy.py --apply --output artifacts/deployment-preflight.json`
 
@@ -83,7 +98,7 @@ client private key. The Worker receives only the short-lived lease token.
    certification bindings:
 
    - `--deployment-commit <40-hex>`
-   - `--release-version v4.3.0`
+   - `--release-version v4.3.1`
    - `--gateway-image name@sha256:<64-hex>`
    - `--allowed-signers-sha256 sha256:<64-hex>`
    - `--signer-identity <reviewed-identity>` (repeatable)

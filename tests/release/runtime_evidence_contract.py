@@ -43,6 +43,7 @@ REQUIRED_RUNTIME_RECOVERY_SCENARIOS = (
     "no_effect_commit_view_reconciled_by_scheduler",
     "stop_cancels_pending_spawn_before_provider",
     "stop_linearizes_against_inflight_spawn",
+    "explicit_recovery_rejects_stale_runner_registration",
     "stop_permanent_failure_remains_recoverable",
     "git_preview_content_addressed_publication_replay",
     "git_apply_external_replay_canonicalized",

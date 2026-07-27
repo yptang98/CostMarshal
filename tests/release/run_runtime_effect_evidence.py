@@ -22,6 +22,12 @@ from runtime_evidence_contract import (  # noqa: E402
     RUNTIME_EVIDENCE_TESTS,
 )
 
+LINUX_ONLY_EVIDENCE_TESTS = {
+    "tests/oci_actor_runner_test.py": (
+        "the OCI actor recovery receipt requires a Linux runtime host"
+    ),
+}
+
 
 def _plain_nonnegative_integer(value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -64,8 +70,20 @@ def main(argv: list[str] | None = None) -> int:
     results: list[dict[str, Any]] = []
     receipts: list[dict[str, Any]] = []
     errors: list[str] = []
-    passed = True
+    blockers: list[str] = []
     for relative in RUNTIME_EVIDENCE_TESTS:
+        platform_requirement = LINUX_ONLY_EVIDENCE_TESTS.get(relative)
+        if platform_requirement is not None and not sys.platform.startswith("linux"):
+            results.append(
+                {
+                    "test": relative,
+                    "returncode": 2,
+                    "status": "blocked",
+                    "blocker": platform_requirement,
+                }
+            )
+            blockers.append(f"{relative}: {platform_requirement}")
+            continue
         environment = os.environ.copy()
         environment.pop("PYTHONOPTIMIZE", None)
         try:
@@ -103,7 +121,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             assert receipt is not None
             receipts.append(receipt)
-        passed = passed and completed.returncode == 0 and receipt_error is None
+        if completed.returncode != 0:
+            errors.append(
+                f"{relative}: evidence test returned {completed.returncode}"
+            )
     crash_points = sorted({point for receipt in receipts for point in receipt["crash_points"]})
     recovery_scenarios = sorted(
         {scenario for receipt in receipts for scenario in receipt["recovery_scenarios"]}
@@ -118,18 +139,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     orphan_effects = sum(int(receipt["orphan_effects"]) for receipt in receipts)
     if set(crash_points) != set(REQUIRED_RUNTIME_CRASH_POINTS):
-        errors.append("runtime crash-point receipts do not exactly match the release contract")
+        message = "runtime crash-point receipts do not exactly match the release contract"
+        (blockers if blockers else errors).append(message)
     if set(recovery_scenarios) != set(REQUIRED_RUNTIME_RECOVERY_SCENARIOS):
-        errors.append("runtime recovery-scenario receipts do not exactly match the release contract")
+        message = "runtime recovery-scenario receipts do not exactly match the release contract"
+        (blockers if blockers else errors).append(message)
     if duplicate_provider_calls or missing_provider_calls or orphan_effects:
         errors.append("runtime receipts report provider-call divergence or orphan effects")
-    passed = passed and not errors and len(receipts) == len(RUNTIME_EVIDENCE_TESTS)
+    if len(receipts) != len(RUNTIME_EVIDENCE_TESTS):
+        message = "runtime evidence receipts are incomplete"
+        (blockers if blockers else errors).append(message)
+    status = "fail" if errors else "blocked" if blockers else "pass"
+    passed = status == "pass"
     git_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     payload = {
         "schema_version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "git_sha": git_sha,
-        "status": "pass" if passed else "fail",
+        "status": status,
         "transactional_effect_worker": passed,
         "crash_points_tested": len(crash_points),
         "crash_points": crash_points,
@@ -138,13 +165,14 @@ def main(argv: list[str] | None = None) -> int:
         "missing_provider_calls": missing_provider_calls,
         "orphan_effects": orphan_effects,
         "errors": errors,
+        "blockers": blockers,
         "receipts": receipts,
         "tests": results,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(payload, indent=2, sort_keys=True))
-    return 0 if passed else 1
+    return {"pass": 0, "fail": 1, "blocked": 2}[status]
 
 
 if __name__ == "__main__":

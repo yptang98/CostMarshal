@@ -1,5 +1,32 @@
 # Changelog
 
+## v4.3.1 - 2026-07-27
+
+- Added `v4` to the cross-platform CI branch contract.
+- Added a manual, least-privilege GHCR production-image workflow. It validates
+  digest-pinned base images and the exact release ref, reruns the complete
+  local evidence suite, publishes commit-only Worker/Gateway images with SBOM
+  and BuildKit provenance, and emits an immutable digest receipt.
+- Added a root allowlist `.dockerignore` so gateway builds never transmit Git
+  metadata, generated evidence, plugins, tests, or unrelated repository files
+  to the builder.
+- Added Broker and Proxy readiness checks and made deployment success require
+  both Compose services to report `running` and `healthy`.
+- Restricted the production gateway SQLite path to a direct filename under
+  the Compose-mounted `/var/lib/costmarshal` state directory.
+- Corrected cross-platform runtime-evidence aggregation: Linux-only OCI
+  recovery evidence now reports `blocked` on non-Linux hosts instead of
+  producing a false release failure, while the gate still requires Linux
+  evidence before certification.
+- Documented and contract-tested LongCat-2.0 as text-only after live semantic
+  probes showed that both Responses and Chat accepted image-shaped requests
+  with HTTP 200 but did not expose either data-URI or public-URL images to the
+  model. Transport success can no longer be mistaken for visual capability.
+- Hardened the local release-evidence runner with isolated process groups and
+  bounded whole-tree termination. A timed-out test can no longer leave a
+  descendant holding the captured output pipe and stall the release suite
+  indefinitely.
+
 ## v4.3.0 - 2026-07-27
 
 - Added immutable audio, video, and document attachment receipts. Every input

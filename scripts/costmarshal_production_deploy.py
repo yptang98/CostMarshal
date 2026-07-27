@@ -157,6 +157,23 @@ def _raw_policy(path: Path) -> dict[str, Any]:
     return value
 
 
+def _container_database_path(policy_path: Path) -> str:
+    raw = _raw_policy(policy_path)
+    database_path = raw.get("database_path")
+    if (
+        not isinstance(database_path, str)
+        or not re.fullmatch(
+            r"/var/lib/costmarshal/[A-Za-z0-9][A-Za-z0-9._-]*",
+            database_path,
+        )
+    ):
+        raise DeploymentBlocked(
+            "gateway policy database_path must be one direct regular filename "
+            "under /var/lib/costmarshal"
+        )
+    return database_path
+
+
 def _credential_receipts(policy_path: Path) -> list[dict[str, Any]]:
     raw = _raw_policy(policy_path)
     providers = raw.get("providers")
@@ -197,6 +214,54 @@ def _credential_receipts(policy_path: Path) -> list[dict[str, Any]]:
     return receipts
 
 
+def _compose_service_rows(raw: str) -> list[dict[str, Any]]:
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        rows: list[Any] = []
+        try:
+            for line in raw.splitlines():
+                if line.strip():
+                    rows.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            raise DeploymentBlocked("Docker Compose service status was not JSON") from exc
+    else:
+        rows = decoded if isinstance(decoded, list) else [decoded]
+    if not rows or any(not isinstance(row, dict) for row in rows):
+        raise DeploymentBlocked("Docker Compose returned no service status")
+    return rows
+
+
+def _healthy_services(raw: str) -> list[dict[str, str]]:
+    rows = _compose_service_rows(raw)
+    expected = {"credential-broker", "provider-proxy"}
+    services: dict[str, dict[str, str]] = {}
+    for row in rows:
+        service = row.get("Service")
+        state = row.get("State")
+        health = row.get("Health")
+        if not all(isinstance(value, str) and value for value in (service, state, health)):
+            raise DeploymentBlocked("Docker Compose service status is incomplete")
+        if service in services:
+            raise DeploymentBlocked("Docker Compose returned duplicate service status")
+        services[service] = {
+            "service": service,
+            "state": state.lower(),
+            "health": health.lower(),
+        }
+    if set(services) != expected:
+        raise DeploymentBlocked(
+            "deployment did not leave exactly the Broker and Proxy services"
+        )
+    for service in sorted(expected):
+        status = services[service]
+        if status["state"] != "running" or status["health"] != "healthy":
+            raise DeploymentBlocked(
+                f"deployment service {service} is not running and healthy"
+            )
+    return [services[service] for service in sorted(expected)]
+
+
 def preflight(args: argparse.Namespace) -> dict[str, Any]:
     compose = args.compose.expanduser().resolve()
     policy_path = args.policy.expanduser().resolve()
@@ -210,6 +275,7 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
         policy = GatewayPolicy.load(policy_path)
     except GatewayError as exc:
         raise DeploymentBlocked(f"gateway policy is invalid: {exc}") from exc
+    database_path = _container_database_path(policy_path)
     image = os.environ.get("COSTMARSHAL_GATEWAY_IMAGE", "")
     if not IMAGE_DIGEST.fullmatch(image):
         raise DeploymentBlocked(
@@ -275,6 +341,7 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
         "release_version": release_version,
         "gateway_image": image,
         "gateway_policy_sha256": policy.sha256,
+        "gateway_database_path": database_path,
         "compose_sha256": _sha256(compose),
         "engine": engine,
         "engine_version": engine_version,
@@ -329,26 +396,22 @@ def deploy(args: argparse.Namespace) -> dict[str, Any]:
         cwd=compose.parent,
         timeout=args.timeout_seconds,
     )
-    services = _run(
+    raw_services = _run(
         [
             args.engine,
             "compose",
             "-f",
             str(compose),
             "ps",
-            "--status",
-            "running",
-            "--services",
+            "--all",
+            "--format",
+            "json",
         ],
         cwd=compose.parent,
-    ).splitlines()
-    expected = {"credential-broker", "provider-proxy"}
-    if set(services) != expected:
-        raise DeploymentBlocked(
-            "deployment did not leave exactly the Broker and Proxy running"
-        )
+    )
+    services = _healthy_services(raw_services)
     receipt["status"] = "deployed"
-    receipt["running_services"] = sorted(services)
+    receipt["services"] = services
     return receipt
 
 

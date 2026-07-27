@@ -15,6 +15,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from costmarshal_v2.production_gateway import GatewayError, GatewayPolicy
+from scripts.costmarshal_production_deploy import (
+    DeploymentBlocked,
+    _container_database_path,
+    _healthy_services,
+)
 
 
 class ProductionDeploymentContractTest(unittest.TestCase):
@@ -42,7 +47,12 @@ class ProductionDeploymentContractTest(unittest.TestCase):
         self.assertNotIn("/run/provider-credentials", broker)
         self.assertIn("/run/provider-credentials:ro", proxy_service)
         self.assertIn("COSTMARSHAL_PROVIDER_CREDENTIALS_DIR", proxy_service)
+        self.assertIn("COSTMARSHAL_GATEWAY_STATE_DIR", broker)
+        self.assertIn("COSTMARSHAL_GATEWAY_STATE_DIR", proxy_service)
         self.assertNotIn("workload_client_ca", proxy_service)
+        self.assertEqual(compose.count("healthcheck:"), 2)
+        self.assertIn("127.0.0.1', 8443", broker)
+        self.assertIn("127.0.0.1', 9443", proxy_service)
         self.assertNotRegex(compose, r"(?i)(api[_-]?key|secret)\s*:\s*[\"']?[A-Za-z0-9_-]{16,}")
 
     def test_example_policy_cannot_start_until_prices_and_identity_are_reviewed(self) -> None:
@@ -120,10 +130,60 @@ class ProductionDeploymentContractTest(unittest.TestCase):
         self.assertIn('"config", "--quiet"', script)
         self.assertIn('"up",', script)
         self.assertIn('"--wait"', script)
+        self.assertIn('"--format",', script)
+        self.assertIn('"healthy"', script)
         self.assertIn("source checkout is dirty", script)
         self.assertIn("credential_present", script)
         self.assertNotIn("credential_sha256", script)
         self.assertNotIn("LONGCAT_API_KEY", script)
+
+    def test_production_database_must_use_the_shared_state_mount(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            temp = Path(raw)
+            policy = temp / "gateway-policy.json"
+            policy.write_text(
+                json.dumps({"database_path": "/var/lib/costmarshal/gateway.db"}),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                _container_database_path(policy),
+                "/var/lib/costmarshal/gateway.db",
+            )
+            for unsafe in (
+                "gateway.db",
+                "/tmp/gateway.db",
+                "/var/lib/costmarshal/nested/gateway.db",
+                "/var/lib/costmarshal/../gateway.db",
+            ):
+                policy.write_text(
+                    json.dumps({"database_path": unsafe}),
+                    encoding="utf-8",
+                )
+                with self.assertRaises(DeploymentBlocked):
+                    _container_database_path(policy)
+
+    def test_deployment_receipt_requires_both_services_healthy(self) -> None:
+        healthy = json.dumps(
+            [
+                {
+                    "Service": "credential-broker",
+                    "State": "running",
+                    "Health": "healthy",
+                },
+                {
+                    "Service": "provider-proxy",
+                    "State": "running",
+                    "Health": "healthy",
+                },
+            ]
+        )
+        self.assertEqual(
+            [row["service"] for row in _healthy_services(healthy)],
+            ["credential-broker", "provider-proxy"],
+        )
+        unhealthy = healthy.replace('"healthy"', '"starting"', 1)
+        with self.assertRaises(DeploymentBlocked):
+            _healthy_services(unhealthy)
 
 
 if __name__ == "__main__":

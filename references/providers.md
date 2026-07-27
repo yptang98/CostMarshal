@@ -14,7 +14,7 @@ modality only when the model fact, gateway policy, worker adapter, and immutable
 task receipt all agree.
 
 The built-in facts were reviewed against official provider documentation on
-2026-07-26. Model names and API behavior can change; inspect the preset and
+2026-07-27. Model names and API behavior can change; inspect the preset and
 revalidate it before production deployment. Pricing is intentionally excluded
 from presets and still requires a separately reviewed, hash-bound snapshot.
 
@@ -33,6 +33,26 @@ from presets and still requires a separately reviewed, hash-bound snapshot.
 
 Short aliases `deepseek`, `kimi`, `longcat`, `mimo`, and `doubao` resolve to
 the recommended preset for that provider.
+
+### LongCat image boundary
+
+Codex itself accepts committed images and can serialize them as Responses
+`input_image` items. That transport fact is not a LongCat model capability.
+The current LongCat Chat documentation declares plain-text message content.
+On 2026-07-27, a live LongCat-2.0 probe established this exact behavior:
+
+- a text Responses control returned the requested sentinel;
+- a local PNG data URI sent as `input_image` returned HTTP 200 but the model
+  stated that no attachment was visible;
+- a public image URL sent through Responses returned HTTP 200 with the same
+  no-image result; and
+- the structured Chat `image_url` form also returned HTTP 200 without image
+  perception.
+
+CostMarshal consequently advertises only `input:text` for `longcat-2.0`.
+Capability review must use a semantic challenge with an answer that cannot be
+derived from the filename or prompt. HTTP 200, schema acceptance, or an empty
+error field is insufficient evidence and must never add `input:image`.
 
 Inspect the machine-readable catalog:
 

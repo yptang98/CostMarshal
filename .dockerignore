@@ -1,0 +1,9 @@
+*
+!.dockerignore
+!container/
+!container/gateway/
+!container/gateway/Dockerfile
+!costmarshal_v2/
+!costmarshal_v2/*.py
+!scripts/
+!scripts/costmarshal_gateway.py

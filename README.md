@@ -8,7 +8,7 @@
 
   <p>
     <a href="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="VERSION"><img alt="Version 4.3.0" src="https://img.shields.io/badge/version-4.3.0-2bb3a3"></a>
+    <a href="VERSION"><img alt="Version 4.3.1" src="https://img.shields.io/badge/version-4.3.1-2bb3a3"></a>
     <a href="https://www.python.org/downloads/"><img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white"></a>
     <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-f0b94b"></a>
   </p>
@@ -179,7 +179,7 @@ contains a key or an unreviewed price.
 | --- | --- | --- | --- |
 | DeepSeek | V4 Flash / Pro | Text | Text through the production Chat adapter |
 | Kimi | K3 / K2.6 | Text, image; K2.6 also video | Text/image through the production Chat adapter |
-| LongCat | 2.0 | Text | Text |
+| LongCat | 2.0 | Text only (documented and live-probed) | Text |
 | Xiaomi MiMo | 2.5 / 2.5 Pro | 2.5: text, image, audio, video | Text/image Agent; image/audio/video report-only API |
 | Doubao Ark | Seed 2.0 Lite | Text, image, audio, video | Text/image Agent; image/audio/video report-only API |
 | Codex | Native signed-in model | Model-dependent | Text |
@@ -201,6 +201,17 @@ events by setting `wire_api: chat-completions`. The adapter buffers the bounded
 upstream completion before emitting Responses SSE, so it is compatible but not
 token-by-token realtime. Video and document input require a native Responses
 provider and are rejected by the Chat adapter.
+
+Codex accepting image attachments does not make every configured provider
+visual.
+LongCat's current [Chat API documentation](https://longcat.chat/platform/docs/api/chat.html)
+specifies text-only input. A 2026-07-27 live probe sent both a local PNG data
+URI and a public image URL through LongCat-2.0 Responses, plus a public image
+URL through Chat Completions. All requests returned HTTP 200, but the model
+reported that no image was available. CostMarshal therefore keeps LongCat
+text-only. An HTTP success, accepted JSON field, or advertised Responses
+transport must never auto-grant `input:image`; a reviewed semantic probe must
+prove that the model actually perceived a challenge image.
 
 Multimodal is enforced end to end: routing uses the intersection of the model's
 documented API capabilities and the selected execution adapter. Agent mode
@@ -280,6 +291,10 @@ The home directory resolution order is an explicit `--codex-home`, then non-empt
   and a preview-first production deployment preflight. These controls do not
   replace deployment-specific real-provider, OCI, and external-signature
   evidence.
+- v4.3.1 makes `v4` a CI-protected branch, provides a manual GHCR build that
+  publishes only digest-addressed Worker/Gateway images with SBOM and
+  provenance, and requires both production services to become healthy before
+  deployment can succeed.
 
 Read [`SECURITY.md`](SECURITY.md) before production use.
 

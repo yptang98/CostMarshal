@@ -1,0 +1,150 @@
+name: Build production images
+
+on:
+  workflow_dispatch:
+    inputs:
+      python_base_image:
+        description: "Reviewed Python image as name@sha256:<digest>"
+        required: true
+        type: string
+      node_base_image:
+        description: "Reviewed Node image as name@sha256:<digest>"
+        required: true
+        type: string
+      codex_npm_version:
+        description: "Reviewed exact @openai/codex version"
+        required: true
+        default: "0.144.1"
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: costmarshal-production-images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      PYTHON_BASE_IMAGE: ${{ inputs.python_base_image }}
+      NODE_BASE_IMAGE: ${{ inputs.node_base_image }}
+      CODEX_NPM_VERSION: ${{ inputs.codex_npm_version }}
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Select Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+      - name: Validate immutable build inputs and release ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_pattern='^[^[:space:]@]+@sha256:[0-9a-f]{64}$'
+          version_pattern='^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'
+          release_pattern='^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'
+          [[ "$PYTHON_BASE_IMAGE" =~ $image_pattern ]]
+          [[ "$NODE_BASE_IMAGE" =~ $image_pattern ]]
+          [[ "$CODEX_NPM_VERSION" =~ $version_pattern ]]
+          [[ "$GITHUB_REF" == "refs/heads/v4" || "$GITHUB_REF" == refs/tags/v* ]]
+          release_version="$(cat VERSION)"
+          [[ "$release_version" =~ $release_pattern ]]
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            test "$GITHUB_REF" = "refs/tags/$release_version"
+          fi
+      - name: Verify the release source
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends tmux
+          python -m pip install --disable-pip-version-check -r requirements.txt
+          npm install --global "@openai/codex@$CODEX_NPM_VERSION"
+          python scripts/sync_plugin_package.py
+          python tests/release/run_local_test_evidence.py
+      - name: Authenticate to GHCR
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+      - name: Build and publish immutable images
+        shell: bash
+        run: |
+          set -euo pipefail
+          repository="${GITHUB_REPOSITORY,,}"
+          gateway_tag="ghcr.io/${repository}/gateway:sha-${GITHUB_SHA}"
+          worker_tag="ghcr.io/${repository}/worker:sha-${GITHUB_SHA}"
+          docker buildx create --name costmarshal-release --driver docker-container --use
+          docker buildx inspect --bootstrap
+          docker buildx build . \
+            --file container/gateway/Dockerfile \
+            --platform linux/amd64 \
+            --build-arg "PYTHON_BASE_IMAGE=$PYTHON_BASE_IMAGE" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --tag "$gateway_tag" \
+            --provenance=mode=max \
+            --sbom=true \
+            --push \
+            --metadata-file gateway-metadata.json
+          docker buildx build container/worker \
+            --file container/worker/Dockerfile \
+            --platform linux/amd64 \
+            --build-arg "NODE_BASE_IMAGE=$NODE_BASE_IMAGE" \
+            --build-arg "CODEX_NPM_VERSION=$CODEX_NPM_VERSION" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --tag "$worker_tag" \
+            --provenance=mode=max \
+            --sbom=true \
+            --push \
+            --metadata-file worker-metadata.json
+          gateway_digest="$(jq -er '."containerimage.digest"' gateway-metadata.json)"
+          worker_digest="$(jq -er '."containerimage.digest"' worker-metadata.json)"
+          digest_pattern='^sha256:[0-9a-f]{64}$'
+          [[ "$gateway_digest" =~ $digest_pattern ]]
+          [[ "$worker_digest" =~ $digest_pattern ]]
+          GATEWAY_IMAGE="${gateway_tag%:*}@$gateway_digest" \
+          WORKER_IMAGE="${worker_tag%:*}@$worker_digest" \
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          receipt = {
+              "schema_version": "costmarshal-production-images-v1",
+              "source_commit": os.environ["GITHUB_SHA"],
+              "release_version": Path("VERSION").read_text(encoding="utf-8").strip(),
+              "gateway_image": os.environ["GATEWAY_IMAGE"],
+              "worker_image": os.environ["WORKER_IMAGE"],
+              "python_base_image": os.environ["PYTHON_BASE_IMAGE"],
+              "node_base_image": os.environ["NODE_BASE_IMAGE"],
+              "codex_npm_version": os.environ["CODEX_NPM_VERSION"],
+          }
+          Path("production-images.json").write_text(
+              json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          {
+            echo "## Immutable production images"
+            echo
+            echo "\`$(jq -r .gateway_image production-images.json)\`"
+            echo
+            echo "\`$(jq -r .worker_image production-images.json)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain the digest receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: production-images-${{ github.sha }}
+          path: production-images.json
+          if-no-files-found: error
+          retention-days: 30

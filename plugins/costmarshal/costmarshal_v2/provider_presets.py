@@ -355,7 +355,12 @@ PROVIDER_PRESETS: dict[str, ProviderPreset] = {
             "code",
         ),
         docs_url="https://longcat.chat/platform/docs/api/chat.html",
-        note="Official docs describe text-only Chat Completions; Responses compatibility was live-verified by this deployment on 2026-07-26.",
+        note=(
+            "Official Chat docs specify text-only input. On 2026-07-27, "
+            "standard Responses and Chat image requests both returned HTTP "
+            "200 while LongCat-2.0 reported that no image was present; "
+            "transport acceptance is not visual capability."
+        ),
     ),
     "mimo-v2.5": ProviderPreset(
         preset_id="mimo-v2.5",
