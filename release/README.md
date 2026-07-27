@@ -15,7 +15,9 @@ lockfile. `scripts/validate_production_build_inputs.py` rejects unknown fields,
 mutable or non-official image references, non-linux/amd64 targets, lockfile
 drift, and review windows longer than 31 days. Both normal CI and the manual
 production-image workflow validate it; the latter additionally requires its
-`source_sha` to equal the exact checked-out commit.
+`source_sha` to equal the exact checked-out commit. Review dates are UTC
+calendar dates so the same commit does not change validity across runner
+timezones.
 
 Backtest preregistration is two-step:
 

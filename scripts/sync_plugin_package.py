@@ -265,11 +265,11 @@ def source_files() -> dict[str, Path]:
             raise RuntimeError(f"plugin package source tree is missing or linked: {relative}")
         for source in sorted(tree.rglob("*")):
             source_relative = source.relative_to(ROOT)
+            if not _admitted(source_relative):
+                continue
             _assert_unredirected_source(source)
             if _is_link_or_reparse(source):
                 raise RuntimeError(f"plugin package source contains a link: {source_relative}")
-            if not _admitted(source_relative):
-                continue
             source_key = source_relative.as_posix()
             if not _portable(source_relative) or _forbidden(source_relative):
                 raise RuntimeError(

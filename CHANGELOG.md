@@ -4,7 +4,8 @@
 
 - Added an expiring, committed production-build input review that pins the
   official Python and Node OCI indexes, their exact linux/amd64 manifests, and
-  the observed runtime versions.
+  the observed runtime versions. Review dates use UTC calendar days so validity
+  is stable across runner timezones.
 - Replaced mutable global Codex installation with a committed npm lockfile,
   verified top-level integrity, platform-binary integrity, and
   `npm ci --ignore-scripts`.

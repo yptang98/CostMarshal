@@ -102,7 +102,7 @@ class CiContractTest(unittest.TestCase):
             self.assertRegex(action, r"^[^@]+@[0-9a-f]{40}$")
 
     def test_production_build_inputs_are_pinned_reviewed_and_expiring(self) -> None:
-        result = validate(BUILD_INPUTS, today=date(2026, 7, 28))
+        result = validate(BUILD_INPUTS, today=date(2026, 7, 27))
         self.assertEqual(result["platforms"], ["linux/amd64"])
         self.assertRegex(
             result["python_base_image"],
