@@ -1,6 +1,6 @@
 {
   "name": "costmarshal",
-  "version": "4.3.1",
+  "version": "4.3.2",
   "description": "Codex-native cost-aware orchestration across low, medium, and high API providers.",
   "author": {
     "name": "yptang98",

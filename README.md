@@ -8,7 +8,7 @@
 
   <p>
     <a href="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="VERSION"><img alt="Version 4.3.1" src="https://img.shields.io/badge/version-4.3.1-2bb3a3"></a>
+    <a href="VERSION"><img alt="Version 4.3.2" src="https://img.shields.io/badge/version-4.3.2-2bb3a3"></a>
     <a href="https://www.python.org/downloads/"><img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white"></a>
     <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-f0b94b"></a>
   </p>
@@ -295,6 +295,9 @@ The home directory resolution order is an explicit `--codex-home`, then non-empt
   publishes only digest-addressed Worker/Gateway images with SBOM and
   provenance, and requires both production services to become healthy before
   deployment can succeed.
+- v4.3.2 binds the Compose Proxy network to the OCI Worker trust contract and
+  makes deployment success require certificate/key validation, immutable
+  network attestation, and live policy-hash TLS health from both services.
 
 Read [`SECURITY.md`](SECURITY.md) before production use.
 

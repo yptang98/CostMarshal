@@ -74,6 +74,8 @@ services:
       - 0.0.0.0
       - --port
       - "9443"
+    ports:
+      - "${COSTMARSHAL_PROXY_BIND_IP:-127.0.0.1}:9443:9443"
     volumes:
       - ./gateway-policy.json:/etc/costmarshal/gateway-policy.json:ro
       - ${COSTMARSHAL_GATEWAY_STATE_DIR:?set pre-created uid-65532 state directory}:/var/lib/costmarshal
@@ -102,7 +104,10 @@ networks:
     internal: true
   provider-proxy:
     name: costmarshal-provider-proxy
+    driver: bridge
     internal: true
+    labels:
+      io.costmarshal.provider-proxy: "true"
   provider-egress:
 
 secrets:

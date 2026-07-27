@@ -17,6 +17,8 @@ Keep all material outside the repository:
 - broker and proxy TLS certificates and private keys;
 - a client CA plus an mTLS worker certificate containing exactly one SPIFFE
   URI SAN matching the policy;
+- a server CA bundle that validates both Broker and Proxy certificates at the
+  exact deployment endpoint hostnames;
 - one least-privilege, spend-capped provider-key file per enabled provider,
   stored as a direct child of a Proxy-only credential directory; and
 - a digest-pinned gateway image built from
@@ -25,6 +27,10 @@ Keep all material outside the repository:
 - a reviewed OpenSSH `allowed_signers` file. Only its SHA-256 and signer
   identities enter the project boundary; the private key never enters
   CostMarshal.
+
+Runtime private-key files must be non-interactive and protected by filesystem
+permissions. The deployment preflight rejects encrypted keys that would require
+a terminal password prompt.
 
 The broker never mounts provider keys. The proxy never mounts the workload
 client private key. The Worker receives only the short-lived lease token.
@@ -67,30 +73,44 @@ client private key. The Worker receives only the short-lived lease token.
    immutable repository digests. It accepts only the `v4` branch or a `v*`
    tag and never creates a mutable `latest` tag. A private GHCR package
    requires an authenticated `docker pull` on the target host.
-3. Export the file-path variables required by `compose.yaml`; never put secret
-   contents in the Compose file or project state. Set
+3. Copy [`production.env.example`](production.env.example) to a root-owned
+   file outside Git, replace every `REPLACE_*` value, and pass it to the
+   deployment command with `--env-file`. It contains paths and immutable
+   identities only; never put secret contents in the environment file,
+   Compose file, or project state. The parser accepts only the documented
+   allowlist and rejects repository-local files or conflicting shell values.
+   Set
    `COSTMARSHAL_PROVIDER_CREDENTIALS_DIR` to a non-symlink directory containing
    the exact credential basenames referenced as
    `/run/provider-credentials/<name>` in policy. Only the Proxy mounts this
    directory. Pre-create the state and audit directories owned by uid/gid
    `65532`; the services run read-only and non-root and will not repair unsafe
-   host permissions.
+   host permissions. The bundled single-host topology publishes Broker and
+   Proxy only on configurable loopback addresses. Managed Workers still reach
+   the Proxy through the internal, labelled `costmarshal-provider-proxy`
+   network.
 4. Set `COSTMARSHAL_GATEWAY_IMAGE` to the published image digest. Run the
    read-only preflight first; it validates the clean release commit, policy,
-   image digest, Docker/Compose, secret file bounds, credential mapping,
-   shared database path, and directory ownership without printing secret
-   contents:
+   image digest, Docker/Compose, secret file bounds, TLS key/certificate
+   pairing, CA parseability, credential mapping, HTTPS endpoint shape, shared
+   database path, and directory ownership without printing secret contents:
 
-   `python scripts/costmarshal_production_deploy.py --output artifacts/deployment-preflight.json`
+   `python scripts/costmarshal_production_deploy.py --env-file /etc/costmarshal/production.env --output artifacts/deployment-preflight.json`
 
    After reviewing the receipt, explicitly deploy. Both the Broker and Proxy
-   must pass their non-root TCP readiness checks; a merely running container
-   does not produce a successful deployment receipt:
+   must pass their non-root readiness checks, the internal Proxy network must
+   match the label and immutable-ID contract used by Workers, and both HTTPS
+   `/healthz` responses must match the reviewed policy SHA-256 through the
+   configured CA and Broker mTLS identity. A merely running container does not
+   produce a successful deployment receipt:
 
-   `python scripts/costmarshal_production_deploy.py --apply --output artifacts/deployment-preflight.json`
+   `python scripts/costmarshal_production_deploy.py --env-file /etc/costmarshal/production.env --apply --output artifacts/deployment-preflight.json`
 
-5. Restrict the broker bind address to the scheduler host. Attach only managed
-   Worker containers to the internal `costmarshal-provider-proxy` network.
+5. Keep both published bind addresses on loopback for this single-host
+   topology. Attach only managed Worker containers to the internal
+   `costmarshal-provider-proxy` network. If post-start TLS verification fails,
+   the deploy command exits blocked but leaves the containers available for
+   inspection; do not treat that state as deployed.
 6. Configure the CostMarshal project with
    `--runtime-adapter costmarshal-gateway-v1`,
    `--gateway-policy-sha256 sha256:<validated-hash>`, broker URL ending in
@@ -98,12 +118,13 @@ client private key. The Worker receives only the short-lived lease token.
    certification bindings:
 
    - `--deployment-commit <40-hex>`
-   - `--release-version v4.3.1`
+   - `--release-version v4.3.2`
    - `--gateway-image name@sha256:<64-hex>`
    - `--allowed-signers-sha256 sha256:<64-hex>`
    - `--signer-identity <reviewed-identity>` (repeatable)
 
-7. On the scheduler host, set these variables to the mTLS client files:
+7. On the scheduler host, set these variables before preflight; the deployment
+   command and runtime use the same mTLS identity:
 
    - `COSTMARSHAL_BROKER_CLIENT_CERT_FILE`
    - `COSTMARSHAL_BROKER_CLIENT_KEY_FILE`

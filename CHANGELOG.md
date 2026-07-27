@@ -1,5 +1,21 @@
 # Changelog
 
+## v4.3.2 - 2026-07-28
+
+- Fixed the single-host production Compose network contract by labelling the
+  internal `costmarshal-provider-proxy` bridge exactly as the OCI Worker
+  isolation layer requires.
+- Published the Proxy port on configurable loopback only so the scheduler and
+  evidence collectors can verify it without granting external ingress.
+- Strengthened deployment preflight with parseable CA bundles, matching TLS
+  certificate/private-key pairs, mTLS client material, and credential-free
+  HTTPS endpoint validation.
+- Strengthened deployment completion with immutable Docker network
+  attestation and policy-SHA-bound TLS health probes for both Broker and
+  Proxy. TCP-only readiness can no longer produce a successful receipt.
+- Added a secret-free production environment template covering every required
+  image, endpoint, state, credential, and TLS path.
+
 ## v4.3.1 - 2026-07-27
 
 - Added `v4` to the cross-platform CI branch contract.

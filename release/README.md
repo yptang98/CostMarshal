@@ -1,8 +1,11 @@
 # Release evidence policy
 
 `evidence-policy.json` is the reviewed trust root for production-certification
-gates. The v3.0 prerelease keeps every value unset, so tests can exercise the machinery without allowing a
-caller-provided key or image to become release evidence.
+gates. The reusable v4 source tree keeps deployment-specific values unset, so
+tests can exercise the machinery without allowing a caller-provided key,
+image, endpoint, or environment variable to become release evidence. A real
+release candidate must fill and review these fields through the two-commit
+procedure below; an unmodified template remains intentionally blocked.
 
 Backtest preregistration is two-step:
 
