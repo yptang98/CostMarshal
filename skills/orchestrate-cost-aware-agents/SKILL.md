@@ -41,6 +41,14 @@ Classify the user's request before running the internal engine:
   scheduler in bounded cycles and stop monitoring only at gated leader
   acceptance, explicit failure, budget exhaustion, a recoverable pause, or user
   stop.
+  For legitimately low-floor, text-only analysis, debugging proposals, and
+  scout/reviewer packages routed to LongCat, prefer report-only
+  `proposal-api`: send committed allowlisted context, grant no writes or tools,
+  and require Codex Leader review. Do not relabel a medium/high-risk task merely
+  to force a cheaper tier. A severity-0/1 defect may receive one precise
+  feedback retry; otherwise continue to the admitted Codex Worker or let the
+  Codex Leader implement. Treat `low`/`medium`/`high` as cost/safety routing
+  authority, never as a fixed intelligence ranking.
 - **Coordinate a large project**: inspect `repositories` and `workstreams`
   before task creation. Register only explicit committed Git roots, bind each
   task to one repository and optional Workstream, and respect Workstream
@@ -82,6 +90,12 @@ package requires review, pairing, or replay. Treat model outcomes not actually
 run as unobserved. A project retrospective may propose a candidate, but never
 promote it directly to active routing; require reviewed replay, shadow, and
 canary evidence first.
+
+Codex has two explicit strong roles: the current agent is the Codex Leader, and
+a separately dispatched high-tier signed-in actor is a Codex Worker. Do not
+invent or request `CODEX_API_KEY` for the built-in signed-in provider. LongCat
+and other provider workers are assessed by observed task-scoped evidence, not
+by a permanent "weak model" label.
 
 The plugin Skill is the only implicit CostMarshal entry. A separately installed
 legacy `$costmarshal` Skill is explicit-only and may coexist solely for migration

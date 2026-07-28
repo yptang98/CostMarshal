@@ -26,6 +26,10 @@ from costmarshal_v2.context_projection import (  # noqa: E402
     persist_change_artifact,
 )
 from costmarshal_v2.paths import ProjectLayout  # noqa: E402
+from costmarshal_v2.profile_binding import (  # noqa: E402
+    install_profile_snapshot,
+    synthetic_default_profile,
+)
 from costmarshal_v2.routing import default_provider_catalog  # noqa: E402
 from costmarshal_v2.scheduler import bind_actor_prompt, prepare_collaboration_contract  # noqa: E402
 from costmarshal_v2.state import (  # noqa: E402
@@ -80,6 +84,12 @@ def main() -> int:
         layout = ProjectLayout(root=temp / "runtime", project_dir=project_dir)
         actor = load_actor(layout, dispatched["actor_id"])
         project = load_project(layout)
+        native_prompt_text = (
+            project_dir / str(actor["prompt_path"])
+        ).read_text(encoding="utf-8")
+        assert str(workspace) not in native_prompt_text
+        assert "process current working directory" in native_prompt_text
+        assert "Use relative paths" in native_prompt_text
         execution, sandbox, scopes, base_sha = actor_execution_workspace(layout, project, actor)
         assert execution != workspace.resolve()
         assert sandbox == "workspace-write"
@@ -262,6 +272,45 @@ def main() -> int:
         isolated_auth = Path(high_env["CODEX_HOME"]) / "auth.json"
         assert isolated_auth.is_file()
         assert isolated_auth.read_text(encoding="utf-8") == "secret-auth\n"
+
+        # The normal Codex installation does not require CODEX_HOME to be set.
+        # A high-tier Codex worker must still find the default ~/.codex login
+        # and copy only its private auth into the actor home. Its executable
+        # configuration remains the immutable synthetic route snapshot.
+        default_user_home = temp / "default-user-home"
+        default_codex_home = default_user_home / ".codex"
+        default_codex_home.mkdir(parents=True)
+        (default_codex_home / "auth.json").write_text(
+            "default-secret-auth\n", encoding="utf-8"
+        )
+        synthetic_payload, synthetic_binding = synthetic_default_profile(
+            snapshot_relpath="profile-snapshots/default-high-test.config.toml"
+        )
+        install_profile_snapshot(layout.root, synthetic_payload, synthetic_binding)
+        default_high_actor = dict(high_actor)
+        default_high_actor["id"] = "agent-high-default-home-test"
+        default_high_actor["profile_binding"] = synthetic_binding
+        with patch.dict(
+            os.environ,
+            {
+                "USERPROFILE": str(default_user_home),
+                "HOME": str(default_user_home),
+            },
+            clear=True,
+        ):
+            default_high_env, _ = isolated_actor_env(
+                project,
+                default_high_actor,
+                layout=layout,
+            )
+        default_isolated_home = Path(default_high_env["CODEX_HOME"])
+        assert (
+            default_isolated_home / "auth.json"
+        ).read_text(encoding="utf-8") == "default-secret-auth\n"
+        assert (
+            default_isolated_home / "config.toml"
+        ).read_bytes() == synthetic_payload
+
         (credential_codex_home / "auth.json").write_text(
             "drifted-auth\n", encoding="utf-8"
         )

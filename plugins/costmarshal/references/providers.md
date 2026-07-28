@@ -14,7 +14,7 @@ modality only when the model fact, gateway policy, worker adapter, and immutable
 task receipt all agree.
 
 The built-in facts were reviewed against official provider documentation on
-2026-07-27. Model names and API behavior can change; inspect the preset and
+2026-07-29. Model names and API behavior can change; inspect the preset and
 revalidate it before production deployment. Pricing is intentionally excluded
 from presets and still requires a separately reviewed, hash-bound snapshot.
 
@@ -53,6 +53,41 @@ CostMarshal consequently advertises only `input:text` for `longcat-2.0`.
 Capability review must use a semantic challenge with an answer that cannot be
 derived from the filename or prompt. HTTP 200, schema acceptance, or an empty
 error field is insufficient evidence and must never add `input:image`.
+
+### LongCat proposal worker
+
+LongCat is not treated as a permanently weak model. The catalog `tier` is a
+reviewed cost/safety routing class; capability is learned from immutable Leader
+evaluations for the exact model, profile hash, task type, difficulty, and role.
+
+The v4.5 `proposal-api` adapter uses LongCat's documented
+`/chat/completions` endpoint with thinking disabled. It is deliberately
+report-only:
+
+- only explicitly allowlisted regular-file blobs from committed `HEAD` are
+  serialized; dirty files, untracked files, build output, symlinks, binary
+  blobs, and sensitive paths are excluded or rejected;
+- no provider tools, attachments, or workspace writes are available;
+- the input envelope is capped at 64 files and 256 KiB, the output envelope is
+  capped at 8,192 tokens, and transient retries are bounded;
+- authoritative prompt/completion usage is retained for both successful and
+  token-truncated responses; and
+- every proposal remains untrusted until a Codex Leader or independent Codex
+  Worker verifies it.
+
+Live Windows tests on 2026-07-29 found that LongCat-2.0 produced accepted
+complete implementations and debugging fixes in roughly 2.1K–2.6K total
+tokens. It also found hidden edge cases without being told. Security-review
+quality was more variable: concise scoped review was useful, while longer or
+less constrained reviews sometimes truncated or included inaccurate exploit
+examples. The routing implication is task-specific: use LongCat as a capable
+cheap proposal/scout when the scope and acceptance tests are sharp, allow one
+targeted feedback retry for a small defect, and keep Codex as the final
+implementation and security authority.
+
+The normal Codex-agent LongCat profile still uses the Responses-compatible
+endpoint required by current Codex. The report-only adapter uses Chat directly
+because it does not need Codex tools; these are separate execution modes.
 
 Inspect the machine-readable catalog:
 

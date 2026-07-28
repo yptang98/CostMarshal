@@ -8,7 +8,7 @@
 
   <p>
     <a href="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="VERSION"><img alt="Version 4.4.0" src="https://img.shields.io/badge/version-4.4.0-2bb3a3"></a>
+    <a href="VERSION"><img alt="Version 4.5.0" src="https://img.shields.io/badge/version-4.5.0-2bb3a3"></a>
     <a href="https://www.python.org/downloads/"><img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white"></a>
     <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-f0b94b"></a>
   </p>
@@ -78,7 +78,7 @@ runtime, recovery, automation, and diagnostics—not as a requirement for ordina
 | | Capability | What it gives you |
 | :---: | --- | --- |
 | 💸 | Cost-aware routing | Chooses the safest economical provider chain from reviewed prices, token forecasts, and acceptance history. |
-| 🧭 | Three capability tiers | Routes bounded work across low, medium, and high tiers without tying policy to one vendor. |
+| 🧭 | Three routing tiers | Routes bounded work across low, medium, and high cost/safety tiers without treating price as model intelligence. |
 | 🛡️ | Safety floors | Risk, difficulty, task type, and required capabilities can raise the minimum tier; cost never lowers it. |
 | ✅ | Leader-owned acceptance | Workers report results, but only the Codex leader can accept, reject, continue, or apply changes. |
 | ♻️ | Durable recovery | Actors, attempts, mailboxes, budgets, reports, and recovery state survive interrupted sessions. |
@@ -100,9 +100,9 @@ time, tokens, or context.
 flowchart LR
     A[Your task in Codex] --> B[CostMarshal Skill]
     B --> C{Safety + cost routing}
-    C -->|bounded work| D[Low / medium provider]
-    C -->|high-risk or hard work| E[High provider]
-    D --> F[Codex leader review]
+    C -->|bounded proposal| D[Low-cost API worker]
+    C -->|strong execution| E[Codex Worker]
+    D --> F[Codex Leader review]
     E --> F
     F -->|accept| G[Verified result]
     F -->|reject + admitted successor| C
@@ -183,6 +183,20 @@ contains a key or an unreviewed price.
 | Xiaomi MiMo | 2.5 / 2.5 Pro | 2.5: text, image, audio, video | Text/image Agent; image/audio/video report-only API |
 | Doubao Ark | Seed 2.0 Lite | Text, image, audio, video | Text/image Agent; image/audio/video report-only API |
 | Codex | Native signed-in model | Model-dependent | Text |
+
+`low`, `medium`, and `high` are routing authority and cost/safety tiers, not
+intelligence labels. LongCat can be placed in any reviewed tier. CostMarshal
+then learns its actual acceptance rate, quality, efficiency, errors, and task
+fit separately for each exact model/profile/task/role scope.
+
+For bounded text analysis, debugging, implementation proposals, and first-pass
+review, v4.5 adds a LongCat `proposal-api` path. It sends only explicitly
+allowlisted blobs from the repository's committed `HEAD`, gives the model no
+tools or write scope, records authoritative Chat usage even when output is
+truncated, and requires Codex Leader or Codex Worker review before anything is
+applied. The normal Codex Worker remains the strong execution path and reuses
+the user's existing signed-in Codex login without requiring a misleading
+`CODEX_API_KEY`.
 
 Ask Codex to configure the providers and assign tiers without exposing keys:
 
@@ -301,7 +315,7 @@ The home directory resolution order is an explicit `--codex-home`, then non-empt
 - v4.3.3 commits an expiring production-build review, pins the complete Codex
   npm dependency graph, verifies the selected linux/amd64 base manifests, and
   makes CI build and exercise the actual hardened Gateway and Worker images.
-- v4.4 records an idempotent local evolution cycle after each accepted Leader
+- v4.5 records an idempotent local evolution cycle after each accepted Leader
   result, creates transcript-free Leader Snapshots from decision events, and
   gives Leader startup a bounded Hot/Warm context view while Cold references
   remain indexed but unloaded. These actions create no provider calls, tasks,
@@ -315,8 +329,9 @@ Read [`SECURITY.md`](SECURITY.md) before production use.
 | --- | --- | --- |
 | **Codex Skill** | Converts natural-language intent into bounded orchestration | Normal user-facing product surface |
 | **Scheduler** | Relays messages, enforces locks, records state, and launches fenced effects | Never plans, reviews, or calls a model itself |
-| **Leader** | Plans, reviews, integrates, and accepts at explicit gates | Runs on demand; does not become a hidden default worker |
-| **Worker** | Executes one bounded attempt with a specific provider and scope | Cannot broaden context, mutate control state, or self-authorize continuation |
+| **Codex Leader** | Plans, reviews, integrates, and accepts at explicit gates | The current Codex agent retains final authority |
+| **Codex Worker** | Performs strong independent implementation or review | Uses the built-in signed-in Codex provider; no invented API-key requirement |
+| **Provider Worker** | Produces one bounded proposal with LongCat or another reviewed API | Cannot broaden context, mutate control state, apply its own output, or self-authorize continuation |
 | **Work Graph** | Tracks dependencies, roles, readiness, and accepted joins | A blocked package cannot dispatch |
 | **Artifact & Gate Engine** | Registers content-addressed outputs and evaluates deterministic acceptance policy | Leader acceptance cannot override a failed configured gate |
 | **Evolution Engine** | Records scores/errors, rebuilds cross-project model profiles, chooses teaching policy, and proposes candidates | Observations never activate policy directly |
@@ -347,7 +362,7 @@ recommendations move through
 every transition. One successful or failed task can never rewrite active
 routing policy by itself.
 
-After every recorded result, v4.4 also appends one evidence-hash-deduplicated
+After every recorded result, v4.5 also appends one evidence-hash-deduplicated
 local evolution cycle. The cycle summarizes quality, efficiency, cost, error
 attribution, model-memory confidence, and the next matching task's teaching
 recommendation. It never starts paired/replay work, calls a provider, or

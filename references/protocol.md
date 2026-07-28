@@ -1,4 +1,4 @@
-# CostMarshal v4.4 Protocol
+# CostMarshal v4.5 Protocol
 
 This is the canonical v2 protocol. Legacy `scripts/mc.py` commands are not part of it.
 

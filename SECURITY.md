@@ -7,9 +7,9 @@ Report suspected vulnerabilities through a private GitHub security advisory for
 private prompts, or customer data in a public issue. Revoke an exposed provider
 credential before collecting diagnostics.
 
-## v4.3 trust boundaries
+## v4.5 trust boundaries
 
-CostMarshal v4.4's OCI controls isolate worker processes from
+CostMarshal v4.5's OCI controls isolate worker processes from
 the host workspace, other provider credentials, mutable profiles, and scheduler
 authority. They do not make the selected provider client hostile-safe.
 
@@ -64,6 +64,13 @@ row with bounded validity and all unresolved drift evidence attached.
 Native worker mode is development compatibility only and is not a host security
 boundary. ArchMarshal integration is read-only governance checking and does not
 expand CostMarshal's authority.
+
+The LongCat `proposal-api` host adapter is also development/report-only. It
+serializes only explicitly allowlisted regular-file blobs from committed Git
+`HEAD`; dirty and untracked files, symlinks, binaries, and sensitive paths are
+not sent. The provider receives no tools or write scope. Its text is still
+untrusted and must not be applied without Codex review. Production use requires
+an equivalent externally certified Broker/Proxy and strong-isolation boundary.
 
 ## Certification
 

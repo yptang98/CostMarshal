@@ -15,6 +15,8 @@ import sys
 import tempfile
 import time
 import tomllib
+import urllib.error
+import urllib.request
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from pathlib import Path
@@ -26,6 +28,7 @@ from .context_projection import (
     apply_cumulative_change_artifact,
     build_cumulative_change_manifest,
     capture_projection_changes,
+    is_sensitive_context_path,
     materialize_context_projection,
     persist_change_artifact,
     verify_materialized_context_projection,
@@ -138,6 +141,10 @@ ATTACHMENT_SUFFIXES = {
     ),
 }
 MAX_MULTIMODAL_ATTACHMENT_BYTES = 2 * 1024 * 1024
+MAX_PROPOSAL_CONTEXT_FILES = 64
+MAX_PROPOSAL_CONTEXT_BYTES = 256 * 1024
+MAX_PROPOSAL_RESPONSE_BYTES = 512 * 1024
+LONGCAT_PROPOSAL_BASE_URL = "https://api.longcat.chat/openai/v1"
 _NANO_CNY = Decimal("1000000000")
 
 
@@ -442,6 +449,18 @@ def _install_private_codex_file(target: Path, name: str, payload: bytes) -> None
         destination.chmod(0o600)
 
 
+def _source_codex_home(inherited: dict[str, str]) -> str:
+    """Resolve the host Codex home without requiring CODEX_HOME to be set."""
+
+    configured = inherited.get("CODEX_HOME")
+    if configured:
+        return str(Path(configured).expanduser().resolve())
+    user_home = inherited.get("USERPROFILE") or inherited.get("HOME")
+    if user_home:
+        return str((Path(user_home).expanduser() / ".codex").resolve())
+    return str((Path.home() / ".codex").resolve())
+
+
 def _isolated_codex_home(layout: ProjectLayout, actor: dict[str, Any], inherited: dict[str, str]) -> Path:
     """Create a credential-free Codex home containing only this actor's profile."""
 
@@ -462,13 +481,13 @@ def _isolated_codex_home(layout: ProjectLayout, actor: dict[str, Any], inherited
         # Authentication is a separate credential channel; its bytes are not
         # provider endpoint/config identity and are never included in the
         # profile snapshot.
-        source_home = inherited.get("CODEX_HOME")
+        source_home = _source_codex_home(inherited)
         if actor.get("tier") == "high" and source_home:
             auth_payload = _private_codex_file_bytes(source_home, "auth.json")
             if auth_payload is not None:
                 _install_private_codex_file(target, "auth.json", auth_payload)
         return target.resolve()
-    source_home = inherited.get("CODEX_HOME")
+    source_home = _source_codex_home(inherited)
     if profile and source_home:
         source = Path(source_home).expanduser() / f"{profile}.config.toml"
         destination = target / source.name
@@ -1997,6 +2016,349 @@ def bound_input_images(
     )
 
 
+class ProposalApiError(RuntimeError):
+    """A bounded, secret-free failure from the host proposal adapter."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        usage: dict[str, int] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.usage = usage
+
+
+def _proposal_context_text(
+    execution_workspace: Path,
+    task: dict[str, Any],
+) -> str:
+    """Read only allowlisted committed text for a report-only proposal."""
+
+    try:
+        allowed = normalize_path_list(
+            task.get("allowed_context") or [],
+            kind="allowed",
+        )
+    except SecurityValidationError as exc:
+        raise ProposalApiError(f"proposal context is invalid: {exc}") from exc
+    maximum = min(
+        MAX_PROPOSAL_CONTEXT_BYTES,
+        max(4096, int(task.get("estimated_input_tokens") or 0) * 4),
+    )
+    try:
+        git_root = Path(
+            subprocess.check_output(
+                [
+                    "git",
+                    "-C",
+                    str(execution_workspace),
+                    "rev-parse",
+                    "--show-toplevel",
+                ],
+                text=True,
+                stderr=subprocess.STDOUT,
+            ).strip()
+        ).resolve()
+        if git_root != execution_workspace.resolve():
+            raise ProposalApiError(
+                "proposal context workspace must be the Git repository root"
+            )
+        tree_payload = subprocess.check_output(
+            [
+                "git",
+                "-C",
+                str(execution_workspace),
+                "ls-tree",
+                "-r",
+                "-z",
+                "--full-tree",
+                "HEAD",
+            ],
+            stderr=subprocess.STDOUT,
+        )
+    except FileNotFoundError as exc:
+        raise ProposalApiError("git is required for proposal context") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = exc.output.decode("utf-8", errors="replace").strip()
+        raise ProposalApiError(
+            f"proposal context requires a committed Git workspace: {detail}"
+        ) from exc
+
+    tracked: dict[str, str] = {}
+    for raw_entry in tree_payload.split(b"\0"):
+        if not raw_entry:
+            continue
+        metadata, separator, raw_path = raw_entry.partition(b"\t")
+        fields = metadata.split()
+        if not separator or len(fields) != 3:
+            raise ProposalApiError("proposal context Git tree is malformed")
+        mode, object_type, raw_object_id = fields
+        if mode not in {b"100644", b"100755"} or object_type != b"blob":
+            continue
+        try:
+            relative = raw_path.decode("utf-8", errors="strict")
+            object_id = raw_object_id.decode("ascii", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ProposalApiError(
+                "proposal context contains a non-UTF-8 Git path"
+            ) from exc
+        tracked[relative] = object_id
+
+    selected: dict[str, str] = {}
+    for relative in allowed:
+        if is_sensitive_context_path(relative):
+            raise ProposalApiError(
+                f"proposal context contains a sensitive path: {relative}"
+            )
+        try:
+            candidate = ensure_workspace_containment(
+                execution_workspace,
+                execution_workspace / relative,
+                must_exist=True,
+            )
+        except SecurityValidationError as exc:
+            raise ProposalApiError(
+                f"proposal context is unavailable: {relative}"
+            ) from exc
+        if candidate.is_file() and not candidate.is_symlink():
+            normalized = relative.replace("\\", "/")
+            object_id = tracked.get(normalized)
+            if object_id is None:
+                raise ProposalApiError(
+                    f"proposal context is not a committed regular file: {relative}"
+                )
+            selected[normalized] = object_id
+            if len(selected) > MAX_PROPOSAL_CONTEXT_FILES:
+                raise ProposalApiError(
+                    f"proposal context exceeds {MAX_PROPOSAL_CONTEXT_FILES} files"
+                )
+            continue
+        if not candidate.is_dir() or candidate.is_symlink():
+            raise ProposalApiError(
+                f"proposal context must be a regular file or directory: {relative}"
+            )
+        prefix = relative.replace("\\", "/").rstrip("/") + "/"
+        for child_relative, object_id in sorted(tracked.items()):
+            if not child_relative.startswith(prefix):
+                continue
+            if is_sensitive_context_path(child_relative):
+                raise ProposalApiError(
+                    f"proposal context contains a sensitive path: {child_relative}"
+                )
+            selected[child_relative] = object_id
+            if len(selected) > MAX_PROPOSAL_CONTEXT_FILES:
+                raise ProposalApiError(
+                    f"proposal context exceeds {MAX_PROPOSAL_CONTEXT_FILES} files"
+                )
+    chunks: list[str] = []
+    total = 0
+    for relative, object_id in sorted(selected.items()):
+        try:
+            payload = subprocess.check_output(
+                [
+                    "git",
+                    "-C",
+                    str(execution_workspace),
+                    "cat-file",
+                    "blob",
+                    object_id,
+                ],
+                stderr=subprocess.STDOUT,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise ProposalApiError(
+                f"proposal context committed blob could not be read: {relative}"
+            ) from exc
+        total += len(payload)
+        if total > maximum:
+            raise ProposalApiError(
+                f"proposal context exceeds the {maximum}-byte task envelope"
+            )
+        try:
+            text = payload.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ProposalApiError(
+                f"proposal context is not UTF-8 text: {relative}"
+            ) from exc
+        chunks.append(f"===== {relative} =====\n{text}")
+    if not chunks:
+        return ""
+    return "\n\n## Allowlisted committed context\n\n" + "\n\n".join(chunks)
+
+
+def _usage_token(
+    usage: dict[str, Any],
+    primary: str,
+    fallback: str,
+) -> int:
+    primary_value = usage.get(primary)
+    fallback_value = usage.get(fallback)
+    if type(primary_value) is int and primary_value > 0:
+        return primary_value
+    if type(fallback_value) is int and fallback_value >= 0:
+        return fallback_value
+    if type(primary_value) is int and primary_value >= 0:
+        return primary_value
+    raise ProposalApiError("proposal response usage is incomplete")
+
+
+def _run_longcat_proposal(
+    *,
+    actor: dict[str, Any],
+    profile_payload: bytes,
+    api_key: str,
+    prompt_text: str,
+    context_text: str,
+    max_output_tokens: int,
+) -> tuple[str, dict[str, int]]:
+    """Call LongCat's documented Chat API without giving it host tools."""
+
+    try:
+        profile = parse_profile_bytes(profile_payload)
+    except ProfileBindingError as exc:
+        raise ProposalApiError("proposal profile is invalid") from exc
+    provider_identity = profile.get("model_provider")
+    provider_rows = profile.get("model_providers")
+    provider = (
+        provider_rows.get(provider_identity)
+        if isinstance(provider_rows, dict)
+        and isinstance(provider_identity, str)
+        else None
+    )
+    if (
+        actor.get("provider") != "longcat"
+        or provider_identity != "longcat"
+        or not isinstance(provider, dict)
+        or str(provider.get("base_url") or "").rstrip("/")
+        != LONGCAT_PROPOSAL_BASE_URL
+    ):
+        raise ProposalApiError(
+            "proposal-api is currently verified only for the LongCat preset"
+        )
+    model = str(actor.get("model") or profile.get("model") or "")
+    if model in {"", "inherit"}:
+        model = str(profile.get("model") or "")
+    if model != "LongCat-2.0":
+        raise ProposalApiError(
+            "proposal-api requires the reviewed LongCat-2.0 model"
+        )
+    if not api_key:
+        raise ProposalApiError("LongCat proposal credential is unavailable")
+    if max_output_tokens <= 0 or max_output_tokens > 8192:
+        raise ProposalApiError(
+            "proposal output-token envelope must be between 1 and 8192"
+        )
+    user_input = (
+        prompt_text
+        + context_text
+        + "\n\n## Proposal-mode boundary\n"
+        "- Do not call tools or claim that you ran commands.\n"
+        "- Do not expose hidden reasoning.\n"
+        "- Return a bounded completion report. If changes are needed, include "
+        "a minimal proposed diff or complete replacement content, but do not "
+        "claim that it was applied.\n"
+    )
+    body = json.dumps(
+        {
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a report-only CostMarshal worker. Follow the "
+                        "bounded task and output contract exactly."
+                    ),
+                },
+                {"role": "user", "content": user_input},
+            ],
+            "max_tokens": max_output_tokens,
+            "temperature": 0,
+            "thinking": {"type": "disabled"},
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    endpoint = LONGCAT_PROPOSAL_BASE_URL + "/chat/completions"
+    transient_statuses = {429, 500, 502, 503, 504}
+    response_body: bytes | None = None
+    for attempt in range(3):
+        request = urllib.request.Request(
+            endpoint,
+            data=body,
+            headers={
+                "Authorization": "Bearer " + api_key,
+                "Content-Type": "application/json",
+                "User-Agent": "CostMarshal-proposal-api/1",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=300) as response:  # noqa: S310
+                response_body = response.read(MAX_PROPOSAL_RESPONSE_BYTES + 1)
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code not in transient_statuses or attempt == 2:
+                raise ProposalApiError(
+                    f"LongCat proposal request failed with HTTP {exc.code}"
+                ) from exc
+            retry_after = exc.headers.get("Retry-After")
+            delay = min(
+                10.0,
+                float(retry_after)
+                if retry_after and retry_after.isdigit()
+                else float(2**attempt),
+            )
+            time.sleep(delay)
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if attempt == 2:
+                raise ProposalApiError(
+                    "LongCat proposal request failed after bounded retries"
+                ) from exc
+            time.sleep(float(2**attempt))
+    if response_body is None:
+        raise ProposalApiError("LongCat proposal response is unavailable")
+    if len(response_body) > MAX_PROPOSAL_RESPONSE_BYTES:
+        raise ProposalApiError("LongCat proposal response exceeds 512 KiB")
+    try:
+        payload = json.loads(response_body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProposalApiError("LongCat proposal response is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ProposalApiError("LongCat proposal response must be an object")
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1:
+        raise ProposalApiError("LongCat proposal response has invalid choices")
+    choice = choices[0]
+    message = choice.get("message") if isinstance(choice, dict) else None
+    content = message.get("content") if isinstance(message, dict) else None
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        raise ProposalApiError("LongCat proposal response has no usage")
+    input_tokens = _usage_token(usage, "prompt_tokens", "input_tokens")
+    output_tokens = _usage_token(
+        usage,
+        "completion_tokens",
+        "output_tokens",
+    )
+    normalized_usage = {
+        "input_tokens": input_tokens,
+        "cached_input_tokens": 0,
+        "output_tokens": output_tokens,
+    }
+    if not isinstance(content, str) or not content.strip():
+        raise ProposalApiError(
+            "LongCat proposal response has no final text",
+            usage=normalized_usage,
+        )
+    if choice.get("finish_reason") != "stop":
+        raise ProposalApiError(
+            "LongCat proposal response did not finish within its token envelope",
+            usage=normalized_usage,
+        )
+    return content, normalized_usage
+
+
 def build_codex_argv(
     layout: ProjectLayout,
     actor: dict[str, Any],
@@ -3002,6 +3364,12 @@ def _run_actor_once(
     report.parent.mkdir(parents=True, exist_ok=True)
     execution_workspace, sandbox, write_scopes, base_sha = actor_execution_workspace(layout, project, actor)
     required_isolation = (actor.get("isolation") or {}).get("mode") == "required"
+    execution_mode = str(actor.get("execution_mode") or "agent")
+    native_proposal = not required_isolation and execution_mode == "proposal-api"
+    if required_isolation and execution_mode == "proposal-api":
+        raise SystemExit(
+            "proposal-api is a host report adapter and cannot run as an OCI agent"
+        )
     projection_receipt: dict[str, Any] | None = None
     semantic_contract: dict[str, Any] | None = None
     attempt_input_contract: dict[str, Any] | None = None
@@ -3223,15 +3591,70 @@ def _run_actor_once(
             finalize_only=provider_completion_recovery is not None,
         )
     else:
-        argv = build_codex_argv(
-            layout,
-            actor,
-            project,
-            report,
-            execution_workspace=execution_workspace,
-            sandbox=sandbox,
-        )
         env, secret_values = isolated_actor_env(project, actor, layout=layout)
+        if native_proposal:
+            try:
+                verify_profile_snapshot(
+                    layout.root,
+                    actor.get("profile_binding"),
+                )
+            except ProfileBindingError as exc:
+                raise SystemExit(
+                    f"proposal-api profile binding failed closed: {exc}"
+                ) from exc
+            if write_scopes:
+                raise SystemExit(
+                    "proposal-api is report-only and cannot receive write scope"
+                )
+            proposal_task = load_task(
+                layout,
+                str(actor.get("task_id") or ""),
+            )
+            prompt_text += _proposal_context_text(
+                execution_workspace,
+                proposal_task,
+            )
+            proposal_script = (
+                Path(__file__).resolve().parents[1]
+                / "scripts"
+                / "costmarshal_proposal_worker.py"
+            )
+            if not proposal_script.is_file():
+                raise SystemExit("proposal-api worker entrypoint is unavailable")
+            profile_binding = actor.get("profile_binding")
+            assert isinstance(profile_binding, dict)
+            profile_path = (
+                layout.root / str(profile_binding["snapshot_relpath"])
+            ).resolve()
+            try:
+                profile_path.relative_to(layout.root.resolve())
+            except ValueError as exc:
+                raise SystemExit(
+                    "proposal-api profile snapshot escapes the runtime"
+                ) from exc
+            argv = [
+                sys.executable,
+                str(proposal_script),
+                "--profile-file",
+                str(profile_path),
+                "--report",
+                str(report),
+                "--provider",
+                str(actor.get("provider") or ""),
+                "--model",
+                str(actor.get("model") or "inherit"),
+                "--max-output-tokens",
+                str(int(proposal_task.get("estimated_output_tokens") or 0)),
+            ]
+        else:
+            argv = build_codex_argv(
+                layout,
+                actor,
+                project,
+                report,
+                execution_workspace=execution_workspace,
+                sandbox=sandbox,
+            )
     events: list[dict[str, Any]] = []
     usage_known = not required_isolation
     runtime_registration: dict[str, Any] = {}

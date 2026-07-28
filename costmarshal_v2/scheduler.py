@@ -1218,14 +1218,25 @@ def render_actor_prompt(layout: ProjectLayout, actor: dict[str, Any]) -> str:
     if workspace and not (
         actor.get("role") == "agent" and isinstance(collaboration_contract, dict)
     ):
-        lines.extend(
-            [
-                "",
-                "## Workspace",
-                f"- `{workspace}`",
-                "- Treat claimed and allowed write paths as relative to this workspace unless they are absolute.",
-            ]
-        )
+        if actor.get("role") == "agent":
+            lines.extend(
+                [
+                    "",
+                    "## Attempt Workspace",
+                    "- Work only in the process current working directory; it is the attempt-scoped Git worktree selected by the runner.",
+                    "- Use relative paths for every workspace read, edit, and test command.",
+                    "- Never target a host workspace or source-project absolute path; the runner will reject writes outside this attempt.",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "",
+                    "## Workspace",
+                    f"- `{workspace}`",
+                    "- Treat claimed and allowed write paths as relative to this workspace unless they are absolute.",
+                ]
+            )
     source_project = project.get("source_project")
     if source_project and not (
         actor.get("role") == "agent" and isinstance(collaboration_contract, dict)
@@ -4074,6 +4085,10 @@ def command_new_task(args: Any) -> None:
         raise SystemExit(
             "audio, video, and document input requires --execution-mode multimodal-api"
         )
+    if execution_mode == "proposal-api" and input_attachments:
+        raise SystemExit(
+            "proposal-api currently supports committed text context only"
+        )
     if execution_mode == "multimodal-api":
         total_attachment_bytes = sum(
             int(row["size_bytes"]) for row in input_attachments
@@ -4174,6 +4189,19 @@ def command_new_task(args: Any) -> None:
                 "multimodal-api execution requires a provider catalog row bound "
                 "to costmarshal-gateway-v1"
             )
+    if execution_mode == "proposal-api":
+        if route_preview.provider_id != "longcat":
+            raise SystemExit(
+                "proposal-api is currently verified only for the LongCat preset"
+            )
+        if estimated_input_tokens <= 0 or estimated_output_tokens <= 0:
+            raise SystemExit(
+                "proposal-api requires positive input and output token envelopes"
+            )
+        if estimated_output_tokens > 8192:
+            raise SystemExit(
+                "proposal-api output-token envelope cannot exceed 8192"
+            )
     task_id = args.id or next_task_id(layout)
     directory = task_dir(layout, task_id)
     if directory.exists():
@@ -4206,9 +4234,11 @@ def command_new_task(args: Any) -> None:
         raise SystemExit(
             "Every allowed write path must be covered by a write claim: " + ", ".join(uncovered_allowed)
         )
-    if execution_mode == "multimodal-api" and (allowed_paths or claim_paths):
+    if execution_mode in {"proposal-api", "multimodal-api"} and (
+        allowed_paths or claim_paths
+    ):
         raise SystemExit(
-            "multimodal-api execution is report-only and cannot claim or write workspace paths"
+            f"{execution_mode} execution is report-only and cannot claim or write workspace paths"
         )
     lock_claim_paths = _task_lock_claim_paths(
         {"repository_id": repository_id},
@@ -5201,8 +5231,12 @@ def command_dispatch(args: Any) -> None:
         raise SystemExit(f"Unable to route task: {exc}") from exc
     provider_spec = provider_by_id(catalog, decision.provider_id)
     execution_mode = str(task.get("execution_mode") or "agent")
-    if execution_mode not in {"agent", "multimodal-api"}:
+    if execution_mode not in {"agent", "proposal-api", "multimodal-api"}:
         raise SystemExit("Task execution_mode is invalid")
+    if execution_mode == "proposal-api" and not unsafe_native:
+        raise SystemExit(
+            "proposal-api currently requires the explicit host report-adapter opt-in"
+        )
     if execution_mode == "multimodal-api" and unsafe_native:
         raise SystemExit(
             "multimodal-api execution requires the strongly isolated OCI worker"
@@ -13987,8 +14021,44 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
                 issues.append(
                     f"{task['id']} agent execution cannot transport non-image attachments"
                 )
-            if execution_mode not in {"agent", "multimodal-api"}:
+            if execution_mode not in {
+                "agent",
+                "proposal-api",
+                "multimodal-api",
+            }:
                 issues.append(f"{task['id']} execution_mode is invalid")
+            if execution_mode == "proposal-api":
+                provider_id = str(
+                    (
+                        task.get("provider")
+                        if task.get("provider") not in {None, "", "auto"}
+                        else (task.get("route_preview") or {}).get("provider_id")
+                    )
+                    or ""
+                )
+                if provider_id != "longcat":
+                    issues.append(
+                        f"{task['id']} proposal-api route is not LongCat"
+                    )
+                if raw_attachments:
+                    issues.append(
+                        f"{task['id']} proposal-api cannot transport attachments"
+                    )
+                if task.get("allowed_paths") or task.get("claimed_paths"):
+                    issues.append(
+                        f"{task['id']} proposal-api must remain report-only"
+                    )
+                if int(task.get("estimated_input_tokens") or 0) <= 0:
+                    issues.append(
+                        f"{task['id']} proposal-api input token envelope is missing"
+                    )
+                proposal_output = int(
+                    task.get("estimated_output_tokens") or 0
+                )
+                if proposal_output <= 0 or proposal_output > 8192:
+                    issues.append(
+                        f"{task['id']} proposal-api output token envelope is invalid"
+                    )
             if execution_mode == "multimodal-api" and catalog is not None:
                 provider_id = str(
                     (

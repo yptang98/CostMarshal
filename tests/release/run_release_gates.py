@@ -74,6 +74,7 @@ REQUIRED_LOCAL_TESTS = (
     "tests/required_credential_preflight_test.py",
     "tests/security_contract_test.py",
     "tests/actor_security_contract_test.py",
+    "tests/proposal_api_contract_test.py",
     "tests/context_projection_test.py",
     "tests/handoff_contract_test.py",
     "tests/v3_3_leader_artifact_contract_test.py",

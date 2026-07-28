@@ -1,9 +1,9 @@
 ---
 name: costmarshal
-description: "CostMarshal v4.4 internal policy/runtime for the Codex plugin: scheduler-first, capability-aware and cost-aware low/medium/high provider orchestration across repository-bound Workstreams, with immutable multimodal inputs, reviewed Provider drift guardrails, an mTLS workload-identity Broker, hard-budget Provider Proxy, short-lived signed production certification, staged integration Gates, total-cost reports, structured teaching execution graphs, evidence-bound evolution cycles, Hot/Warm/Cold context views, recency-aware exact-version model memory, accepted project knowledge, project-local Skill candidates, event-driven Leader Snapshots, structured handoffs, atomic batch acceptance, project artifact lineage, work graphs, artifact gates, recoverable effects, OCI worker isolation, durable attempts, budget reservations, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
+description: "CostMarshal v4.5 internal policy/runtime for the Codex plugin: scheduler-first, capability-aware and cost-aware low/medium/high provider orchestration across repository-bound Workstreams, with a committed-context report-only proposal path, immutable multimodal inputs, reviewed Provider drift guardrails, an mTLS workload-identity Broker, hard-budget Provider Proxy, short-lived signed production certification, staged integration Gates, total-cost reports, structured teaching execution graphs, evidence-bound evolution cycles, Hot/Warm/Cold context views, recency-aware exact-version model memory, accepted project knowledge, project-local Skill candidates, event-driven Leader Snapshots, structured handoffs, atomic batch acceptance, project artifact lineage, work graphs, artifact gates, recoverable effects, OCI worker isolation, durable attempts, budget reservations, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
 ---
 
-# CostMarshal v4.4
+# CostMarshal v4.5
 
 Use this skill for long or decomposable work where multiple API price/capability tiers should cooperate under explicit safety, cost, and recovery controls.
 
@@ -12,7 +12,9 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
 ## Invariants
 
 1. The scheduler relays commands and supervises processes; it does not make technical decisions.
-2. Provider identity and tier are separate. Tiers are exactly `low`, `medium`, and `high`.
+2. Provider identity and tier are separate. Tiers are exactly `low`, `medium`,
+   and `high`; they express reviewed cost/safety routing authority, not a
+   permanent intelligence ranking.
 3. Risk/difficulty/task-type safety floors cannot be bypassed by a cheaper provider request.
 4. A task is done only after an explicit leader result with `accepted_by_leader=true`.
 5. Workers may report failed/escalate evidence, but actor-authored collect commands may request only `waiting_leader`; task outcome and continuation are leader-owned.
@@ -33,22 +35,28 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
     require report-only `multimodal-api`, strong OCI, the certified gateway,
     no write scope, and authoritative Proxy settlement.
 18. Model memory is isolated by exact provider/model/profile hash and task scope, reports 95% Wilson intervals, and decays aggregate confidence with a 90-day half-life. External/tool/dependency/budget/context failures remain auditable but must not penalize model capability.
-19. New non-off teaching tasks use a hash-bound execution graph. Enforced acceptance requires a validated teaching-run ID; review, paired comparison, and replay evidence must satisfy their distinct fixed topologies.
-20. Total-cost reports center on known cost per accepted Artifact and separately expose execution, verification, rework, handoff/context, Leader attention, and failure/recovery observations. Never invent a monetary price for unknown costs, time, tokens, or context.
-21. Repository registration is metadata-only and immutable. Never move, adopt,
+19. `proposal-api` is a report-only LongCat Chat adapter for legitimately
+    low-floor text work. It may read only committed allowlisted UTF-8 blobs,
+    receives no tools or writes, preserves billable usage on truncation, and
+    requires Codex review before application. One targeted retry is appropriate
+    for a small, precisely identified defect; repeated or material failure
+    escalates.
+20. New non-off teaching tasks use a hash-bound execution graph. Enforced acceptance requires a validated teaching-run ID; review, paired comparison, and replay evidence must satisfy their distinct fixed topologies.
+21. Total-cost reports center on known cost per accepted Artifact and separately expose execution, verification, rework, handoff/context, Leader attention, and failure/recovery observations. Never invent a monetary price for unknown costs, time, tokens, or context.
+22. Repository registration is metadata-only and immutable. Never move, adopt,
     rewrite, or manage the user's source repositories or global project/Skill
     directories.
-22. Automatic evolution and Leader Snapshot refreshes are local,
+23. Automatic evolution and Leader Snapshot refreshes are local,
     reconstructible projections. They must not change the `record-result`
     response, create Provider calls or tasks, load Cold/raw transcript content,
     or activate learned policy.
-22. A Workstream owns an explicit repository set, dependency set, concurrency
+24. A Workstream owns an explicit repository set, dependency set, concurrency
     quota, and optional CNY allocation. Downstream dispatch requires a
     hash-valid passed integration Gate for every predecessor Workstream.
-23. Cross-repository integration is staged, never atomic. Freeze the complete
+25. Cross-repository integration is staged, never atomic. Freeze the complete
     current Workstream task set, accepted interface Artifacts, exact Git heads,
     and verified rollback ancestors before Leader Gate review.
-24. An enforced production boundary requires `costmarshal-gateway-v1`: mTLS
+26. An enforced production boundary requires `costmarshal-gateway-v1`: mTLS
     SPIFFE identity, signed short-lived leases, a live policy-hash-bound Broker
     and hard-budget Proxy, digest-pinned OCI isolation, SQLite authority, and
     accepted external evidence. Runtime health and Artifact IDs are insufficient
@@ -57,7 +65,7 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
     Worker/gateway image digests, trust-root hash, signer, and five external
     report receipts. Any missing or drifting binding blocks dispatch; legacy
     raw-key workers and legacy production boundaries never satisfy this boundary.
-25. Provider probes are safety-only. Drift disables a provider and unknown
+27. Provider probes are safety-only. Drift disables a provider and unknown
     dimensions reduce its routing priority; observations never add capability,
     lower price, or restore authority. A replacement row requires an explicit
     human review bound to all unresolved observations and expires within 90
@@ -74,6 +82,9 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
 5. Create bounded work packages with explicit repository/Workstream ownership,
    role, dependencies, deliverables, risk, difficulty, estimates, acceptance
    criteria, allowed context, and write scope.
+   For legitimately low-floor text analysis, debugging proposals, or
+   scout/reviewer work routed to LongCat, prefer report-only `proposal-api`.
+   Do not relabel a medium/high-risk task to bypass its safety floor.
 6. Run `route` to inspect safety floor, chain, cost, and acceptance prior when economics matter.
 7. Dispatch only after the route explanation, Workstream quotas, and claims are acceptable.
 8. Keep `run-scheduler` active while actors execute.

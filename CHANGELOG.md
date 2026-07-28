@@ -1,5 +1,24 @@
 # Changelog
 
+## v4.5.0 - 2026-07-29
+
+- Added a report-only LongCat `proposal-api` worker for bounded text
+  implementation proposals, debugging, and first-pass review. It has no tools
+  or write scope and remains subject to Codex Leader acceptance.
+- Restricted proposal context to explicitly allowlisted regular-file blobs from
+  committed Git `HEAD`; dirty/untracked files, generated binaries, symlinks,
+  sensitive paths, oversized context, and non-UTF-8 content fail closed.
+- Preserved authoritative LongCat Chat usage on successful and
+  token-truncated responses, with bounded retries and output envelopes.
+- Fixed high-tier Codex Worker authentication discovery so the normal
+  signed-in `~/.codex/auth.json` is reused even when `CODEX_HOME` is unset.
+- Clarified the architecture as Codex Leader, Codex Worker, and provider
+  workers. Routing tiers express reviewed cost/safety authority rather than a
+  fixed intelligence ranking.
+- Added live capability evidence showing that LongCat can produce accepted
+  implementations and debugging fixes with targeted Codex review, while
+  complex security review remains variable and retains Codex final authority.
+
 ## v4.4.0 - 2026-07-29
 
 - Added an idempotent, evidence-bound self-evolution cycle after every recorded

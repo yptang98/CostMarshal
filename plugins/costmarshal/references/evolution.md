@@ -1,6 +1,6 @@
 # Work Graph and evidence-backed evolution
 
-CostMarshal v4.4 learns from use without giving observations authority to
+CostMarshal v4.5 learns from use without giving observations authority to
 rewrite active policy.
 
 ## Authoritative records

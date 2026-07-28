@@ -395,9 +395,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     new_task.add_argument(
         "--execution-mode",
-        choices=["auto", "agent", "multimodal-api"],
+        choices=["auto", "agent", "proposal-api", "multimodal-api"],
         default="auto",
-        help="Auto selects multimodal-api for audio/video/document input and agent otherwise",
+        help=(
+            "Auto selects multimodal-api for audio/video/document input and "
+            "agent otherwise; proposal-api is a report-only low-cost provider path"
+        ),
     )
     new_task.add_argument("--min-success-probability", type=float)
     new_task.add_argument(
@@ -1028,7 +1031,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     production_boundary.add_argument(
         "--release-version",
-        help="Exact CostMarshal release version, for example v4.4.0",
+        help="Exact CostMarshal release version, for example v4.5.0",
     )
     production_boundary.add_argument(
         "--gateway-image",

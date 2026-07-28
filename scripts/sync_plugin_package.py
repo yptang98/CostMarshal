@@ -94,6 +94,7 @@ INDIVIDUAL_FILES = (
     "scripts/costmarshal.py",
     "scripts/costmarshal_actor.py",
     "scripts/costmarshal_gateway.py",
+    "scripts/costmarshal_proposal_worker.py",
     "scripts/costmarshal_production_certification.py",
 )
 IGNORED_NAMES = {
