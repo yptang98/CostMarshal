@@ -300,8 +300,7 @@ def main() -> int:
             actor_id,
             "--attempt",
             actor["attempt_id"],
-            "--launch-token",
-            actor["launch_token"],
+            f"--launch-token={actor['launch_token']}",
         ]
         env = os.environ.copy()
         env["COSTMARSHAL_V2_HOME"] = str(temp / "runtime")
