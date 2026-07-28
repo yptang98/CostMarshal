@@ -16,6 +16,7 @@ from .state import now_iso
 LEADER_DECISION_SCHEMA = "costmarshal-leader-decision-v1"
 PROJECT_KNOWLEDGE_SCHEMA = "costmarshal-project-knowledge-v1"
 SKILL_CANDIDATE_SCHEMA = "costmarshal-skill-candidate-v1"
+CONTEXT_VIEW_SCHEMA = "costmarshal-context-view-v1"
 KNOWLEDGE_KINDS = frozenset(
     {
         "charter",
@@ -176,6 +177,203 @@ def require_accepted_artifacts(
                 f"Skill candidate requires accepted evidence from {minimum} distinct tasks"
             )
     return sources
+
+
+def _search_terms(value: object) -> set[str]:
+    text = str(value or "").casefold()
+    words = {
+        item
+        for item in re.findall(r"[a-z0-9_.:-]{2,}|[\u4e00-\u9fff]{2,}", text)
+        if len(item) >= 2
+    }
+    # Continuous Chinese text often has no separators. Short overlapping
+    # chunks make deterministic title matching useful without an embedding
+    # model, network call, or private-content index.
+    for block in re.findall(r"[\u4e00-\u9fff]{3,}", text):
+        words.update(block[index : index + 2] for index in range(len(block) - 1))
+    return words
+
+
+def build_context_view(
+    *,
+    project: Mapping[str, Any],
+    task: Mapping[str, Any] | None,
+    query: str | None,
+    knowledge_rows: Iterable[Mapping[str, Any]],
+    artifact_rows: Iterable[Mapping[str, Any]],
+    leader_snapshots: Iterable[Mapping[str, Any]],
+    hot_limit: int = 12,
+    warm_limit: int = 20,
+) -> dict[str, Any]:
+    """Build bounded Hot/Warm/Cold references without loading raw content."""
+
+    if hot_limit < 1 or hot_limit > 50 or warm_limit < 1 or warm_limit > 100:
+        raise ProjectKnowledgeError("context limits are outside the safe range")
+    target_task_id = str((task or {}).get("id") or "") or None
+    search_material = " ".join(
+        str(value or "")
+        for value in (
+            query,
+            (task or {}).get("title"),
+            (task or {}).get("purpose"),
+            (task or {}).get("task_type"),
+            " ".join((task or {}).get("required_capabilities") or []),
+        )
+    )
+    terms = _search_terms(search_material)
+    candidates: list[dict[str, Any]] = []
+
+    snapshots = list(leader_snapshots)
+    if snapshots:
+        latest = snapshots[-1]
+        candidates.append(
+            {
+                "tier": "hot",
+                "score": 1000,
+                "kind": "leader-snapshot",
+                "id": latest.get("snapshot_id"),
+                "title": "Current transcript-free Leader state",
+                "task_id": None,
+                "reason": "latest durable state projection",
+                "sha256": latest.get("snapshot_sha256"),
+            }
+        )
+    if task is not None:
+        candidates.append(
+            {
+                "tier": "hot",
+                "score": 900,
+                "kind": "task",
+                "id": target_task_id,
+                "title": str(task.get("title") or target_task_id or "Current task"),
+                "task_id": target_task_id,
+                "reason": "explicit current work package",
+                "sha256": _digest(dict(task)),
+            }
+        )
+
+    durable_kinds = {"charter", "architecture", "interface", "risk"}
+    for index, row in enumerate(knowledge_rows):
+        title = str(row.get("title") or "")
+        task_match = bool(
+            target_task_id and str(row.get("task_id") or "") == target_task_id
+        )
+        relevance = len(terms & _search_terms(title))
+        durable = row.get("kind") in durable_kinds
+        score = (200 if task_match else 0) + (40 if durable else 0) + relevance * 20
+        tier = "hot" if task_match or relevance >= 2 else "warm" if durable or relevance else "cold"
+        candidates.append(
+            {
+                "tier": tier,
+                "score": score,
+                "kind": f"knowledge:{row.get('kind')}",
+                "id": row.get("knowledge_id"),
+                "title": title,
+                "task_id": row.get("task_id"),
+                "reason": (
+                    "current task evidence"
+                    if task_match
+                    else "query/title relevance"
+                    if relevance
+                    else "durable project knowledge"
+                    if durable
+                    else "indexed cold knowledge"
+                ),
+                "sha256": row.get("knowledge_sha256"),
+                "_order": index,
+            }
+        )
+
+    latest_artifacts: dict[str, Mapping[str, Any]] = {}
+    for row in artifact_rows:
+        artifact_id = row.get("artifact_id")
+        if isinstance(artifact_id, str) and artifact_id:
+            latest_artifacts[artifact_id] = row
+    for index, row in enumerate(latest_artifacts.values()):
+        if row.get("lifecycle") != "accepted":
+            continue
+        task_match = bool(
+            target_task_id and str(row.get("task_id") or "") == target_task_id
+        )
+        title = str(row.get("kind") or "accepted Artifact")
+        relevance = len(terms & _search_terms(title))
+        tier = "hot" if task_match else "warm" if relevance else "cold"
+        candidates.append(
+            {
+                "tier": tier,
+                "score": (150 if task_match else 0) + relevance * 10,
+                "kind": "accepted-artifact",
+                "id": row.get("artifact_id"),
+                "title": title,
+                "task_id": row.get("task_id"),
+                "reason": (
+                    "accepted output of current task"
+                    if task_match
+                    else "accepted evidence reference"
+                    if relevance
+                    else "indexed accepted evidence"
+                ),
+                "sha256": row.get("sha256"),
+                "_order": index,
+            }
+        )
+
+    def ordered(tier: str) -> list[dict[str, Any]]:
+        rows = [row for row in candidates if row["tier"] == tier]
+        rows.sort(
+            key=lambda row: (
+                -int(row.get("score") or 0),
+                -int(row.get("_order") or 0),
+                str(row.get("id") or ""),
+            )
+        )
+        return [
+            {key: value for key, value in row.items() if key not in {"score", "_order"}}
+            for row in rows
+        ]
+
+    hot_all = ordered("hot")
+    warm_all = ordered("warm")
+    cold_all = ordered("cold")
+    hot = hot_all[:hot_limit]
+    warm = warm_all[:warm_limit]
+    cold_index = [
+        {
+            "kind": row["kind"],
+            "id": row["id"],
+            "title": row["title"],
+        }
+        for row in cold_all[:100]
+    ]
+    body = {
+        "schema_version": CONTEXT_VIEW_SCHEMA,
+        "project_id": str(project.get("project_id") or ""),
+        "task_id": target_task_id,
+        "query_terms": sorted(terms),
+        "hot": hot,
+        "warm": warm,
+        "cold_index": cold_index,
+        "counts": {
+            "hot_available": len(hot_all),
+            "hot_loaded": len(hot),
+            "warm_available": len(warm_all),
+            "warm_loaded": len(warm),
+            "cold_indexed": len(cold_all),
+        },
+        "content_policy": {
+            "raw_content_loaded": False,
+            "transcripts_loaded": False,
+            "cold_content_loaded": False,
+            "retrieval": "deterministic metadata relevance",
+        },
+    }
+    digest = _digest(body)
+    return {
+        **body,
+        "view_id": "CTX-" + digest.removeprefix("sha256:")[:32],
+        "view_sha256": digest,
+        "generated_at": now_iso(),
+    }
 
 
 def build_project_knowledge(
@@ -426,12 +624,14 @@ def validate_skill_candidate(
 
 
 __all__ = [
+    "CONTEXT_VIEW_SCHEMA",
     "KNOWLEDGE_KINDS",
     "LEADER_DECISION_SCHEMA",
     "PROJECT_KNOWLEDGE_SCHEMA",
     "SKILL_CANDIDATE_SCHEMA",
     "ProjectKnowledgeError",
     "build_leader_decision",
+    "build_context_view",
     "build_project_knowledge",
     "build_skill_candidate",
     "require_accepted_artifacts",

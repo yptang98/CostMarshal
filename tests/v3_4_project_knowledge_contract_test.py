@@ -25,6 +25,7 @@ from costmarshal_v2.project_artifacts import (  # noqa: E402
 )
 from costmarshal_v2.project_knowledge import (  # noqa: E402
     ProjectKnowledgeError,
+    build_context_view,
     build_leader_decision,
     build_project_knowledge,
     build_skill_candidate,
@@ -191,6 +192,67 @@ class V34ProjectKnowledgeContractTest(unittest.TestCase):
                 verification=["Check"],
                 failure_boundaries=["Stop"],
             )
+
+    def test_context_view_loads_bounded_references_and_indexes_cold_content(self) -> None:
+        task_knowledge = build_project_knowledge(
+            project_id="P-1",
+            command_id="CMD-task-context",
+            kind="accepted-fact",
+            title="Parser interface accepts UTF-8 input",
+            source_artifact_ids=["ART-a"],
+            artifact_rows=self.rows,
+            leader_decision_id=None,
+            leader_decisions=[],
+            task_id="V2-0001",
+        )
+        architecture = build_project_knowledge(
+            project_id="P-1",
+            command_id="CMD-architecture-context",
+            kind="architecture",
+            title="Stable parser boundary",
+            source_artifact_ids=["ART-b"],
+            artifact_rows=self.rows,
+            leader_decision_id=None,
+            leader_decisions=[],
+        )
+        cold = build_project_knowledge(
+            project_id="P-1",
+            command_id="CMD-cold-context",
+            kind="milestone-summary",
+            title="Unrelated billing milestone",
+            source_artifact_ids=["ART-b"],
+            artifact_rows=self.rows,
+            leader_decision_id=None,
+            leader_decisions=[],
+        )
+        view = build_context_view(
+            project={"project_id": "P-1"},
+            task={
+                "id": "V2-0001",
+                "title": "Repair parser interface",
+                "purpose": "Accept UTF-8 safely",
+                "task_type": "coding",
+            },
+            query="parser interface",
+            knowledge_rows=[task_knowledge, architecture, cold],
+            artifact_rows=self.rows,
+            leader_snapshots=[
+                {
+                    "snapshot_id": "LSNP-1",
+                    "snapshot_sha256": "sha256:snapshot",
+                }
+            ],
+            hot_limit=4,
+            warm_limit=4,
+        )
+        hot_ids = {row["id"] for row in view["hot"]}
+        cold_ids = {row["id"] for row in view["cold_index"]}
+        self.assertIn(task_knowledge["knowledge_id"], hot_ids)
+        self.assertIn("LSNP-1", hot_ids)
+        self.assertIn(cold["knowledge_id"], cold_ids)
+        self.assertFalse(view["content_policy"]["raw_content_loaded"])
+        self.assertFalse(view["content_policy"]["transcripts_loaded"])
+        self.assertFalse(view["content_policy"]["cold_content_loaded"])
 
     def test_skill_export_is_explicit_project_local_and_never_installs(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

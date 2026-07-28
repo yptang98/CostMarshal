@@ -31,6 +31,7 @@ from .scheduler import (
     command_batch_acceptance,
     command_collect,
     command_configure_production_boundary,
+    command_context_view,
     command_cost_report,
     command_create_integration_plan,
     command_create_workstream,
@@ -46,6 +47,7 @@ from .scheduler import (
     command_governance_status,
     command_governance_rebind,
     command_model_memory,
+    command_evolution_status,
     command_knowledge,
     command_integration_gate,
     command_policy_status,
@@ -796,6 +798,17 @@ def build_parser() -> argparse.ArgumentParser:
     knowledge.add_argument("--task")
     knowledge.set_defaults(func=command_knowledge)
 
+    context_view = sub.add_parser(
+        "context-view",
+        help="Retrieve bounded Hot/Warm references while leaving Cold content and transcripts unloaded",
+    )
+    context_view.add_argument("--project", required=True)
+    context_view.add_argument("--task")
+    context_view.add_argument("--query")
+    context_view.add_argument("--hot-limit", type=int, default=12)
+    context_view.add_argument("--warm-limit", type=int, default=20)
+    context_view.set_defaults(func=command_context_view)
+
     skill_candidate = sub.add_parser(
         "register-skill-candidate",
         help="Register a project-local Skill candidate without exporting or installing it",
@@ -1015,7 +1028,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     production_boundary.add_argument(
         "--release-version",
-        help="Exact CostMarshal release version, for example v4.3.3",
+        help="Exact CostMarshal release version, for example v4.4.0",
     )
     production_boundary.add_argument(
         "--gateway-image",
@@ -1078,6 +1091,13 @@ def build_parser() -> argparse.ArgumentParser:
     memory.add_argument("--provider")
     memory.add_argument("--task-type")
     memory.set_defaults(func=command_model_memory)
+
+    evolution_status = sub.add_parser(
+        "evolution-status",
+        help="Inspect the local self-evolution cycle without creating tasks or provider calls",
+    )
+    evolution_status.add_argument("--project", required=True)
+    evolution_status.set_defaults(func=command_evolution_status)
 
     teaching_run = sub.add_parser(
         "record-teaching-run",

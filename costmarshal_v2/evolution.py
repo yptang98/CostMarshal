@@ -20,6 +20,7 @@ EVALUATION_SCHEMA = "costmarshal-attempt-evaluation-v1"
 RETROSPECTIVE_SCHEMA = "costmarshal-project-retrospective-v1"
 POLICY_CANDIDATE_SCHEMA = "costmarshal-policy-candidate-v1"
 MODEL_MEMORY_SCHEMA = "costmarshal-model-memory-v2"
+EVOLUTION_CYCLE_SCHEMA = "costmarshal-evolution-cycle-v1"
 MODEL_EVIDENCE_HALF_LIFE_DAYS = 90.0
 ERROR_ATTRIBUTIONS = frozenset(
     {
@@ -59,6 +60,13 @@ POLICY_TRANSITIONS = {
     "deprecated": (),
     "rolled_back": (),
 }
+MODEL_ERROR_ATTRIBUTIONS = frozenset({"model-capability"})
+ORCHESTRATION_ERROR_ATTRIBUTIONS = frozenset(
+    {"routing", "instruction", "context", "verification", "human-review"}
+)
+EXTERNAL_ERROR_ATTRIBUTIONS = frozenset(
+    {"tool", "environment", "dependency", "budget"}
+)
 
 
 class EvolutionError(ValueError):
@@ -597,6 +605,320 @@ def profile_for_task(
     return max(candidates, key=lambda item: int(item.get("sample_count") or 0), default=None)
 
 
+def _risk_rank(value: Any) -> int:
+    return {"low": 0, "medium": 1, "high": 2}.get(str(value or "low"), 0)
+
+
+def _mean_scores(rows: list[dict[str, Any]]) -> dict[str, float] | None:
+    if not rows:
+        return None
+    names = (
+        "quality",
+        "efficiency",
+        "instruction_following",
+        "handoff",
+        "reliability",
+        "routing_fit",
+    )
+    return {
+        name: round(
+            fmean(float((row.get("scores") or {}).get(name) or 0) for row in rows),
+            3,
+        )
+        for name in names
+    }
+
+
+def _latest_candidate_events(
+    rows: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    latest: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        candidate_id = str(row.get("candidate_id") or row.get("id") or "")
+        if candidate_id:
+            latest[candidate_id] = row
+    return [latest[candidate_id] for candidate_id in sorted(latest)]
+
+
+def build_evolution_cycle(
+    *,
+    project: dict[str, Any],
+    tasks: Iterable[dict[str, Any]],
+    evaluations: Iterable[dict[str, Any]],
+    teaching_runs: Iterable[dict[str, Any]],
+    policy_candidates: Iterable[dict[str, Any]],
+    model_memory: dict[str, Any],
+    trigger: str,
+) -> dict[str, Any]:
+    """Build one local, advisory learning cycle from immutable evidence.
+
+    The cycle never creates work, calls a provider, or activates a policy. It
+    exists to make the already-recorded evaluation/memory/teaching decisions
+    inspectable without adding latency or cost to the user's model request.
+    """
+
+    project_id = str(project.get("project_id") or "")
+    if not project_id:
+        raise EvolutionError("evolution cycle requires a project id")
+    task_rows = list(tasks)
+    evaluation_rows = [
+        row
+        for row in evaluations
+        if row.get("schema_version") == EVALUATION_SCHEMA
+        and str(row.get("project_id") or "") == project_id
+    ]
+    teaching_rows = [
+        row
+        for row in teaching_runs
+        if str(row.get("project_id") or "") == project_id
+    ]
+    candidate_rows = _latest_candidate_events(policy_candidates)
+
+    attribution_counts = Counter(
+        str((row.get("error") or {}).get("attribution") or "unknown")
+        for row in evaluation_rows
+        if (row.get("error") or {}).get("attribution") != "none"
+    )
+    categorized_errors = {
+        "model": sum(
+            attribution_counts.get(name, 0) for name in MODEL_ERROR_ATTRIBUTIONS
+        ),
+        "orchestration": sum(
+            attribution_counts.get(name, 0)
+            for name in ORCHESTRATION_ERROR_ATTRIBUTIONS
+        ),
+        "external": sum(
+            attribution_counts.get(name, 0) for name in EXTERNAL_ERROR_ATTRIBUTIONS
+        ),
+        "ambiguous": sum(
+            attribution_counts.get(name, 0) for name in ("timeout", "unknown")
+        ),
+    }
+
+    scopes: dict[tuple[str, ...], list[dict[str, Any]]] = defaultdict(list)
+    for row in evaluation_rows:
+        identity_scope = (
+            str(row.get("provider") or "unknown"),
+            str(row.get("model") or "inherit"),
+            str(row.get("profile_sha256") or ""),
+            str(row.get("task_type") or "unknown"),
+            str(row.get("difficulty") or "normal"),
+            str(row.get("role") or "builder"),
+        )
+        scopes[identity_scope].append(row)
+
+    teaching_recommendations: list[dict[str, Any]] = []
+    for identity_scope, rows in sorted(scopes.items()):
+        provider, model, profile_sha256, task_type, difficulty, role = identity_scope
+        profile = profile_for_task(
+            model_memory,
+            provider=provider,
+            model=model,
+            profile_sha256=profile_sha256 or None,
+            task_type=task_type,
+            difficulty=difficulty,
+            role=role,
+        )
+        risk = max(
+            (str(row.get("risk") or "low") for row in rows),
+            key=_risk_rank,
+            default="low",
+        )
+        decision = choose_teaching_mode(
+            requested_mode="auto",
+            risk=risk,
+            profile=profile,
+            max_cost_cny=None,
+        )
+        teaching_recommendations.append(
+            {
+                "identity": {
+                    "provider": provider,
+                    "model": model,
+                    "profile_sha256": profile_sha256 or None,
+                },
+                "scope": {
+                    "task_type": task_type,
+                    "difficulty": difficulty,
+                    "role": role,
+                    "risk": risk,
+                },
+                "mode": decision["mode"],
+                "reason": decision["reason"],
+                "sample_count": decision.get("sample_count", 0),
+                "confidence": decision.get("confidence", 0.0),
+                "action": (
+                    "advisory-for-next-matching-task"
+                    if decision["mode"] != "off"
+                    else "normal-execution"
+                ),
+            }
+        )
+
+    status_counts = Counter(str(row.get("status") or "unknown") for row in task_rows)
+    terminal = bool(task_rows) and all(
+        row.get("status") in {"done", "failed", "cancelled"} for row in task_rows
+    )
+    known_cost = _money_sum(evaluation_rows)
+    active_candidates = [
+        row
+        for row in candidate_rows
+        if row.get("state") not in {"deprecated", "rolled_back"}
+    ]
+    policy_action = (
+        "review-staged-candidate"
+        if terminal and active_candidates
+        else "retain-and-observe"
+    )
+
+    evidence_material = {
+        "project_id": project_id,
+        "evaluations": [
+            {
+                "id": row.get("id"),
+                "sha256": canonical_sha256(row),
+            }
+            for row in sorted(
+                evaluation_rows, key=lambda item: str(item.get("id") or "")
+            )
+        ],
+        "teaching_runs": [
+            {
+                "id": row.get("run_id"),
+                "sha256": str(row.get("run_sha256") or canonical_sha256(row)),
+            }
+            for row in sorted(
+                teaching_rows, key=lambda item: str(item.get("run_id") or "")
+            )
+        ],
+        "policy_candidates": [
+            {
+                "id": row.get("candidate_id") or row.get("id"),
+                "state": row.get("state"),
+                "sha256": canonical_sha256(row),
+            }
+            for row in candidate_rows
+        ],
+        "task_states": sorted(
+            (
+                str(row.get("id") or ""),
+                str(row.get("status") or "unknown"),
+            )
+            for row in task_rows
+        ),
+        "memory_evidence_sha256": model_memory.get("evidence_sha256"),
+        "teaching_recommendations": teaching_recommendations,
+    }
+    evidence_sha256 = canonical_sha256(evidence_material)
+    cycle_id = "EVOLVE-" + evidence_sha256.removeprefix("sha256:")[:32]
+    return {
+        "schema_version": EVOLUTION_CYCLE_SCHEMA,
+        "cycle_id": cycle_id,
+        "generated_at": now_iso(),
+        "project_id": project_id,
+        "trigger": str(trigger or "manual-inspection"),
+        "mode": "local-advisory",
+        "privacy": "aggregate-only; no prompts, reports, summaries, or raw artifacts",
+        "project_state": {
+            "terminal": terminal,
+            "task_count": len(task_rows),
+            "task_status_counts": dict(sorted(status_counts.items())),
+        },
+        "outcome": {
+            "evaluation_count": len(evaluation_rows),
+            "accepted_count": sum(
+                row.get("accepted") is True for row in evaluation_rows
+            ),
+            "routing_success_count": sum(
+                row.get("routing_success") is True for row in evaluation_rows
+            ),
+            "score_means": _mean_scores(evaluation_rows),
+            "estimated_cost_cny": known_cost,
+            "error_attribution": dict(sorted(attribution_counts.items())),
+            "error_categories": categorized_errors,
+            "external_failures_penalize_model": False,
+        },
+        "teaching": {
+            "recommendations": teaching_recommendations,
+            "automatic_execution": False,
+            "provider_calls_created": 0,
+            "note": (
+                "Recommendations are consumed only by a future matching task "
+                "or an explicit evidence-bound teaching run."
+            ),
+        },
+        "policy": {
+            "action": policy_action,
+            "candidate_states": [
+                {
+                    "candidate_id": row.get("candidate_id") or row.get("id"),
+                    "state": row.get("state"),
+                }
+                for row in candidate_rows
+            ],
+            "automatic_activation": False,
+            "required_path": (
+                "candidate -> replayed -> shadow -> canary -> active; "
+                "each transition requires explicit reviewed evidence"
+            ),
+        },
+        "evidence": {
+            "evaluation_ids": [
+                str(row.get("id"))
+                for row in evaluation_rows
+                if row.get("id")
+            ],
+            "teaching_run_ids": [
+                str(row.get("run_id")) for row in teaching_rows if row.get("run_id")
+            ],
+            "model_memory_sha256": model_memory.get("evidence_sha256"),
+        },
+        "evidence_sha256": evidence_sha256,
+    }
+
+
+def append_evolution_cycle(layout: ProjectLayout, cycle: dict[str, Any]) -> bool:
+    rows = read_jsonl(layout.evolution_cycles_jsonl)
+    if any(row.get("cycle_id") == cycle.get("cycle_id") for row in rows):
+        return False
+    append_jsonl(layout.evolution_cycles_jsonl, cycle)
+    return True
+
+
+def validate_evolution_cycle(value: dict[str, Any]) -> dict[str, Any]:
+    if value.get("schema_version") != EVOLUTION_CYCLE_SCHEMA:
+        raise EvolutionError("unsupported evolution cycle schema")
+    evidence_sha256 = str(value.get("evidence_sha256") or "")
+    if (
+        len(evidence_sha256) != 71
+        or not evidence_sha256.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in evidence_sha256[7:])
+    ):
+        raise EvolutionError("evolution cycle evidence hash is invalid")
+    if value.get("cycle_id") != (
+        "EVOLVE-" + evidence_sha256.removeprefix("sha256:")[:32]
+    ):
+        raise EvolutionError("evolution cycle id is not evidence-bound")
+    if value.get("mode") != "local-advisory":
+        raise EvolutionError("evolution cycle must remain local advisory")
+    teaching = value.get("teaching") or {}
+    policy = value.get("policy") or {}
+    outcome = value.get("outcome") or {}
+    if (
+        teaching.get("automatic_execution") is not False
+        or teaching.get("provider_calls_created") != 0
+        or policy.get("automatic_activation") is not False
+        or outcome.get("external_failures_penalize_model") is not False
+    ):
+        raise EvolutionError("evolution cycle violates its zero-surprise boundary")
+    return value
+
+
+def latest_evolution_cycle(layout: ProjectLayout) -> dict[str, Any] | None:
+    rows = read_jsonl(layout.evolution_cycles_jsonl)
+    return validate_evolution_cycle(rows[-1]) if rows else None
+
+
 def _money_sum(rows: Iterable[dict[str, Any]]) -> str | None:
     total = Decimal("0")
     seen = False
@@ -792,19 +1114,24 @@ def active_policy_effects(layout: ProjectLayout) -> dict[str, Any]:
 __all__ = [
     "ERROR_ATTRIBUTIONS",
     "EVALUATION_SCHEMA",
+    "EVOLUTION_CYCLE_SCHEMA",
     "EvolutionError",
     "MODEL_MEMORY_SCHEMA",
     "POLICY_LIFECYCLE",
     "RETROSPECTIVE_SCHEMA",
     "TEACHING_MODES",
     "append_evaluation",
+    "append_evolution_cycle",
     "append_retrospective_and_candidate",
     "active_policy_effects",
     "build_attempt_evaluation",
+    "build_evolution_cycle",
     "build_model_memory",
     "build_project_retrospective",
     "choose_teaching_mode",
     "latest_policy_candidates",
+    "latest_evolution_cycle",
     "profile_for_task",
     "transition_policy_candidate",
+    "validate_evolution_cycle",
 ]

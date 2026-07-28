@@ -1,9 +1,9 @@
 ---
 name: costmarshal
-description: "CostMarshal v4.3 internal policy/runtime for the Codex plugin: scheduler-first, capability-aware and cost-aware low/medium/high provider orchestration across repository-bound Workstreams, with immutable multimodal inputs, reviewed Provider drift guardrails, an mTLS workload-identity Broker, hard-budget Provider Proxy, short-lived signed production certification, staged integration Gates, total-cost reports, structured teaching execution graphs, recency-aware exact-version model memory, accepted project knowledge, project-local Skill candidates, Leader Snapshots, structured handoffs, atomic batch acceptance, project artifact lineage, work graphs, artifact gates, recoverable effects, OCI worker isolation, durable attempts, budget reservations, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
+description: "CostMarshal v4.4 internal policy/runtime for the Codex plugin: scheduler-first, capability-aware and cost-aware low/medium/high provider orchestration across repository-bound Workstreams, with immutable multimodal inputs, reviewed Provider drift guardrails, an mTLS workload-identity Broker, hard-budget Provider Proxy, short-lived signed production certification, staged integration Gates, total-cost reports, structured teaching execution graphs, evidence-bound evolution cycles, Hot/Warm/Cold context views, recency-aware exact-version model memory, accepted project knowledge, project-local Skill candidates, event-driven Leader Snapshots, structured handoffs, atomic batch acceptance, project artifact lineage, work graphs, artifact gates, recoverable effects, OCI worker isolation, durable attempts, budget reservations, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
 ---
 
-# CostMarshal v4.3
+# CostMarshal v4.4
 
 Use this skill for long or decomposable work where multiple API price/capability tiers should cooperate under explicit safety, cost, and recovery controls.
 
@@ -38,6 +38,10 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
 21. Repository registration is metadata-only and immutable. Never move, adopt,
     rewrite, or manage the user's source repositories or global project/Skill
     directories.
+22. Automatic evolution and Leader Snapshot refreshes are local,
+    reconstructible projections. They must not change the `record-result`
+    response, create Provider calls or tasks, load Cold/raw transcript content,
+    or activate learned policy.
 22. A Workstream owns an explicit repository set, dependency set, concurrency
     quota, and optional CNY allocation. Downstream dispatch requires a
     hash-valid passed integration Gate for every predecessor Workstream.

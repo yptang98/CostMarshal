@@ -116,6 +116,10 @@ class ProjectLayout:
         return self.reports_dir / "policy-candidates.jsonl"
 
     @property
+    def evolution_cycles_jsonl(self) -> Path:
+        return self.reports_dir / "evolution-cycles.jsonl"
+
+    @property
     def leader_snapshots_jsonl(self) -> Path:
         return self.reports_dir / "leader-snapshots.jsonl"
 

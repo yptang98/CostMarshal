@@ -305,6 +305,44 @@ def main() -> int:
             "Smoke accepted",
         )
         assert_true(result["event"]["accepted_by_leader"] is True, "record-result should persist leader acceptance")
+        assert_true(
+            set(result)
+            == {
+                "status",
+                "recorded",
+                "event",
+                "gate",
+                "evaluation",
+                "retrospective_recorded",
+            },
+            "automatic evolution must preserve the record-result response contract",
+        )
+        evolution_rows = [
+            json.loads(line)
+            for line in (
+                project / "reports" / "evolution-cycles.jsonl"
+            ).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert_true(
+            len(evolution_rows) == 1,
+            "record-result should append one idempotent local evolution cycle",
+        )
+        evolution_status = run_json(
+            temp,
+            "evolution-status",
+            "--project",
+            str(project),
+        )
+        assert_true(
+            evolution_status["automatic_side_effects"]
+            == {
+                "provider_calls": False,
+                "task_creation": False,
+                "policy_activation": False,
+            },
+            "evolution inspection must make its zero-surprise side effects explicit",
+        )
         replayed_result = run_json(
             temp,
             "record-result",

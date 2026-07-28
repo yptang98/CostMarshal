@@ -1,4 +1,4 @@
-# CostMarshal v4.3 Protocol
+# CostMarshal v4.4 Protocol
 
 This is the canonical v2 protocol. Legacy `scripts/mc.py` commands are not part of it.
 
@@ -138,6 +138,11 @@ and low-confidence scopes. Explicit `review`, `paired`, or `replay` teaching
 requires evidence before acceptance. Policy recommendations begin as
 non-activating candidates and require reviewed replay, shadow, and canary stages
 before activation.
+
+Every result event also refreshes a deduplicated evolution cycle and
+transcript-free Leader Snapshot. These local projections do not wake a model.
+Leader startup loads bounded Hot/Warm metadata references; Cold content and raw
+transcripts remain unloaded unless a later explicit task grants access.
 
 ### Pricing snapshot gate
 

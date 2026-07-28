@@ -9,7 +9,7 @@ credential before collecting diagnostics.
 
 ## v4.3 trust boundaries
 
-CostMarshal v4.3's OCI controls isolate worker processes from
+CostMarshal v4.4's OCI controls isolate worker processes from
 the host workspace, other provider credentials, mutable profiles, and scheduler
 authority. They do not make the selected provider client hostile-safe.
 

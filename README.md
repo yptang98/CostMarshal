@@ -8,7 +8,7 @@
 
   <p>
     <a href="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="VERSION"><img alt="Version 4.3.3" src="https://img.shields.io/badge/version-4.3.3-2bb3a3"></a>
+    <a href="VERSION"><img alt="Version 4.4.0" src="https://img.shields.io/badge/version-4.4.0-2bb3a3"></a>
     <a href="https://www.python.org/downloads/"><img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white"></a>
     <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-f0b94b"></a>
   </p>
@@ -301,6 +301,11 @@ The home directory resolution order is an explicit `--codex-home`, then non-empt
 - v4.3.3 commits an expiring production-build review, pins the complete Codex
   npm dependency graph, verifies the selected linux/amd64 base manifests, and
   makes CI build and exercise the actual hardened Gateway and Worker images.
+- v4.4 records an idempotent local evolution cycle after each accepted Leader
+  result, creates transcript-free Leader Snapshots from decision events, and
+  gives Leader startup a bounded Hot/Warm context view while Cold references
+  remain indexed but unloaded. These actions create no provider calls, tasks,
+  or active policy changes.
 
 Read [`SECURITY.md`](SECURITY.md) before production use.
 
@@ -341,6 +346,19 @@ recommendations move through
 `candidate → replayed → shadow → canary → active`, with explicit review at
 every transition. One successful or failed task can never rewrite active
 routing policy by itself.
+
+After every recorded result, v4.4 also appends one evidence-hash-deduplicated
+local evolution cycle. The cycle summarizes quality, efficiency, cost, error
+attribution, model-memory confidence, and the next matching task's teaching
+recommendation. It never starts paired/replay work, calls a provider, or
+activates a policy. `evolution-status` exposes the latest recorded cycle and a
+current rebuild.
+
+Decision events also refresh a transcript-free Leader Snapshot. Leader startup
+uses `context-view` semantics to include only bounded Hot/Warm metadata
+references; Cold knowledge is indexed by ID and title but its content is not
+loaded. This keeps long-project context inspectable without silently widening
+the model prompt.
 
 CostMarshal stores project state under `$CODEX_HOME/costmarshal-v2` when `CODEX_HOME` is set, otherwise under `~/.codex/costmarshal-v2`. The plugin snapshot is curated from an explicit allowlist and excludes repository metadata, development tests, generated artifacts, legacy interfaces, and secret-bearing files.
 

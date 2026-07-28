@@ -127,14 +127,18 @@ from .evolution import (
     EvolutionError,
     active_policy_effects,
     append_evaluation,
+    append_evolution_cycle,
     append_retrospective_and_candidate,
     build_attempt_evaluation,
+    build_evolution_cycle,
     build_model_memory,
     build_project_retrospective,
     choose_teaching_mode,
+    latest_evolution_cycle,
     latest_policy_candidates,
     profile_for_task,
     transition_policy_candidate,
+    validate_evolution_cycle,
 )
 from .cost_model import (
     CostModelError,
@@ -211,6 +215,7 @@ from .project_knowledge import (
     PROJECT_KNOWLEDGE_SCHEMA,
     SKILL_CANDIDATE_SCHEMA,
     ProjectKnowledgeError,
+    build_context_view,
     build_leader_decision,
     build_project_knowledge,
     build_skill_candidate,
@@ -1106,6 +1111,16 @@ def render_actor_prompt(layout: ProjectLayout, actor: dict[str, Any]) -> str:
     ]
     lines.extend(f"- {item}" for item in actor_role_contract(actor.get("role", "")))
     if actor.get("role") == "leader":
+        try:
+            context_view = _project_context_view(
+                layout,
+                task=None,
+                query=None,
+                hot_limit=8,
+                warm_limit=12,
+            )
+        except (ProjectKnowledgeError, LeaderSnapshotError, OSError, ValueError):
+            context_view = None
         lines.extend(
             [
                 "",
@@ -1120,6 +1135,26 @@ def render_actor_prompt(layout: ProjectLayout, actor: dict[str, Any]) -> str:
                 "- The runner persists that response as `reports/manager-latest.md`; use the CLI for state-changing decisions.",
             ]
         )
+        if context_view is not None:
+            lines.extend(
+                [
+                    "",
+                    "## Bounded Project Context",
+                    f"- Context view: `{context_view['view_id']}`",
+                    "- Hot and Warm entries below are metadata references only; Cold content and transcripts are not loaded.",
+                ]
+            )
+            for row in context_view["hot"]:
+                lines.append(
+                    f"- Hot `{row.get('id')}` ({row.get('kind')}): {row.get('title')}"
+                )
+            for row in context_view["warm"]:
+                lines.append(
+                    f"- Warm `{row.get('id')}` ({row.get('kind')}): {row.get('title')}"
+                )
+            lines.append(
+                f"- Cold references indexed, not loaded: {context_view['counts']['cold_indexed']}"
+            )
     else:
         lines.extend(
             [
@@ -9330,6 +9365,34 @@ def command_record_result(args: Any) -> None:
         retrospective_recorded, _ = append_retrospective_and_candidate(
             layout, retrospective
         )
+    evolution_recorded = False
+    evolution_cycle_id: str | None = None
+    evolution_warning: str | None = None
+    try:
+        evolution_cycle = _build_current_evolution_cycle(
+            layout,
+            project=project,
+            trigger=f"result:{row['id']}",
+        )
+        evolution_cycle_id = str(evolution_cycle["cycle_id"])
+        evolution_recorded = append_evolution_cycle(layout, evolution_cycle)
+    except (EvolutionError, OSError, TypeError, ValueError) as exc:
+        # Learning is advisory. A local aggregation problem must never turn an
+        # otherwise valid Leader result into a failed user operation.
+        evolution_warning = compact_text(str(exc), limit=240)
+    leader_snapshot_recorded = False
+    leader_snapshot_id: str | None = None
+    leader_snapshot_warning: str | None = None
+    if bool(getattr(args, "auto_leader_snapshot", True)):
+        try:
+            leader_snapshot, leader_snapshot_recorded = (
+                _record_current_leader_snapshot(layout, project=project)
+            )
+            leader_snapshot_id = str(leader_snapshot["snapshot_id"])
+        except (LeaderSnapshotError, WorkGraphError, OSError, TypeError, ValueError) as exc:
+            # The result is authoritative; the compact Leader view is
+            # reconstructible and must not make acceptance fail.
+            leader_snapshot_warning = compact_text(str(exc), limit=240)
     append_event(
         layout,
         "result_recorded",
@@ -9342,13 +9405,24 @@ def command_record_result(args: Any) -> None:
         gate_result_id=gate_result["id"],
         evaluation_id=evaluation["id"],
         retrospective_recorded=retrospective_recorded,
+        evolution_recorded=evolution_recorded,
+        evolution_cycle_id=evolution_cycle_id,
+        evolution_warning=evolution_warning,
+        leader_snapshot_recorded=leader_snapshot_recorded,
+        leader_snapshot_id=leader_snapshot_id,
+        leader_snapshot_warning=leader_snapshot_warning,
     )
     send_message(
         layout,
         sender=SCHEDULER_ID,
         recipient=LEADER_ID,
         subject=f"Result recorded: {args.task}",
-        body=f"{args.task} recorded as {args.status}; accepted_by_leader={bool(args.accepted_by_leader)}; quality={args.quality_score}.",
+        body=(
+            f"{args.task} recorded as {args.status}; "
+            f"accepted_by_leader={bool(args.accepted_by_leader)}; "
+            f"quality={args.quality_score}; "
+            f"leader_snapshot={leader_snapshot_id or 'unavailable'}."
+        ),
         task_id=args.task,
     )
     print_json(
@@ -11688,6 +11762,12 @@ def status_payload(layout: ProjectLayout) -> dict[str, Any]:
             "policy_candidate_count": len(
                 read_jsonl(layout.policy_candidates_jsonl)
             ),
+            "evolution_cycle_count": len(
+                read_jsonl(layout.evolution_cycles_jsonl)
+            ),
+            "leader_snapshot_count": len(
+                read_jsonl(layout.leader_snapshots_jsonl)
+            ),
             "knowledge_count": len(read_jsonl(layout.knowledge_jsonl)),
             "skill_candidate_count": len(
                 read_jsonl(layout.skill_candidates_jsonl)
@@ -12164,6 +12244,61 @@ def command_knowledge(args: Any) -> None:
     )
 
 
+def _project_context_view(
+    layout: ProjectLayout,
+    *,
+    task: dict[str, Any] | None,
+    query: str | None,
+    hot_limit: int,
+    warm_limit: int,
+) -> dict[str, Any]:
+    artifacts = read_jsonl(layout.artifacts_jsonl)
+    decisions = read_jsonl(layout.leader_decisions_jsonl)
+    knowledge = [
+        validate_project_knowledge(
+            row,
+            artifact_rows=artifacts,
+            leader_decisions=decisions,
+        )
+        for row in read_jsonl(layout.knowledge_jsonl)
+    ]
+    snapshots = [
+        validate_leader_snapshot(row)
+        for row in read_jsonl(layout.leader_snapshots_jsonl)
+    ]
+    return build_context_view(
+        project=load_project(layout),
+        task=task,
+        query=query,
+        knowledge_rows=knowledge,
+        artifact_rows=artifacts,
+        leader_snapshots=snapshots,
+        hot_limit=hot_limit,
+        warm_limit=warm_limit,
+    )
+
+
+def command_context_view(args: Any) -> None:
+    layout = resolve_project(args.root, args.project)
+    task_id = str(getattr(args, "task", None) or "").strip()
+    if task_id:
+        require_task(layout, task_id)
+        task = load_task(layout, task_id)
+    else:
+        task = None
+    try:
+        view = _project_context_view(
+            layout,
+            task=task,
+            query=getattr(args, "query", None),
+            hot_limit=int(getattr(args, "hot_limit", 12)),
+            warm_limit=int(getattr(args, "warm_limit", 20)),
+        )
+    except (ProjectKnowledgeError, LeaderSnapshotError) as exc:
+        raise SystemExit(f"Context view is invalid: {exc}") from exc
+    print_json({"status": "ok", "context": view})
+
+
 def command_register_skill_candidate(args: Any) -> None:
     """Register reusable evidence without exporting or installing any Skill."""
 
@@ -12350,23 +12485,20 @@ def command_export_skill_candidate(args: Any) -> None:
     )
 
 
-def command_leader_snapshot(args: Any) -> None:
-    """Create one immutable snapshot, deduplicated by its durable state hash."""
-
-    layout = resolve_project(args.root, args.project)
-    project = load_project(layout)
-    try:
-        snapshot = build_leader_snapshot(
-            project=project,
-            graph=load_work_graph(layout),
-            tasks=task_rows(layout),
-            artifact_rows=read_jsonl(layout.artifacts_jsonl),
-        )
-        existing = read_jsonl(layout.leader_snapshots_jsonl)
-        for row in existing:
-            validate_leader_snapshot(row)
-    except (LeaderSnapshotError, WorkGraphError) as exc:
-        raise SystemExit(f"Leader Snapshot rejected: {exc}") from exc
+def _record_current_leader_snapshot(
+    layout: ProjectLayout,
+    *,
+    project: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], bool]:
+    snapshot = build_leader_snapshot(
+        project=project or load_project(layout),
+        graph=load_work_graph(layout),
+        tasks=task_rows(layout),
+        artifact_rows=read_jsonl(layout.artifacts_jsonl),
+    )
+    existing = read_jsonl(layout.leader_snapshots_jsonl)
+    for row in existing:
+        validate_leader_snapshot(row)
     recorded = not any(
         row.get("snapshot_id") == snapshot["snapshot_id"] for row in existing
     )
@@ -12379,6 +12511,17 @@ def command_leader_snapshot(args: Any) -> None:
             snapshot_sha256=snapshot["snapshot_sha256"],
             work_graph_revision=snapshot["state_binding"]["work_graph_revision"],
         )
+    return snapshot, recorded
+
+
+def command_leader_snapshot(args: Any) -> None:
+    """Create one immutable snapshot, deduplicated by its durable state hash."""
+
+    layout = resolve_project(args.root, args.project)
+    try:
+        snapshot, recorded = _record_current_leader_snapshot(layout)
+    except (LeaderSnapshotError, WorkGraphError) as exc:
+        raise SystemExit(f"Leader Snapshot rejected: {exc}") from exc
     print_json({"status": "ok", "recorded": recorded, "snapshot": snapshot})
 
 
@@ -12466,6 +12609,7 @@ def command_batch_acceptance(args: Any) -> None:
             root=args.root,
             project=args.project,
             command_id=f"{batch_command_id}:{index:04d}",
+            auto_leader_snapshot=False,
             **values,
         )
         buffer = io.StringIO()
@@ -12482,6 +12626,12 @@ def command_batch_acceptance(args: Any) -> None:
             raise SystemExit(
                 f"batch decision {index} produced invalid command output"
             ) from exc
+    try:
+        _record_current_leader_snapshot(layout)
+    except (LeaderSnapshotError, WorkGraphError, OSError, TypeError, ValueError):
+        # Reconstructible advisory state must not roll back otherwise valid,
+        # independently gated batch decisions.
+        pass
     print_json(
         {
             "status": "ok",
@@ -12577,6 +12727,7 @@ def _print_status_markdown(payload: dict[str, Any]) -> None:
             f"- Evaluations: {evolution['evaluation_count']}; routing successes: {evolution['routing_success_count']}",
             f"- Gates: {evolution['gate_count']}; passed: {evolution['gate_pass_count']}; artifact events: {evolution['artifact_event_count']}",
             f"- Retrospectives: {evolution['retrospective_count']}; policy candidates awaiting staged promotion: {evolution['policy_candidate_count']}",
+            f"- Automatic local evolution cycles: {evolution['evolution_cycle_count']}; transcript-free Leader Snapshots: {evolution['leader_snapshot_count']}",
             f"- Project knowledge: {evolution['knowledge_count']}; project-local Skill candidates: {evolution['skill_candidate_count']}",
         ]
     )
@@ -12653,6 +12804,50 @@ def command_model_memory(args: Any) -> None:
             **memory,
             "profiles": profiles,
             "filtered_profile_count": len(profiles),
+        }
+    )
+
+
+def _build_current_evolution_cycle(
+    layout: ProjectLayout,
+    *,
+    project: dict[str, Any] | None = None,
+    trigger: str,
+) -> dict[str, Any]:
+    current_project = project or load_project(layout)
+    return build_evolution_cycle(
+        project=current_project,
+        tasks=task_rows(layout),
+        evaluations=read_jsonl(layout.evaluations_jsonl),
+        teaching_runs=read_jsonl(layout.teaching_runs_jsonl),
+        policy_candidates=read_jsonl(layout.policy_candidates_jsonl),
+        model_memory=build_model_memory(layout.root),
+        trigger=trigger,
+    )
+
+
+def command_evolution_status(args: Any) -> None:
+    layout = resolve_project(args.root, args.project)
+    try:
+        preview = _build_current_evolution_cycle(
+            layout,
+            trigger="manual-inspection",
+        )
+    except EvolutionError as exc:
+        raise SystemExit(f"Evolution status is invalid: {exc}") from exc
+    rows = read_jsonl(layout.evolution_cycles_jsonl)
+    print_json(
+        {
+            "status": "ok",
+            "mode": "local-advisory",
+            "cycle_count": len(rows),
+            "latest_recorded": latest_evolution_cycle(layout),
+            "current": preview,
+            "automatic_side_effects": {
+                "provider_calls": False,
+                "task_creation": False,
+                "policy_activation": False,
+            },
         }
     )
 
@@ -14100,6 +14295,27 @@ def validate_layout(layout: ProjectLayout) -> list[str]:
         error = row.get("error") or {}
         if error.get("attribution") not in ERROR_ATTRIBUTIONS:
             issues.append(f"{label} has invalid error attribution")
+    evolution_cycle_rows = (
+        read_rows_for_validation(
+            layout.evolution_cycles_jsonl, "evolution-cycles.jsonl", issues
+        )
+        if layout.evolution_cycles_jsonl.exists()
+        else []
+    )
+    seen_evolution_cycles: set[str] = set()
+    for index, row in enumerate(evolution_cycle_rows, start=1):
+        try:
+            validated_cycle = validate_evolution_cycle(row)
+            cycle_id = str(validated_cycle.get("cycle_id") or "")
+            if cycle_id in seen_evolution_cycles:
+                issues.append(
+                    f"evolution-cycles.jsonl line {index} duplicates {cycle_id}"
+                )
+            seen_evolution_cycles.add(cycle_id)
+        except EvolutionError as exc:
+            issues.append(
+                f"evolution-cycles.jsonl line {index} is invalid: {exc}"
+            )
     gate_rows = (
         read_rows_for_validation(
             layout.gate_results_jsonl, "gate-results.jsonl", issues

@@ -1,5 +1,23 @@
 # Changelog
 
+## v4.4.0 - 2026-07-29
+
+- Added an idempotent, evidence-bound self-evolution cycle after every recorded
+  Leader result. It aggregates score, cost, error attribution, model-memory
+  confidence, teaching recommendations, and staged policy state without
+  creating provider calls, tasks, or active policy changes.
+- Preserved the exact `record-result` response contract and made all automatic
+  learning/snapshot work reconstructible and non-blocking. External failures
+  remain auditable without being charged to model capability.
+- Made Leader Snapshots event-driven for result decisions and deduplicated by
+  durable state. Batch acceptance emits one final snapshot instead of one per
+  nested decision.
+- Added deterministic Hot/Warm/Cold project-context retrieval. Leader startup
+  receives bounded Hot/Warm metadata references, while Cold content and raw
+  transcripts remain unloaded.
+- Added `evolution-status` and `context-view` diagnostics for inspecting these
+  decisions without changing project state.
+
 ## v4.3.3 - 2026-07-28
 
 - Added an expiring, committed production-build input review that pins the

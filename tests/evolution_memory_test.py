@@ -10,14 +10,18 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from costmarshal_v2.evolution import (
+    EvolutionError,
     active_policy_effects,
+    append_evolution_cycle,
     append_retrospective_and_candidate,
     build_attempt_evaluation,
+    build_evolution_cycle,
     build_model_memory,
     build_project_retrospective,
     choose_teaching_mode,
     latest_policy_candidates,
     transition_policy_candidate,
+    validate_evolution_cycle,
 )
 from costmarshal_v2.paths import ProjectLayout
 from costmarshal_v2.routing import leader_acceptance_prior
@@ -117,6 +121,54 @@ class EvolutionMemoryTest(unittest.TestCase):
         )
         self.assertIsNotNone(retrospective)
         self.assertEqual(retrospective["routing_success_count"], 1)
+
+    def test_evolution_cycle_is_local_advisory_and_idempotent(self) -> None:
+        evaluation = {
+            **self._evaluation(),
+            "accepted": False,
+            "routing_success": False,
+            "error": {"attribution": "environment", "severity": 3},
+        }
+        memory = build_model_memory(
+            Path("."),
+            evaluations=[evaluation],
+        )
+        arguments = {
+            "project": {"project_id": "P1", "name": "demo"},
+            "tasks": [{"id": "T001", "status": "done"}],
+            "evaluations": [evaluation],
+            "teaching_runs": [],
+            "policy_candidates": [],
+            "model_memory": memory,
+        }
+        first = build_evolution_cycle(**arguments, trigger="result:RES-1")
+        replay = build_evolution_cycle(**arguments, trigger="manual-inspection")
+        self.assertEqual(first["cycle_id"], replay["cycle_id"])
+        self.assertEqual(first["outcome"]["error_categories"]["external"], 1)
+        self.assertFalse(first["outcome"]["external_failures_penalize_model"])
+        self.assertEqual(first["teaching"]["provider_calls_created"], 0)
+        self.assertFalse(first["teaching"]["automatic_execution"])
+        self.assertFalse(first["policy"]["automatic_activation"])
+        self.assertEqual(validate_evolution_cycle(first), first)
+        tampered = {
+            **first,
+            "teaching": {
+                **first["teaching"],
+                "provider_calls_created": 1,
+            },
+        }
+        with self.assertRaisesRegex(EvolutionError, "zero-surprise"):
+            validate_evolution_cycle(tampered)
+        self.assertEqual(
+            first["teaching"]["recommendations"][0]["mode"],
+            "paired",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            layout = ProjectLayout(root=root, project_dir=root / "projects" / "p")
+            ensure_runtime_dirs(layout)
+            self.assertTrue(append_evolution_cycle(layout, first))
+            self.assertFalse(append_evolution_cycle(layout, replay))
 
     def test_policy_requires_replay_shadow_and_canary_before_activation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -1,6 +1,6 @@
 # Work Graph and evidence-backed evolution
 
-CostMarshal v4.3 learns from use without giving observations authority to
+CostMarshal v4.4 learns from use without giving observations authority to
 rewrite active policy.
 
 ## Authoritative records
@@ -17,6 +17,9 @@ Each project stores transactional compatibility views:
 - `reports/cost-reports.jsonl` — evidence-bound total-cost snapshots.
 - `reports/retrospectives.jsonl` and `policy-candidates.jsonl` — project-level
   summaries and reviewed promotion inputs.
+
+- `reports/evolution-cycles.jsonl` stores per-result,
+  evidence-hash-deduplicated local advisory cycles.
 
 After SQLite cutover, these files are materialized views over the same atomic
 control transactions as task state and Leader results.
@@ -67,6 +70,22 @@ Every non-off mode stores a task-bound, hash-bound graph:
 Enforced Leader acceptance uses `record-result --teaching-run <run-id>`;
 arbitrary free-form strings are rejected for new structured-graph tasks.
 Historical tasks without a graph remain readable.
+
+## Automatic evolution cycle
+
+Every successful `record-result` transaction also builds a local evolution
+cycle from the current evaluation, teaching, model-memory, task-state, and
+policy ledgers. This is a bounded aggregation step, not a model operation:
+
+- it creates no Provider request and reserves no budget;
+- it creates no task or teaching execution;
+- it never advances a policy lifecycle state;
+- a cycle aggregation failure cannot reject an otherwise valid Leader result;
+- the existing `record-result` JSON response stays unchanged.
+
+`evolution-status` shows the latest recorded cycle and reconstructs the current
+view. External/tool/environment/dependency/budget failures remain visible but
+are not classified as model-capability failures.
 
 ## Total-cost model
 

@@ -1,4 +1,4 @@
-# CostMarshal v4.3 Storage
+# CostMarshal v4.4 Storage
 
 The runtime root defaults to `$COSTMARSHAL_V2_HOME`, then `$CODEX_HOME/costmarshal-v2`, then `~/.codex/costmarshal-v2`.
 
@@ -41,6 +41,7 @@ The runtime root defaults to `$COSTMARSHAL_V2_HOME`, then `$CODEX_HOME/costmarsh
       evaluations.jsonl
       retrospectives.jsonl
       policy-candidates.jsonl
+      evolution-cycles.jsonl
       leader-snapshots.jsonl
       leader-decisions.jsonl
       knowledge.jsonl
@@ -93,6 +94,8 @@ Before explicit cutover, the JSON/JSONL files below are the legacy sources of tr
 - `scheduler/provider-metadata.json`: expiring human-reviewed provider
   overrides bound to observation IDs and canonical provider-row hashes.
 - `retrospectives.jsonl` and `policy-candidates.jsonl`: project summaries and staged, non-activating learning proposals.
+- `evolution-cycles.jsonl`: idempotent per-result local learning summaries;
+  each row is aggregate-only and cannot call a Provider or activate policy.
 - `usage.jsonl`: immutable usage deltas.
 - `scheduler/events.jsonl`: audit events and completed scheduler command IDs.
 - `locks/claims.json`: active logical write claims.

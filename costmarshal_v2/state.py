@@ -195,6 +195,8 @@ def ensure_runtime_dirs(layout: ProjectLayout) -> None:
         layout.retrospectives_jsonl.touch()
     if not layout.policy_candidates_jsonl.exists():
         layout.policy_candidates_jsonl.touch()
+    if not layout.evolution_cycles_jsonl.exists():
+        layout.evolution_cycles_jsonl.touch()
     if not layout.leader_snapshots_jsonl.exists():
         layout.leader_snapshots_jsonl.touch()
     if not layout.leader_decisions_jsonl.exists():
