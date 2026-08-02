@@ -1,9 +1,9 @@
 ---
 name: costmarshal
-description: "CostMarshal v5.0 internal policy/runtime for the Codex plugin: two-level native Codex attempt teams plus scheduler-first, cost-aware low/medium/high API routing. It governs repository-bound Workstreams, report-only proposals and multimodal inputs, Provider drift, mTLS gateway leases, hard budgets, production certification, integration Gates, cost reports, teaching and model memory, accepted knowledge, Skill candidates, Leader Snapshots, handoffs, artifact lineage, recoverable effects, OCI worker isolation, durable attempts, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
+description: "CostMarshal v5.1 internal policy/runtime for the Codex plugin: two-level native Codex attempt teams plus scheduler-first, cost-aware low/medium/high API routing. It governs repository-bound Workstreams, report-only proposals and multimodal inputs, Provider drift, mTLS gateway leases, hard budgets, production certification, integration Gates, cost reports, teaching and model memory, accepted knowledge, Skill candidates, Leader Snapshots, handoffs, artifact lineage, recoverable effects, OCI worker isolation, durable attempts, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
 ---
 
-# CostMarshal v5.0
+# CostMarshal v5.1
 
 Use this skill for long or decomposable work where multiple API price/capability tiers should cooperate under explicit safety, cost, and recovery controls.
 

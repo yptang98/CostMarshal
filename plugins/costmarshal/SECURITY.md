@@ -7,9 +7,9 @@ Report suspected vulnerabilities through a private GitHub security advisory for
 private prompts, or customer data in a public issue. Revoke an exposed provider
 credential before collecting diagnostics.
 
-## v5.0 trust boundaries
+## v5.1 trust boundaries
 
-CostMarshal v5.0's OCI controls isolate worker processes from
+CostMarshal v5.1's OCI controls isolate worker processes from
 the host workspace, other provider credentials, mutable profiles, and scheduler
 authority. They do not make the selected provider client hostile-safe.
 

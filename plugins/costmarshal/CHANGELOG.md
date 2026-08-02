@@ -1,6 +1,6 @@
 # Changelog
 
-## v5.0.0 - 2026-08-03
+## v5.1.0 - 2026-08-03
 
 - Added two-level Codex-native orchestration. CostMarshal remains the
   cross-provider control plane, while an admitted Codex attempt can use a

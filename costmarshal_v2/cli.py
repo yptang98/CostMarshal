@@ -1094,7 +1094,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     production_boundary.add_argument(
         "--release-version",
-        help="Exact CostMarshal release version, for example v5.0.0",
+        help="Exact CostMarshal release version, for example v5.1.0",
     )
     production_boundary.add_argument(
         "--gateway-image",

@@ -48,7 +48,29 @@ def assert_true(condition: bool, message: str) -> None:
 
 def main() -> int:
     temp = Path(tempfile.mkdtemp(prefix="costmarshal-v2-official-smoke-"))
+    previous_codex_home = os.environ.get("CODEX_HOME")
     try:
+        # Keep the official smoke independent from the developer's user-level
+        # Codex configuration. Route admission intentionally fails closed when
+        # a named provider profile is missing, so a clean runner creates its
+        # own longcat fixture before init/dispatch.
+        codex_home = temp / "codex-home"
+        os.environ["CODEX_HOME"] = str(codex_home)
+        configured = run_json(
+            temp,
+            "configure-profiles",
+            "--codex-home",
+            str(codex_home),
+        )
+        assert_true(
+            configured["profile"] == "longcat",
+            "official smoke fixture should create the low-tier profile",
+        )
+        assert_true(
+            Path(configured["path"]).is_file(),
+            "official smoke fixture profile should exist",
+        )
+
         init = run_json(
             temp,
             "init",
@@ -65,7 +87,7 @@ def main() -> int:
         assert_true((project / "project.json").is_file(), "init should create v3-compatible project state")
 
         help_text = run(temp, "--version").stdout
-        assert_true("v5.0.0" in help_text, "official CLI should expose v5 version")
+        assert_true("v5.1.0" in help_text, "official CLI should expose v5 version")
 
         plan = run_json(temp, "start-leader", "--project", str(project), "--command", "codex --prompt {prompt_file}", "--dry-run")
         assert_true(plan["backend"] == "local", "start-leader should use v2 backend abstraction")
@@ -149,6 +171,10 @@ def main() -> int:
         print(json.dumps({"status": "ok", "temporary_state": "cleaned"}, indent=2))
         return 0
     finally:
+        if previous_codex_home is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = previous_codex_home
         resolved = temp.resolve()
         temp_root = Path(tempfile.gettempdir()).resolve()
         if resolved == temp_root or temp_root not in resolved.parents:
