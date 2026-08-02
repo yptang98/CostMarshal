@@ -4,11 +4,11 @@
   <h1>CostMarshal</h1>
 
   <p><strong>Give every task the right model—not the most expensive model.</strong></p>
-  <p>Codex-native orchestration across low-, medium-, and high-cost API providers, with durable recovery, budget guardrails, and leader-owned acceptance.</p>
+  <p>Two-level Codex-native orchestration: CostMarshal routes across APIs, while native Codex child agents parallelize each bounded attempt.</p>
 
   <p>
     <a href="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/yptang98/CostMarshal/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="VERSION"><img alt="Version 4.5.0" src="https://img.shields.io/badge/version-4.5.0-2bb3a3"></a>
+    <a href="VERSION"><img alt="Version 5.0.0" src="https://img.shields.io/badge/version-5.0.0-2bb3a3"></a>
     <a href="https://www.python.org/downloads/"><img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white"></a>
     <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-f0b94b"></a>
   </p>
@@ -100,17 +100,21 @@ time, tokens, or context.
 flowchart LR
     A[Your task in Codex] --> B[CostMarshal Skill]
     B --> C{Safety + cost routing}
-    C -->|bounded proposal| D[Low-cost API worker]
-    C -->|strong execution| E[Codex Worker]
+    C -->|provider-backed agent| D[API Codex attempt]
+    C -->|signed-in execution| E[Codex attempt]
+    C -->|report-only| J[Proposal API worker]
+    D --> H[Native child agents]
+    E --> I[Native child agents]
     D --> F[Codex Leader review]
     E --> F
+    J --> F
     F -->|accept| G[Verified result]
     F -->|reject + admitted successor| C
 ```
 
 1. **Plan** — Codex turns the request into bounded tasks, write scopes, budgets, and acceptance criteria.
 2. **Route** — CostMarshal applies a fail-closed safety floor, then compares valid non-decreasing provider chains.
-3. **Execute** — A task-scoped actor receives only its bound prompt, provider profile, and allowed paths.
+3. **Execute** — A task-scoped actor receives only its bound prompt, provider profile, and allowed paths. After the compatibility handshake, it may use a bounded attempt-local native child team.
 4. **Review** — The Codex leader inspects sealed evidence and explicitly accepts or rejects the attempt.
 5. **Recover** — Durable on-disk state allows the scheduler to resume without relying on chat memory.
 6. **Learn** — Accepted and rejected attempts become auditable evaluations; aggregate model profiles inform later routing and teaching decisions.
@@ -141,10 +145,48 @@ external reviewed Skill-management workflow.
 | --- | :---: |
 | Low-risk bounded analysis, extraction, docs, tests, verification, or small edits | **Low** |
 | Medium risk, implementation, review, or code review | **Medium** |
-| High risk or hard difficulty | **High** |
+| High risk, hard difficulty, or an explicit `--major-decision` | **High** |
 | Unknown or judgment-heavy work | **Medium** |
 
 New projects default to `completion-first`: the admitted route retains a strongest-compatible terminal fallback, while acceptance at an earlier step stops further spend. Provider repetition and tier downgrade are always rejected.
+
+### Leader and expert tier
+
+The main leader does not have to be the strongest model. `init` accepts
+`--leader-provider`, `--leader-model`, and `--leader-profile`, and any project
+can change the leader later with `configure-leader` (preview with
+`--dry-run`). The default remains the signed-in Codex model; a user can point
+the leader at a relatively strong provider such as DeepSeek through a named
+Codex config profile:
+
+```text
+python scripts/costmarshal.py init ... --leader-provider deepseek --leader-model deepseek-v4-pro --leader-profile deepseek
+python scripts/costmarshal.py configure-leader --project <project-dir> --provider deepseek --model deepseek-v4-pro --profile deepseek
+python scripts/costmarshal.py start-leader --project <project-dir> --dry-run
+```
+
+A non-Codex leader keeps the same workspace tools, sandbox, budget
+reservation, and evidence contract because it executes through Codex CLI with
+that provider's profile; only the model changes. The persisted policy is shown
+in the leader actor prompt and in `status`. Real Codex profiles are accepted
+as-is: standard non-secret fields such as `model_context_window` and
+`model_catalog_json` are allowed, and a profile may inherit its provider
+endpoint/key contract from the shared `config.toml`. Unknown or credential-
+bearing settings still fail closed.
+
+Codex's built-in strongest models are advanced experts, not default execution.
+The default catalog marks the Codex provider `expert_only`: automatic routing
+uses it as the first step only when the safe floor is high (risk `high`,
+difficulty `hard`, or an explicit `--major-decision` on `new-task`/`route`), or
+when no non-expert provider can serve the task. Later chain steps are reached
+only through explicit leader-authorized escalation. This keeps the strongest
+Codex calls reserved for high-difficulty work and genuinely major decisions
+(final acceptance, integration Gates, architecture, security review).
+
+Token accounting for leader and agent executions uses the Codex CLI's own
+reported usage from its JSON events; CostMarshal does not guess token counts
+on those paths. Provider-reported usage remains authoritative only for
+report-only gateway executions where Codex is not the executing agent.
 
 <details>
 <summary><strong>Routing and budget model</strong></summary>
@@ -190,7 +232,7 @@ then learns its actual acceptance rate, quality, efficiency, errors, and task
 fit separately for each exact model/profile/task/role scope.
 
 For bounded text analysis, debugging, implementation proposals, and first-pass
-review, v4.5 adds a LongCat `proposal-api` path. It sends only explicitly
+review, the LongCat `proposal-api` path sends only explicitly
 allowlisted blobs from the repository's committed `HEAD`, gives the model no
 tools or write scope, records authoritative Chat usage even when output is
 truncated, and requires Codex Leader or Codex Worker review before anything is
@@ -218,6 +260,29 @@ provider and are rejected by the Chat adapter.
 
 Codex accepting image attachments does not make every configured provider
 visual.
+
+### Codex v5 compatibility
+
+CostMarshal v5 deliberately separates the two orchestration layers:
+
+- CostMarshal owns provider selection, credential and profile binding, budget
+  reservation, leases, recovery, evidence, and final Leader acceptance.
+- Native Codex child agents are optional and live only inside one admitted
+  attempt. They inherit that attempt's provider, model, sandbox, context,
+  deadline, and budget; they cannot switch to another API or create a nested
+  CostMarshal route.
+
+The production worker pins `@openai/codex` 0.145.0 and performs a fail-closed
+version handshake before enabling native children. Diagnose a host installation
+without making a provider call:
+
+```powershell
+python scripts/costmarshal.py codex-native-status --require-app-server
+```
+
+`native_exec_ready` is the execution requirement. `app_server_ready` reports
+whether the same installation can also be embedded through Codex App Server;
+CostMarshal's deterministic scheduler remains the authority in either case.
 LongCat's current [Chat API documentation](https://longcat.chat/platform/docs/api/chat.html)
 specifies text-only input. A 2026-07-27 live probe sent both a local PNG data
 URI and a public image URL through LongCat-2.0 Responses, plus a public image
@@ -315,7 +380,7 @@ The home directory resolution order is an explicit `--codex-home`, then non-empt
 - v4.3.3 commits an expiring production-build review, pins the complete Codex
   npm dependency graph, verifies the selected linux/amd64 base manifests, and
   makes CI build and exercise the actual hardened Gateway and Worker images.
-- v4.5 records an idempotent local evolution cycle after each accepted Leader
+- CostMarshal records an idempotent local evolution cycle after each accepted Leader
   result, creates transcript-free Leader Snapshots from decision events, and
   gives Leader startup a bounded Hot/Warm context view while Cold references
   remain indexed but unloaded. These actions create no provider calls, tasks,
@@ -362,7 +427,7 @@ recommendations move through
 every transition. One successful or failed task can never rewrite active
 routing policy by itself.
 
-After every recorded result, v4.5 also appends one evidence-hash-deduplicated
+After every recorded result, CostMarshal also appends one evidence-hash-deduplicated
 local evolution cycle. The cycle summarizes quality, efficiency, cost, error
 attribution, model-memory confidence, and the next matching task's teaching
 recommendation. It never starts paired/replay work, calls a provider, or

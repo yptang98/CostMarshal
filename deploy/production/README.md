@@ -125,7 +125,7 @@ client private key. The Worker receives only the short-lived lease token.
    certification bindings:
 
    - `--deployment-commit <40-hex>`
-   - `--release-version v4.5.0`
+   - `--release-version v5.0.0`
    - `--gateway-image name@sha256:<64-hex>`
    - `--allowed-signers-sha256 sha256:<64-hex>`
    - `--signer-identity <reviewed-identity>` (repeatable)

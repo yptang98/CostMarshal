@@ -64,7 +64,7 @@ def find_codex() -> str:
             return resolved
     raise AssertionError(
         "Codex CLI is required for the product install smoke; install "
-        "@openai/codex 0.144.1 or newer"
+        "@openai/codex 0.145.0 or newer"
     )
 
 

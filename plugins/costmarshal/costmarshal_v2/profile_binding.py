@@ -23,10 +23,80 @@ from .profiles import codex_home as resolve_codex_home, is_valid_profile_name
 PROFILE_BINDING_SCHEMA = "costmarshal-profile-binding-v1"
 MAX_PROFILE_BYTES = 256 * 1024
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_ALLOWED_TOP_KEYS = {
+    "model_provider",
+    "model",
+    "model_reasoning_effort",
+    "model_context_window",
+    "model_catalog_json",
+    "disable_response_storage",
+    "web_search",
+    "model_providers",
+}
+_ALLOWED_PROVIDER_ROW_KEYS = {"name", "base_url", "wire_api", "env_key"}
 
 
 class ProfileBindingError(ValueError):
     pass
+
+
+def _validate_optional_standard_keys(parsed: Mapping[str, Any]) -> None:
+    """Validate the reviewed non-secret Codex config keys real profiles carry."""
+
+    context_window = parsed.get("model_context_window")
+    if context_window is not None and (
+        isinstance(context_window, bool)
+        or not isinstance(context_window, int)
+        or context_window <= 0
+    ):
+        raise ProfileBindingError(
+            "provider profile model_context_window must be a positive integer"
+        )
+    catalog_json = parsed.get("model_catalog_json")
+    if catalog_json is not None and (
+        not isinstance(catalog_json, str)
+        or not catalog_json.strip()
+        or any(ord(char) < 32 for char in catalog_json)
+    ):
+        raise ProfileBindingError(
+            "provider profile model_catalog_json must be a non-empty plain path string"
+        )
+
+
+def _inherited_provider_row(
+    home: Path,
+    provider_identity: str,
+) -> dict[str, Any] | None:
+    """Return a reviewed provider row inherited from the shared config.toml.
+
+    Codex merges ``<home>/config.toml`` with a named profile, so a real
+    profile may legitimately omit ``[model_providers.<id>]`` and inherit the
+    endpoint/key contract from the main config.  Only the four safe fields are
+    extracted; anything else in the main config is ignored.
+    """
+
+    source = home / "config.toml"
+    try:
+        raw = source.read_bytes()
+    except OSError:
+        return None
+    if len(raw) > MAX_PROFILE_BYTES:
+        return None
+    try:
+        parsed = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return None
+    providers = parsed.get("model_providers") if isinstance(parsed, dict) else None
+    if not isinstance(providers, dict):
+        return None
+    row = providers.get(provider_identity)
+    if not isinstance(row, dict):
+        return None
+    return {
+        key: value
+        for key, value in row.items()
+        if key in _ALLOWED_PROVIDER_ROW_KEYS and value is not None
+    }
 
 
 def synthetic_default_profile(*, snapshot_relpath: str) -> tuple[bytes, dict[str, Any]]:
@@ -127,24 +197,33 @@ def read_named_profile(
         raise ProfileBindingError(f"provider profile changed while being read: {profile}")
     payload = b"".join(chunks)
     parsed = parse_profile_bytes(payload)
-    allowed_top = {
-        "model_provider",
-        "model",
-        "model_reasoning_effort",
-        "disable_response_storage",
-        "web_search",
-        "model_providers",
-    }
-    if set(parsed) - allowed_top:
+    if set(parsed) - _ALLOWED_TOP_KEYS:
         raise ProfileBindingError("provider profile contains unsupported settings")
+    _validate_optional_standard_keys(parsed)
     provider_identity = parsed.get("model_provider")
+    if not isinstance(provider_identity, str) or not provider_identity:
+        raise ProfileBindingError("provider profile must declare a string model_provider")
     providers = parsed.get("model_providers")
-    if not isinstance(provider_identity, str) or not isinstance(providers, dict):
-        raise ProfileBindingError("provider profile must declare model_provider and model_providers")
-    row = providers.get(provider_identity)
+    row = providers.get(provider_identity) if isinstance(providers, dict) else None
     if not isinstance(row, dict):
-        raise ProfileBindingError("provider profile selected model_provider is missing")
-    if set(row) - {"name", "base_url", "wire_api", "env_key"}:
+        row = _inherited_provider_row(home, provider_identity)
+    if not isinstance(row, dict):
+        # The provider definition lives outside this profile (for example in
+        # config.toml) or is otherwise unresolvable here.  Routing evidence
+        # still binds the exact profile bytes; host Codex performs the real
+        # merge and fails closed itself if the provider is genuinely unknown.
+        return payload, _binding(
+            payload,
+            logical_name=profile,
+            source_kind="named-profile",
+            provider_identity=provider_identity,
+            base_url=None,
+            wire_api=None,
+            env_key=None,
+            model=parsed.get("model"),
+            snapshot_relpath=snapshot_relpath,
+        )
+    if set(row) - _ALLOWED_PROVIDER_ROW_KEYS:
         raise ProfileBindingError("provider profile contains unsupported provider settings")
     env_key = row.get("env_key")
     if env_key != expected_env_key:

@@ -3,8 +3,12 @@
 This image is the trusted bootstrap for `worker_isolation.mode=required`. It contains two fixed commands:
 
 - `costmarshal-isolation-canary --json` proves the non-root, read-only-rootfs, capability, mount, and engine-socket boundary before dispatch.
-- `costmarshal-worker --jsonl [--model MODEL]` accepts the bounded task prompt
-  on stdin, runs `codex exec --json`, and writes only `/out/final.md`.
+- `costmarshal-worker --jsonl [--model MODEL] [--codex-native
+  --max-subagents N --minimum-codex-version VERSION]` accepts the bounded task
+  prompt on stdin, runs `codex exec --json`, and writes only `/out/final.md`.
+  Codex-native mode performs a fail-closed CLI version handshake and permits
+  only attempt-local children that inherit the same model, provider credential,
+  sandbox, budget, and lease.
 - `costmarshal-worker --jsonl --mode multimodal-api
   --max-output-tokens N [--image/--audio/--video/--document PATH]` is a
   report-only path for a gateway-bound native Responses provider. It cannot

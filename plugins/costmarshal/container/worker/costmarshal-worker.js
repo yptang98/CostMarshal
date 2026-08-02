@@ -4,7 +4,7 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 
 const MAX_PROMPT_BYTES = 2 * 1024 * 1024;
 const MAX_CREDENTIAL_BYTES = 256 * 1024;
@@ -21,6 +21,7 @@ const ATTACHMENT_SUFFIXES = {
   video: new Set([".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm"]),
   document: new Set([".csv", ".doc", ".docx", ".html", ".json", ".md", ".pdf", ".pptx", ".rtf", ".txt", ".xlsx"]),
 };
+const CODEX_NATIVE_SCHEMA = "costmarshal-codex-native-v1";
 
 function fail(message, exitCode = 64) {
   const output = process.env.COSTMARSHAL_OUTPUT_PATH;
@@ -43,11 +44,34 @@ function parseArgs(argv) {
   let model = null;
   let mode = "agent";
   let maxOutputTokens = null;
+  let codexNative = false;
+  let maxSubagents = 3;
+  let minimumCodexVersion = "0.145.0";
   const attachments = { image: [], audio: [], video: [], document: [] };
   let totalAttachmentBytes = 0;
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
     if (value === "--jsonl") continue;
+    if (value === "--codex-native") {
+      codexNative = true;
+      continue;
+    }
+    if (value === "--max-subagents" && index + 1 < argv.length) {
+      maxSubagents = Number(argv[index + 1]);
+      if (!Number.isSafeInteger(maxSubagents) || maxSubagents < 1 || maxSubagents > 8) {
+        fail("invalid Codex-native subagent limit");
+      }
+      index += 1;
+      continue;
+    }
+    if (value === "--minimum-codex-version" && index + 1 < argv.length) {
+      minimumCodexVersion = argv[index + 1];
+      if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(minimumCodexVersion)) {
+        fail("invalid minimum Codex version");
+      }
+      index += 1;
+      continue;
+    }
     if (value === "--mode" && index + 1 < argv.length) {
       mode = argv[index + 1];
       if (!new Set(["agent", "multimodal-api"]).has(mode)) fail("invalid worker execution mode");
@@ -99,7 +123,37 @@ function parseArgs(argv) {
   if (mode === "multimodal-api" && maxOutputTokens === null) {
     fail("multimodal-api requires an output-token envelope");
   }
-  return { model, mode, maxOutputTokens, attachments };
+  if (mode !== "agent" && codexNative) fail("Codex-native subagents require agent mode");
+  return { model, mode, maxOutputTokens, attachments, codexNative, maxSubagents, minimumCodexVersion };
+}
+
+function semanticVersion(value) {
+  const match = String(value || "").match(/(?:^|\D)(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?/);
+  return match ? match.slice(1, 4).map(Number) : null;
+}
+
+function versionAtLeast(value, minimum) {
+  const observed = semanticVersion(value);
+  const required = semanticVersion(minimum);
+  if (!observed || !required) return false;
+  for (let index = 0; index < 3; index += 1) {
+    if (observed[index] !== required[index]) return observed[index] > required[index];
+  }
+  return true;
+}
+
+function codexNativeHandshake(minimumVersion) {
+  const result = spawnSync("codex", ["--version"], {
+    encoding: "utf8",
+    shell: false,
+    timeout: 5000,
+  });
+  const text = `${result.stdout || ""}\n${result.stderr || ""}`.trim();
+  if (result.error || result.status !== 0 || !versionAtLeast(text, minimumVersion)) {
+    fail(`Codex-native compatibility requires codex ${minimumVersion} or newer`, 69);
+  }
+  const observed = semanticVersion(text);
+  return observed.join(".");
 }
 
 function fixedPath(envName, expected) {
@@ -310,7 +364,15 @@ async function invokeMultimodalApi({ profileText, providerSecret, providerEnvKey
 }
 
 async function main() {
-  const { model, mode, maxOutputTokens, attachments } = parseArgs(process.argv.slice(2));
+  const {
+    model,
+    mode,
+    maxOutputTokens,
+    attachments,
+    codexNative,
+    maxSubagents,
+    minimumCodexVersion,
+  } = parseArgs(process.argv.slice(2));
   const profile = fixedPath("COSTMARSHAL_PROFILE_PATH", "/bootstrap/profile.config.toml");
   const output = fixedPath("COSTMARSHAL_OUTPUT_PATH", "/out/final.md");
   const workspaceMode = process.env.COSTMARSHAL_WORKSPACE_MODE;
@@ -399,6 +461,28 @@ async function main() {
   const args = [
     "--ask-for-approval",
     "never",
+  ];
+  if (codexNative) {
+    const observedVersion = codexNativeHandshake(minimumCodexVersion);
+    args.push(
+      "-c",
+      "features.multi_agent=true",
+      "-c",
+      `agents.max_concurrent_threads_per_session=${maxSubagents + 1}`,
+    );
+    process.stdout.write(`${JSON.stringify({
+      type: "costmarshal.codex_native.ready",
+      schema_version: CODEX_NATIVE_SCHEMA,
+      observed_version: observedVersion,
+      minimum_version: minimumCodexVersion,
+      mode: "attempt-local",
+      max_subagents: maxSubagents,
+      max_depth: 1,
+      cross_provider_children: false,
+      authority: "costmarshal",
+    })}\n`);
+  }
+  args.push(
     "exec",
     "--ephemeral",
     "--skip-git-repo-check",
@@ -409,7 +493,7 @@ async function main() {
     "--json",
     "--output-last-message",
     output,
-  ];
+  );
   if (model) args.push("--model", model);
   for (const image of attachments.image) args.push("--image", image);
   args.push("-");
@@ -436,8 +520,11 @@ async function main() {
 
 module.exports = {
   attachmentMediaType,
+  codexNativeHandshake,
   invokeMultimodalApi,
   responseText,
+  semanticVersion,
+  versionAtLeast,
 };
 
 if (require.main === module) {

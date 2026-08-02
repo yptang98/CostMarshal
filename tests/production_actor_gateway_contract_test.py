@@ -229,7 +229,20 @@ class ProductionActorGatewayContractTest(unittest.TestCase):
                 execution_workspace=self.execution_workspace,
                 workspace_mode="read-only",
             )
-        self.assertEqual(command, ["costmarshal-worker", "--jsonl", "--model", "LongCat-2.0"])
+        self.assertEqual(
+            command,
+            [
+                "costmarshal-worker",
+                "--jsonl",
+                "--codex-native",
+                "--max-subagents",
+                "3",
+                "--minimum-codex-version",
+                "0.145.0",
+                "--model",
+                "LongCat-2.0",
+            ],
+        )
         self.assertEqual(spec.provider_ca_path, self.ca.resolve())
         self.assertIsNotNone(spec.credential_path)
         self.assertEqual(spec.credential_path.read_text(encoding="utf-8"), LEASE_TOKEN)

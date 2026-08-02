@@ -23,6 +23,10 @@ from .profiles import (
     command_configure_provider,
     command_provider_presets,
 )
+from .codex_native import (
+    MINIMUM_CODEX_VERSION,
+    command_codex_native_status,
+)
 from .scheduler import (
     LEADER_WORK_TYPES,
     RISKS,
@@ -74,6 +78,7 @@ from .scheduler import (
     command_run_scheduler,
     command_send,
     command_start_leader,
+    command_configure_leader,
     command_stop_actor,
     command_status,
     command_leader_snapshot,
@@ -122,7 +127,7 @@ def command_state_store_status(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="CostMarshal v4 scheduler")
+    parser = argparse.ArgumentParser(description="CostMarshal v5 scheduler")
     parser.add_argument("--root", type=Path, default=default_root(), help="CostMarshal runtime root (v2 path compatible)")
     parser.add_argument("--version", action="version", version=f"CostMarshal {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -133,6 +138,23 @@ def build_parser() -> argparse.ArgumentParser:
     configure_profiles.add_argument("--force", action="store_true")
     configure_profiles.add_argument("--dry-run", action="store_true")
     configure_profiles.set_defaults(func=command_configure_profiles)
+
+    codex_native_status = sub.add_parser(
+        "codex-native-status",
+        help="Probe Codex CLI, native subagent, and App Server compatibility without making a provider call",
+    )
+    codex_native_status.add_argument("--codex-command", default="codex")
+    codex_native_status.add_argument(
+        "--minimum-version",
+        default=MINIMUM_CODEX_VERSION,
+    )
+    codex_native_status.add_argument("--timeout", type=float, default=5.0)
+    codex_native_status.add_argument(
+        "--require-app-server",
+        action="store_true",
+        help="Require App Server as well as native exec compatibility",
+    )
+    codex_native_status.set_defaults(func=command_codex_native_status)
 
     provider_presets = sub.add_parser(
         "provider-presets",
@@ -285,6 +307,15 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--backend-command", help="Backend executable, for example a tmux binary when --backend tmux")
     init.add_argument("--leader-model", default="inherit")
     init.add_argument("--leader-profile")
+    init.add_argument(
+        "--leader-provider",
+        default="codex",
+        help=(
+            "Leader provider id: 'codex' (signed-in default) or a configured "
+            "provider such as 'deepseek'. Non-Codex leaders run through a named "
+            "Codex config profile so workspace tools, sandbox, and evidence stay intact."
+        ),
+    )
     init.add_argument("--leader-command", help="Legacy custom manager command; default uses the structured codex exec runner")
     init.add_argument("--allow-unsafe-custom-worker-commands", action="store_true", help="Privileged compatibility escape hatch; bypasses worker sandbox and secret isolation")
     init.add_argument("--worker-isolation", choices=["required"], default="required", help="Require attested Linux OCI isolation for task workers")
@@ -298,6 +329,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     start_leader = sub.add_parser("start-leader", help="Run one on-demand Codex manager turn (legacy command name)")
     start_leader.add_argument("--project", required=True)
+    start_leader.add_argument("--provider", help="Leader provider override: codex or a configured provider such as deepseek")
     start_leader.add_argument("--model")
     start_leader.add_argument("--profile")
     start_leader.add_argument("--command")
@@ -306,11 +338,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_manager = sub.add_parser("run-manager", help="Run one on-demand Codex manager turn")
     run_manager.add_argument("--project", required=True)
+    run_manager.add_argument("--provider", help="Leader provider override: codex or a configured provider such as deepseek")
     run_manager.add_argument("--model")
     run_manager.add_argument("--profile")
     run_manager.add_argument("--command")
     run_manager.add_argument("--dry-run", action="store_true")
     run_manager.set_defaults(func=command_start_leader)
+
+    configure_leader = sub.add_parser(
+        "configure-leader",
+        help="Preview or persist the project leader provider/model/profile at runtime",
+    )
+    configure_leader.add_argument("--project", required=True)
+    configure_leader.add_argument(
+        "--provider",
+        help="Leader provider id: codex or a configured provider such as deepseek",
+    )
+    configure_leader.add_argument("--model", help="Leader model id, or inherit")
+    configure_leader.add_argument(
+        "--profile",
+        help="Codex config profile used to reach the leader provider",
+    )
+    configure_leader.add_argument("--dry-run", action="store_true")
+    configure_leader.set_defaults(func=command_configure_leader)
 
     new_task = sub.add_parser("new-task", help="Create a v2 bounded task")
     new_task.add_argument("--project", required=True)
@@ -346,6 +396,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     new_task.add_argument("--risk", choices=["low", "medium", "high"], default="low")
     new_task.add_argument("--difficulty", choices=["simple", "normal", "hard"], default="normal")
+    new_task.add_argument(
+        "--major-decision",
+        action="store_true",
+        help=(
+            "Mark this package as a major decision so the safe tier floor is "
+            "high and expert-only Codex providers become eligible"
+        ),
+    )
     new_task.add_argument("--provider", default="auto", help="Provider id from the project catalog, or auto")
     new_task.add_argument("--tier", choices=["auto", "low", "medium", "high"], default="auto")
     new_task.add_argument("--profile")
@@ -439,6 +497,11 @@ def build_parser() -> argparse.ArgumentParser:
     route.add_argument("--task-type", default="analysis")
     route.add_argument("--risk", choices=["low", "medium", "high"], default="low")
     route.add_argument("--difficulty", choices=["simple", "normal", "hard"], default="normal")
+    route.add_argument(
+        "--major-decision",
+        action="store_true",
+        help="Treat this simulated task as a major decision (high tier floor)",
+    )
     route.add_argument("--provider", default="auto")
     route.add_argument("--tier", choices=["auto", "low", "medium", "high"], default="auto")
     route.add_argument(
@@ -1031,7 +1094,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     production_boundary.add_argument(
         "--release-version",
-        help="Exact CostMarshal release version, for example v4.5.0",
+        help="Exact CostMarshal release version, for example v5.0.0",
     )
     production_boundary.add_argument(
         "--gateway-image",

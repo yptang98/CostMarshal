@@ -1,6 +1,6 @@
 ---
 name: orchestrate-cost-aware-agents
-description: Orchestrate Codex work across low-, medium-, and high-cost API providers with CostMarshal's mTLS production gateway, hard-budget Proxy, repository-bound Workstreams, staged integration Gates, accepted project knowledge, project-local Skill candidates, Work Graph, Leader Snapshots, structured handoffs, project artifact lineage, model memory, teaching policy, safety floors, leader acceptance, artifact gates, budget reservations, recoverable execution, and optional read-only ArchMarshal governance. Use when a user asks Codex to optimize cost versus quality, coordinate multiple model/API tiers or repositories, operate or audit CostMarshal, resume a CostMarshal run, or complete a task through economical provider handoffs.
+description: Orchestrate Codex work across low-, medium-, and high-cost API providers with CostMarshal's two-level Codex-native attempt teams, mTLS production gateway, hard-budget Proxy, repository-bound Workstreams, staged integration Gates, accepted project knowledge, project-local Skill candidates, Work Graph, Leader Snapshots, structured handoffs, project artifact lineage, model memory, teaching policy, safety floors, leader acceptance, artifact gates, budget reservations, recoverable execution, and optional read-only ArchMarshal governance. Use when a user asks Codex to optimize cost versus quality, coordinate multiple model/API tiers or repositories, use native Codex subagents under cost controls, operate or audit CostMarshal, resume a CostMarshal run, or complete a task through economical provider handoffs.
 ---
 
 # Orchestrate cost-aware agents
@@ -61,6 +61,11 @@ Classify the user's request before running the internal engine:
   Summarize dependency readiness, integration Gates, evaluations, errors,
   cost, and any unpromoted policy candidate; never infer success only from a
   live process.
+- **Check Codex compatibility**: use `codex-native-status` before diagnosing
+  native child-agent or App Server availability. This probe makes no provider
+  call. A failed handshake disables only the native attempt team and preserves
+  the original single-agent execution contract; it never authorizes a provider,
+  isolation, credential, or safety fallback.
 - **Resume or recover**: run `recover` read-only first. Show the exact restart
   plan before `--restart-missing`; preserve sealed routes, generations, attempts,
   reservations, runtime receipts, and leader ownership. Never silently respawn
@@ -68,6 +73,40 @@ Classify the user's request before running the internal engine:
 - **Stop**: use the actor's durable identity with `stop-actor --stop-runtime`,
   then verify terminal state and cleanup receipts. Do not kill by an unverified
   PID or process name.
+
+## Leader and expert-tier policy
+
+The current Codex desktop session is the dispatcher: it plans, routes, starts,
+and accepts work through the CostMarshal CLI. The *leader turns* that run
+outside the desktop session (for example `start-leader` / `run-manager`) do
+not have to use the strongest model. Configure the project leader with
+`configure-leader`, or set it once at `init`:
+
+```text
+Use DeepSeek as the project leader with the deepseek profile and model
+deepseek-v4-pro, and keep Codex's strongest built-in model as an advanced
+expert that is called only for high-difficulty or major-decision work.
+```
+
+When the user asks, run `configure-leader --dry-run` first and explain the
+preview before applying it. A non-Codex leader executes through a named Codex
+config profile (for example `~/.codex/deepseek.config.toml`), so it keeps the
+same workspace tools, sandbox, budget reservation, and evidence contract while
+using the selected model. The leader's provider/model/profile is persisted in
+the project and shown in the actor prompt and `status`.
+
+Codex's built-in strongest models are advanced experts, not default execution.
+The catalog marks them `expert_only`: automatic routing selects them as the
+first step only when the task floor is high (risk `high`, difficulty `hard`, or
+`--major-decision`), or when no non-expert provider can serve the task. Later
+steps in a sealed chain are reached only through an explicit leader-authorized
+escalation. Use `--major-decision` sparingly for genuinely high-stakes
+acceptance, integration, architecture, or security calls.
+
+Token accounting for leader and agent executions comes directly from the Codex
+CLI's own reported usage in its JSON events; CostMarshal never guesses token
+counts for these paths. Treat provider-reported usage as authoritative only
+for report-only gateway paths where Codex is not the executing agent.
 
 ## Internal execution contract
 
@@ -96,6 +135,16 @@ a separately dispatched high-tier signed-in actor is a Codex Worker. Do not
 invent or request `CODEX_API_KEY` for the built-in signed-in provider. LongCat
 and other provider workers are assessed by observed task-scoped evidence, not
 by a permanent "weak model" label.
+
+CostMarshal v5 has two orchestration layers. The outer CostMarshal scheduler is
+the only layer allowed to select providers, bind credentials, reserve budget,
+issue leases, persist evidence, or accept work. Inside one admitted Agent
+attempt, native Codex children may parallelize bounded exploration,
+implementation, and review. They must inherit the same provider, model,
+sandbox, visible context, write scope, reservation, lease, and deadline; they
+must not change provider, mutate CostMarshal control state, accept the task, or
+spawn grandchildren. The parent reconciles all child results into one final
+report.
 
 The plugin Skill is the only implicit CostMarshal entry. A separately installed
 legacy `$costmarshal` Skill is explicit-only and may coexist solely for migration

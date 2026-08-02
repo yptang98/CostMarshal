@@ -353,6 +353,72 @@ def main() -> int:
             )
         assert configured_path == (default_user_home / ".codex" / "roundtrip.config.toml").resolve()
         assert material is not None and material[0] == configured_path.read_bytes()
+
+        # Real-world Codex profiles may carry standard non-secret keys
+        # (model_context_window, model_catalog_json) and inherit the provider
+        # endpoint/key contract from the shared config.toml.  Routing evidence
+        # must accept them instead of rejecting the user's actual config.
+        inherited_home = home / "inherited-home"
+        inherited_home.mkdir()
+        (inherited_home / "config.toml").write_text(
+            '[model_providers.deepseek]\n'
+            'name = "DeepSeek"\n'
+            'base_url = "https://api.deepseek.com"\n'
+            'wire_api = "responses"\n'
+            'env_key = "DEEPSEEK_API_KEY"\n',
+            encoding="utf-8",
+        )
+        (inherited_home / "deepseek.config.toml").write_text(
+            'model = "deepseek-v4-pro"\n'
+            'model_provider = "deepseek"\n'
+            'model_reasoning_effort = "high"\n'
+            'model_context_window = 1048576\n'
+            'model_catalog_json = "C:/Users/example/.codex/models.json"\n',
+            encoding="utf-8",
+        )
+        with patch.dict(
+            os.environ,
+            {"CODEX_HOME": str(inherited_home)},
+            clear=False,
+        ):
+            inherited = read_named_profile(
+                "deepseek",
+                expected_env_key="DEEPSEEK_API_KEY",
+                snapshot_relpath="profile-snapshots/deepseek/config.toml",
+            )
+        assert inherited is not None
+        assert inherited[1]["status"] == "available"
+        assert inherited[1]["provider_identity"] == "deepseek"
+        assert inherited[1]["base_url"] == "https://api.deepseek.com"
+        assert inherited[1]["wire_api"] == "responses"
+        assert inherited[1]["env_key"] == "DEEPSEEK_API_KEY"
+
+        # Unknown or credential-bearing keys remain fail-closed.
+        (inherited_home / "deepseek.config.toml").write_text(
+            'model = "deepseek-v4-pro"\n'
+            'model_provider = "deepseek"\n'
+            '[model_providers.deepseek]\n'
+            'name = "DeepSeek"\n'
+            'base_url = "https://api.deepseek.com"\n'
+            'env_key = "DEEPSEEK_API_KEY"\n'
+            'headers = { Authorization = "Bearer sk-test" }\n',
+            encoding="utf-8",
+        )
+        with patch.dict(
+            os.environ,
+            {"CODEX_HOME": str(inherited_home)},
+            clear=False,
+        ):
+            try:
+                read_named_profile(
+                    "deepseek",
+                    expected_env_key="DEEPSEEK_API_KEY",
+                    snapshot_relpath="profile-snapshots/deepseek/config.toml",
+                )
+                rejected = False
+            except Exception:
+                rejected = True
+        assert rejected
     print("provider profile contract ok")
     return 0
 

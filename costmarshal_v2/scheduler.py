@@ -93,6 +93,9 @@ from .routing import (
     route_plan_fingerprint,
     validate_provider_catalog,
 )
+from .profiles import validate_profile_name, validate_provider_id
+from .codex_native import default_policy as default_codex_native_policy
+from .codex_native import prompt_contract as codex_native_prompt_contract
 from .provider_governance import (
     CHECK_NAMES as PROVIDER_CHECK_NAMES,
     ProviderGovernanceError,
@@ -715,6 +718,76 @@ def provider_defaults(provider: str, model: str | None, profile: str | None) -> 
     return (model or "inherit", profile)
 
 
+LEADER_PROVIDER_DEFAULT = "codex"
+LEADER_TIER_DEFAULT = "high"
+LEADER_POLICY_SCHEMA = 1
+_LEADER_MODEL_SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}")
+
+
+def normalize_leader_model(value: str | None) -> str:
+    """Return 'inherit' or a shell-safe Codex model identifier for the leader."""
+
+    model = str(value or "inherit").strip()
+    if not model or model == "inherit":
+        return "inherit"
+    if _LEADER_MODEL_SAFE.fullmatch(model) is None:
+        raise SystemExit(
+            "leader model must be 'inherit' or a safe model identifier "
+            "(letters, numbers, and . _ : / @ + - only)"
+        )
+    return model
+
+
+def resolve_leader_policy(
+    project: Mapping[str, Any],
+    *,
+    provider: str | None,
+    model: str | None,
+    profile: str | None,
+) -> dict[str, Any]:
+    """Validate and normalize the project leader policy.
+
+    ``codex`` is the default signed-in leader.  Any other provider (for example
+    ``deepseek``) is reached through a named Codex config profile in the user's
+    Codex home, so the leader keeps its workspace tools, sandbox, budget, and
+    evidence contract while the model itself is user-selectable.
+    """
+
+    raw_provider = str(provider or LEADER_PROVIDER_DEFAULT).strip().lower()
+    normalized_provider = validate_provider_id(raw_provider)
+    normalized_model = normalize_leader_model(model)
+    normalized_profile = None
+    if profile is not None and str(profile).strip():
+        normalized_profile = validate_profile_name(str(profile).strip())
+    elif normalized_provider != LEADER_PROVIDER_DEFAULT:
+        # A non-Codex leader needs a profile that Codex exec can reach the
+        # provider through; the provider id is the natural profile name.
+        normalized_profile = normalized_provider
+    catalog = validate_provider_catalog(
+        (project or {}).get("provider_catalog")
+        if (project or {}).get("provider_catalog") is not None
+        else default_provider_catalog()
+    )
+    env_key = None
+    for row in catalog["providers"]:
+        if row["provider_id"] == normalized_provider:
+            env_key = row.get("env_key")
+            break
+    return {
+        "schema_version": LEADER_POLICY_SCHEMA,
+        "provider": normalized_provider,
+        "model": normalized_model,
+        "profile": normalized_profile,
+        "tier": LEADER_TIER_DEFAULT,
+        "env_key": env_key,
+        # Codex's built-in strongest models stay advanced experts; leader work
+        # may escalate to them explicitly when the task is high-difficulty or
+        # a major decision.
+        "expert_escalation": True,
+        "updated_at": now_iso(),
+    }
+
+
 def actor_summary(actor: dict[str, Any]) -> dict[str, Any]:
     runtime = actor_runtime(actor)
     return {
@@ -1085,7 +1158,7 @@ def actor_role_contract(role: str) -> list[str]:
             "Escalate rather than changing write scope, reading raw transcripts, exposing secrets, or making architectural decisions outside the brief.",
             "Return one concise final report for leader verification; do not spend tokens trying to edit CostMarshal runtime files.",
         ]
-    return ["Follow the CostMarshal v4 protocol for this actor role."]
+    return ["Follow the CostMarshal v5 protocol for this actor role."]
 
 
 def render_actor_prompt(layout: ProjectLayout, actor: dict[str, Any]) -> str:
@@ -1095,7 +1168,7 @@ def render_actor_prompt(layout: ProjectLayout, actor: dict[str, Any]) -> str:
     task = load_task(layout, task_id) if task_id and task_exists(layout, task_id) else None
     mailbox = actor.get("mailbox") or {}
     lines = [
-        f"# CostMarshal v4 Actor Prompt: {actor['id']}",
+        f"# CostMarshal v5 Actor Prompt: {actor['id']}",
         "",
         f"Project: {project.get('name')} (`{project.get('project_id')}`)",
         f"Objective: {project.get('objective')}",
@@ -1110,6 +1183,9 @@ def render_actor_prompt(layout: ProjectLayout, actor: dict[str, Any]) -> str:
         "## Role Contract",
     ]
     lines.extend(f"- {item}" for item in actor_role_contract(actor.get("role", "")))
+    native_contract = codex_native_prompt_contract(actor)
+    if native_contract:
+        lines.extend(["", *native_contract])
     if actor.get("role") == "leader":
         try:
             context_view = _project_context_view(
@@ -1316,6 +1392,7 @@ def make_actor(
             "kind": "codex-exec",
             "sandbox": "workspace-write",
             "approval_policy": "never",
+            "codex_native": default_codex_native_policy(enabled=role == "agent"),
         },
         "context_policy": {
             "default": "Use mailbox messages and explicit task briefs only.",
@@ -1501,7 +1578,7 @@ def preflight_worker_isolation(
 def protocol_text() -> str:
     return "\n".join(
         [
-            "# CostMarshal v4 Protocol",
+            "# CostMarshal v5 Protocol",
             "",
             "The scheduler is a relay and process supervisor. It does not perform project reasoning, implementation, or technical review.",
             "",
@@ -1701,6 +1778,16 @@ def command_init(args: Any) -> None:
             "must_do": ["durable state", "mailbox relay", "process supervision", "recovery audit"],
         },
     }
+    try:
+        leader_policy = resolve_leader_policy(
+            project,
+            provider=getattr(args, "leader_provider", None),
+            model=getattr(args, "leader_model", None),
+            profile=getattr(args, "leader_profile", None),
+        )
+    except SystemExit as exc:
+        raise SystemExit(f"Invalid leader policy: {exc}") from exc
+    project["leader_policy"] = leader_policy
     atomic_write_json(layout.project_json, project)
     try:
         repository_registry = upsert_repository(
@@ -1742,13 +1829,14 @@ def command_init(args: Any) -> None:
         layout,
         actor_id=LEADER_ID,
         role="leader",
-        model=args.leader_model,
+        model=leader_policy["model"],
         command_template=getattr(args, "leader_command", None),
         session_name=session_name,
         backend_kind=backend_kind,
-        provider="codex",
-        tier="high",
-        profile=getattr(args, "leader_profile", None),
+        provider=leader_policy["provider"],
+        tier=leader_policy["tier"],
+        profile=leader_policy["profile"],
+        env_key=leader_policy["env_key"],
     )
     save_actor(layout, leader)
     sync_actor_summary(layout, leader)
@@ -3605,15 +3693,113 @@ def command_start_leader(args: Any) -> None:
     layout = resolve_project(args.root, args.project)
     require_actor(layout, LEADER_ID)
     actor = load_actor(layout, LEADER_ID)
+    project = load_project(layout)
+    policy = project.get("leader_policy") or {}
+    provider = str(
+        getattr(args, "provider", None) or policy.get("provider") or LEADER_PROVIDER_DEFAULT
+    ).strip().lower()
+    try:
+        provider = validate_provider_id(provider)
+    except SystemExit as exc:
+        raise SystemExit(f"Invalid leader provider: {exc}") from exc
+    actor["provider"] = provider
     if args.model:
-        actor["model"] = args.model
+        actor["model"] = normalize_leader_model(args.model)
+    elif provider == LEADER_PROVIDER_DEFAULT and not actor.get("model"):
+        actor["model"] = "inherit"
     if getattr(args, "profile", None):
-        actor["profile"] = args.profile
-    actor["provider"] = "codex"
+        actor["profile"] = validate_profile_name(str(args.profile))
+    if provider != LEADER_PROVIDER_DEFAULT:
+        if not actor.get("profile"):
+            actor["profile"] = provider
+        try:
+            catalog = project_provider_catalog(project)
+            row = provider_by_id(catalog, provider)
+        except RoutingValidationError as exc:
+            raise SystemExit(f"Leader provider is not in the project catalog: {exc}") from exc
+        if row.get("env_key"):
+            actor["env_key"] = row.get("env_key")
+    else:
+        # The signed-in Codex session owns the default leader credential; no
+        # separate API key is required.
+        actor["env_key"] = None
+        if not getattr(args, "profile", None):
+            actor["profile"] = None
     if args.command:
         actor["command_template"] = args.command
     payload = start_actor(layout, actor, dry_run=args.dry_run)
     print_json({"status": "ok", **payload})
+
+
+def command_configure_leader(args: Any) -> None:
+    """Preview or persist the project leader provider/model/profile at runtime."""
+
+    layout = resolve_project(args.root, args.project)
+    require_actor(layout, LEADER_ID)
+    project = load_project(layout)
+    actor = load_actor(layout, LEADER_ID)
+    current = project.get("leader_policy") or {}
+    provider_arg = getattr(args, "provider", None)
+    model_arg = getattr(args, "model", None)
+    profile_arg = getattr(args, "profile", None)
+    provider = (
+        str(provider_arg).strip().lower()
+        if provider_arg is not None and str(provider_arg).strip()
+        else str(current.get("provider") or LEADER_PROVIDER_DEFAULT)
+    )
+    model = (
+        model_arg
+        if model_arg is not None and str(model_arg).strip()
+        else str(current.get("model") or "inherit")
+    )
+    profile = (
+        profile_arg
+        if profile_arg is not None
+        else (
+            None
+            if provider == LEADER_PROVIDER_DEFAULT
+            else current.get("profile")
+        )
+    )
+    try:
+        policy = resolve_leader_policy(
+            project,
+            provider=provider,
+            model=model,
+            profile=profile,
+        )
+    except SystemExit as exc:
+        raise SystemExit(f"Invalid leader policy: {exc}") from exc
+    preview = {
+        "status": "ok",
+        "dry_run": bool(getattr(args, "dry_run", False)),
+        "leader_actor_id": LEADER_ID,
+        "policy": policy,
+    }
+    if getattr(args, "dry_run", False):
+        print_json(preview)
+        return
+    project["leader_policy"] = policy
+    project["updated_at"] = now_iso()
+    atomic_write_json(layout.project_json, project)
+    actor["provider"] = policy["provider"]
+    actor["model"] = policy["model"]
+    actor["tier"] = policy["tier"]
+    actor["profile"] = policy["profile"]
+    actor["env_key"] = policy["env_key"]
+    actor["updated_at"] = now_iso()
+    refresh_actor_prompt(layout, actor)
+    save_actor(layout, actor)
+    sync_actor_summary(layout, actor)
+    append_event(
+        layout,
+        "leader_configured",
+        provider=policy["provider"],
+        model=policy["model"],
+        profile=policy["profile"],
+        tier=policy["tier"],
+    )
+    print_json(preview)
 
 
 # These two receipts cover only host-context access and the bootstrap prompt.
@@ -3923,7 +4109,7 @@ def render_task_brief(task: dict[str, Any]) -> str:
         [
             f"# Task {task['id']}: {task['title']}",
             "",
-            "You are a CostMarshal v4 agent actor. Work only from this brief and the explicitly listed context.",
+            "You are a CostMarshal v5 agent actor. Work only from this brief and the explicitly listed context.",
             "",
             "## Purpose",
             task["purpose"],
@@ -4161,6 +4347,7 @@ def command_new_task(args: Any) -> None:
         "risk": getattr(args, "risk", "low"),
         "difficulty": getattr(args, "difficulty", "normal"),
         "task_type": args.task_type,
+        "major_decision": bool(getattr(args, "major_decision", False)),
         "required_capabilities": required_capabilities,
         "min_success_probability": effective_min_success,
         "routing_objective": routing_objective,
@@ -4318,6 +4505,7 @@ def command_new_task(args: Any) -> None:
                 "repository_id": repository_id,
                 "risk": str(getattr(args, "risk", "low")),
                 "difficulty": str(getattr(args, "difficulty", "normal")),
+                "major_decision": bool(getattr(args, "major_decision", False)),
                 "dependencies": dependencies,
                 "deliverables": deliverables,
                 "required_capabilities": required_capabilities,
@@ -4345,6 +4533,7 @@ def command_new_task(args: Any) -> None:
         "repository_binding_sha256": repository["binding_sha256"],
         "risk": getattr(args, "risk", "low"),
         "difficulty": getattr(args, "difficulty", "normal"),
+        "major_decision": bool(getattr(args, "major_decision", False)),
         "provider": "auto",
         "tier": "auto",
         "provider_request": provider_request,
@@ -4687,6 +4876,7 @@ def command_route(args: Any) -> None:
         "risk": args.risk,
         "difficulty": args.difficulty,
         "task_type": args.task_type,
+        "major_decision": bool(getattr(args, "major_decision", False)),
         "required_capabilities": getattr(args, "required_capabilities", None) or [],
         "min_success_probability": effective_min_success,
         "min_success_probability_source": min_success_source,
@@ -11897,7 +12087,7 @@ def render_dashboard(payload: dict[str, Any]) -> str:
     backend = payload.get("backend") or {}
     scheduler = payload.get("scheduler") or {}
     lines = [
-        f"# CostMarshal v4 Dashboard: {project.get('name')}",
+        f"# CostMarshal v5 Dashboard: {project.get('name')}",
         "",
         f"Project id: `{project.get('project_id')}`",
         f"Objective: {compact_text(project.get('objective') or '', 120)}",
@@ -12679,7 +12869,7 @@ def command_batch_acceptance(args: Any) -> None:
 
 def _print_status_markdown(payload: dict[str, Any]) -> None:
     lines = [
-        f"# CostMarshal v4 Status: {payload['project'].get('name')}",
+        f"# CostMarshal v5 Status: {payload['project'].get('name')}",
         "",
         f"Project id: `{payload['project'].get('project_id')}`",
         f"Backend: `{(payload.get('backend') or {}).get('kind')}`",

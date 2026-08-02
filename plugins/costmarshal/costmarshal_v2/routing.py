@@ -61,6 +61,7 @@ _PROVIDER_FIELDS = {
     "env_key",
     "enabled",
     "priority",
+    "expert_only",
     "input_cny_per_1m",
     "output_cny_per_1m",
     "pricing",
@@ -206,6 +207,7 @@ def _provider(
     model: str | None,
     env_key: str | None,
     capabilities: Iterable[str] = (),
+    expert_only: bool = False,
 ) -> dict[str, Any]:
     return {
         "provider_id": provider_id,
@@ -215,6 +217,7 @@ def _provider(
         "env_key": env_key,
         "enabled": True,
         "priority": 100,
+        "expert_only": bool(expert_only),
         # Prices are intentionally unknown by default.  Deployments must set
         # reviewed prices rather than silently relying on stale vendor pricing.
         "input_cny_per_1m": None,
@@ -266,6 +269,12 @@ def default_provider_catalog() -> dict[str, Any]:
                     "long-context",
                     "code",
                 ),
+                # Codex's built-in models (for example the strongest current
+                # flagship) are advanced experts, not default execution.  They
+                # are first-step candidates only for high-difficulty or
+                # major-decision work, and remain reachable afterwards only
+                # through an explicit leader-authorized escalation.
+                expert_only=True,
             ),
         ],
     }
@@ -867,6 +876,9 @@ def validate_provider_catalog(catalog: Mapping[str, Any]) -> dict[str, Any]:
         priority = raw.get("priority", 100)
         if isinstance(priority, bool) or not isinstance(priority, int) or priority < 0:
             raise RoutingValidationError(f"{label}.priority must be a non-negative integer")
+        expert_only = raw.get("expert_only", False)
+        if not isinstance(expert_only, bool):
+            raise RoutingValidationError(f"{label}.expert_only must be boolean")
         raw_pricing = raw.get("pricing")
         has_legacy_price = raw.get("input_cny_per_1m") is not None or raw.get("output_cny_per_1m") is not None
         if raw_pricing is not None and has_legacy_price:
@@ -915,6 +927,7 @@ def validate_provider_catalog(catalog: Mapping[str, Any]) -> dict[str, Any]:
                 "env_key": env_key,
                 "enabled": enabled,
                 "priority": priority,
+                "expert_only": expert_only,
                 "input_cny_per_1m": input_price,
                 "output_cny_per_1m": output_price,
                 "capabilities": list(capabilities),
@@ -964,6 +977,9 @@ def validate_task_routing(task: Mapping[str, Any]) -> dict[str, Any]:
     risk = _normalized_task_value(task, "risk", "low")
     difficulty = _normalized_task_value(task, "difficulty", "normal")
     task_type = _normalized_task_value(task, "task_type", "analysis")
+    major_decision = task.get("major_decision", False)
+    if not isinstance(major_decision, bool):
+        raise RoutingValidationError("task.major_decision must be boolean")
     if risk not in RISKS:
         raise RoutingValidationError(f"task.risk must be one of: {', '.join(sorted(RISKS))}")
     if difficulty not in DIFFICULTIES:
@@ -990,6 +1006,7 @@ def validate_task_routing(task: Mapping[str, Any]) -> dict[str, Any]:
         "risk": risk,
         "difficulty": difficulty,
         "task_type": task_type,
+        "major_decision": major_decision,
         "required_capabilities": normalized_capabilities,
         "min_success_probability": minimum_success,
         "routing_objective": routing_objective,
@@ -1000,7 +1017,11 @@ def auto_tier_floor(task: Mapping[str, Any]) -> str:
     """Return the minimum safe tier for auto routing."""
 
     values = validate_task_routing(task)
-    if values["risk"] == "high" or values["difficulty"] == "hard":
+    if (
+        values["major_decision"]
+        or values["risk"] == "high"
+        or values["difficulty"] == "hard"
+    ):
         return "high"
     if values["risk"] == "medium" or values["task_type"] in MEDIUM_TIER_TASK_TYPES:
         return "medium"
@@ -2302,12 +2323,30 @@ def decide_route(
             minimum_rank = TIER_RANK[requested_tier]
         selected_tier = ""
         candidates = []
+        expert_deferred = False
         for tier in TIERS[minimum_rank:]:
             tier_rows = [row for row in enabled if row["tier"] == tier]
             if tier_rows:
                 selected_tier = tier
                 candidates = tier_rows
                 break
+        # Codex's built-in strongest models are advanced experts, not default
+        # execution.  For an automatic first step they are eligible only when
+        # the task itself is high-difficulty or a major decision (floor high),
+        # or when no non-expert provider exists at the reached tier.  An
+        # explicit provider/tier request remains a major-decision intent and
+        # is honored above.
+        if (
+            requested_tier is None
+            and selected_tier == "high"
+            and floor != "high"
+        ):
+            non_expert = [
+                row for row in candidates if not row.get("expert_only")
+            ]
+            if non_expert:
+                candidates = non_expert
+                expert_deferred = True
         if not candidates:
             raise RoutingValidationError(
                 f"no enabled provider satisfies tier floor {TIERS[minimum_rank]}"
@@ -2319,6 +2358,11 @@ def decide_route(
         else:
             base = requested_tier or floor
             reason = f"no enabled provider at tier {base}; selected next available stronger tier {selected_tier}"
+        if expert_deferred:
+            reason += (
+                " and deferred expert-only Codex providers unless the work is "
+                "high-difficulty or a major decision"
+            )
 
     # The peer limit bounds the combinatorial auto-chain planner.  Explicit
     # provider selection is a single lookup and explicit-tier selection only
@@ -2584,14 +2628,23 @@ def decide_route(
         if expected_cost_per_accepted is not None
         else ""
     )
+    decision_text = "major decision" if values["major_decision"] else "no major-decision flag"
+    expert_text = (
+        "expert-only provider selected because the task reached the strongest "
+        "safe tier or an explicit expert request"
+        if provider.get("expert_only")
+        else ""
+    )
     explanation = (
         f"Tier floor {floor} from risk={values['risk']}, difficulty={values['difficulty']}, "
+        f"{decision_text}, "
         f"task_type={values['task_type']}; {reason}; chose {provider['provider_id']} "
         f"({provider['tier']}) from [{', '.join(candidate_ids)}], {cost_text}, "
         "estimated tokens ordinary-input/cached-input/output "
         f"{input_tokens}/{cached_input_tokens}/{output_tokens}, conservative leader-acceptance "
         f"prior {prior.conservative_probability}, worst-case chain cost CNY "
         f"{worst_case_chain_cost}{objective_text}."
+        + (f" {expert_text}." if expert_text else "")
     )
     return RouteDecision(
         provider_id=provider["provider_id"],

@@ -1,7 +1,7 @@
 {
   "name": "costmarshal",
-  "version": "4.5.0",
-  "description": "Codex-native cost-aware orchestration across low, medium, and high API providers.",
+  "version": "5.0.0",
+  "description": "Codex-native two-level orchestration across low, medium, and high API providers.",
   "author": {
     "name": "yptang98",
     "url": "https://github.com/yptang98"
@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "CostMarshal",
     "shortDescription": "Coordinate low, medium, and high APIs from Codex.",
-    "longDescription": "CostMarshal gives Codex a scheduler-first, recoverable way to coordinate low-, medium-, and high-cost API providers across bounded tasks, Workstreams, and registered repositories. It preserves safety floors, leader-owned acceptance, immutable pricing and profile evidence, budget reservations, staged integration Gates, and optional read-only ArchMarshal governance while keeping the local runtime engine behind a Codex-native Skill interface.",
+    "longDescription": "CostMarshal v5 gives Codex a scheduler-first, recoverable control plane for low-, medium-, and high-cost API providers, while allowing native Codex child agents to parallelize work inside each admitted provider attempt. Cross-provider routing, budgets, leases, isolation, evidence, and leader acceptance remain CostMarshal-owned.",
     "developerName": "yptang98",
     "category": "Productivity",
     "capabilities": [

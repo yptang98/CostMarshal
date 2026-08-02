@@ -5,6 +5,6 @@
   "description": "Locked runtime dependency graph for the CostMarshal production worker image.",
   "license": "UNLICENSED",
   "dependencies": {
-    "@openai/codex": "0.144.1"
+    "@openai/codex": "0.145.0"
   }
 }

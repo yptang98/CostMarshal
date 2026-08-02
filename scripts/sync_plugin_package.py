@@ -43,6 +43,7 @@ TREE_FILES = (
     "costmarshal_v2/actor_runner.py",
     "costmarshal_v2/change_apply.py",
     "costmarshal_v2/cli.py",
+    "costmarshal_v2/codex_native.py",
     "costmarshal_v2/context_projection.py",
     "costmarshal_v2/control_store.py",
     "costmarshal_v2/cost_model.py",
@@ -118,7 +119,7 @@ FORBIDDEN_NAMES = {
     "thumbs.db",
 }
 FORBIDDEN_ROOTS = {"plugins", "release", "tests"}
-MAX_PACKAGE_FILES = 66
+MAX_PACKAGE_FILES = 67
 MAX_FILE_BYTES = 1024 * 1024
 MAX_TOTAL_BYTES = 4 * 1024 * 1024
 MAX_RELATIVE_PATH_BYTES = 240

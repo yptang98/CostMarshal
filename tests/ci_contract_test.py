@@ -102,7 +102,7 @@ class CiContractTest(unittest.TestCase):
             self.assertRegex(action, r"^[^@]+@[0-9a-f]{40}$")
 
     def test_production_build_inputs_are_pinned_reviewed_and_expiring(self) -> None:
-        result = validate(BUILD_INPUTS, today=date(2026, 7, 27))
+        result = validate(BUILD_INPUTS, today=date(2026, 7, 29))
         self.assertEqual(result["platforms"], ["linux/amd64"])
         self.assertRegex(
             result["python_base_image"],
@@ -114,7 +114,7 @@ class CiContractTest(unittest.TestCase):
         )
         self.assertEqual(result["python_version"], "3.11.15")
         self.assertEqual(result["node_version"], "22.23.1")
-        self.assertEqual(result["codex_npm_version"], "0.144.1")
+        self.assertEqual(result["codex_npm_version"], "0.145.0")
         self.assertRegex(
             result["codex_npm_lock_sha256"],
             r"^sha256:[0-9a-f]{64}$",

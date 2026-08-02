@@ -23,6 +23,13 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit
 
+from .codex_native import (
+    CODEX_NATIVE_SCHEMA,
+    codex_native_overrides,
+    normalized_policy,
+    probe_codex,
+    uses_default_codex_command,
+)
 from .context_projection import (
     ContextProjectionError,
     apply_cumulative_change_artifact,
@@ -2377,6 +2384,7 @@ def build_codex_argv(
     argv = resolve_codex_command(actor) + [
         "--ask-for-approval",
         str(runner.get("approval_policy") or "never"),
+        *codex_native_overrides(actor),
         "exec",
         "--ephemeral",
         "--skip-git-repo-check",
@@ -3108,6 +3116,21 @@ def _required_worker_bundle(
         raise SystemExit(f"required worker execution spec is invalid [{exc.code}]: {exc}") from exc
     execution_mode = str(actor.get("execution_mode") or "agent")
     command = ["costmarshal-worker", "--jsonl"]
+    codex_native = normalized_policy(actor)
+    if (
+        execution_mode == "agent"
+        and codex_native["enabled"]
+        and actor.get("role") == "agent"
+    ):
+        command.extend(
+            [
+                "--codex-native",
+                "--max-subagents",
+                str(codex_native["max_subagents"]),
+                "--minimum-codex-version",
+                str(codex_native["minimum_cli_version"]),
+            ]
+        )
     if execution_mode != "agent":
         command.extend(["--mode", execution_mode])
     model = actor.get("model")
@@ -3580,6 +3603,7 @@ def _run_actor_once(
     env: dict[str, str] = {}
     required_spec: WorkerExecutionSpec | None = None
     required_command: list[str] = []
+    codex_native_receipt: dict[str, Any] | None = None
     if required_isolation:
         required_spec, required_command, secret_values = _required_worker_bundle(
             layout,
@@ -3647,9 +3671,49 @@ def _run_actor_once(
                 str(int(proposal_task.get("estimated_output_tokens") or 0)),
             ]
         else:
+            codex_native = normalized_policy(actor)
+            execution_actor = actor
+            if codex_native["enabled"] and actor.get("role") == "agent":
+                if uses_default_codex_command(actor):
+                    codex_native_receipt = probe_codex(
+                        resolve_codex_command(actor),
+                        minimum_version=str(codex_native["minimum_cli_version"]),
+                    )
+                else:
+                    # Compatibility probing an arbitrary command can itself
+                    # have side effects.  Custom runners retain the v4-style
+                    # single-agent contract unless they implement a future
+                    # explicit attestation interface.
+                    codex_native_receipt = {
+                        "schema_version": CODEX_NATIVE_SCHEMA,
+                        "native_exec_ready": False,
+                        "app_server_ready": False,
+                        "subagent_mode": "disabled",
+                        "cross_provider_children": False,
+                        "authority": "costmarshal",
+                        "checks": {"default_codex_command": False},
+                        "errors": [
+                            "custom Codex commands are not probed or granted native subagents"
+                        ],
+                    }
+                if not codex_native_receipt["native_exec_ready"]:
+                    # Native children are an optimization inside an already
+                    # admitted attempt.  A legacy/custom Codex executable may
+                    # still execute the original single-agent contract, but
+                    # must never receive unknown multi-agent config.
+                    execution_actor = {
+                        **actor,
+                        "runner": {
+                            **(actor.get("runner") or {}),
+                            "codex_native": {
+                                **codex_native,
+                                "enabled": False,
+                            },
+                        },
+                    }
             argv = build_codex_argv(
                 layout,
-                actor,
+                execution_actor,
                 project,
                 report,
                 execution_workspace=execution_workspace,
@@ -3658,6 +3722,8 @@ def _run_actor_once(
     events: list[dict[str, Any]] = []
     usage_known = not required_isolation
     runtime_registration: dict[str, Any] = {}
+    if codex_native_receipt is not None:
+        runtime_registration["codex_native"] = codex_native_receipt
 
     def register_runner() -> None:
         current_actor = _validate_worker_fence(

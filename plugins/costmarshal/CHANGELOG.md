@@ -1,5 +1,41 @@
 # Changelog
 
+## v5.0.0 - 2026-08-03
+
+- Added two-level Codex-native orchestration. CostMarshal remains the
+  cross-provider control plane, while an admitted Codex attempt can use a
+  bounded native child-agent team that inherits its model, credential, sandbox,
+  context, budget, lease, and deadline.
+- Added a fail-closed `costmarshal-codex-native-v1` contract that forbids child
+  provider switching, nested delegation, control-state mutation, routing,
+  acceptance, and independent spend.
+- Added `codex-native-status` for provider-free CLI/App Server capability
+  probing, semantic minimum-version checks, and machine-readable compatibility
+  receipts.
+- Upgraded the production worker to the locked `@openai/codex` 0.145.0 release
+  and made its bootstrap attest native-team mode before starting `codex exec`.
+- Preserved the existing durable scheduler, sealed routes, OCI boundary,
+  provider gateway, budget reservations, recovery, and Leader-owned acceptance
+  as the authoritative outer layer.
+- Added a user-configurable Leader. `init` accepts `--leader-provider`,
+  `--leader-model`, and `--leader-profile`, and a new `configure-leader`
+  command previews or persists the leader policy at runtime. The leader no
+  longer has to be the strongest model: a relatively strong provider such as
+  DeepSeek can own leader turns through a named Codex config profile while
+  keeping the same workspace tools, sandbox, budget reservation, and evidence
+  contract. The default remains the signed-in Codex model.
+- Marked the built-in Codex provider `expert_only` in the default catalog.
+  Automatic routing selects it as the first step only when the safe tier floor
+  is high (risk high, difficulty hard, or the new `--major-decision` task
+  flag), or when no non-expert provider can serve the task; later chain steps
+  remain reachable only through explicit leader-authorized escalation.
+- Documented that leader and agent token accounting uses the Codex CLI's own
+  reported usage from its JSON events instead of guessed counts.
+- The desktop Codex session remains the dispatcher that plans and routes work;
+  the new leader policy and expert-tier rules are exposed to it through
+  `configure-leader`, `start-leader`, `new-task --major-decision`, and `route
+  --major-decision`.
+
 ## v4.5.0 - 2026-07-29
 
 - Added a report-only LongCat `proposal-api` worker for bounded text

@@ -1,9 +1,9 @@
 ---
 name: costmarshal
-description: "CostMarshal v4.5 internal policy/runtime for the Codex plugin: scheduler-first, capability-aware and cost-aware low/medium/high provider orchestration across repository-bound Workstreams, with a committed-context report-only proposal path, immutable multimodal inputs, reviewed Provider drift guardrails, an mTLS workload-identity Broker, hard-budget Provider Proxy, short-lived signed production certification, staged integration Gates, total-cost reports, structured teaching execution graphs, evidence-bound evolution cycles, Hot/Warm/Cold context views, recency-aware exact-version model memory, accepted project knowledge, project-local Skill candidates, event-driven Leader Snapshots, structured handoffs, atomic batch acceptance, project artifact lineage, work graphs, artifact gates, recoverable effects, OCI worker isolation, durable attempts, budget reservations, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
+description: "CostMarshal v5.0 internal policy/runtime for the Codex plugin: two-level native Codex attempt teams plus scheduler-first, cost-aware low/medium/high API routing. It governs repository-bound Workstreams, report-only proposals and multimodal inputs, Provider drift, mTLS gateway leases, hard budgets, production certification, integration Gates, cost reports, teaching and model memory, accepted knowledge, Skill candidates, Leader Snapshots, handoffs, artifact lineage, recoverable effects, OCI worker isolation, durable attempts, leader acceptance, and optional read-only ArchMarshal governance. Invoke this legacy root Skill explicitly only; normal Codex use enters through orchestrate-cost-aware-agents."
 ---
 
-# CostMarshal v4.5
+# CostMarshal v5.0
 
 Use this skill for long or decomposable work where multiple API price/capability tiers should cooperate under explicit safety, cost, and recovery controls.
 
@@ -70,6 +70,11 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
     lower price, or restore authority. A replacement row requires an explicit
     human review bound to all unresolved observations and expires within 90
     days.
+28. Codex-native child agents are attempt-local only. They inherit the parent
+    attempt's provider, model, credential, sandbox, visible context, write
+    scope, budget, lease, and deadline. They cannot route, switch provider,
+    mutate CostMarshal control state, accept work, or delegate another level;
+    the parent emits the only completion report.
 
 ## Standard workflow
 
@@ -107,11 +112,24 @@ Only `scripts/costmarshal.py` and the `costmarshal_v2` package are official. Do 
 python scripts/costmarshal.py provider-presets --preset mimo
 python scripts/costmarshal.py configure-provider --codex-home "$env:CODEX_HOME" --preset mimo-v2.5 --profile mimo --tier medium
 
-# Initialize three-tier routing.
-python scripts/costmarshal.py init --name <name> --objective "<objective>" --workspace <workspace> --provider-catalog <catalog.json> --project-budget-cny <amount> --default-min-success-probability <0..1> --governance off --worker-image <name@sha256:digest>
+# Probe native subagent and App Server compatibility without a provider call.
+python scripts/costmarshal.py codex-native-status --require-app-server
 
-# Create a bounded task.
+# Configure the leader: default is the signed-in Codex model; any provider in
+# the catalog (for example DeepSeek) can own leader turns through a named
+# Codex config profile. The strongest Codex models remain advanced experts and
+# are only first-step candidates for high-difficulty or major-decision work.
+python scripts/costmarshal.py configure-leader --project <project-dir> --provider deepseek --model deepseek-v4-pro --profile deepseek
+python scripts/costmarshal.py configure-leader --project <project-dir> --dry-run --provider codex --model inherit
+
+# Initialize three-tier routing.
+python scripts/costmarshal.py init --name <name> --objective "<objective>" --workspace <workspace> --provider-catalog <catalog.json> --project-budget-cny <amount> --default-min-success-probability <0..1> --governance off --worker-image <name@sha256:digest> --leader-provider deepseek --leader-model deepseek-v4-pro --leader-profile deepseek
+
+# Create a bounded task; use --major-decision only for genuinely
+# high-stakes acceptance, integration, architecture, or security calls that
+# should be eligible for the expert-only Codex tier.
 python scripts/costmarshal.py new-task --project <project-dir> --title "<title>" --purpose "<purpose>" --task-type implementation --role builder --depends-on <accepted-task-id> --deliverable completion-report --risk medium --difficulty normal --estimated-input-tokens 100000 --estimated-output-tokens 10000 --claim-path src/file.py --allowed-path src/file.py
+python scripts/costmarshal.py new-task --project <project-dir> --title "<title>" --purpose "<purpose>" --task-type review --risk high --difficulty hard --major-decision --estimated-input-tokens 100000 --estimated-output-tokens 10000 --claim-path docs/decision.md
 
 # Attach a committed image; this also requires input:image and adds it to context.
 python scripts/costmarshal.py new-task --project <project-dir> --title "<title>" --purpose "<purpose>" --input-image assets/reference.png
@@ -125,6 +143,7 @@ python scripts/costmarshal.py review-provider-metadata --project <project-dir> -
 
 # Explain without mutation.
 python scripts/costmarshal.py route --project <project-dir> --task-type implementation --risk medium --difficulty normal --estimated-input-tokens 100000 --estimated-output-tokens 10000
+python scripts/costmarshal.py route --project <project-dir> --task-type review --risk low --difficulty normal --major-decision
 
 # Dispatch and supervise.
 python scripts/costmarshal.py dispatch --project <project-dir> --task V2-0001 --start
