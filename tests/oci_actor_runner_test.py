@@ -26,6 +26,10 @@ from costmarshal_v2.actor_runner import (  # noqa: E402
     actor_execution_workspace,
     run_actor,
 )
+from costmarshal_v2.codex_native import (  # noqa: E402
+    DEFAULT_MAX_SUBAGENTS,
+    MINIMUM_CODEX_VERSION,
+)
 from costmarshal_v2.control_store import (  # noqa: E402
     control_document_transaction,
     control_store_enabled,
@@ -53,6 +57,13 @@ CLI = ROOT / "scripts" / "costmarshal.py"
 IMAGE = "ghcr.io/example/costmarshal-worker@sha256:" + ("a" * 64)
 LINUX_RUNNER_FIXTURE_MARKER = "linux-proc-v2:fixture-boot:1:1:1:" + ("f" * 64)
 LINUX_RUNNER_PROCESS_TOKEN = "costmarshal-process-" + ("e" * 64)
+CODEX_NATIVE_WORKER_ARGS = (
+    "--codex-native",
+    "--max-subagents",
+    str(DEFAULT_MAX_SUBAGENTS),
+    "--minimum-codex-version",
+    MINIMUM_CODEX_VERSION,
+)
 
 
 def run_actor_fixture(*args, **kwargs) -> int:
@@ -209,7 +220,13 @@ class FakeOciAdapter:
         assert str(spec.output_exchange).startswith(str(spec.output_exchange.parents[2]))
         assert str(spec.output_exchange).startswith(str(spec.profile_path.parent))
         assert str(spec.forbidden_mount_roots[0]) not in str(spec.output_exchange)
-        assert command == ["costmarshal-worker", "--jsonl", "--model", "LongCat-2.0"]
+        assert command == [
+            "costmarshal-worker",
+            "--jsonl",
+            *CODEX_NATIVE_WORKER_ARGS,
+            "--model",
+            "LongCat-2.0",
+        ]
         assert "V2-" in stdin_prompt
         self.__class__.started_spec = spec
         self.__class__.started_command = list(command)
@@ -246,7 +263,13 @@ class FakeOciAdapter:
         validate_execution_spec(spec)
         assert container_name == _expected_oci_container_name(spec)
         assert container_id is None
-        assert tuple(command) == ("costmarshal-worker", "--jsonl", "--model", "LongCat-2.0")
+        assert tuple(command) == (
+            "costmarshal-worker",
+            "--jsonl",
+            *CODEX_NATIVE_WORKER_ARGS,
+            "--model",
+            "LongCat-2.0",
+        )
         self.__class__.attached = True
         return SimpleNamespace(
             spec=spec,
@@ -531,6 +554,7 @@ class AttachInspectionFailureAdapter(FakeOciAdapter):
         assert tuple(command) == (
             "costmarshal-worker",
             "--jsonl",
+            *CODEX_NATIVE_WORKER_ARGS,
             "--model",
             "LongCat-2.0",
         )
@@ -588,6 +612,7 @@ class LegacyRecoveryOnlyAdapter(FakeOciAdapter):
         assert tuple(command) == (
             "costmarshal-worker",
             "--jsonl",
+            *CODEX_NATIVE_WORKER_ARGS,
             "--model",
             "LongCat-2.0",
         )
@@ -1393,7 +1418,13 @@ raise SystemExit(actor_runner.run_actor(
         usage_actor.setdefault("runtime", {}).update(
             {
                 "container_name": _expected_oci_container_name(usage_identity),
-                "container_command": ["costmarshal-worker", "--jsonl", "--model", "LongCat-2.0"],
+                "container_command": [
+                    "costmarshal-worker",
+                    "--jsonl",
+                    *CODEX_NATIVE_WORKER_ARGS,
+                    "--model",
+                    "LongCat-2.0",
+                ],
                 "oci_lifecycle_state": "started",
             }
         )
