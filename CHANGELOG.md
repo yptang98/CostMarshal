@@ -1,5 +1,23 @@
 # Changelog
 
+## v5.1.2 - 2026-08-03
+
+- Fixed the LongCat proposal worker on non-UTF-8 consoles. The scheduler
+  writes the prompt over the pipe as UTF-8, but the worker read stdin with the
+  console codepage (cp936/GBK) and surrogateescape, turning UTF-8 BOM or
+  non-GBK bytes into lone surrogates that crashed the request body encode with
+  UnicodeEncodeError. The worker now reads raw stdin bytes and decodes as
+  UTF-8; actor and proposal stdout/stderr are reconfigured to UTF-8.
+- Fixed a Windows provider-runner hang: native child stdout is now captured to
+  a file instead of a pipe, so a descendant such as conhost.exe that outlives
+  the provider process can no longer hold the pipe open and stall the runner
+  at EOF. The runner relays the captured output after the provider exits.
+- Fixed `_proposal_context_text` error handling for text-mode git output
+  (`exc.output` may be str, not bytes).
+- Real LongCat end-to-end verified: a low-tier proposal worker completed with
+  authoritative Chat usage (input 917 / output 634 tokens) and the leader
+  acceptance record was written with `accepted_by_leader=true`.
+
 ## v5.1.1 - 2026-08-03
 
 - Fixed real-provider worker isolation for profiles that inherit

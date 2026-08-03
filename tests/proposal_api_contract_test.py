@@ -339,6 +339,57 @@ class ProposalApiContractTest(unittest.TestCase):
                 "agent-v2-0001",
             )
 
+    def test_worker_reads_stdin_as_utf8_with_bom_and_non_gbk_bytes(self) -> None:
+        """The proposal worker must not crash on UTF-8 BOM or non-GBK input.
+
+        The scheduler writes the prompt as UTF-8 over the pipe.  Reading the
+        text stream with the console codepage (for example cp936/GBK) turns
+        BOM/non-GBK bytes into lone surrogates, and re-encoding them crashes
+        with UnicodeEncodeError before the provider call.  The worker must
+        decode stdin bytes explicitly and only fail with a structured
+        proposal.failed payload.
+        """
+
+        with tempfile.TemporaryDirectory(prefix="costmarshal-proposal-utf8-") as temporary:
+            root = Path(temporary)
+            profile = root / "longcat.config.toml"
+            profile.write_text(
+                provider_preset_profile_text("longcat-2.0"),
+                encoding="utf-8",
+            )
+            report = root / "report.md"
+            prompt = "\ufeff# 实测 UTF-8 BOM 与中文 prompt\n\nProduce a short proposal.\n"
+            env = os.environ.copy()
+            env["LONGCAT_API_KEY"] = "invalid-test-key"
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "costmarshal_proposal_worker.py"),
+                    "--profile-file",
+                    str(profile),
+                    "--report",
+                    str(report),
+                    "--provider",
+                    "longcat",
+                    "--model",
+                    "LongCat-2.0",
+                    "--max-output-tokens",
+                    "64",
+                ],
+                input=prompt.encode("utf-8"),
+                env=env,
+                cwd=ROOT,
+                text=False,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 1)
+            stdout_text = completed.stdout.decode("utf-8", errors="replace")
+            stderr_text = completed.stderr.decode("utf-8", errors="replace")
+            self.assertIn('"type": "proposal.failed"', stdout_text)
+            self.assertNotIn("UnicodeEncodeError", stdout_text + stderr_text)
+            self.assertTrue(report.is_file())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

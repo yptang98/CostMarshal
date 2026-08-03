@@ -19,6 +19,16 @@ from costmarshal_v2.security import redact_secret_values  # noqa: E402
 from costmarshal_v2.state import atomic_write_text  # noqa: E402
 
 
+def _reconfigure_utf8() -> None:
+    """Write proposal protocol output as UTF-8 regardless of console codepage."""
+
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Trusted report-only provider adapter for CostMarshal"
@@ -38,7 +48,12 @@ def main(argv: list[str] | None = None) -> int:
         profile_payload = args.profile_file.read_bytes()
         if len(profile_payload) > 256 * 1024:
             raise ProposalApiError("proposal profile exceeds 256 KiB")
-        prompt_text = sys.stdin.read()
+        # The scheduler writes the prompt over the pipe as UTF-8.  Reading the
+        # text stream would use the console codepage (for example cp936/GBK)
+        # with surrogateescape, which turns UTF-8 BOM or non-GBK bytes into
+        # lone surrogates that cannot be re-encoded.  Read the raw bytes and
+        # decode explicitly as UTF-8.
+        prompt_text = sys.stdin.buffer.read().decode("utf-8", errors="replace")
         if not prompt_text.strip():
             raise ProposalApiError("proposal prompt is empty")
         content, usage = _run_longcat_proposal(
@@ -97,4 +112,5 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    _reconfigure_utf8()
     raise SystemExit(main())

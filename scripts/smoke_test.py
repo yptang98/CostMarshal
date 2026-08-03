@@ -87,7 +87,7 @@ def main() -> int:
         assert_true((project / "project.json").is_file(), "init should create v3-compatible project state")
 
         help_text = run(temp, "--version").stdout
-        assert_true("v5.1.1" in help_text, "official CLI should expose v5 version")
+        assert_true("v5.1.2" in help_text, "official CLI should expose v5 version")
 
         plan = run_json(temp, "start-leader", "--project", str(project), "--command", "codex --prompt {prompt_file}", "--dry-run")
         assert_true(plan["backend"] == "local", "start-leader should use v2 backend abstraction")

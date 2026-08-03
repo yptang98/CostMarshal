@@ -2128,7 +2128,12 @@ def _proposal_context_text(
     except FileNotFoundError as exc:
         raise ProposalApiError("git is required for proposal context") from exc
     except subprocess.CalledProcessError as exc:
-        detail = exc.output.decode("utf-8", errors="replace").strip()
+        raw_output = exc.output
+        detail = (
+            raw_output.decode("utf-8", errors="replace").strip()
+            if isinstance(raw_output, bytes)
+            else str(raw_output or "").strip()
+        )
         raise ProposalApiError(
             f"proposal context requires a committed Git workspace: {detail}"
         ) from exc
@@ -4486,17 +4491,22 @@ def _run_actor_once(
             )
             raise
         process: subprocess.Popen[str] | None = None
+        capture: Any = None
         try:
+            # Redirect child stdout to a file instead of a pipe.  On Windows a
+            # descendant (for example conhost.exe created by an in-model shell
+            # command) can outlive the provider process while still holding the
+            # pipe, which would make the read loop wait for EOF forever.  A
+            # file has no holder, so the runner always proceeds after the
+            # provider exits and then relays the captured output itself.
+            capture = tempfile.TemporaryFile(mode="w+b")
             process = subprocess.Popen(
                 process_argv(argv),
                 cwd=str(execution_workspace),
                 env=env,
                 stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
+                stdout=capture,
                 stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
             )
             try:
                 _native_launch_barrier("after_popen_before_governance")
@@ -4533,12 +4543,16 @@ def _run_actor_once(
                 _terminate_unreleased_native_child(process)
                 raise
             assert process.stdin is not None
-            process.stdin.write(prompt_text)
+            process.stdin.write(prompt_text.encode("utf-8"))
             process.stdin.close()
-            assert process.stdout is not None
-            for line in process.stdout:
+            returncode = process.wait()
+            assert capture is not None
+            capture.flush()
+            capture.seek(0)
+            output_text = capture.read().decode("utf-8", errors="replace")
+            for line in output_text.splitlines():
                 safe_line = redact_secret_values(line, secret_values)
-                sys.stdout.write(safe_line)
+                sys.stdout.write(safe_line + "\n")
                 sys.stdout.flush()
                 try:
                     payload = json.loads(line)
@@ -4546,12 +4560,14 @@ def _run_actor_once(
                     continue
                 if isinstance(payload, dict):
                     events.append(payload)
-            returncode = process.wait()
         except OSError as exc:
             if process is not None:
                 _terminate_unreleased_native_child(process)
             returncode = 127
             atomic_write_text(report, f"# Completion Report\n\nStatus: failed\n\n## Result\n{type(exc).__name__}: {exc}\n")
+        finally:
+            if capture is not None:
+                capture.close()
 
     if required_isolation and provider_completion_observed:
         _actor_fault("after_provider_cleanup_before_seal")
