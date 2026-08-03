@@ -468,6 +468,37 @@ def _source_codex_home(inherited: dict[str, str]) -> str:
     return str((Path.home() / ".codex").resolve())
 
 
+def _write_inherited_provider_config(target: Path, binding: dict[str, Any]) -> None:
+    """Make an isolated worker home self-contained for an inherited provider.
+
+    A real Codex profile may omit ``[model_providers.<id>]`` and inherit the
+    provider endpoint/key contract from the host ``config.toml``.  Workers only
+    receive the reviewed profile snapshot, so when the binding captured an
+    inherited row (base_url/wire_api/env_key) we recreate exactly that reviewed
+    row in the isolated ``config.toml`` -- never the host config or its
+    secrets.
+    """
+
+    provider_id = str(binding.get("provider_identity") or "")
+    base_url = str(binding.get("base_url") or "")
+    if not provider_id or not base_url:
+        return
+    lines = [
+        f"[model_providers.{json.dumps(provider_id)}]",
+        f"name = {json.dumps(provider_id)}",
+        f"base_url = {json.dumps(base_url)}",
+    ]
+    wire_api = binding.get("wire_api")
+    if wire_api:
+        lines.append(f"wire_api = {json.dumps(str(wire_api))}")
+    env_key = binding.get("env_key")
+    if env_key:
+        lines.append(f"env_key = {json.dumps(str(env_key))}")
+    destination = target / "config.toml"
+    if not destination.exists():
+        atomic_write_text(destination, "\n".join(lines) + "\n")
+
+
 def _isolated_codex_home(layout: ProjectLayout, actor: dict[str, Any], inherited: dict[str, str]) -> Path:
     """Create a credential-free Codex home containing only this actor's profile."""
 
@@ -483,6 +514,16 @@ def _isolated_codex_home(layout: ProjectLayout, actor: dict[str, Any], inherited
             payload = verify_profile_snapshot(layout.root, binding)
             destination = target / (f"{profile}.config.toml" if profile else "config.toml")
             install_bound_copy(destination, payload, binding)
+            if profile:
+                parsed_profile = parse_profile_bytes(payload)
+                providers = parsed_profile.get("model_providers")
+                row = (
+                    providers.get(binding.get("provider_identity"))
+                    if isinstance(providers, dict)
+                    else None
+                )
+                if not isinstance(row, dict) and binding.get("base_url"):
+                    _write_inherited_provider_config(target, binding)
         except ProfileBindingError as exc:
             raise SystemExit(f"provider profile binding failed closed: {exc}") from exc
         # Authentication is a separate credential channel; its bytes are not

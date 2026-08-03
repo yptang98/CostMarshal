@@ -1,6 +1,6 @@
 {
   "name": "costmarshal",
-  "version": "5.1.0",
+  "version": "5.1.1",
   "description": "Codex-native two-level orchestration across low, medium, and high API providers.",
   "author": {
     "name": "yptang98",

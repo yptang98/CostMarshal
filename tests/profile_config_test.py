@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -17,6 +18,14 @@ CLI = ROOT / "scripts" / "costmarshal.py"
 sys.path.insert(0, str(ROOT))
 
 from costmarshal_v2.profile_binding import read_named_profile  # noqa: E402
+from costmarshal_v2.actor_runner import (  # noqa: E402
+    _isolated_codex_home,
+    _write_inherited_provider_config,
+)
+from costmarshal_v2.profile_binding import (  # noqa: E402
+    install_profile_snapshot,
+    validate_profile_binding,
+)
 
 
 def run(*args: str, expect: int = 0) -> subprocess.CompletedProcess[str]:
@@ -419,6 +428,70 @@ def main() -> int:
             except Exception:
                 rejected = True
         assert rejected
+
+        # A worker's isolated home must be self-contained: when the bound
+        # profile inherits [model_providers.<id>] from config.toml, the runner
+        # recreates exactly the reviewed provider row so Codex exec can resolve
+        # it without the host config or its secrets.
+        (inherited_home / "deepseek.config.toml").write_text(
+            'model = "deepseek-v4-pro"\n'
+            'model_provider = "deepseek"\n'
+            'model_reasoning_effort = "high"\n'
+            'model_context_window = 1048576\n'
+            'model_catalog_json = "C:/Users/example/.codex/models.json"\n',
+            encoding="utf-8",
+        )
+        layout_root = Path(raw) / "isolated-runtime"
+        project_dir = layout_root / "projects" / "p"
+        project_dir.mkdir(parents=True)
+        layout = SimpleNamespace(
+            root=layout_root,
+            project_dir=project_dir,
+        )
+        with patch.dict(
+            os.environ,
+            {"CODEX_HOME": str(inherited_home)},
+            clear=False,
+        ):
+            material = read_named_profile(
+                "deepseek",
+                expected_env_key="DEEPSEEK_API_KEY",
+                snapshot_relpath="profile-snapshots/isolated/config.toml",
+            )
+        assert material is not None
+        payload, binding = material
+        binding = validate_profile_binding(binding, require_available=True)
+        install_profile_snapshot(layout_root, payload, binding)
+        actor = {
+            "id": "agent-isolated",
+            "role": "agent",
+            "profile": "deepseek",
+            "tier": "medium",
+            "profile_binding": binding,
+        }
+        isolated = _isolated_codex_home(layout, actor, {})
+        assert (isolated / "deepseek.config.toml").is_file()
+        inherited_config = isolated / "config.toml"
+        assert inherited_config.is_file()
+        inherited_text = inherited_config.read_text(encoding="utf-8")
+        assert "base_url = \"https://api.deepseek.com\"" in inherited_text
+        assert "wire_api = \"responses\"" in inherited_text
+        assert "env_key = \"DEEPSEEK_API_KEY\"" in inherited_text
+        assert "sk-" not in inherited_text
+
+        # No inherited row means no fabricated provider config.
+        empty_target = Path(raw) / "empty-isolated"
+        empty_target.mkdir()
+        _write_inherited_provider_config(
+            empty_target,
+            {
+                "provider_identity": "deepseek",
+                "base_url": None,
+                "wire_api": None,
+                "env_key": None,
+            },
+        )
+        assert not (empty_target / "config.toml").exists()
     print("provider profile contract ok")
     return 0
 

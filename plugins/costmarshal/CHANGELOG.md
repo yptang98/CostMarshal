@@ -1,5 +1,20 @@
 # Changelog
 
+## v5.1.1 - 2026-08-03
+
+- Fixed real-provider worker isolation for profiles that inherit
+  `[model_providers.<id>]` from the host `config.toml`. Workers only receive
+  the reviewed profile snapshot, so the runner now recreates exactly the
+  reviewed provider row (base_url/wire_api/env_key from the route binding) in
+  the isolated `config.toml`. A real DeepSeek worker previously failed with
+  "Model provider `deepseek` not found"; it now connects, executes, completes,
+  and records authoritative Codex CLI usage (`usage_observed=true`).
+- Verified end to end with a live DeepSeek leader: the leader autonomously
+  planned, created a bounded task, routed it to the DeepSeek medium tier, and
+  dispatched a worker through the mailbox.
+- Added regression coverage for inherited-provider isolation and exact-command
+  OCI worker contracts (Linux CI).
+
 ## v5.1.0 - 2026-08-03
 
 - Added two-level Codex-native orchestration. CostMarshal remains the
